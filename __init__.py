@@ -315,7 +315,6 @@ class Command:
         if current == 'on_start':
             return
         ct.ini_write(PLUGINS_INI, PLUGINS_INI_SECTION, MODULE_NAME, 'on_start')
-        print('Differ: enabled autostart (on_start subscribed in plugins.ini)')
 
     def _disable_autostart(self):
         """Remove the on_start subscription from plugins.ini so the plugin
@@ -325,7 +324,6 @@ class Command:
         if not current:
             return
         ct.ini_proc(ct.INI_DELETE_KEY, PLUGINS_INI, PLUGINS_INI_SECTION, MODULE_NAME)
-        print('Differ: disabled autostart (on_start unsubscribed from plugins.ini)')
 
     def change_config(self):
         try:
@@ -481,8 +479,6 @@ class Command:
         except Exception:
             session_path = ''
         self._register_compare_tab(compare_tab_id, pairs, session_path)
-        print('Differ: registered compare tab_id={} session={}'.format(
-            compare_tab_id, session_path or '(none)'))
 
         # Persistently subscribe to on_start so the plugin auto-loads on
         # next startup and lazy events (on_save~) fire after restart.
@@ -547,35 +543,50 @@ class Command:
         """When a Differ temp file is saved in the compare view, sync the
         saved content back to the original tab it was created from.
 
-        Also sync the SIBLING editor (the other half of the compare pair),
-        because saving one half should not leave the other half's original
-        out of sync. Both halves are temp files belonging to the same
-        compare tab."""
+        Also SAVE the sibling editor (the other half of the split) to disk
+        and sync it too, so pressing Ctrl+S in one half saves both halves.
+        A re-entrancy guard prevents infinite recursion when the sibling's
+        save triggers this handler again."""
         fn = ed_self.get_filename()
         if not fn or TEMP_DIR not in fn:
             return
 
-        # Sync the editor that was just saved.
-        self._sync_editor_to_original(ed_self)
+        # Re-entrancy guard: if we're already inside on_save (called
+        # recursively via sibling.save()), just sync and return without
+        # trying to save the sibling again.
+        if getattr(self, '_in_on_save', False):
+            self._sync_editor_to_original(ed_self)
+            return
 
-        # Also sync the sibling editor (the other half of the split).
-        # In a compare tab, the saved editor is linked to a sibling via
-        # PROP_HANDLE_PRIMARY/PROP_HANDLE_SECONDARY.
-        h_self = ed_self.get_prop(ct.PROP_HANDLE_SELF)
-        h_primary = ed_self.get_prop(ct.PROP_HANDLE_PRIMARY)
-        h_secondary = ed_self.get_prop(ct.PROP_HANDLE_SECONDARY)
-        if h_self == h_primary and h_secondary:
-            sibling = ct.Editor(h_secondary)
-        elif h_self == h_secondary and h_primary:
-            sibling = ct.Editor(h_primary)
-        else:
-            sibling = None
+        self._in_on_save = True
+        try:
+            # Sync the editor that was just saved.
+            self._sync_editor_to_original(ed_self)
 
-        if sibling is not None:
-            sib_fn = sibling.get_filename()
-            if sib_fn and TEMP_DIR in sib_fn:
-                # Sync the sibling's current content to its original.
-                self._sync_editor_to_original(sibling)
+            # Find the sibling editor (the other half of the split).
+            h_self = ed_self.get_prop(ct.PROP_HANDLE_SELF)
+            h_primary = ed_self.get_prop(ct.PROP_HANDLE_PRIMARY)
+            h_secondary = ed_self.get_prop(ct.PROP_HANDLE_SECONDARY)
+            if h_self == h_primary and h_secondary:
+                sibling = ct.Editor(h_secondary)
+            elif h_self == h_secondary and h_primary:
+                sibling = ct.Editor(h_primary)
+            else:
+                sibling = None
+
+            if sibling is not None:
+                sib_fn = sibling.get_filename()
+                if sib_fn and TEMP_DIR in sib_fn:
+                    # If the sibling is modified, save it to disk. This
+                    # triggers on_save(sibling), which syncs the sibling
+                    # to its original. The guard prevents recursion.
+                    if sibling.get_prop(ct.PROP_MODIFIED):
+                        sibling.save()
+                    else:
+                        # Sibling not modified, just sync current content.
+                        self._sync_editor_to_original(sibling)
+        finally:
+            self._in_on_save = False
 
     def _sync_editor_to_original(self, ed):
         """Sync a single compare-half editor's content back to its original
@@ -598,7 +609,6 @@ class Command:
         # persisted state. Used after restart if PROP_TAB_ID did not match.
         orig_fn = self._find_orig_fn_for_temp(fn)
         if orig_fn:
-            print('Differ: on_save fallback, looking for filename={}'.format(orig_fn))
             for h in ct.ed_handles():
                 e = ct.Editor(h)
                 if e.get_filename() == orig_fn:
@@ -658,7 +668,6 @@ class Command:
         We also rebuild the in-memory scroll sync set from the persisted
         state and re-subscribe to on_scroll so synchronized scrolling works
         in restored compare tabs without needing a manual refresh."""
-        print('Differ: on_start fired (plugin auto-loaded for compare tab persistence)')
         state = self._load_state()  # prunes stale entries
         # Rebuild scroll.tab_id set from persisted compare tab IDs so that
         # ScrollSplittedTab.toggle() works correctly after restart.
@@ -671,8 +680,6 @@ class Command:
         # Re-subscribe to on_scroll event if sync_scroll is enabled.
         if self.cfg.get('sync_scroll') and self.scroll.tab_id:
             ct.app_proc(ct.PROC_EVENTS_SUB, self.scroll.name+';on_scroll;;')
-            print('Differ: on_start re-subscribed to on_scroll for {} compare tab(s)'.format(
-                len(self.scroll.tab_id)))
 
     def on_exit_pre(self, ed_self):
         """Called before CudaText is about to exit. Sets a flag so that
@@ -1014,7 +1021,6 @@ class Command:
             if fc == 1:
                 return
             text = get_lines(eds[0])
-            print(text)
             if text:
                 eds[1].insert(0, b0, text)
         else:
@@ -1225,8 +1231,6 @@ class Command:
         entry = self._unregister_compare_tab(tab_id)
         if entry is None:
             return  # not a compare tab
-
-        print('Differ: on_close compare tab_id={} being closed'.format(tab_id))
 
         # Remove from in-memory scroll set.
         try:
