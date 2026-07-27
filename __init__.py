@@ -613,11 +613,25 @@ class Command:
                 e = ct.Editor(h)
                 if e.get_filename() == orig_fn:
                     self._apply_text_preserving_undo(e, new_text)
-                    e.set_prop(ct.PROP_MODIFIED, True)
+                    self._save_or_mark_original(e)
                     ct.msg_status(_('Differ: synced changes to original tab (by filename)'))
                     return
 
         ct.msg_status(_('Differ: original tab no longer open; changes saved to temp file only'))
+
+    def _save_or_mark_original(self, e):
+        """After syncing content to an original tab: if it's a real file on
+        disk, save it immediately so the file reflects the changes. If it's
+        an untitled tab (no filename), just mark it modified without
+        triggering a Save dialog -- the user can save it later if desired."""
+        orig_fn = e.get_filename()
+        if orig_fn:
+            # Real file on disk -- save it.
+            e.save()
+        else:
+            # Untitled tab -- mark modified so the user sees the dot,
+            # but don't trigger a Save dialog.
+            e.set_prop(ct.PROP_MODIFIED, True)
 
     def _apply_text_preserving_undo(self, ed, new_text):
         """Replace the entire editor text while preserving Undo history.
@@ -646,15 +660,16 @@ class Command:
         """Find the original tab by PROP_TAB_ID and overwrite its content
         (preserving Undo via replace_lines).
 
-        The original tab is marked modified so the user can review and
-        save it explicitly. Returns True if the original was found."""
+        If the original is a real file on disk, it's saved immediately.
+        If it's an untitled tab, it's marked modified without triggering
+        a Save dialog. Returns True if the original was found."""
         # Compare as strings to avoid int/str type mismatches.
         target = str(tab_id)
         for h in ct.ed_handles():
             e = ct.Editor(h)
             if str(e.get_prop(ct.PROP_TAB_ID)) == target:
                 self._apply_text_preserving_undo(e, new_text)
-                e.set_prop(ct.PROP_MODIFIED, True)
+                self._save_or_mark_original(e)
                 ct.msg_status(_('Differ: synced changes to original tab (by tab id)'))
                 return True
         return False
