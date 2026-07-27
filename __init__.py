@@ -101,9 +101,19 @@ TIMESTAMP_END = '}.txt'
 # so we can sync changes back to the original tab even after restarts/renames.
 TEMP_ID_BEGIN = '_['
 TEMP_ID_END = ']_'
-# Persistent mapping: temp_filename -> original_filename ("" for untitled tabs).
-# Fallback to find the original tab after restart if PROP_TAB_ID doesn't match.
-ORIGINS_FILE = os.path.join(ct.app_path(ct.APP_DIR_SETTINGS), 'cuda_differ_origins.json')
+# Persistent state file: stores compare-tab IDs and their temp-file mappings.
+# Keyed by compare tab's PROP_TAB_ID so it survives restarts and renames.
+# Structure:
+# {
+#   "compare_tabs": {
+#     "<compare_tab_id>": [
+#       {"temp_fn": "...", "orig_fn": "..."},   # primary half
+#       {"temp_fn": "...", "orig_fn": "..."}    # secondary half
+#     ]
+#   }
+# }
+# orig_fn is "" for untitled originals (those rely on PROP_TAB_ID only).
+STATE_FILE = os.path.join(ct.app_path(ct.APP_DIR_SETTINGS), 'cuda_differ_state.json')
 # Path to plugins.ini -- used to persistently subscribe to on_start so the
 # plugin auto-loads on next CudaText startup when compare tabs are active.
 PLUGINS_INI = os.path.join(ct.app_path(ct.APP_DIR_SETTINGS), 'plugins.ini')
@@ -208,7 +218,6 @@ class Command:
         self.cfg = self.get_config()
         self.diff = df.Differ()
         self.diff_dlg = DifferDialog()
-        self.diff_tabs = []
         # Set to True by on_exit_pre when CudaText is about to exit, so that
         # on_close_pre (which fires next, once per closing tab) can skip
         # temp-file deletion and let compare tabs persist across restarts.
@@ -219,29 +228,70 @@ class Command:
         self.menuid_withfile = None
         self.menuid_withtab = None
 
-    def _load_origins(self):
-        """Load the persistent temp_filename -> original_filename mapping.
-        Stale entries (temp file no longer on disk) are pruned."""
+    def _load_state(self):
+        """Load the persisted compare-tab state. Prunes stale entries
+        (compare tabs whose temp files no longer exist on disk)."""
         try:
-            with open(ORIGINS_FILE, 'r', encoding='utf8') as f:
+            with open(STATE_FILE, 'r', encoding='utf8') as f:
                 data = json.load(f)
         except (OSError, ValueError):
-            return {}
-        if not isinstance(data, dict):
-            return {}
-        # Prune stale entries whose temp files no longer exist.
-        cleaned = {k: v for k, v in data.items() if os.path.isfile(k)}
-        if len(cleaned) != len(data):
-            self._save_origins(cleaned)
-        return cleaned
+            return {'compare_tabs': {}}
+        if not isinstance(data, dict) or not isinstance(data.get('compare_tabs'), dict):
+            return {'compare_tabs': {}}
+        ctabs = data['compare_tabs']
+        cleaned = {}
+        for tab_id_str, pairs in ctabs.items():
+            if not isinstance(pairs, list):
+                continue
+            # Keep entry only if at least one temp file still exists.
+            if any(isinstance(p, dict) and os.path.isfile(p.get('temp_fn', '')) for p in pairs):
+                cleaned[tab_id_str] = pairs
+        if len(cleaned) != len(ctabs):
+            self._save_state({'compare_tabs': cleaned})
+        return {'compare_tabs': cleaned}
 
-    def _save_origins(self, origins):
-        """Save the temp_filename -> original_filename mapping to disk."""
+    def _save_state(self, state):
+        """Save the compare-tab state to disk."""
         try:
-            with open(ORIGINS_FILE, 'w', encoding='utf8') as f:
-                json.dump(origins, f, indent=2)
+            with open(STATE_FILE, 'w', encoding='utf8') as f:
+                json.dump(state, f, indent=2)
         except OSError as ex:
-            msg('failed to save origins file: {}'.format(ex), level=2)
+            msg('failed to save state file: {}'.format(ex), level=2)
+
+    def _is_compare_tab(self, tab_id):
+        """Check if the given PROP_TAB_ID belongs to a compare tab."""
+        state = self._load_state()
+        return str(tab_id) in state['compare_tabs']
+
+    def _register_compare_tab(self, compare_tab_id, pairs):
+        """Register a compare tab with its temp-file/original-filename pairs.
+
+        pairs: list of 2 dicts: [{"temp_fn": ..., "orig_fn": ...}, ...]
+        """
+        state = self._load_state()
+        state['compare_tabs'][str(compare_tab_id)] = pairs
+        self._save_state(state)
+
+    def _unregister_compare_tab(self, compare_tab_id):
+        """Remove a compare tab from the persisted state. Returns the
+        removed pairs (list) or None if not found."""
+        state = self._load_state()
+        key = str(compare_tab_id)
+        pairs = state['compare_tabs'].pop(key, None)
+        if pairs is not None:
+            self._save_state(state)
+        return pairs
+
+    def _find_orig_fn_for_temp(self, temp_fn):
+        """Search the persisted state for the original filename associated
+        with a given temp filename. Returns "" for untitled originals, or
+        None if not found."""
+        state = self._load_state()
+        for pairs in state['compare_tabs'].values():
+            for p in pairs:
+                if isinstance(p, dict) and p.get('temp_fn') == temp_fn:
+                    return p.get('orig_fn', '')
+        return None
 
     def _enable_autostart(self):
         """Persistently subscribe to on_start via plugins.ini so the plugin
@@ -372,6 +422,9 @@ class Command:
     def set_files(self, file0, file1):
         files = [file0, file1]
         lexers = [None, None]
+        # Collect (temp_fn, orig_fn) pairs for each half so we can register
+        # the compare tab by its PROP_TAB_ID after file_open.
+        pairs = []
         for (index, name) in enumerate(files):
             for h in ct.ed_handles():
                 e = ct.Editor(h)
@@ -391,12 +444,8 @@ class Command:
                     except OSError as ex:
                         msg('failed to create temp file: {}'.format(ex), level=2)
                         return
-                    # Record the original's filename so we can find it after
-                    # restart even if PROP_TAB_ID doesn't match. Empty string
-                    # for untitled tabs (those rely on PROP_TAB_ID only).
-                    origins = self._load_origins()
-                    origins[temp_fn] = e.get_filename() or ''
-                    self._save_origins(origins)
+                    orig_fn = e.get_filename() or ''
+                    pairs.append({'temp_fn': temp_fn, 'orig_fn': orig_fn})
                     files[index] = temp_fn
                     break
 
@@ -408,7 +457,12 @@ class Command:
             title = title2
         ct.ed.set_prop(ct.PROP_TAB_TITLE, title)
 
-        self.diff_tabs.append(title)
+        # Register the compare tab by its PROP_TAB_ID (persists restarts,
+        # invariant under renames/moves). This replaces the old title-based
+        # diff_tabs list which broke after restart or tab rename.
+        compare_tab_id = ct.ed.get_prop(ct.PROP_TAB_ID)
+        self._register_compare_tab(compare_tab_id, pairs)
+        print('Differ: registered compare tab_id={}'.format(compare_tab_id))
 
         # Persistently subscribe to on_start so the plugin auto-loads on
         # next startup and lazy events (on_save~) fire after restart.
@@ -458,7 +512,7 @@ class Command:
             self.refresh()
 
     def on_scroll(self, ed_self):
-        if ed_self.get_prop(ct.PROP_TAB_TITLE, '') in self.diff_tabs:
+        if self._is_compare_tab(ed_self.get_prop(ct.PROP_TAB_ID)):
             self.scroll.on_scroll(ed_self)
 
     def on_caret(self, ed_self):
@@ -492,10 +546,9 @@ class Command:
                 return
 
         # Strategy 2: fallback -- find the original by filename from the
-        # persistent origins mapping. Used after restart if PROP_TAB_ID
-        # did not match (e.g. session-restore edge cases).
-        origins = self._load_origins()
-        orig_fn = origins.get(fn, '')
+        # persisted state. Used after restart if PROP_TAB_ID did not match
+        # (e.g. session-restore edge cases).
+        orig_fn = self._find_orig_fn_for_temp(fn)
         if orig_fn:
             print('Differ: on_save fallback, looking for filename={}'.format(orig_fn))
             for h in ct.ed_handles():
@@ -542,10 +595,26 @@ class Command:
         """Called once on program start. The plugin is loaded because it was
         subscribed to on_start via plugins.ini (set when a compare tab was
         active). Just being loaded is enough -- all lazy events (on_save~,
-        on_close_pre~) will now fire. We prune stale origins here as
-        lightweight housekeeping."""
+        on_close_pre~) will now fire.
+
+        We also rebuild the in-memory scroll sync set from the persisted
+        state and re-subscribe to on_scroll so synchronized scrolling works
+        in restored compare tabs without needing a manual refresh."""
         print('Differ: on_start fired (plugin auto-loaded for compare tab persistence)')
-        self._load_origins()  # prunes stale entries
+        state = self._load_state()  # prunes stale entries
+        # Rebuild scroll.tab_id set from persisted compare tab IDs so that
+        # ScrollSplittedTab.toggle() works correctly after restart.
+        self.scroll.tab_id = set()
+        for tab_id_str in state['compare_tabs']:
+            try:
+                self.scroll.tab_id.add(int(tab_id_str))
+            except (ValueError, TypeError):
+                pass
+        # Re-subscribe to on_scroll event if sync_scroll is enabled.
+        if self.cfg.get('sync_scroll') and self.scroll.tab_id:
+            ct.app_proc(ct.PROC_EVENTS_SUB, self.scroll.name+';on_scroll;;')
+            print('Differ: on_start re-subscribed to on_scroll for {} compare tab(s)'.format(
+                len(self.scroll.tab_id)))
 
     def on_exit_pre(self, ed_self):
         """Called before CudaText is about to exit. Sets a flag so that
@@ -1084,73 +1153,84 @@ class Command:
                     return
 
     def on_close_pre(self, ed_self: ct.Editor):
-        """When a compare tab is closed: sync unsaved changes from its temp
+        """When any tab is closed, check if it's a compare tab (by PROP_TAB_ID
+        in the persisted state). If so: sync unsaved changes from its temp
         files back to the original tabs, then delete only those temp files.
-        If this was the last compare tab, disable autostart so the plugin
-        does not load on next startup.
+        If this was the last compare tab, disable autostart.
 
-        During app exit, temp files are preserved so the compare tab can be
-        restored after restart. Temp files are only deleted when the user
-        explicitly closes the compare tab."""
-        title = ed_self.get_prop(ct.PROP_TAB_TITLE, '')
-        if title in self.diff_tabs:
-            self.diff_tabs.remove(title)
+        During app exit, temp files and autostart are preserved so the
+        compare tab can be restored after restart."""
+        tab_id = ed_self.get_prop(ct.PROP_TAB_ID)
+        pairs = self._unregister_compare_tab(tab_id)
+        if pairs is None:
+            return  # not a compare tab
 
-            # avoid 'combined' tab title 'name1 | name2' saved to 'history files.json'
-            ed_self.set_prop(ct.PROP_TAB_TITLE, '')
+        print('Differ: on_close_pre compare tab_id={} being closed'.format(tab_id))
 
-            # During app exit, keep temp files and autostart subscription
-            # so compare tabs persist restarts and the plugin auto-loads.
-            if getattr(self, '_app_exiting', False):
-                return
+        # avoid 'combined' tab title 'name1 | name2' saved to 'history files.json'
+        ed_self.set_prop(ct.PROP_TAB_TITLE, '')
 
-            # Sync unsaved edits and clean up temp files for this compare tab.
-            origins = self._load_origins()
-            origins_dirty = False
-            for h in (ed_self.get_prop(ct.PROP_HANDLE_PRIMARY),
-                      ed_self.get_prop(ct.PROP_HANDLE_SECONDARY)):
-                if not h:
-                    continue
-                sub = ct.Editor(h)
-                fn = sub.get_filename()
-                if not fn or TEMP_DIR not in fn:
-                    continue
-                # Sync unsaved (modified) content back to the original tab.
-                if sub.get_prop(ct.PROP_MODIFIED):
-                    tab_id = parse_tab_id_from_temp(fn)
-                    synced = False
-                    if tab_id is not None:
-                        synced = self._sync_back_to_original(tab_id, sub.get_text_all())
-                    if not synced:
-                        # Fallback: by filename from origins mapping.
-                        orig_fn = origins.get(fn, '')
-                        if orig_fn:
-                            for hh in ct.ed_handles():
-                                e = ct.Editor(hh)
-                                if e.get_filename() == orig_fn:
-                                    e.set_text_all(sub.get_text_all())
-                                    e.set_prop(ct.PROP_MODIFIED, True)
-                                    ct.msg_status(_('Differ: synced changes to original tab (by filename)'))
-                                    synced = True
-                                    break
-                    if not synced:
-                        ct.msg_status(_('Differ: original tab no longer open; changes saved to temp file only'))
-                # Delete only this temp file and remove its mapping entry.
-                try:
-                    if os.path.isfile(fn):
-                        os.unlink(fn)
-                except OSError as ex:
-                    msg('failed to delete temp file "{}": {}'.format(fn, ex), level=2)
-                if fn in origins:
-                    del origins[fn]
-                    origins_dirty = True
-            if origins_dirty:
-                self._save_origins(origins)
+        # Also remove from in-memory scroll set.
+        try:
+            self.scroll.tab_id.discard(int(tab_id))
+        except (ValueError, TypeError):
+            pass
 
-            # If no more compare tabs are open, disable autostart so the
-            # plugin does not load on next startup (no overhead).
-            if not self.diff_tabs:
-                self._disable_autostart()
+        # During app exit, keep temp files and autostart subscription
+        # so compare tabs persist restarts and the plugin auto-loads.
+        if getattr(self, '_app_exiting', False):
+            # Re-register since we already unregistered above.
+            self._register_compare_tab(tab_id, pairs)
+            return
+
+        # Sync unsaved edits and clean up temp files for this compare tab.
+        # Build a lookup from temp_fn -> orig_fn using the pairs we just removed.
+        temp_to_orig = {}
+        for p in pairs:
+            if isinstance(p, dict):
+                temp_to_orig[p.get('temp_fn', '')] = p.get('orig_fn', '')
+
+        for h in (ed_self.get_prop(ct.PROP_HANDLE_PRIMARY),
+                  ed_self.get_prop(ct.PROP_HANDLE_SECONDARY)):
+            if not h:
+                continue
+            sub = ct.Editor(h)
+            fn = sub.get_filename()
+            if not fn or TEMP_DIR not in fn:
+                continue
+            # Sync unsaved (modified) content back to the original tab.
+            if sub.get_prop(ct.PROP_MODIFIED):
+                orig_tab_id = parse_tab_id_from_temp(fn)
+                synced = False
+                if orig_tab_id is not None:
+                    synced = self._sync_back_to_original(orig_tab_id, sub.get_text_all())
+                if not synced:
+                    # Fallback: by filename from the state pairs.
+                    orig_fn = temp_to_orig.get(fn, '')
+                    if orig_fn:
+                        print('Differ: on_close_pre fallback by filename={}'.format(orig_fn))
+                        for hh in ct.ed_handles():
+                            e = ct.Editor(hh)
+                            if e.get_filename() == orig_fn:
+                                e.set_text_all(sub.get_text_all())
+                                e.set_prop(ct.PROP_MODIFIED, True)
+                                ct.msg_status(_('Differ: synced changes to original tab (by filename)'))
+                                synced = True
+                                break
+                if not synced:
+                    ct.msg_status(_('Differ: original tab no longer open; changes saved to temp file only'))
+            # Delete only this temp file.
+            try:
+                if os.path.isfile(fn):
+                    os.unlink(fn)
+            except OSError as ex:
+                msg('failed to delete temp file "{}": {}'.format(fn, ex), level=2)
+
+        # If no more compare tabs are open, disable autostart so the
+        # plugin does not load on next startup (no overhead).
+        state = self._load_state()
+        if not state['compare_tabs']:
+            self._disable_autostart()
 
     def move_to_sep_tabs_timer(self, tag='', info=''):
 
