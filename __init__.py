@@ -222,7 +222,7 @@ class Command:
         self.diff = df.Differ()
         self.diff_dlg = DifferDialog()
         # Set to True by on_exit_pre when CudaText is about to exit, so that
-        # on_close_pre (which fires next, once per closing tab) can skip
+        # on_close (which fires next, once per closing tab) can skip
         # temp-file deletion and let compare tabs persist across restarts.
         self._app_exiting = False
 
@@ -309,7 +309,7 @@ class Command:
     def _enable_autostart(self):
         """Persistently subscribe to on_start via plugins.ini so the plugin
         auto-loads on next CudaText startup. This ensures lazy events
-        (on_save~, on_close_pre~) fire after restart when compare tabs
+        (on_save~, on_close~) fire after restart when compare tabs
         are restored from session."""
         current = ct.ini_read(PLUGINS_INI, PLUGINS_INI_SECTION, MODULE_NAME, '')
         if current == 'on_start':
@@ -545,51 +545,96 @@ class Command:
 
     def on_save(self, ed_self):
         """When a Differ temp file is saved in the compare view, sync the
-        saved content back to the original tab it was created from."""
+        saved content back to the original tab it was created from.
+
+        Also sync the SIBLING editor (the other half of the compare pair),
+        because saving one half should not leave the other half's original
+        out of sync. Both halves are temp files belonging to the same
+        compare tab."""
         fn = ed_self.get_filename()
         if not fn or TEMP_DIR not in fn:
             return
-        new_text = ed_self.get_text_all()
+
+        # Sync the editor that was just saved.
+        self._sync_editor_to_original(ed_self)
+
+        # Also sync the sibling editor (the other half of the split).
+        # In a compare tab, the saved editor is linked to a sibling via
+        # PROP_HANDLE_PRIMARY/PROP_HANDLE_SECONDARY.
+        h_self = ed_self.get_prop(ct.PROP_HANDLE_SELF)
+        h_primary = ed_self.get_prop(ct.PROP_HANDLE_PRIMARY)
+        h_secondary = ed_self.get_prop(ct.PROP_HANDLE_SECONDARY)
+        if h_self == h_primary and h_secondary:
+            sibling = ct.Editor(h_secondary)
+        elif h_self == h_secondary and h_primary:
+            sibling = ct.Editor(h_primary)
+        else:
+            sibling = None
+
+        if sibling is not None:
+            sib_fn = sibling.get_filename()
+            if sib_fn and TEMP_DIR in sib_fn:
+                # Sync the sibling's current content to its original.
+                self._sync_editor_to_original(sibling)
+
+    def _sync_editor_to_original(self, ed):
+        """Sync a single compare-half editor's content back to its original
+        tab. Tries PROP_TAB_ID first (parsed from temp filename), then
+        falls back to filename from the persisted state."""
+        fn = ed.get_filename()
+        if not fn or TEMP_DIR not in fn:
+            return
+        new_text = ed.get_text_all()
         tab_id = parse_tab_id_from_temp(fn)
 
         # Strategy 1: find the original by PROP_TAB_ID (parsed from temp
         # filename). This is the primary mechanism and works if the ID
         # persists across restarts (which it should per the API).
         if tab_id is not None:
-            print('Differ: on_save looking for tab_id={}'.format(tab_id))
-            open_ids = []
-            for h in ct.ed_handles():
-                e = ct.Editor(h)
-                open_ids.append(e.get_prop(ct.PROP_TAB_ID))
-            print('Differ: open tab IDs={}'.format(open_ids))
             if self._sync_back_to_original(tab_id, new_text):
                 return
 
         # Strategy 2: fallback -- find the original by filename from the
-        # persisted state. Used after restart if PROP_TAB_ID did not match
-        # (e.g. session-restore edge cases).
+        # persisted state. Used after restart if PROP_TAB_ID did not match.
         orig_fn = self._find_orig_fn_for_temp(fn)
         if orig_fn:
             print('Differ: on_save fallback, looking for filename={}'.format(orig_fn))
             for h in ct.ed_handles():
                 e = ct.Editor(h)
                 if e.get_filename() == orig_fn:
-                    caret = e.get_carets()
-                    e.set_text_all(new_text)
-                    if caret:
-                        x, y, x2, y2 = caret[0]
-                        try:
-                            e.set_caret(x, y, x2, y2)
-                        except Exception:
-                            pass
+                    self._apply_text_preserving_undo(e, new_text)
                     e.set_prop(ct.PROP_MODIFIED, True)
                     ct.msg_status(_('Differ: synced changes to original tab (by filename)'))
                     return
 
         ct.msg_status(_('Differ: original tab no longer open; changes saved to temp file only'))
 
+    def _apply_text_preserving_undo(self, ed, new_text):
+        """Replace the entire editor text while preserving Undo history.
+        Uses replace_lines() instead of set_text_all() which would destroy
+        Undo information."""
+        caret = ed.get_carets()
+        try:
+            lines = new_text.split('\n')
+            count = ed.get_line_count()
+            if count > 0:
+                ed.replace_lines(0, count - 1, lines)
+            else:
+                ed.insert(0, 0, new_text)
+        except Exception as ex:
+            # Fallback to set_text_all if replace_lines fails for any reason.
+            msg('replace_lines failed, falling back to set_text_all: {}'.format(ex), level=1)
+            ed.set_text_all(new_text)
+        if caret:
+            x, y, x2, y2 = caret[0]
+            try:
+                ed.set_caret(x, y, x2, y2)
+            except Exception:
+                pass
+
     def _sync_back_to_original(self, tab_id, new_text):
-        """Find the original tab by PROP_TAB_ID and overwrite its content.
+        """Find the original tab by PROP_TAB_ID and overwrite its content
+        (preserving Undo via replace_lines).
 
         The original tab is marked modified so the user can review and
         save it explicitly. Returns True if the original was found."""
@@ -598,14 +643,7 @@ class Command:
         for h in ct.ed_handles():
             e = ct.Editor(h)
             if str(e.get_prop(ct.PROP_TAB_ID)) == target:
-                caret = e.get_carets()
-                e.set_text_all(new_text)
-                if caret:
-                    x, y, x2, y2 = caret[0]
-                    try:
-                        e.set_caret(x, y, x2, y2)
-                    except Exception:
-                        pass
+                self._apply_text_preserving_undo(e, new_text)
                 e.set_prop(ct.PROP_MODIFIED, True)
                 ct.msg_status(_('Differ: synced changes to original tab (by tab id)'))
                 return True
@@ -615,7 +653,7 @@ class Command:
         """Called once on program start. The plugin is loaded because it was
         subscribed to on_start via plugins.ini (set when a compare tab was
         active). Just being loaded is enough -- all lazy events (on_save~,
-        on_close_pre~) will now fire.
+        on_close~) will now fire.
 
         We also rebuild the in-memory scroll sync set from the persisted
         state and re-subscribe to on_scroll so synchronized scrolling works
@@ -638,7 +676,7 @@ class Command:
 
     def on_exit_pre(self, ed_self):
         """Called before CudaText is about to exit. Sets a flag so that
-        on_close_pre (which fires next, once per closing tab) can skip
+        on_close (which fires next, once per closing tab) can skip
         temp-file deletion and let compare tabs persist across restarts."""
         self._app_exiting = True
 
@@ -1138,8 +1176,7 @@ class Command:
         """Close the compare tab and focus the first original tab.
 
         Originals are always left open (we never close them when starting
-        a compare). The on_close_pre handler syncs unsaved changes from
-        the temp files back to the originals and deletes the temp files
+        a compare). The on_close handler deletes the temp files
         belonging to this compare tab."""
         if e.get_prop(ct.PROP_EDITORS_LINKED):
             return
@@ -1158,8 +1195,7 @@ class Command:
                 if tab_id is not None:
                     original_ids.append(tab_id)
 
-        # Close the compare tab. on_close_pre will sync unsaved changes
-        # back to originals and delete this tab's temp files.
+        # Close the compare tab. on_close will delete this tab's temp files.
         e1 = ct.Editor(e.get_prop(ct.PROP_HANDLE_PRIMARY))
         e1.focus()  # otherwise cmd_FileClose may hit the wrong editor
         e1.cmd(ct_cmd.cmd_FileClose)
@@ -1171,19 +1207,6 @@ class Command:
                 if ee.get_prop(ct.PROP_TAB_ID) == tab_id:
                     ee.focus()
                     return
-
-    def on_close_pre(self, ed_self: ct.Editor):
-        """Fires before the close is confirmed (before the save/discard/cancel
-        dialog). We do NOTHING destructive here -- no sync, no file deletion,
-        no state unregister. If we did, the user clicking "Cancel" would
-        leave the compare tab in a broken state.
-
-        The only thing we might do here is return False to BLOCK the close,
-        but we don't need that. All real cleanup happens in on_close, which
-        fires AFTER the user has confirmed (save/discard) and the editor is
-        still active."""
-        # Intentionally empty for compare tabs. Non-compare tabs are ignored.
-        pass
 
     def on_close(self, ed_self: ct.Editor):
         """Fires after the close is confirmed (user clicked Save or Discard
