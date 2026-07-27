@@ -1,10 +1,8 @@
 import os
 import json
-from time import sleep
 import typing as tp
 from pathlib import Path
 from datetime import datetime
-#from time import strftime
 
 import cudatext as ct
 import cudatext_cmd as ct_cmd
@@ -31,6 +29,11 @@ PLG_NAME = _('Differ')
 METAJSONFILE = os.path.dirname(__file__) + os.sep + 'differ_opts.json'
 JSONFILE = 'cuda_differ.json'  # To store in settings/cuda_differ.json
 JSONPATH = ct.app_path(ct.APP_DIR_SETTINGS) + os.sep + JSONFILE
+# Persistent mapping: temp_filename -> original_filename ("" for untitled tabs).
+# Used as a fallback to find the original tab after restart, in case the
+# original tab's PROP_TAB_ID does not match the ID embedded in the temp
+# filename (e.g. session-restore edge cases).
+ORIGINS_FILE = os.path.join(ct.app_path(ct.APP_DIR_SETTINGS), 'cuda_differ_origins.json')
 
 OPTS_META = [
     {'opt': 'differ.changed_color',
@@ -196,23 +199,6 @@ def prettify_pair_title(title):
     return SEP.join(names)
 
 
-
-def delete_all_files_in_folder(folder_path):
-    if not os.path.exists(folder_path):
-        # print(f"ERROR: Differ: Folder {folder_path} does not exist")
-        return
-
-    for filename in os.listdir(folder_path):
-        file_path = os.path.join(folder_path, filename)
-        try:
-            if os.path.isfile(file_path) or os.path.islink(file_path):
-                os.unlink(file_path)  # Remove the file
-            # elif os.path.isdir(file_path):
-            #    shutil.rmtree(file_path)  # Remove the directory
-        except Exception as e:
-            print(f'ERROR: Differ failed to delete "{file_path}", reason: {e}')
-
-
 class Command:
     def __init__(self):
         self.scroll = ScrollSplittedTab(__name__)
@@ -229,6 +215,30 @@ class Command:
         self.menuid_sep = None
         self.menuid_withfile = None
         self.menuid_withtab = None
+
+    def _load_origins(self):
+        """Load the persistent temp_filename -> original_filename mapping.
+        Stale entries (temp file no longer on disk) are pruned."""
+        try:
+            with open(ORIGINS_FILE, 'r', encoding='utf8') as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            return {}
+        if not isinstance(data, dict):
+            return {}
+        # Prune stale entries whose temp files no longer exist.
+        cleaned = {k: v for k, v in data.items() if os.path.isfile(k)}
+        if len(cleaned) != len(data):
+            self._save_origins(cleaned)
+        return cleaned
+
+    def _save_origins(self, origins):
+        """Save the temp_filename -> original_filename mapping to disk."""
+        try:
+            with open(ORIGINS_FILE, 'w', encoding='utf8') as f:
+                json.dump(origins, f, indent=2)
+        except OSError as ex:
+            msg('failed to save origins file: {}'.format(ex), level=2)
 
     def change_config(self):
         try:
@@ -357,6 +367,12 @@ class Command:
                     except OSError as ex:
                         msg('failed to create temp file: {}'.format(ex), level=2)
                         return
+                    # Record the original's filename so we can find it after
+                    # restart even if PROP_TAB_ID doesn't match. Empty string
+                    # for untitled tabs (those rely on PROP_TAB_ID only).
+                    origins = self._load_origins()
+                    origins[temp_fn] = e.get_filename() or ''
+                    self._save_origins(origins)
                     files[index] = temp_fn
                     break
 
@@ -431,19 +447,56 @@ class Command:
         fn = ed_self.get_filename()
         if not fn or TEMP_DIR not in fn:
             return
+        new_text = ed_self.get_text_all()
         tab_id = parse_tab_id_from_temp(fn)
-        if tab_id is None:
-            return
-        self._sync_back_to_original(tab_id, ed_self.get_text_all())
+
+        # Strategy 1: find the original by PROP_TAB_ID (parsed from temp
+        # filename). This is the primary mechanism and works if the ID
+        # persists across restarts (which it should per the API).
+        if tab_id is not None:
+            print('Differ: on_save looking for tab_id={}'.format(tab_id))
+            open_ids = []
+            for h in ct.ed_handles():
+                e = ct.Editor(h)
+                open_ids.append(e.get_prop(ct.PROP_TAB_ID))
+            print('Differ: open tab IDs={}'.format(open_ids))
+            if self._sync_back_to_original(tab_id, new_text):
+                return
+
+        # Strategy 2: fallback -- find the original by filename from the
+        # persistent origins mapping. Used after restart if PROP_TAB_ID
+        # did not match (e.g. session-restore edge cases).
+        origins = self._load_origins()
+        orig_fn = origins.get(fn, '')
+        if orig_fn:
+            print('Differ: on_save fallback, looking for filename={}'.format(orig_fn))
+            for h in ct.ed_handles():
+                e = ct.Editor(h)
+                if e.get_filename() == orig_fn:
+                    caret = e.get_carets()
+                    e.set_text_all(new_text)
+                    if caret:
+                        x, y, x2, y2 = caret[0]
+                        try:
+                            e.set_caret(x, y, x2, y2)
+                        except Exception:
+                            pass
+                    e.set_prop(ct.PROP_MODIFIED, True)
+                    ct.msg_status(_('Differ: synced changes to original tab (by filename)'))
+                    return
+
+        ct.msg_status(_('Differ: original tab no longer open; changes saved to temp file only'))
 
     def _sync_back_to_original(self, tab_id, new_text):
         """Find the original tab by PROP_TAB_ID and overwrite its content.
 
         The original tab is marked modified so the user can review and
         save it explicitly. Returns True if the original was found."""
+        # Compare as strings to avoid int/str type mismatches.
+        target = str(tab_id)
         for h in ct.ed_handles():
             e = ct.Editor(h)
-            if e.get_prop(ct.PROP_TAB_ID) == tab_id:
+            if str(e.get_prop(ct.PROP_TAB_ID)) == target:
                 caret = e.get_carets()
                 e.set_text_all(new_text)
                 if caret:
@@ -453,9 +506,8 @@ class Command:
                     except Exception:
                         pass
                 e.set_prop(ct.PROP_MODIFIED, True)
-                ct.msg_status(_('Differ: synced changes to original tab'))
+                ct.msg_status(_('Differ: synced changes to original tab (by tab id)'))
                 return True
-        ct.msg_status(_('Differ: original tab no longer open; changes saved to temp file only'))
         return False
 
     '''
@@ -1013,6 +1065,8 @@ class Command:
                 return
 
             # Sync unsaved edits and clean up temp files for this compare tab.
+            origins = self._load_origins()
+            origins_dirty = False
             for h in (ed_self.get_prop(ct.PROP_HANDLE_PRIMARY),
                       ed_self.get_prop(ct.PROP_HANDLE_SECONDARY)):
                 if not h:
@@ -1024,24 +1078,36 @@ class Command:
                 # Sync unsaved (modified) content back to the original tab.
                 if sub.get_prop(ct.PROP_MODIFIED):
                     tab_id = parse_tab_id_from_temp(fn)
+                    synced = False
                     if tab_id is not None:
-                        self._sync_back_to_original(tab_id, sub.get_text_all())
-                # Delete only this temp file.
+                        synced = self._sync_back_to_original(tab_id, sub.get_text_all())
+                    if not synced:
+                        # Fallback: by filename from origins mapping.
+                        orig_fn = origins.get(fn, '')
+                        if orig_fn:
+                            for hh in ct.ed_handles():
+                                e = ct.Editor(hh)
+                                if e.get_filename() == orig_fn:
+                                    e.set_text_all(sub.get_text_all())
+                                    e.set_prop(ct.PROP_MODIFIED, True)
+                                    ct.msg_status(_('Differ: synced changes to original tab (by filename)'))
+                                    synced = True
+                                    break
+                    if not synced:
+                        ct.msg_status(_('Differ: original tab no longer open; changes saved to temp file only'))
+                # Delete only this temp file and remove its mapping entry.
                 try:
                     if os.path.isfile(fn):
                         os.unlink(fn)
                 except OSError as ex:
                     msg('failed to delete temp file "{}": {}'.format(fn, ex), level=2)
+                if fn in origins:
+                    del origins[fn]
+                    origins_dirty = True
+            if origins_dirty:
+                self._save_origins(origins)
 
     def move_to_sep_tabs_timer(self, tag='', info=''):
 
         e = ct.Editor(int(info))
         self.move_to_sep_tabs_ex(e)
-
-    def on_exit(self, ed_self):
-        # Temp files are now tied to specific compare tabs and are deleted
-        # when those tabs are closed (see on_close_pre). We deliberately do
-        # NOT wipe the whole differ_backup folder on exit, because compare
-        # tabs may persist across restarts and need their temp files to
-        # remain on disk for session restore.
-        pass
