@@ -29,11 +29,6 @@ PLG_NAME = _('Differ')
 METAJSONFILE = os.path.dirname(__file__) + os.sep + 'differ_opts.json'
 JSONFILE = 'cuda_differ.json'  # To store in settings/cuda_differ.json
 JSONPATH = ct.app_path(ct.APP_DIR_SETTINGS) + os.sep + JSONFILE
-# Persistent mapping: temp_filename -> original_filename ("" for untitled tabs).
-# Used as a fallback to find the original tab after restart, in case the
-# original tab's PROP_TAB_ID does not match the ID embedded in the temp
-# filename (e.g. session-restore edge cases).
-ORIGINS_FILE = os.path.join(ct.app_path(ct.APP_DIR_SETTINGS), 'cuda_differ_origins.json')
 
 OPTS_META = [
     {'opt': 'differ.changed_color',
@@ -106,6 +101,14 @@ TIMESTAMP_END = '}.txt'
 # so we can sync changes back to the original tab even after restarts/renames.
 TEMP_ID_BEGIN = '_['
 TEMP_ID_END = ']_'
+# Persistent mapping: temp_filename -> original_filename ("" for untitled tabs).
+# Fallback to find the original tab after restart if PROP_TAB_ID doesn't match.
+ORIGINS_FILE = os.path.join(ct.app_path(ct.APP_DIR_SETTINGS), 'cuda_differ_origins.json')
+# Path to plugins.ini -- used to persistently subscribe to on_start so the
+# plugin auto-loads on next CudaText startup when compare tabs are active.
+PLUGINS_INI = os.path.join(ct.app_path(ct.APP_DIR_SETTINGS), 'plugins.ini')
+PLUGINS_INI_SECTION = 'events'
+MODULE_NAME = __name__.split('.')[-1]  # e.g. 'cuda_differ'
 
 
 def get_temp_name(e: ct.Editor):
@@ -239,6 +242,27 @@ class Command:
                 json.dump(origins, f, indent=2)
         except OSError as ex:
             msg('failed to save origins file: {}'.format(ex), level=2)
+
+    def _enable_autostart(self):
+        """Persistently subscribe to on_start via plugins.ini so the plugin
+        auto-loads on next CudaText startup. This ensures lazy events
+        (on_save~, on_close_pre~) fire after restart when compare tabs
+        are restored from session."""
+        current = ct.ini_read(PLUGINS_INI, PLUGINS_INI_SECTION, MODULE_NAME, '')
+        if current == 'on_start':
+            return
+        ct.ini_write(PLUGINS_INI, PLUGINS_INI_SECTION, MODULE_NAME, 'on_start')
+        print('Differ: enabled autostart (on_start subscribed in plugins.ini)')
+
+    def _disable_autostart(self):
+        """Remove the on_start subscription from plugins.ini so the plugin
+        does NOT auto-load on next startup (no overhead when no compare
+        tabs are active)."""
+        current = ct.ini_read(PLUGINS_INI, PLUGINS_INI_SECTION, MODULE_NAME, '')
+        if not current:
+            return
+        ct.ini_proc(ct.INI_DELETE_KEY, PLUGINS_INI, PLUGINS_INI_SECTION, MODULE_NAME)
+        print('Differ: disabled autostart (on_start unsubscribed from plugins.ini)')
 
     def change_config(self):
         try:
@@ -385,6 +409,10 @@ class Command:
         ct.ed.set_prop(ct.PROP_TAB_TITLE, title)
 
         self.diff_tabs.append(title)
+
+        # Persistently subscribe to on_start so the plugin auto-loads on
+        # next startup and lazy events (on_save~) fire after restart.
+        self._enable_autostart()
         
         # set lexers
         a_ed = ct.Editor(ct.ed.get_prop(ct.PROP_HANDLE_PRIMARY))
@@ -509,6 +537,21 @@ class Command:
                 ct.msg_status(_('Differ: synced changes to original tab (by tab id)'))
                 return True
         return False
+
+    def on_start(self, ed_self):
+        """Called once on program start. The plugin is loaded because it was
+        subscribed to on_start via plugins.ini (set when a compare tab was
+        active). Just being loaded is enough -- all lazy events (on_save~,
+        on_close_pre~) will now fire. We prune stale origins here as
+        lightweight housekeeping."""
+        print('Differ: on_start fired (plugin auto-loaded for compare tab persistence)')
+        self._load_origins()  # prunes stale entries
+
+    def on_exit_pre(self, ed_self):
+        """Called before CudaText is about to exit. Sets a flag so that
+        on_close_pre (which fires next, once per closing tab) can skip
+        temp-file deletion and let compare tabs persist across restarts."""
+        self._app_exiting = True
 
     '''
     def on_tab_change(self, ed_self):
@@ -1040,15 +1083,11 @@ class Command:
                     ee.focus()
                     return
 
-    def on_exit_pre(self, ed_self):
-        """Called before CudaText is about to exit. Sets a flag so that
-        on_close_pre (which fires next, once per closing tab) can skip
-        temp-file deletion and let compare tabs persist across restarts."""
-        self._app_exiting = True
-
     def on_close_pre(self, ed_self: ct.Editor):
         """When a compare tab is closed: sync unsaved changes from its temp
         files back to the original tabs, then delete only those temp files.
+        If this was the last compare tab, disable autostart so the plugin
+        does not load on next startup.
 
         During app exit, temp files are preserved so the compare tab can be
         restored after restart. Temp files are only deleted when the user
@@ -1060,7 +1099,8 @@ class Command:
             # avoid 'combined' tab title 'name1 | name2' saved to 'history files.json'
             ed_self.set_prop(ct.PROP_TAB_TITLE, '')
 
-            # During app exit, keep temp files so compare tabs persist restarts.
+            # During app exit, keep temp files and autostart subscription
+            # so compare tabs persist restarts and the plugin auto-loads.
             if getattr(self, '_app_exiting', False):
                 return
 
@@ -1106,6 +1146,11 @@ class Command:
                     origins_dirty = True
             if origins_dirty:
                 self._save_origins(origins)
+
+            # If no more compare tabs are open, disable autostart so the
+            # plugin does not load on next startup (no overhead).
+            if not self.diff_tabs:
+                self._disable_autostart()
 
     def move_to_sep_tabs_timer(self, tag='', info=''):
 
