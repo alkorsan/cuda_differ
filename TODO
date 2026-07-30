@@ -1,4 +1,19 @@
-remove all events from install inf and subscrive dynamically to the events we need when the plugin is loaded , when we close the last diff tab we must unsubscribe from all events except right click menu
+
+currently the plugin creates temp files then compare them, cudatext have a new and better way to compare without using temp files using this, open untitled tab , set PROP_EDITORS_LINKED to False then split the tab to two frames like that:
+file_open('')
+ed.set_prop(PROP_EDITORS_LINKED, False)
+ed.set_prop(PROP_SPLIT, ('v', 500))
+
+then we can load the original file content or untitled tab content inside that new splited tab, this allows us to not use any temp file and simplify the code a lot much 
+_______________
+
+ 
+when i switch to a different session the temporal backup files are deleted and the diff tab become broken, everything must persist until the user explicitly close the diff tab
+
+when user click wrap we must wrap both editors
+
+
+remove all events from install inf and subscribe dynamically to the events we need when the plugin is loaded , when we close the last diff tab we must unsubscribe from all events except right click menu
 
 if cuda_differ_history.ini exist copy its content to the new json file and delete this old json
 
@@ -9,4 +24,22 @@ in the doc add the options in Available options include section
 
 remove back to separate tabs command
 
-Differ should delete unused files from differ_backup
+
+  _______________________________
+bug1
+
+compare two files 1.txt 3.txt with differ, keep both unchanged
+run
+file_open([r"", r"D:\\zbala\\2.txt"])
+restart
+you get a strange window saying: The file is empty  !!!!!
+
+bug2
+compare two files 1.txt 3.txt with differ, keep both unchanged
+run
+file_open([r"", r"D:\\zbala\\2.txt"])
+write something in the empty editor at the left
+restart
+it gets colored like if we enabled compare on it !!!!!!!!!!
+and the diff tab is not colored
+

@@ -97,13 +97,14 @@ Right-clicking a tab title shows "Differ" submenu with:
 
 When you edit files inside the compare view and press Ctrl+S:
 
-- Both sides of the compare are saved at once -- you only need to save
-  one side, the other is saved automatically.
+- Both sides of the compare are synced to their original tabs at once.
 - Your edits are written back to the original files on disk immediately,
   so the files on disk reflect your changes.
 - If an original was an untitled tab (no file on disk), it is marked as
   modified (dot on the tab) but no Save dialog appears. You can save it
   later if you want.
+- The compare tab itself is never saved to disk -- it is an untitled
+  scratch tab. Ctrl+S only triggers the sync to the originals.
 - Undo/Redo history is preserved in the original tabs, so you can undo
   the synced changes with Ctrl+Z after switching to the original tab.
 
@@ -113,8 +114,8 @@ When you edit files inside the compare view and press Ctrl+S:
 Compare tabs survive CudaText restarts:
 
 - If you close CudaText with a compare tab open, the compare tab is
-  restored when you start CudaText again, with the same files and the
-  same comparison.
+  restored when you start CudaText again, with the same content and
+  comparison.
 - The plugin loads automatically on startup only when compare tabs are
   active, so there is no performance impact when you are not comparing.
 - When you close the last compare tab, the plugin stops auto-loading on
@@ -123,8 +124,7 @@ Compare tabs survive CudaText restarts:
 When you close a compare tab manually (not via app exit):
 - If you have unsaved changes, CudaText asks whether to save or discard.
 - If you save, your changes are synced to the original files.
-- If you discard, the temp files are deleted and the originals keep
-  their last-saved content.
+- If you discard, the originals keep their last-saved content.
 - If you cancel, nothing happens -- the compare tab stays open and
   fully functional.
 
@@ -157,9 +157,10 @@ Available options include:
 
 == Notes ==
 
-- Untitled tabs can be compared just like saved files. A temporary copy
-  is made for the compare view, and your edits are synced back to the
-  original untitled tab when you save.
+- Untitled tabs can be compared just like saved files. Your edits in the
+  compare view are synced back to the original untitled tab when you save.
+- The compare view uses CudaText's built-in split-editor feature -- no
+  temporary files are created on disk.
 - If both files become identical after editing, all markers are cleared
   and a message is shown.
 

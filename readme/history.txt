@@ -1,3 +1,6 @@
+2026.07.29 (by @badrelmers)
+* change: compare tabs now use CudaText's split-editor feature instead of temp files -- no more settings/differ_backup folder, no temp files on disk
+* change: Ctrl+S in a compare tab now syncs both sides back to the original tabs and blocks the Save dialog (compare tabs are untitled and never saved to disk directly)
 2026.07.27 (by @badrelmers)
 + add: compare tabs now persist across CudaText restarts -- temp files, scroll sync, and all compare state are restored automatically
 + add: changes saved in a compare tab are synced back to the original files automatically, so editing in the compare view updates the originals
