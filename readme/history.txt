@@ -1,7 +1,9 @@
 2026.07.30 (by @badrelmers)
+- fix: "two sides are identical" dialog no longer shown on automatic refreshes (startup, auto-refresh, theme change) -- only shown on manual Refresh command and initial compare
+- fix: green title color no longer reset to red after restart -- startup logic moved from on_start to on_start2 (fires after session restore completes)
 - fix: initial green color is no longer reset to red by spurious on_change_slow events from set_text_all during compare creation
 - fix: refresh() and on_state() no longer apply diff colors to split tabs not managed by Differ
-- fix: removed on_focus event (was too heavy) -- diff markers are now re-applied once in on_start for all managed compare tabs
+- fix: removed on_focus event (was too heavy) -- diff markers are now re-applied once in on_start2 for all managed compare tabs
 - fix: removed "file is empty" dialog when comparing empty tabs
 * change: saved/unsaved state writes to JSON are debounced via an in-memory cache -- no redundant writes when the user edits continuously without saving
 + add: "Refresh" entry in the tab context menu (below a separator) to re-apply diff markers manually

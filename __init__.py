@@ -107,7 +107,7 @@ DIFF_TAB_COUNT = 1
 #   "file_history": ["path1", "path2", ...]
 # }
 STATE_FILE = os.path.join(ct.app_path(ct.APP_DIR_SETTINGS), 'cuda_differ_state.json')
-# Path to plugins.ini -- used to persistently subscribe to on_start so the
+# Path to plugins.ini -- used to persistently subscribe to on_start2 so the
 # plugin auto-loads on next CudaText startup when compare tabs are active.
 PLUGINS_INI = os.path.join(ct.app_path(ct.APP_DIR_SETTINGS), 'plugins.ini')
 PLUGINS_INI_SECTION = 'events'
@@ -243,17 +243,18 @@ class Command:
         return (entry.get('primary_orig_tab_id'), entry.get('secondary_orig_tab_id'))
 
     def _enable_autostart(self):
-        """Persistently subscribe to on_start via plugins.ini so the plugin
-        auto-loads on next CudaText startup. This ensures lazy events
-        (on_save~, on_close~) fire after restart when compare tabs
-        are restored from session."""
+        """Persistently subscribe to on_start2 via plugins.ini so the plugin
+        auto-loads on next CudaText startup. We use on_start2 (not on_start)
+        because on_start fires before session restore completes, which would
+        reset our green title color. on_start2 fires after configs and
+        session restore, so our color override sticks."""
         current = ct.ini_read(PLUGINS_INI, PLUGINS_INI_SECTION, MODULE_NAME, '')
-        if current == 'on_start':
+        if current == 'on_start2':
             return
-        ct.ini_write(PLUGINS_INI, PLUGINS_INI_SECTION, MODULE_NAME, 'on_start')
+        ct.ini_write(PLUGINS_INI, PLUGINS_INI_SECTION, MODULE_NAME, 'on_start2')
 
     def _disable_autostart(self):
-        """Remove the on_start subscription from plugins.ini so the plugin
+        """Remove the on_start2 subscription from plugins.ini so the plugin
         does NOT auto-load on next startup (no overhead when no compare
         tabs are active)."""
         current = ct.ini_read(PLUGINS_INI, PLUGINS_INI_SECTION, MODULE_NAME, '')
@@ -447,7 +448,7 @@ class Command:
         # in on_change_slow; real user edits after this will work normally.
         self._suppress_change_slow[str(compare_tab_id)] = 2
 
-        # Persistently subscribe to on_start so the plugin auto-loads on
+        # Persistently subscribe to on_start2 so the plugin auto-loads on
         # next startup and lazy events fire after restart.
         self._enable_autostart()
 
@@ -489,7 +490,7 @@ class Command:
     def on_state(self, ed_self, state):
         if state == ct.APPSTATE_THEME_SYNTAX:
             self.get_config()
-            self.refresh()
+            self._refresh_ex(ct.ed)  # automatic -- no dialog
 
     def on_scroll(self, ed_self):
         if self._is_compare_tab(ed_self.get_prop(ct.PROP_TAB_ID)):
@@ -521,11 +522,11 @@ class Command:
             else:
                 # Real user edit -- reset title color to default (red).
                 ed_self.set_prop(ct.PROP_TAB_COLOR_FONT, ct.COLOR_NONE)
-                # Persist the unsaved state so on_start can restore the
+                # Persist the unsaved state so on_start2 can restore the
                 # correct color after restart.
                 self._set_saved_state(tab_id, False)
         if self.cfg.get('enable_auto_refresh', False):
-            self.refresh()
+            self._refresh_ex(ed_self)  # automatic -- no dialog
 
     def on_save_pre(self, ed_self):
         """Intercept Ctrl+S in a compare tab. Instead of saving the untitled
@@ -563,7 +564,7 @@ class Command:
             # Do NOT clear PROP_MODIFIED -- that would break session
             # auto-save/restore for the compare tab.
             ed_self.set_prop(ct.PROP_TAB_COLOR_FONT, 0x00A000)  # green
-            # Persist the saved state so on_start can restore green
+            # Persist the saved state so on_start2 can restore green
             # color after restart.
             self._set_saved_state(tab_id, True)
             # Clear any pending suppress counter -- save overrides the
@@ -618,13 +619,19 @@ class Command:
             except Exception:
                 pass
 
-    def on_start(self, ed_self):
-        """Called once on program start. The plugin is loaded because it was
-        subscribed to on_start via plugins.ini (set when a compare tab was
+    def on_start2(self, ed_self):
+        """Called once on program start, after configs are applied and just
+        before the main form shows. The plugin is loaded because it was
+        subscribed to on_start2 via plugins.ini (set when a compare tab was
         active). Just being loaded is enough -- all lazy events (on_save~,
         on_close~) will now fire.
 
-        We also rebuild the in-memory scroll sync set, re-subscribe to
+        We use on_start2 (not on_start) because on_start fires too early --
+        before session restore completes. By on_start2, all editors exist
+        and CudaText has finished restoring the modified flag/tab colors,
+        so our green color override sticks instead of being reset.
+
+        We rebuild the in-memory scroll sync set, re-subscribe to
         on_scroll, re-apply the saved/unsaved title color, and re-apply
         diff markers (bookmarks/decorations/gaps) for each restored
         compare tab. Markers are in-memory and don't survive session
@@ -660,7 +667,7 @@ class Command:
 
     def _apply_color_to_tab(self, tab_id_str, color):
         """Apply a title font color to a compare tab by its PROP_TAB_ID.
-        Used by on_start to restore the green/default color after restart."""
+        Used by on_start2 to restore the green/default color after restart."""
         target = str(tab_id_str)
         for h in ct.ed_handles():
             e = ct.Editor(h)
@@ -684,13 +691,19 @@ class Command:
         self.tabmenu_init(ed_self)
 
     def refresh(self):
-        """Refresh the focused tab. Only applies to compare tabs managed
-        by this plugin -- other split tabs are left alone."""
-        self._refresh_ex(ct.ed)
+        """Manual refresh (from menu command or context menu). Shows the
+        'identical' dialog if both sides are equal. Only applies to compare
+        tabs managed by this plugin."""
+        self._refresh_ex(ct.ed, show_dialog=True)
 
-    def _refresh_ex(self, ed):
+    def _refresh_ex(self, ed, show_dialog=False):
         """Core refresh logic. 'ed' is any editor belonging to the compare
-        tab. Only applies to compare tabs managed by this plugin."""
+        tab. Only applies to compare tabs managed by this plugin.
+
+        'show_dialog' controls whether the 'two sides are identical' dialog
+        is shown. Automatic refreshes (on_start2, on_change_slow, on_state)
+        pass False to avoid pestering the user; manual refresh and the
+        initial compare pass True."""
         if ed is None:
             return
         if ed.get_prop(ct.PROP_EDITORS_LINKED):
@@ -714,8 +727,9 @@ class Command:
             self.clear(a_ed)
             self.clear(b_ed)
             self.diff.diffmap = []
-            t = _('The two sides are identical.')
-            ct.msg_box(t, ct.MB_OK)
+            if show_dialog:
+                t = _('The two sides are identical.')
+                ct.msg_box(t, ct.MB_OK)
             return
 
         a_ed.set_prop(ct.PROP_WRAP, ct.WRAP_OFF)
@@ -1200,7 +1214,7 @@ class Command:
         # During app exit, keep the state entry and autostart subscription
         # so compare tabs persist restarts and the plugin auto-loads.
         # Re-register since we already unregistered above, preserving the
-        # saved state so on_start can restore the correct title color.
+        # saved state so on_start2 can restore the correct title color.
         if getattr(self, '_app_exiting', False):
             self._register_compare_tab(
                 tab_id,
