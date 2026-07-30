@@ -181,11 +181,14 @@ class Command:
         return str(tab_id) in state.get('compare_tabs', {})
 
     def _register_compare_tab(self, compare_tab_id, primary_orig_id, secondary_orig_id,
-                              primary_orig_name='', secondary_orig_name='', session_path=''):
+                              primary_orig_name='', secondary_orig_name='', session_path='',
+                              saved=True):
         """Register a compare tab with the PROP_TAB_IDs and display names of
         its two original tabs, plus the session path the compare belongs to.
         The names (file path or untitled tab title) are stored so anyone
-        reading the state JSON can easily see what is being compared."""
+        reading the state JSON can easily see what is being compared.
+        'saved' tracks whether the compare tab's content has been synced
+        to the originals (True) or has unsaved edits (False)."""
         state = self._load_state()
         state['compare_tabs'][str(compare_tab_id)] = {
             'session': session_path or '',
@@ -193,8 +196,18 @@ class Command:
             'primary_orig_name': primary_orig_name or '',
             'secondary_orig_tab_id': secondary_orig_id,
             'secondary_orig_name': secondary_orig_name or '',
+            'saved': saved,
         }
         self._save_state(state)
+
+    def _set_saved_state(self, compare_tab_id, saved):
+        """Update the 'saved' flag for a compare tab in the persisted state.
+        Does nothing if the tab is not registered."""
+        state = self._load_state()
+        key = str(compare_tab_id)
+        if key in state['compare_tabs']:
+            state['compare_tabs'][key]['saved'] = saved
+            self._save_state(state)
 
     def _unregister_compare_tab(self, compare_tab_id):
         """Remove a compare tab from the persisted state. Returns the
@@ -407,7 +420,12 @@ class Command:
             compare_tab_id,
             orig_tab_ids[0], orig_tab_ids[1],
             orig_names[0], orig_names[1],
-            session_path)
+            session_path,
+            saved=True)  # initial state: content matches originals = saved
+
+        # Color the tab title green to indicate 'synced' (no unsaved
+        # changes yet -- content is identical to the originals).
+        ct.ed.set_prop(ct.PROP_TAB_COLOR_FONT, 0x00A000)  # green
 
         # Persistently subscribe to on_start so the plugin auto-loads on
         # next startup and lazy events fire after restart.
@@ -431,8 +449,8 @@ class Command:
         self.refresh()
 
     def create_diff(self, txt0, txt1, fn0, fn1):
-        if txt0[-1] != '\n': txt0 += '\n'
-        if txt1[-1] != '\n': txt1 += '\n'
+        if txt0 and txt0[-1] != '\n': txt0 += '\n'
+        if txt1 and txt1[-1] != '\n': txt1 += '\n'
         a = txt0.splitlines(True)
         b = txt1.splitlines(True)
         r = self.diff.unidiff(a, b, fn0, fn1, self.cfg.get('diff_context'))
@@ -457,19 +475,52 @@ class Command:
         if self._is_compare_tab(ed_self.get_prop(ct.PROP_TAB_ID)):
             self.scroll.on_scroll(ed_self)
 
+    def on_focus(self, ed_self):
+        """When a compare tab gets focus, re-apply diff markers if they're
+        missing (e.g. after restart -- markers are in-memory and don't
+        survive session restore). Without this, the user would see the
+        compare content but no colored highlights until they manually
+        click Refresh."""
+        tab_id = ed_self.get_prop(ct.PROP_TAB_ID)
+        if not self._is_compare_tab(tab_id):
+            return
+        # Check if the primary editor has any DIFF_TAG bookmarks. If not,
+        # markers were lost (e.g. after restart) -- re-apply them.
+        a_ed = ct.Editor(ed_self.get_prop(ct.PROP_HANDLE_PRIMARY))
+        if not self._has_diff_markers(a_ed):
+            self.refresh()
+
+    def _has_diff_markers(self, ed):
+        """Check if the editor has any Differ bookmarks (tag == DIFF_TAG)."""
+        try:
+            items = ed.bookmark(ct.BOOKMARK2_GET_ALL, 0)
+        except Exception:
+            return False
+        if not items:
+            return False
+        for item in items:
+            if isinstance(item, dict) and item.get('tag') == DIFF_TAG:
+                return True
+        return False
+
     def on_caret(self, ed_self):
         if self.cfg.get('enable_sync_caret', False):
             self.sync_caret()
 
-    def on_change(self, ed_self):
-        """When the user edits inside a compare tab, restore the tab title
-        font color to default (COLOR_NONE). CudaText then re-applies its
-        'modified' coloring (red), indicating unsaved changes."""
+    def on_change_slow(self, ed_self):
+        """Fires after the user edits and a short pause passes. Used for:
+        - Resetting the compare tab title color from green to default (red)
+          when the user makes changes (indicating unsaved edits).
+        - Persisting the 'unsaved' state so it survives restarts.
+        - Auto-refreshing the diff markers if that option is enabled."""
         tab_id = ed_self.get_prop(ct.PROP_TAB_ID)
         if self._is_compare_tab(tab_id):
+            # Reset title color to default -- CudaText re-applies its
+            # 'modified' coloring (red) to indicate unsaved changes.
             ed_self.set_prop(ct.PROP_TAB_COLOR_FONT, ct.COLOR_NONE)
-
-    def on_change_slow(self, ed_self):
+            # Persist the unsaved state so on_start can restore the
+            # correct color after restart.
+            self._set_saved_state(tab_id, False)
         if self.cfg.get('enable_auto_refresh', False):
             self.refresh()
 
@@ -481,7 +532,7 @@ class Command:
 
         On successful sync, the compare tab's title font is colored green
         to indicate 'synced'. The color is reset to COLOR_NONE (which
-        CudaText re-colors red) when the user edits again -- see on_change.
+        CudaText re-colors red) when the user edits again -- see on_change_slow.
         We do NOT clear PROP_MODIFIED, because that would prevent CudaText's
         session auto-save/restore from persisting the compare tab's content
         across restarts."""
@@ -509,6 +560,9 @@ class Command:
             # Do NOT clear PROP_MODIFIED -- that would break session
             # auto-save/restore for the compare tab.
             ed_self.set_prop(ct.PROP_TAB_COLOR_FONT, 0x00A000)  # green
+            # Persist the saved state so on_start can restore green
+            # color after restart.
+            self._set_saved_state(tab_id, True)
 
         # Block the default save (which would show a Save dialog for the
         # untitled compare tab).
@@ -565,20 +619,35 @@ class Command:
         on_close~) will now fire.
 
         We also rebuild the in-memory scroll sync set from the persisted
-        state and re-subscribe to on_scroll so synchronized scrolling works
-        in restored compare tabs without needing a manual refresh."""
+        state, re-subscribe to on_scroll, and re-apply the saved/unsaved
+        title color (green/default) for each restored compare tab."""
         state = self._load_state()  # prunes stale entries
         # Rebuild scroll.tab_id set from persisted compare tab IDs so that
         # ScrollSplittedTab.toggle() works correctly after restart.
         self.scroll.tab_id = set()
-        for tab_id_str in state['compare_tabs']:
+        for tab_id_str, entry in state['compare_tabs'].items():
             try:
                 self.scroll.tab_id.add(int(tab_id_str))
             except (ValueError, TypeError):
                 pass
+            # Re-apply the title color based on the persisted 'saved' flag.
+            # CudaText colors all restored tabs red by default (modified);
+            # we override to green if the tab was in 'saved' state before exit.
+            if isinstance(entry, dict) and entry.get('saved', True):
+                self._apply_color_to_tab(tab_id_str, 0x00A000)  # green
         # Re-subscribe to on_scroll event if sync_scroll is enabled.
         if self.cfg.get('sync_scroll') and self.scroll.tab_id:
             ct.app_proc(ct.PROC_EVENTS_SUB, self.scroll.name+';on_scroll;;')
+
+    def _apply_color_to_tab(self, tab_id_str, color):
+        """Apply a title font color to a compare tab by its PROP_TAB_ID.
+        Used by on_start to restore the green/default color after restart."""
+        target = str(tab_id_str)
+        for h in ct.ed_handles():
+            e = ct.Editor(h)
+            if str(e.get_prop(ct.PROP_TAB_ID)) == target:
+                e.set_prop(ct.PROP_TAB_COLOR_FONT, color)
+                return
 
     def on_exit_pre(self, ed_self):
         """Called before CudaText is about to exit. Sets a flag so that
@@ -1091,7 +1160,8 @@ class Command:
 
         # During app exit, keep the state entry and autostart subscription
         # so compare tabs persist restarts and the plugin auto-loads.
-        # Re-register since we already unregistered above.
+        # Re-register since we already unregistered above, preserving the
+        # saved state so on_start can restore the correct title color.
         if getattr(self, '_app_exiting', False):
             self._register_compare_tab(
                 tab_id,
@@ -1099,7 +1169,8 @@ class Command:
                 entry.get('secondary_orig_tab_id'),
                 entry.get('primary_orig_name', ''),
                 entry.get('secondary_orig_name', ''),
-                entry.get('session', '')
+                entry.get('session', ''),
+                entry.get('saved', True)
             )
             return
 

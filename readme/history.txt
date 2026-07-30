@@ -1,4 +1,9 @@
 2026.07.30 (by @badrelmers)
+- fix: comparing two empty tabs no longer crashes with IndexError
+* change: compare tab title starts green (synced state) when a compare is first created, since content matches the originals
+* change: title color reset now uses on_change_slow (lighter) instead of on_change
+* change: saved/unsaved state is persisted in the state file and restored on next startup -- green color is re-applied to tabs that were synced before exit
++ add: diff markers (colored highlights) are automatically re-applied when switching to a restored compare tab after restart, so the user doesn't need to click Refresh manually
 * change: compare tab title no longer shows the tab ID -- just the file/tab names (e.g. "foo.txt | bar.txt")
 * change: synced compare tabs keep their modified flag so CudaText's session auto-save/restore persists their content across restarts; the tab title font turns green to indicate 'synced' and resets to default (red) when the user edits again
 + add: state file now stores the original file path (or untitled tab title) next to each compare tab, so the JSON is human-readable
