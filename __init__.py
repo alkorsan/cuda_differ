@@ -180,14 +180,19 @@ class Command:
         state = self._load_state()
         return str(tab_id) in state.get('compare_tabs', {})
 
-    def _register_compare_tab(self, compare_tab_id, primary_orig_id, secondary_orig_id, session_path=''):
-        """Register a compare tab with the PROP_TAB_IDs of its two original
-        tabs, plus the session path the compare belongs to."""
+    def _register_compare_tab(self, compare_tab_id, primary_orig_id, secondary_orig_id,
+                              primary_orig_name='', secondary_orig_name='', session_path=''):
+        """Register a compare tab with the PROP_TAB_IDs and display names of
+        its two original tabs, plus the session path the compare belongs to.
+        The names (file path or untitled tab title) are stored so anyone
+        reading the state JSON can easily see what is being compared."""
         state = self._load_state()
         state['compare_tabs'][str(compare_tab_id)] = {
             'session': session_path or '',
             'primary_orig_tab_id': primary_orig_id,
+            'primary_orig_name': primary_orig_name or '',
             'secondary_orig_tab_id': secondary_orig_id,
+            'secondary_orig_name': secondary_orig_name or '',
         }
         self._save_state(state)
 
@@ -344,8 +349,10 @@ class Command:
         lexers = [None, None]
         orig_tab_ids = [None, None]
         orig_texts = [None, None]
+        orig_names = ['', '']
 
-        # Find the two original tabs, grab their content, lexer, and tab ID.
+        # Find the two original tabs, grab their content, lexer, tab ID,
+        # and a display name (file path for real files, title for untitled).
         for (index, name) in enumerate(files):
             for h in ct.ed_handles():
                 e = ct.Editor(h)
@@ -353,6 +360,11 @@ class Command:
                     lexers[index] = e.get_prop(ct.PROP_LEXER_FILE)
                     orig_tab_ids[index] = e.get_prop(ct.PROP_TAB_ID)
                     orig_texts[index] = e.get_text_all()
+                    fn = e.get_filename()
+                    if fn:
+                        orig_names[index] = fn
+                    else:
+                        orig_names[index] = e.get_prop(ct.PROP_TAB_TITLE) or ''
                     break
 
         # Bail out if we couldn't find both originals.
@@ -373,9 +385,9 @@ class Command:
         a_ed.set_text_all(orig_texts[0])
         b_ed.set_text_all(orig_texts[1])
 
-        # Set a readable combined title.
-        title0 = os.path.basename(file0) if file0 and not file0.startswith(U_PREFIX) else file0[len(U_PREFIX):]
-        title1 = os.path.basename(file1) if file1 and not file1.startswith(U_PREFIX) else file1[len(U_PREFIX):]
+        # Set a readable combined title (just the basenames/titles, no tab IDs).
+        title0 = os.path.basename(orig_names[0]) if orig_names[0] else _('Untitled')
+        title1 = os.path.basename(orig_names[1]) if orig_names[1] else _('Untitled')
         ct.ed.set_prop(ct.PROP_TAB_TITLE, '{} | {}'.format(title0, title1))
 
         # Set lexers from the originals.
@@ -385,14 +397,17 @@ class Command:
             b_ed.set_prop(ct.PROP_LEXER_FILE, lexers[1])
 
         # Register the compare tab by its PROP_TAB_ID with the original
-        # tab IDs, plus the session path for reference.
+        # tab IDs and names, plus the session path for reference.
         compare_tab_id = ct.ed.get_prop(ct.PROP_TAB_ID)
         try:
             session_path = ct.app_path(ct.APP_FILE_SESSION) or ''
         except Exception:
             session_path = ''
         self._register_compare_tab(
-            compare_tab_id, orig_tab_ids[0], orig_tab_ids[1], session_path)
+            compare_tab_id,
+            orig_tab_ids[0], orig_tab_ids[1],
+            orig_names[0], orig_names[1],
+            session_path)
 
         # Persistently subscribe to on_start so the plugin auto-loads on
         # next startup and lazy events fire after restart.
@@ -446,6 +461,14 @@ class Command:
         if self.cfg.get('enable_sync_caret', False):
             self.sync_caret()
 
+    def on_change(self, ed_self):
+        """When the user edits inside a compare tab, restore the tab title
+        font color to default (COLOR_NONE). CudaText then re-applies its
+        'modified' coloring (red), indicating unsaved changes."""
+        tab_id = ed_self.get_prop(ct.PROP_TAB_ID)
+        if self._is_compare_tab(tab_id):
+            ed_self.set_prop(ct.PROP_TAB_COLOR_FONT, ct.COLOR_NONE)
+
     def on_change_slow(self, ed_self):
         if self.cfg.get('enable_auto_refresh', False):
             self.refresh()
@@ -454,7 +477,14 @@ class Command:
         """Intercept Ctrl+S in a compare tab. Instead of saving the untitled
         compare tab to disk (which would show a Save dialog), sync both
         halves' content back to the original tabs and block the save.
-        Returns False to block the default save behavior."""
+        Returns False to block the default save behavior.
+
+        On successful sync, the compare tab's title font is colored green
+        to indicate 'synced'. The color is reset to COLOR_NONE (which
+        CudaText re-colors red) when the user edits again -- see on_change.
+        We do NOT clear PROP_MODIFIED, because that would prevent CudaText's
+        session auto-save/restore from persisting the compare tab's content
+        across restarts."""
         tab_id = ed_self.get_prop(ct.PROP_TAB_ID)
         if not self._is_compare_tab(tab_id):
             return  # not a compare tab -- let CudaText handle normally
@@ -475,8 +505,10 @@ class Command:
                 synced_any = True
 
         if synced_any:
-            # Mark the compare tab as not-modified so no save dot shows.
-            ed_self.set_prop(ct.PROP_MODIFIED, False)
+            # Color the tab title font green to indicate 'synced'.
+            # Do NOT clear PROP_MODIFIED -- that would break session
+            # auto-save/restore for the compare tab.
+            ed_self.set_prop(ct.PROP_TAB_COLOR_FONT, 0x00A000)  # green
 
         # Block the default save (which would show a Save dialog for the
         # untitled compare tab).
@@ -967,13 +999,6 @@ class Command:
         self.menuid_withtab = ct.menu_proc(self.compare_menu, ct.MENU_ADD,
             caption=_('Compare with tab')
             )
-        self.menuid_sep = ct.menu_proc(self.compare_menu, ct.MENU_ADD,
-            caption='-'
-            )
-        self.menuid_move2septabs = ct.menu_proc(self.compare_menu, ct.MENU_ADD,
-            command='module=cuda_differ;cmd=move_to_sep_tabs_context;',
-            caption=_('Back to separate tabs')
-            )
 
         handles = ct.ed_handles()[:30] # avoid too much menu items when user opens 100 files
 
@@ -988,6 +1013,14 @@ class Command:
             if paths:
                 ct.menu_proc(self.menuid_withtab, ct.MENU_CLEAR)
 
+                # Add a "More tabs..." entry at the top that opens the
+                # native CudaText dialog (which has a scrollbar) -- useful
+                # when the popup menu is too long to fit on screen.
+                ct.menu_proc(self.menuid_withtab, ct.MENU_ADD,
+                    command='module=cuda_differ;cmd=tabmenu_chooser_tab;',
+                    caption=_('More tabs...')
+                    )
+
                 for path in paths:
                     ct.menu_proc(self.menuid_withtab, ct.MENU_ADD,
                         command='module=cuda_differ;cmd=tabmenu_files;info='+cur_fn+'::'+path+';',
@@ -1001,7 +1034,6 @@ class Command:
         ct.menu_proc(self.menuid_withtab, ct.MENU_SET_ENABLED, command=cur_ok and bool(paths))
         ct.menu_proc(self.menuid_withfile, ct.MENU_SET_ENABLED, command=cur_ok)
         ct.menu_proc(self.menuid_withfocused, ct.MENU_SET_ENABLED, command=cur_ok and not cur_is_focused)
-        ct.menu_proc(self.menuid_move2septabs, ct.MENU_SET_ENABLED, command=cur_ed.get_prop(ct.PROP_EDITORS_LINKED)==False)
 
     def tabmenu_chooser(self):
         callback = 'module=cuda_differ;cmd=tabmenu_chooser_timer;info=_;'
@@ -1010,9 +1042,17 @@ class Command:
     def tabmenu_chooser_timer(self, tag='', info=''):
         self.compare_with()
 
+    def tabmenu_chooser_tab(self):
+        """Opens the 'Compare current document with tab...' command, which
+        shows the native CudaText tab-picker dialog (with scrollbar)."""
+        callback = 'module=cuda_differ;cmd=tabmenu_chooser_tab_timer;info=_;'
+        ct.timer_proc(ct.TIMER_START_ONE, callback, 100)
+
+    def tabmenu_chooser_tab_timer(self, tag='', info=''):
+        self.compare_with_tab()
+
     def tabmenu_files(self, info):
         callback = 'module=cuda_differ;cmd=tabmenu_files_timer;info='+info+';'
-        #print('tabmenu_files:', info)
         ct.timer_proc(ct.TIMER_START_ONE, callback, 100)
 
     def tabmenu_files_timer(self, tag='', info=''):
@@ -1030,43 +1070,6 @@ class Command:
         for n, dif in enumerate(self.diff.diffmap):
             id = ct.CARET_SET_ONE if n == 0 else ct.CARET_ADD
             eds[fc].set_caret(0, dif[y1], 0, dif[y2], id=id)
-
-    def move_to_sep_tabs(self):
-        self.move_to_sep_tabs_ex(ct.ed)
-
-    def move_to_sep_tabs_context(self):
-        if ct.app_api_version()>='1.0.435':
-            e = ct.Editor(1)
-        else:
-            e = ct.ed
-        self.move_to_sep_tabs_ex(e)
-
-    def move_to_sep_tabs_ex(self, e: ct.Editor):
-        """Close the compare tab and focus the first original tab.
-
-        Originals are always left open (we never close them when starting
-        a compare). No temp files to clean up -- just close the tab."""
-        if e.get_prop(ct.PROP_EDITORS_LINKED):
-            return
-
-        # Look up the original tab IDs from the persisted state so we
-        # can focus one after closing the compare tab.
-        tab_id = e.get_prop(ct.PROP_TAB_ID)
-        orig_a_id, orig_b_id = self._get_orig_tab_ids(tab_id)
-        original_ids = [i for i in (orig_a_id, orig_b_id) if i is not None]
-
-        # Close the compare tab.
-        e1 = ct.Editor(e.get_prop(ct.PROP_HANDLE_PRIMARY))
-        e1.focus()  # otherwise cmd_FileClose may hit the wrong editor
-        e1.cmd(ct_cmd.cmd_FileClose)
-
-        # Focus the first original tab that is still open.
-        for orig_id in original_ids:
-            for h in ct.ed_handles():
-                ee = ct.Editor(h)
-                if ee.get_prop(ct.PROP_TAB_ID) == orig_id:
-                    ee.focus()
-                    return
 
     def on_close(self, ed_self: ct.Editor):
         """Fires after the close is confirmed. For a compare tab: unregister
@@ -1094,6 +1097,8 @@ class Command:
                 tab_id,
                 entry.get('primary_orig_tab_id'),
                 entry.get('secondary_orig_tab_id'),
+                entry.get('primary_orig_name', ''),
+                entry.get('secondary_orig_name', ''),
                 entry.get('session', '')
             )
             return
@@ -1103,8 +1108,3 @@ class Command:
         state = self._load_state()
         if not state['compare_tabs']:
             self._disable_autostart()
-
-    def move_to_sep_tabs_timer(self, tag='', info=''):
-
-        e = ct.Editor(int(info))
-        self.move_to_sep_tabs_ex(e)

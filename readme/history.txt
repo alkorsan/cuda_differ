@@ -1,3 +1,10 @@
+2026.07.30 (by @badrelmers)
+* change: compare tab title no longer shows the tab ID -- just the file/tab names (e.g. "foo.txt | bar.txt")
+* change: synced compare tabs keep their modified flag so CudaText's session auto-save/restore persists their content across restarts; the tab title font turns green to indicate 'synced' and resets to default (red) when the user edits again
++ add: state file now stores the original file path (or untitled tab title) next to each compare tab, so the JSON is human-readable
++ add: "Compare with tab" submenu now has a "More tabs..." entry at the top that opens the native tab-picker dialog (with scrollbar) for when the popup menu is too long
+- fix: removed "Move 2 comparing files to separate tabs" command and "Back to separate tabs" context menu item (no longer needed with the split-tab approach)
+
 2026.07.29 (by @badrelmers)
 * change: compare tabs now use CudaText's split-editor feature instead of temp files -- no more settings/differ_backup folder, no temp files on disk
 * change: Ctrl+S in a compare tab now syncs both sides back to the original tabs and blocks the Save dialog (compare tabs are untitled and never saved to disk directly)

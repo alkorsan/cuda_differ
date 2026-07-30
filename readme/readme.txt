@@ -73,9 +73,6 @@ Copy current line to the right
 Copy current line to the left
     Copies the line under the cursor from the right file to the left file.
 
-Move 2 comparing files to separate tabs
-    Closes the compare tab and returns the two files to separate tabs.
-
 Config...
     Opens the options dialog.
 
@@ -89,8 +86,9 @@ Clear recents history
 Right-clicking a tab title shows "Differ" submenu with:
 - Compare with... -- pick a file to compare against this tab
 - Compare with focused tab -- compare this tab with the currently focused tab
-- Compare with tab -- compare this tab with another open tab
-- Back to separate tabs -- return from compare view to two separate tabs
+- Compare with tab -- submenu listing all open tabs; click one to compare.
+  If the list is too long, the first entry "More tabs..." opens a dialog
+  with a scrollbar to pick any open tab.
 
 
 == Saving and syncing changes ==
@@ -105,6 +103,9 @@ When you edit files inside the compare view and press Ctrl+S:
   later if you want.
 - The compare tab itself is never saved to disk -- it is an untitled
   scratch tab. Ctrl+S only triggers the sync to the originals.
+- After a successful sync, the compare tab's title turns green to
+  indicate its changes have been pushed to the originals. When you edit
+  again, the title returns to the normal modified color (red).
 - Undo/Redo history is preserved in the original tabs, so you can undo
   the synced changes with Ctrl+Z after switching to the original tab.
 
