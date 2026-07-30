@@ -145,6 +145,15 @@ class Command:
         # on_close (which fires next, once per closing tab) can skip
         # temp-file deletion and let compare tabs persist across restarts.
         self._app_exiting = False
+        # In-memory cache of saved/unsaved state per compare tab ID.
+        # Avoids redundant JSON writes when on_change_slow fires repeatedly
+        # without the state actually changing.
+        self._saved_cache = {}
+        # Counter of on_change_slow events to suppress per compare tab ID.
+        # Set to 2 when a compare is created (one per split half) because
+        # set_text_all triggers on_change -> on_change_slow for each half.
+        # Prevents the initial green color from being reset to red.
+        self._suppress_change_slow = {}
 
         self.compare_menu = None
         self.menuid_sep = None
@@ -199,12 +208,17 @@ class Command:
             'saved': saved,
         }
         self._save_state(state)
+        self._saved_cache[str(compare_tab_id)] = saved
 
     def _set_saved_state(self, compare_tab_id, saved):
         """Update the 'saved' flag for a compare tab in the persisted state.
-        Does nothing if the tab is not registered."""
-        state = self._load_state()
+        Uses an in-memory cache to avoid redundant JSON writes -- only
+        writes to disk when the state actually changes."""
         key = str(compare_tab_id)
+        if self._saved_cache.get(key) == saved:
+            return  # state unchanged, skip the write
+        self._saved_cache[key] = saved
+        state = self._load_state()
         if key in state['compare_tabs']:
             state['compare_tabs'][key]['saved'] = saved
             self._save_state(state)
@@ -427,6 +441,12 @@ class Command:
         # changes yet -- content is identical to the originals).
         ct.ed.set_prop(ct.PROP_TAB_COLOR_FONT, 0x00A000)  # green
 
+        # Suppress the next 2 on_change_slow events (one per split half)
+        # because set_text_all triggers on_change -> on_change_slow, which
+        # would reset the green color to red. The counter is decremented
+        # in on_change_slow; real user edits after this will work normally.
+        self._suppress_change_slow[str(compare_tab_id)] = 2
+
         # Persistently subscribe to on_start so the plugin auto-loads on
         # next startup and lazy events fire after restart.
         self._enable_autostart()
@@ -475,34 +495,6 @@ class Command:
         if self._is_compare_tab(ed_self.get_prop(ct.PROP_TAB_ID)):
             self.scroll.on_scroll(ed_self)
 
-    def on_focus(self, ed_self):
-        """When a compare tab gets focus, re-apply diff markers if they're
-        missing (e.g. after restart -- markers are in-memory and don't
-        survive session restore). Without this, the user would see the
-        compare content but no colored highlights until they manually
-        click Refresh."""
-        tab_id = ed_self.get_prop(ct.PROP_TAB_ID)
-        if not self._is_compare_tab(tab_id):
-            return
-        # Check if the primary editor has any DIFF_TAG bookmarks. If not,
-        # markers were lost (e.g. after restart) -- re-apply them.
-        a_ed = ct.Editor(ed_self.get_prop(ct.PROP_HANDLE_PRIMARY))
-        if not self._has_diff_markers(a_ed):
-            self.refresh()
-
-    def _has_diff_markers(self, ed):
-        """Check if the editor has any Differ bookmarks (tag == DIFF_TAG)."""
-        try:
-            items = ed.bookmark(ct.BOOKMARK2_GET_ALL, 0)
-        except Exception:
-            return False
-        if not items:
-            return False
-        for item in items:
-            if isinstance(item, dict) and item.get('tag') == DIFF_TAG:
-                return True
-        return False
-
     def on_caret(self, ed_self):
         if self.cfg.get('enable_sync_caret', False):
             self.sync_caret()
@@ -512,15 +504,26 @@ class Command:
         - Resetting the compare tab title color from green to default (red)
           when the user makes changes (indicating unsaved edits).
         - Persisting the 'unsaved' state so it survives restarts.
-        - Auto-refreshing the diff markers if that option is enabled."""
+        - Auto-refreshing the diff markers if that option is enabled.
+
+        The first 2 calls after a compare is created are suppressed (see
+        _suppress_change_slow) because set_text_all triggers spurious
+        on_change_slow events that would reset the initial green color."""
         tab_id = ed_self.get_prop(ct.PROP_TAB_ID)
         if self._is_compare_tab(tab_id):
-            # Reset title color to default -- CudaText re-applies its
-            # 'modified' coloring (red) to indicate unsaved changes.
-            ed_self.set_prop(ct.PROP_TAB_COLOR_FONT, ct.COLOR_NONE)
-            # Persist the unsaved state so on_start can restore the
-            # correct color after restart.
-            self._set_saved_state(tab_id, False)
+            # Check if this is a spurious event from set_text_all.
+            key = str(tab_id)
+            if key in self._suppress_change_slow:
+                self._suppress_change_slow[key] -= 1
+                if self._suppress_change_slow[key] <= 0:
+                    del self._suppress_change_slow[key]
+                # Skip color change and state write for this spurious event.
+            else:
+                # Real user edit -- reset title color to default (red).
+                ed_self.set_prop(ct.PROP_TAB_COLOR_FONT, ct.COLOR_NONE)
+                # Persist the unsaved state so on_start can restore the
+                # correct color after restart.
+                self._set_saved_state(tab_id, False)
         if self.cfg.get('enable_auto_refresh', False):
             self.refresh()
 
@@ -563,6 +566,9 @@ class Command:
             # Persist the saved state so on_start can restore green
             # color after restart.
             self._set_saved_state(tab_id, True)
+            # Clear any pending suppress counter -- save overrides the
+            # initial-creation suppress.
+            self._suppress_change_slow.pop(str(tab_id), None)
 
         # Block the default save (which would show a Save dialog for the
         # untitled compare tab).
@@ -618,9 +624,11 @@ class Command:
         active). Just being loaded is enough -- all lazy events (on_save~,
         on_close~) will now fire.
 
-        We also rebuild the in-memory scroll sync set from the persisted
-        state, re-subscribe to on_scroll, and re-apply the saved/unsaved
-        title color (green/default) for each restored compare tab."""
+        We also rebuild the in-memory scroll sync set, re-subscribe to
+        on_scroll, re-apply the saved/unsaved title color, and re-apply
+        diff markers (bookmarks/decorations/gaps) for each restored
+        compare tab. Markers are in-memory and don't survive session
+        restore, so we must re-apply them here once at startup."""
         state = self._load_state()  # prunes stale entries
         # Rebuild scroll.tab_id set from persisted compare tab IDs so that
         # ScrollSplittedTab.toggle() works correctly after restart.
@@ -630,6 +638,17 @@ class Command:
                 self.scroll.tab_id.add(int(tab_id_str))
             except (ValueError, TypeError):
                 pass
+            # Populate the saved-state cache from disk so _set_saved_state
+            # can debounce writes correctly.
+            if isinstance(entry, dict):
+                self._saved_cache[tab_id_str] = entry.get('saved', True)
+            # Find an editor for this compare tab and re-apply diff markers.
+            target = tab_id_str
+            for h in ct.ed_handles():
+                e = ct.Editor(h)
+                if str(e.get_prop(ct.PROP_TAB_ID)) == target:
+                    self._refresh_ex(e)
+                    break
             # Re-apply the title color based on the persisted 'saved' flag.
             # CudaText colors all restored tabs red by default (modified);
             # we override to green if the tab was in 'saved' state before exit.
@@ -665,24 +684,26 @@ class Command:
         self.tabmenu_init(ed_self)
 
     def refresh(self):
-        if ct.ed.get_prop(ct.PROP_EDITORS_LINKED):
-            return
+        """Refresh the focused tab. Only applies to compare tabs managed
+        by this plugin -- other split tabs are left alone."""
+        self._refresh_ex(ct.ed)
 
-        a_ed = ct.Editor(ct.ed.get_prop(ct.PROP_HANDLE_PRIMARY))
-        b_ed = ct.Editor(ct.ed.get_prop(ct.PROP_HANDLE_SECONDARY))
+    def _refresh_ex(self, ed):
+        """Core refresh logic. 'ed' is any editor belonging to the compare
+        tab. Only applies to compare tabs managed by this plugin."""
+        if ed is None:
+            return
+        if ed.get_prop(ct.PROP_EDITORS_LINKED):
+            return
+        tab_id = ed.get_prop(ct.PROP_TAB_ID)
+        if not self._is_compare_tab(tab_id):
+            return  # not a compare tab we manage -- skip
+
+        a_ed = ct.Editor(ed.get_prop(ct.PROP_HANDLE_PRIMARY))
+        b_ed = ct.Editor(ed.get_prop(ct.PROP_HANDLE_SECONDARY))
 
         a_text_all = a_ed.get_text_all()
         b_text_all = b_ed.get_text_all()
-
-        if a_text_all == '':
-            t = _('The file:\n{}\nis empty.').format(_('left side'))
-            ct.msg_box(t, ct.MB_OK)
-            return
-
-        if b_text_all == '':
-            t = _('The file:\n{}\nis empty.').format(_('right side'))
-            ct.msg_box(t, ct.MB_OK)
-            return
 
         if not a_text_all.endswith('\n'):
             a_text_all += '\n'
@@ -707,7 +728,7 @@ class Command:
         self.diff.set_seqs(a_text_all.splitlines(True),
                            b_text_all.splitlines(True))
 
-        self.scroll.tab_id.add(ct.ed.get_prop(ct.PROP_TAB_ID))
+        self.scroll.tab_id.add(tab_id)
         self.scroll.toggle(self.cfg.get('sync_scroll'))
 
         self.diff.withdetail = self.cfg.get('compare_with_details')
@@ -1104,6 +1125,16 @@ class Command:
         ct.menu_proc(self.menuid_withfile, ct.MENU_SET_ENABLED, command=cur_ok)
         ct.menu_proc(self.menuid_withfocused, ct.MENU_SET_ENABLED, command=cur_ok and not cur_is_focused)
 
+        # Add a separator and "Refresh" entry at the end of the context menu.
+        # Only enabled when the current tab is a compare tab managed by Differ.
+        ct.menu_proc(self.compare_menu, ct.MENU_ADD, caption='-')
+        self.menuid_refresh = ct.menu_proc(self.compare_menu, ct.MENU_ADD,
+            command='module=cuda_differ;cmd=tabmenu_refresh;',
+            caption=_('Refresh')
+            )
+        ct.menu_proc(self.menuid_refresh, ct.MENU_SET_ENABLED,
+            command=self._is_compare_tab(cur_ed.get_prop(ct.PROP_TAB_ID)))
+
     def tabmenu_chooser(self):
         callback = 'module=cuda_differ;cmd=tabmenu_chooser_timer;info=_;'
         ct.timer_proc(ct.TIMER_START_ONE, callback, 100)
@@ -1119,6 +1150,14 @@ class Command:
 
     def tabmenu_chooser_tab_timer(self, tag='', info=''):
         self.compare_with_tab()
+
+    def tabmenu_refresh(self):
+        """Refresh the compare tab -- re-applies diff markers."""
+        callback = 'module=cuda_differ;cmd=tabmenu_refresh_timer;info=_;'
+        ct.timer_proc(ct.TIMER_START_ONE, callback, 100)
+
+    def tabmenu_refresh_timer(self, tag='', info=''):
+        self.refresh()
 
     def tabmenu_files(self, info):
         callback = 'module=cuda_differ;cmd=tabmenu_files_timer;info='+info+';'
