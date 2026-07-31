@@ -136,14 +136,56 @@ This launches CudaText with the two given files opened in the Differ plugin.
 Open the options dialog via "Options / Settings-plugins / Differ / Config"
 or "Plugins / Differ / Config...".
 
-Available options include:
-- Colors for changed, added, and deleted lines
-- Color of the inter-line gap background
-- Synchronized scrolling (vertical/horizontal) toggle
-- Auto-refresh on edits
-- Sync caret between the two sides
-- Number of context lines in unified diff output
-- Detail comparison of changed lines (character-level highlights)
+All options are stored in settings/cuda_differ.json and can also be set
+directly in CudaText's user.json. The option names are listed below in
+parentheses.
+
+Colors (chapter "colors"):
+- Color of changed lines (differ.changed_color)
+  Background color for lines that were modified (replaced with different
+  content). Leave empty to use the theme default.
+- Color of added lines (differ.added_color)
+  Background color for lines that exist only in the right file (added).
+  Leave empty to use the theme default.
+- Color of deleted lines (differ.deleted_color)
+  Background color for lines that exist only in the left file (removed).
+  Leave empty to use the theme default.
+- Color of inter-line gap background (differ.gap_color)
+  Background color for the blank gap inserted to keep the two sides
+  aligned when one side has fewer lines. Default: LightBG5.
+
+Configuration (chapter "config"):
+- Synchronized scrolling (differ.sync_scroll)
+  When enabled, scrolling one side of the compare view also scrolls the
+  other side. Default: true.
+- Detailed comparison (differ.compare_with_details)
+  When enabled, changed lines are compared character-by-character and
+  the specific changed characters are highlighted within the line.
+  When disabled, changed lines are highlighted as a whole. Default: true.
+- Similarity threshold in percents (differ.ratio_percents)
+  Controls how aggressive the character-level comparison is when
+  deciding whether two lines should be treated as "changed" (similar
+  but not identical) or as separate "deleted + added" lines. A higher
+  value means lines must be more similar to be considered "changed";
+  a lower value means more lines will be shown as changed (with
+  character-level detail). Range: 1-100. Default: 75.
+- Keep carets visible on sync (differ.enable_sync_caret)
+  When enabled, moving the cursor in one side also moves the cursor in
+  the other side to the corresponding difference block. Default: false.
+- Auto-refresh after changes (differ.enable_auto_refresh)
+  When enabled, the diff markers are automatically re-calculated after
+  you stop editing for 1-2 seconds. When disabled, you must click
+  Refresh manually. Default: false.
+- Context lines in unified diff (differ.diff_context)
+  Number of unchanged context lines shown around each change in the
+  unified diff output (produced by the "Diff current document with..."
+  commands). Default: 3.
+- Always load for command-line diffing (differ.cli_always_active)
+  When enabled, the plugin loads on every CudaText startup so that
+  command-line diffing (cudatext -p=cuda_differ#file1#file2) works
+  immediately without needing to activate the plugin first. When
+  disabled, the plugin only loads when compare tabs are already open.
+  Default: false.
 
 
 == Notes ==

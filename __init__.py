@@ -1,7 +1,6 @@
 import os
 import json
 import typing as tp
-from pathlib import Path
 
 import cudatext as ct
 import cudatext_cmd as ct_cmd
@@ -84,7 +83,7 @@ OPTS_META = [
      },
     {'opt': 'differ.gap_color',
      'cmt': _('Color of inter-line gap background'),
-     'def': '',
+     'def': 'LightBG5',
      'frm': '#rgb-e',
      'chp': 'colors',
      },
@@ -122,6 +121,12 @@ OPTS_META = [
      'cmt': _('Number of lines of context displayed when diffing files'),
      'def':  3,
      'frm': 'int',
+     'chp': 'config',
+     },
+    {'opt': 'differ.cli_always_active',
+     'cmt': _('Always load plugin on startup so command-line diffing (cudatext -p=cuda_differ#file1#file2) works without first activating the plugin'),
+     'def':  False,
+     'frm': 'bool',
      'chp': 'config',
      },
 ]
@@ -308,25 +313,30 @@ class Command:
             return (None, None)
         return (entry.get('primary_orig_tab_id'), entry.get('secondary_orig_tab_id'))
 
-    def _enable_autostart(self):
-        """Persistently subscribe to on_start2 via plugins.ini so the plugin
-        auto-loads on next CudaText startup. We use on_start2 (not on_start)
-        because on_start fires before session restore completes, which would
-        reset our green title color. on_start2 fires after configs and
-        session restore, so our color override sticks."""
-        current = ct.ini_read(PLUGINS_INI, PLUGINS_INI_SECTION, MODULE_NAME, '')
-        if current == 'on_start2':
-            return
-        ct.ini_write(PLUGINS_INI, PLUGINS_INI_SECTION, MODULE_NAME, 'on_start2')
+    def _update_autostart(self, has_compare_tabs):
+        """Update the plugins.ini subscription based on current state.
 
-    def _disable_autostart(self):
-        """Remove the on_start2 subscription from plugins.ini so the plugin
-        does NOT auto-load on next startup (no overhead when no compare
-        tabs are active)."""
-        current = ct.ini_read(PLUGINS_INI, PLUGINS_INI_SECTION, MODULE_NAME, '')
-        if not current:
-            return
-        ct.ini_proc(ct.INI_DELETE_KEY, PLUGINS_INI, PLUGINS_INI_SECTION, MODULE_NAME)
+        - If config option 'cli_always_active' is True, subscribe to on_cli
+          (non-lazy) so command-line diffing (cudatext -p=cuda_differ#...)
+          works without first activating the plugin manually.
+        - If has_compare_tabs is True, also subscribe to on_start2 so the
+          plugin auto-loads to restore compare tabs on next startup.
+        - If neither, remove the subscription entirely (no overhead)."""
+        events = []
+        if self.cfg.get('cli_always_active', False):
+            events.append('on_cli')
+        if has_compare_tabs:
+            events.append('on_start2')
+
+        if events:
+            val = ','.join(events)
+            current = ct.ini_read(PLUGINS_INI, PLUGINS_INI_SECTION, MODULE_NAME, '')
+            if current != val:
+                ct.ini_write(PLUGINS_INI, PLUGINS_INI_SECTION, MODULE_NAME, val)
+        else:
+            current = ct.ini_read(PLUGINS_INI, PLUGINS_INI_SECTION, MODULE_NAME, '')
+            if current:
+                ct.ini_proc(ct.INI_DELETE_KEY, PLUGINS_INI, PLUGINS_INI_SECTION, MODULE_NAME)
 
     def change_config(self):
         try:
@@ -352,16 +362,38 @@ class Command:
             # Need to use updated options
             self.config()
             self.scroll.toggle(self.cfg['sync_scroll'])
+            # Re-evaluate autostart since cli_always_active may have changed.
+            state = self._load_state()
+            has_tabs = bool(state['sessions'].get(self._current_session_key, {}))
+            self._update_autostart(has_compare_tabs=has_tabs)
             # self.scroll.enable_sync_caret = self.cfg['enable_sync_caret']
 
     def on_cli(self, fn1, fn2):
+        """Called when CudaText gets command-line param -p=cuda_differ#file1#file2.
+        Opens both files first (so they exist as tabs), then compares them."""
+        # Open both files. file_open activates the tab, so after opening fn2,
+        # ct.ed points to fn2. We pass the filenames to set_files which finds
+        # them by filename.
+        ct.file_open(fn1)
+        ct.file_open(fn2)
         self.set_files(fn1, fn2)
 
     def compare_with(self):
+        """Compare current document with a file picked from a dialog.
+        If the chosen file is not already open, open it first."""
         fn0 = self.get_name(ct.ed)
         fn = ct.dlg_file(True, '!', '', '')
         if not fn:
             return
+        # Check if the file is already open in a tab.
+        already_open = False
+        for h in ct.ed_handles():
+            if ct.Editor(h).get_filename() == fn:
+                already_open = True
+                break
+        if not already_open:
+            # Open the file so set_files can find it as a tab.
+            ct.file_open(fn)
         self.set_files(fn0, fn)
 
     def compare_with_tab(self):
@@ -387,9 +419,17 @@ class Command:
         if not fn:
             return
 
-        enc = ct.ed.get_prop(ct.PROP_ENC)
         a = ct.ed.get_text_all()
-        b = Path(fn).read_text(enc)
+        # Read file b by opening it in CudaText (handles all encodings
+        # correctly -- CudaText's encoding names like utf16le, koi8u, etc.
+        # don't always match Python's codec names).
+        h_orig = ct.ed.get_prop(ct.PROP_HANDLE_SELF)
+        ct.file_open(fn, options='/nohistory')
+        b = ct.ed.get_text_all()
+        ct.ed.cmd(ct_cmd.cmd_FileClose)
+        # Restore focus to the original editor.
+        if h_orig:
+            ct.Editor(h_orig).focus()
         self.create_diff(a, b, fn0, fn)
 
     def diff_with_tab(self):
@@ -451,20 +491,29 @@ class Command:
 
         Creates a new untitled tab, unlinks the split editors (so each half
         has independent text), splits vertically, then loads each original's
-        content into the two halves. The original tabs stay open."""
+        content and editor properties into the two halves."""
         files = [file0, file1]
-        lexers = [None, None]
+        # Properties to copy from originals to the compare halves.
+        # These affect how text is displayed and interpreted.
+        _PROPS_TO_COPY = [
+            ct.PROP_LEXER_FILE,
+            ct.PROP_NEWLINE,
+            ct.PROP_ENC,
+            ct.PROP_TAB_SPACES,
+            ct.PROP_TAB_SIZE,
+            ct.PROP_WRAP,
+        ]
+        orig_props = [None, None]  # list of prop-value dicts per half
         orig_tab_ids = [None, None]
         orig_texts = [None, None]
         orig_names = ['', '']
 
-        # Find the two original tabs, grab their content, lexer, tab ID,
+        # Find the two original tabs, grab their content, properties, tab ID,
         # and a display name (file path for real files, title for untitled).
         for (index, name) in enumerate(files):
             for h in ct.ed_handles():
                 e = ct.Editor(h)
                 if self.is_match_name(e, name):
-                    lexers[index] = e.get_prop(ct.PROP_LEXER_FILE)
                     orig_tab_ids[index] = e.get_prop(ct.PROP_TAB_ID)
                     orig_texts[index] = e.get_text_all()
                     fn = e.get_filename()
@@ -472,6 +521,8 @@ class Command:
                         orig_names[index] = fn
                     else:
                         orig_names[index] = e.get_prop(ct.PROP_TAB_TITLE) or ''
+                    # Capture all properties to copy.
+                    orig_props[index] = {p: e.get_prop(p) for p in _PROPS_TO_COPY}
                     break
 
         # Bail out if we couldn't find both originals.
@@ -497,11 +548,17 @@ class Command:
         title1 = os.path.basename(orig_names[1]) if orig_names[1] else _('Untitled')
         ct.ed.set_prop(ct.PROP_TAB_TITLE, 'Diff: {} | {}'.format(title0, title1))
 
-        # Set lexers from the originals.
-        if lexers[0] is not None:
-            a_ed.set_prop(ct.PROP_LEXER_FILE, lexers[0])
-        if lexers[1] is not None:
-            b_ed.set_prop(ct.PROP_LEXER_FILE, lexers[1])
+        # Copy editor properties (lexer, newline, encoding, tabs, wrap) from
+        # each original to its corresponding compare half.
+        for ed, props in ((a_ed, orig_props[0]), (b_ed, orig_props[1])):
+            if not props:
+                continue
+            for prop, val in props.items():
+                if val is not None:
+                    try:
+                        ed.set_prop(prop, val)
+                    except Exception:
+                        pass  # some props may not be settable on untitled tabs
 
         # Register the compare tab by its PROP_TAB_ID with the original
         # tab IDs and names, plus the session key for grouping.
@@ -529,9 +586,9 @@ class Command:
         # real user edits after this will work normally.
         self._suppress_change[str(compare_tab_id)] = 2
 
-        # Persistently subscribe to on_start2 so the plugin auto-loads on
-        # next startup and lazy events fire after restart.
-        self._enable_autostart()
+        # Update autostart subscription (on_start2 for compare tab restore,
+        # on_cli if cli_always_active config option is enabled).
+        self._update_autostart(has_compare_tabs=True)
 
         # Track this tab for scroll sync.
         self.scroll.tab_id.add(compare_tab_id)
@@ -1366,8 +1423,8 @@ class Command:
             )
             return
 
-        # If no more compare tabs are open in the current session,
-        # disable autostart so the plugin does not load on next startup.
+        # Update autostart: keep on_start2 only if compare tabs still exist;
+        # keep on_cli only if cli_always_active config is enabled.
         state = self._load_state()
-        if not state['sessions'].get(self._current_session_key, {}):
-            self._disable_autostart()
+        has_tabs = bool(state['sessions'].get(self._current_session_key, {}))
+        self._update_autostart(has_compare_tabs=has_tabs)
