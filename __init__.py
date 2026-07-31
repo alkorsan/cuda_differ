@@ -83,7 +83,7 @@ OPTS_META = [
      },
     {'opt': 'differ.gap_color',
      'cmt': _('Color of inter-line gap background'),
-     'def': 'LightBG5',
+     'def': '',
      'frm': '#rgb-e',
      'chp': 'colors',
      },
@@ -121,12 +121,6 @@ OPTS_META = [
      'cmt': _('Number of lines of context displayed when diffing files'),
      'def':  3,
      'frm': 'int',
-     'chp': 'config',
-     },
-    {'opt': 'differ.cli_always_active',
-     'cmt': _('Always load plugin on startup so command-line diffing (cudatext -p=cuda_differ#file1#file2) works without first activating the plugin'),
-     'def':  False,
-     'frm': 'bool',
      'chp': 'config',
      },
 ]
@@ -313,30 +307,22 @@ class Command:
             return (None, None)
         return (entry.get('primary_orig_tab_id'), entry.get('secondary_orig_tab_id'))
 
-    def _update_autostart(self, has_compare_tabs):
-        """Update the plugins.ini subscription based on current state.
+    def _enable_autostart(self):
+        """Persistently subscribe to on_start2 via plugins.ini so the plugin
+        auto-loads on next CudaText startup to restore compare tabs."""
+        current = ct.ini_read(PLUGINS_INI, PLUGINS_INI_SECTION, MODULE_NAME, '')
+        if current == 'on_start2':
+            return
+        ct.ini_write(PLUGINS_INI, PLUGINS_INI_SECTION, MODULE_NAME, 'on_start2')
 
-        - If config option 'cli_always_active' is True, subscribe to on_cli
-          (non-lazy) so command-line diffing (cudatext -p=cuda_differ#...)
-          works without first activating the plugin manually.
-        - If has_compare_tabs is True, also subscribe to on_start2 so the
-          plugin auto-loads to restore compare tabs on next startup.
-        - If neither, remove the subscription entirely (no overhead)."""
-        events = []
-        if self.cfg.get('cli_always_active', False):
-            events.append('on_cli')
-        if has_compare_tabs:
-            events.append('on_start2')
-
-        if events:
-            val = ','.join(events)
-            current = ct.ini_read(PLUGINS_INI, PLUGINS_INI_SECTION, MODULE_NAME, '')
-            if current != val:
-                ct.ini_write(PLUGINS_INI, PLUGINS_INI_SECTION, MODULE_NAME, val)
-        else:
-            current = ct.ini_read(PLUGINS_INI, PLUGINS_INI_SECTION, MODULE_NAME, '')
-            if current:
-                ct.ini_proc(ct.INI_DELETE_KEY, PLUGINS_INI, PLUGINS_INI_SECTION, MODULE_NAME)
+    def _disable_autostart(self):
+        """Remove the on_start2 subscription from plugins.ini so the plugin
+        does NOT auto-load on next startup (no overhead when no compare
+        tabs are active)."""
+        current = ct.ini_read(PLUGINS_INI, PLUGINS_INI_SECTION, MODULE_NAME, '')
+        if not current:
+            return
+        ct.ini_proc(ct.INI_DELETE_KEY, PLUGINS_INI, PLUGINS_INI_SECTION, MODULE_NAME)
 
     def change_config(self):
         try:
@@ -362,10 +348,6 @@ class Command:
             # Need to use updated options
             self.config()
             self.scroll.toggle(self.cfg['sync_scroll'])
-            # Re-evaluate autostart since cli_always_active may have changed.
-            state = self._load_state()
-            has_tabs = bool(state['sessions'].get(self._current_session_key, {}))
-            self._update_autostart(has_compare_tabs=has_tabs)
             # self.scroll.enable_sync_caret = self.cfg['enable_sync_caret']
 
     def on_cli(self, fn1, fn2):
@@ -586,9 +568,9 @@ class Command:
         # real user edits after this will work normally.
         self._suppress_change[str(compare_tab_id)] = 2
 
-        # Update autostart subscription (on_start2 for compare tab restore,
-        # on_cli if cli_always_active config option is enabled).
-        self._update_autostart(has_compare_tabs=True)
+        # Persistently subscribe to on_start2 so the plugin auto-loads on
+        # next startup to restore compare tabs.
+        self._enable_autostart()
 
         # Track this tab for scroll sync.
         self.scroll.tab_id.add(compare_tab_id)
@@ -908,9 +890,6 @@ class Command:
                 ct.msg_box(t, ct.MB_OK)
             return
 
-        a_ed.set_prop(ct.PROP_WRAP, ct.WRAP_OFF)
-        b_ed.set_prop(ct.PROP_WRAP, ct.WRAP_OFF)
-
         self.clear(a_ed)
         self.clear(b_ed)
         self.config()
@@ -1023,6 +1002,7 @@ class Command:
             th['color_changed'] = data['LightBG2']['color_back']
             th['color_added'] = data['LightBG3']['color_back']
             th['color_deleted'] = data['LightBG1']['color_back']
+            th['color_gaps'] = data['LightBG5']['color_back']
             return th
 
         t = get_theme()
@@ -1038,7 +1018,7 @@ class Command:
             'color_deleted':
                 get_color('deleted_color', t.get('color_deleted')),
             'color_gaps':
-                get_color('gap_color', ct.COLOR_NONE),
+                get_color('gap_color', t.get('color_gaps')),
             'sync_scroll':
                 get_opt('sync_scroll', DEFAULT_SYNC_SCROLL == '1'),
             'compare_with_details':
@@ -1423,8 +1403,8 @@ class Command:
             )
             return
 
-        # Update autostart: keep on_start2 only if compare tabs still exist;
-        # keep on_cli only if cli_always_active config is enabled.
+        # If no more compare tabs are open in the current session,
+        # disable autostart so the plugin does not load on next startup.
         state = self._load_state()
-        has_tabs = bool(state['sessions'].get(self._current_session_key, {}))
-        self._update_autostart(has_compare_tabs=has_tabs)
+        if not state['sessions'].get(self._current_session_key, {}):
+            self._disable_autostart()

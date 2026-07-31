@@ -1,11 +1,11 @@
 2026.07.31 (by @badrelmers)
+- fix: removed unnecessary PROP_WRAP reset in refresh (was overriding the wrap mode copied from originals)
+* change: gap_color default now fetched from theme (LightBG5) like changed_color/added_color/deleted_color, instead of being empty/COLOR_NONE
+- fix: removed cli_always_active config option -- CudaText loads the plugin automatically when -p command-line flag is passed, so the option was unnecessary
 - fix: on_cli now opens both files before comparing, so command-line diffing (cudatext -p=cuda_differ#file1#file2) works correctly
 - fix: compare_with now opens the chosen file if it's not already open in a tab
 - fix: diff_with no longer crashes on encodings like utf16le or koi8u -- file content is now read via CudaText's file handling instead of Python's read_text (CudaText encoding names don't always match Python codec names)
-+ add: config option "cli_always_active" (differ.cli_always_active) -- when enabled, the plugin always loads on startup so command-line diffing works without first activating the plugin
-+ add: on_cli event registered as lazy in install.inf; auto-subscribed non-lazy via plugins.ini when cli_always_active is True
 * change: set_files now copies editor properties from originals to compare halves: lexer, line endings (PROP_NEWLINE), encoding (PROP_ENC), tab spaces (PROP_TAB_SPACES), tab size (PROP_TAB_SIZE), and word wrap (PROP_WRAP) -- previously only the lexer was copied
-* change: gap_color default changed from empty to LightBG5 (matching changed_color/added_color pattern)
 * change: compare tab title now starts with "Diff:" for clarity (e.g. "Diff: foo.txt | bar.txt")
 - fix: "Compare with focused tab" disabled when the focused tab is a Differ compare tab (prevented error when comparing a normal tab with a diff tab)
 - fix: removed "Choose files..." command and "Clear recents history" command (no longer needed)

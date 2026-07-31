@@ -136,9 +136,8 @@ This launches CudaText with the two given files opened in the Differ plugin.
 Open the options dialog via "Options / Settings-plugins / Differ / Config"
 or "Plugins / Differ / Config...".
 
-All options are stored in settings/cuda_differ.json and can also be set
-directly in CudaText's user.json. The option names are listed below in
-parentheses.
+All options are stored in settings/cuda_differ.json. The option names are
+listed below in parentheses.
 
 Colors (chapter "colors"):
 - Color of changed lines (differ.changed_color)
@@ -180,12 +179,6 @@ Configuration (chapter "config"):
   Number of unchanged context lines shown around each change in the
   unified diff output (produced by the "Diff current document with..."
   commands). Default: 3.
-- Always load for command-line diffing (differ.cli_always_active)
-  When enabled, the plugin loads on every CudaText startup so that
-  command-line diffing (cudatext -p=cuda_differ#file1#file2) works
-  immediately without needing to activate the plugin first. When
-  disabled, the plugin only loads when compare tabs are already open.
-  Default: false.
 
 
 == Notes ==
