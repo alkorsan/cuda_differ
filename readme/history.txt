@@ -1,6 +1,14 @@
 2026.07.31 (by @badrelmers)
 - fix: untitled tab identification now uses PROP_TAB_ID (extracted from the display string) instead of full title+ID string comparison -- title changes between menu build and menu action no longer break "Compare with tab" #6392
 - fix: tabmenu_editor_ok (current-tab exclusion) also uses tab ID for untitled tabs instead of name string
+* change: state file restructured -- sessions are now the parent key with diff tabs nested inside, enabling per-session cleanup of dead records on startup
+* change: session paths inside the CudaText settings folder are stored as relative paths for portability; full paths are used only for sessions outside settings
++ add: startup cleanup removes dead compare-tab records (e.g. when CudaText discards empty untitled tabs on restart, the orphaned state entries are removed automatically)
++ add: diff markers auto-refresh after Ctrl+S so the user sees updated highlights without clicking Refresh
++ add: "Compare with tab" submenu now lists all open tabs (removed the 30-tab limit)
+* change: title color logic moved from on_change_slow to on_change (immediate) to fix race condition where quick save after edit would leave the tab red instead of green
+* change: _is_compare_tab now uses an in-memory set for O(1) lookup (no disk I/O on every keystroke)
+
 2026.07.30 (by @badrelmers)
 - fix: "two sides are identical" dialog no longer shown on automatic refreshes (startup, auto-refresh, theme change) -- only shown on manual Refresh command and initial compare
 - fix: green title color no longer reset to red after restart -- startup logic moved from on_start to on_start2 (fires after session restore completes)
@@ -12,7 +20,6 @@
 + add: "Refresh" entry in the tab context menu (below a separator) to re-apply diff markers manually
 - fix: comparing two empty tabs no longer crashes with IndexError
 * change: compare tab title starts green (synced state) when a compare is first created, since content matches the originals
-* change: title color reset now uses on_change_slow (lighter) instead of on_change
 * change: saved/unsaved state is persisted in the state file and restored on next startup -- green color is re-applied to tabs that were synced before exit
 + add: diff markers (colored highlights) are automatically re-applied on startup for all restored compare tabs, so the user doesn't need to click Refresh manually
 * change: compare tab title no longer shows the tab ID -- just the file/tab names (e.g. "foo.txt | bar.txt")

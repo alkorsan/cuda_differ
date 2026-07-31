@@ -93,19 +93,24 @@ OPTS_META = [
 ]
 
 DIFF_TAB_COUNT = 1
-# Persistent state file: stores compare-tab IDs and their original tab IDs.
-# Keyed by compare tab's PROP_TAB_ID so it survives restarts and renames.
+# Persistent state file: stores compare-tab state grouped by session.
 # Structure:
 # {
-#   "compare_tabs": {
-#     "<compare_tab_id>": {
-#       "session": "<path of session when compare was created>",
-#       "primary_orig_tab_id": <int>,
-#       "secondary_orig_tab_id": <int>
+#   "sessions": {
+#     "<session_key>": {
+#       "<compare_tab_id>": {
+#         "primary_orig_tab_id": <int>,
+#         "primary_orig_name": "...",
+#         "secondary_orig_tab_id": <int>,
+#         "secondary_orig_name": "...",
+#         "saved": true
+#       }
 #     }
 #   },
 #   "file_history": ["path1", "path2", ...]
 # }
+# session_key is the session file path, relative to the settings folder if
+# the session is inside it (at any depth), or the full path if outside.
 STATE_FILE = os.path.join(ct.app_path(ct.APP_DIR_SETTINGS), 'cuda_differ_state.json')
 # Path to plugins.ini -- used to persistently subscribe to on_start2 so the
 # plugin auto-loads on next CudaText startup when compare tabs are active.
@@ -146,38 +151,62 @@ class Command:
         # temp-file deletion and let compare tabs persist across restarts.
         self._app_exiting = False
         # In-memory cache of saved/unsaved state per compare tab ID.
-        # Avoids redundant JSON writes when on_change_slow fires repeatedly
+        # Avoids redundant JSON writes when on_change fires repeatedly
         # without the state actually changing.
         self._saved_cache = {}
-        # Counter of on_change_slow events to suppress per compare tab ID.
+        # In-memory set of all compare tab IDs in the current session.
+        # Used by _is_compare_tab for fast O(1) lookup without disk I/O --
+        # critical because on_change fires on every keystroke.
+        self._compare_tab_ids = set()
+        # Cached key for the current session (relative path if inside
+        # settings folder, full path otherwise). Set in on_start2 and set_files.
+        self._current_session_key = ''
+        # Counter of on_change events to suppress per compare tab ID.
         # Set to 2 when a compare is created (one per split half) because
-        # set_text_all triggers on_change -> on_change_slow for each half.
-        # Prevents the initial green color from being reset to red.
-        self._suppress_change_slow = {}
+        # set_text_all triggers on_change for each half. Prevents the
+        # initial green color from being reset to red.
+        self._suppress_change = {}
 
         self.compare_menu = None
         self.menuid_sep = None
         self.menuid_withfile = None
         self.menuid_withtab = None
 
+    def _session_key(self, session_path):
+        """Convert a session file path to a state-file key. If the session
+        is inside the CudaText settings folder (at any depth), use a path
+        relative to settings -- this makes the state file portable. If the
+        session is outside settings, use the full path."""
+        if not session_path:
+            return ''
+        settings_dir = ct.app_path(ct.APP_DIR_SETTINGS)
+        if settings_dir:
+            try:
+                rel = os.path.relpath(session_path, settings_dir)
+                # If rel doesn't start with '..', session is inside settings.
+                if not rel.startswith('..' + os.sep) and rel != '..':
+                    return rel
+            except ValueError:
+                pass
+        return session_path
+
     def _load_state(self):
-        """Load the persisted compare-tab state. Prunes stale entries
-        (compare tabs whose original tabs no longer exist)."""
+        """Load the persisted state from disk."""
         try:
             with open(STATE_FILE, 'r', encoding='utf8') as f:
                 data = json.load(f)
         except (OSError, ValueError):
-            return {'compare_tabs': {}, 'file_history': []}
+            return {'sessions': {}, 'file_history': []}
         if not isinstance(data, dict):
-            return {'compare_tabs': {}, 'file_history': []}
-        if not isinstance(data.get('compare_tabs'), dict):
-            data['compare_tabs'] = {}
+            return {'sessions': {}, 'file_history': []}
+        if not isinstance(data.get('sessions'), dict):
+            data['sessions'] = {}
         if not isinstance(data.get('file_history'), list):
             data['file_history'] = []
         return data
 
     def _save_state(self, state):
-        """Save the compare-tab state to disk."""
+        """Save the state to disk."""
         try:
             with open(STATE_FILE, 'w', encoding='utf8') as f:
                 json.dump(state, f, indent=2)
@@ -185,22 +214,22 @@ class Command:
             msg('failed to save state file: {}'.format(ex), level=2)
 
     def _is_compare_tab(self, tab_id):
-        """Check if the given PROP_TAB_ID belongs to a compare tab."""
-        state = self._load_state()
-        return str(tab_id) in state.get('compare_tabs', {})
+        """Check if the given PROP_TAB_ID belongs to a compare tab.
+        Uses an in-memory set for O(1) lookup -- no disk I/O."""
+        return str(tab_id) in self._compare_tab_ids
 
     def _register_compare_tab(self, compare_tab_id, primary_orig_id, secondary_orig_id,
-                              primary_orig_name='', secondary_orig_name='', session_path='',
+                              primary_orig_name='', secondary_orig_name='', session_key='',
                               saved=True):
-        """Register a compare tab with the PROP_TAB_IDs and display names of
-        its two original tabs, plus the session path the compare belongs to.
-        The names (file path or untitled tab title) are stored so anyone
-        reading the state JSON can easily see what is being compared.
-        'saved' tracks whether the compare tab's content has been synced
-        to the originals (True) or has unsaved edits (False)."""
+        """Register a compare tab under its session key with the PROP_TAB_IDs
+        and display names of its two original tabs. 'saved' tracks whether
+        the compare tab's content has been synced to the originals."""
+        if not session_key:
+            session_key = self._current_session_key
         state = self._load_state()
-        state['compare_tabs'][str(compare_tab_id)] = {
-            'session': session_path or '',
+        if session_key not in state['sessions']:
+            state['sessions'][session_key] = {}
+        state['sessions'][session_key][str(compare_tab_id)] = {
             'primary_orig_tab_id': primary_orig_id,
             'primary_orig_name': primary_orig_name or '',
             'secondary_orig_tab_id': secondary_orig_id,
@@ -209,18 +238,19 @@ class Command:
         }
         self._save_state(state)
         self._saved_cache[str(compare_tab_id)] = saved
+        self._compare_tab_ids.add(str(compare_tab_id))
 
     def _set_saved_state(self, compare_tab_id, saved):
-        """Update the 'saved' flag for a compare tab in the persisted state.
-        Uses an in-memory cache to avoid redundant JSON writes -- only
-        writes to disk when the state actually changes."""
+        """Update the 'saved' flag for a compare tab. Uses an in-memory
+        cache to avoid redundant JSON writes."""
         key = str(compare_tab_id)
         if self._saved_cache.get(key) == saved:
-            return  # state unchanged, skip the write
+            return
         self._saved_cache[key] = saved
         state = self._load_state()
-        if key in state['compare_tabs']:
-            state['compare_tabs'][key]['saved'] = saved
+        session = state['sessions'].get(self._current_session_key, {})
+        if key in session:
+            session[key]['saved'] = saved
             self._save_state(state)
 
     def _unregister_compare_tab(self, compare_tab_id):
@@ -228,16 +258,22 @@ class Command:
         removed entry dict or None if not found."""
         state = self._load_state()
         key = str(compare_tab_id)
-        entry = state['compare_tabs'].pop(key, None)
+        session = state['sessions'].get(self._current_session_key, {})
+        entry = session.pop(key, None)
         if entry is not None:
+            # Clean up empty session.
+            if not session:
+                del state['sessions'][self._current_session_key]
             self._save_state(state)
+            self._compare_tab_ids.discard(key)
         return entry
 
     def _get_orig_tab_ids(self, compare_tab_id):
         """Return (primary_orig_id, secondary_orig_id) for a compare tab,
         or (None, None) if not found."""
         state = self._load_state()
-        entry = state['compare_tabs'].get(str(compare_tab_id))
+        session = state['sessions'].get(self._current_session_key, {})
+        entry = session.get(str(compare_tab_id))
         if not isinstance(entry, dict):
             return (None, None)
         return (entry.get('primary_orig_tab_id'), entry.get('secondary_orig_tab_id'))
@@ -444,28 +480,30 @@ class Command:
             b_ed.set_prop(ct.PROP_LEXER_FILE, lexers[1])
 
         # Register the compare tab by its PROP_TAB_ID with the original
-        # tab IDs and names, plus the session path for reference.
+        # tab IDs and names, plus the session key for grouping.
         compare_tab_id = ct.ed.get_prop(ct.PROP_TAB_ID)
         try:
             session_path = ct.app_path(ct.APP_FILE_SESSION) or ''
         except Exception:
             session_path = ''
+        session_key = self._session_key(session_path)
+        self._current_session_key = session_key
         self._register_compare_tab(
             compare_tab_id,
             orig_tab_ids[0], orig_tab_ids[1],
             orig_names[0], orig_names[1],
-            session_path,
+            session_key,
             saved=True)  # initial state: content matches originals = saved
 
         # Color the tab title green to indicate 'synced' (no unsaved
         # changes yet -- content is identical to the originals).
         ct.ed.set_prop(ct.PROP_TAB_COLOR_FONT, 0x00A000)  # green
 
-        # Suppress the next 2 on_change_slow events (one per split half)
-        # because set_text_all triggers on_change -> on_change_slow, which
-        # would reset the green color to red. The counter is decremented
-        # in on_change_slow; real user edits after this will work normally.
-        self._suppress_change_slow[str(compare_tab_id)] = 2
+        # Suppress the next 2 on_change events (one per split half)
+        # because set_text_all triggers on_change, which would reset the
+        # green color to red. The counter is decremented in on_change;
+        # real user edits after this will work normally.
+        self._suppress_change[str(compare_tab_id)] = 2
 
         # Persistently subscribe to on_start2 so the plugin auto-loads on
         # next startup and lazy events fire after restart.
@@ -519,31 +557,44 @@ class Command:
         if self.cfg.get('enable_sync_caret', False):
             self.sync_caret()
 
-    def on_change_slow(self, ed_self):
-        """Fires after the user edits and a short pause passes. Used for:
+    def on_change(self, ed_self):
+        """Fires immediately on every keystroke. Used for:
         - Resetting the compare tab title color from green to default (red)
           when the user makes changes (indicating unsaved edits).
         - Persisting the 'unsaved' state so it survives restarts.
-        - Auto-refreshing the diff markers if that option is enabled.
+
+        Uses on_change (not on_change_slow) because on_change_slow has a
+        1-2 second delay which causes race conditions: if the user edits
+        then quickly saves, the delayed on_change_slow would fire AFTER
+        on_save_pre and reset the green color back to red.
 
         The first 2 calls after a compare is created are suppressed (see
-        _suppress_change_slow) because set_text_all triggers spurious
-        on_change_slow events that would reset the initial green color."""
+        _suppress_change) because set_text_all triggers spurious on_change
+        events that would reset the initial green color.
+
+        Performance: _is_compare_tab uses an in-memory set (no disk I/O),
+        so non-compare tabs return in O(1). The handler is lightweight
+        enough for on_change."""
         tab_id = ed_self.get_prop(ct.PROP_TAB_ID)
-        if self._is_compare_tab(tab_id):
-            # Check if this is a spurious event from set_text_all.
-            key = str(tab_id)
-            if key in self._suppress_change_slow:
-                self._suppress_change_slow[key] -= 1
-                if self._suppress_change_slow[key] <= 0:
-                    del self._suppress_change_slow[key]
-                # Skip color change and state write for this spurious event.
-            else:
-                # Real user edit -- reset title color to default (red).
-                ed_self.set_prop(ct.PROP_TAB_COLOR_FONT, ct.COLOR_NONE)
-                # Persist the unsaved state so on_start2 can restore the
-                # correct color after restart.
-                self._set_saved_state(tab_id, False)
+        if not self._is_compare_tab(tab_id):
+            return
+        key = str(tab_id)
+        if key in self._suppress_change:
+            self._suppress_change[key] -= 1
+            if self._suppress_change[key] <= 0:
+                del self._suppress_change[key]
+            # Skip color change and state write for this spurious event.
+        else:
+            # Real user edit -- reset title color to default (red).
+            ed_self.set_prop(ct.PROP_TAB_COLOR_FONT, ct.COLOR_NONE)
+            # Persist the unsaved state so on_start2 can restore the
+            # correct color after restart.
+            self._set_saved_state(tab_id, False)
+
+    def on_change_slow(self, ed_self):
+        """Fires after the user edits and a short pause passes. Used only
+        for auto-refreshing the diff markers if that option is enabled.
+        Color/saved-state logic is handled in on_change (immediate)."""
         if self.cfg.get('enable_auto_refresh', False):
             self._refresh_ex(ed_self)  # automatic -- no dialog
 
@@ -588,7 +639,10 @@ class Command:
             self._set_saved_state(tab_id, True)
             # Clear any pending suppress counter -- save overrides the
             # initial-creation suppress.
-            self._suppress_change_slow.pop(str(tab_id), None)
+            self._suppress_change.pop(str(tab_id), None)
+            # Auto-refresh diff markers so the user sees updated
+            # highlights without needing to click Refresh manually.
+            self._refresh_ex(ed_self)  # automatic -- no dialog
 
         # Block the default save (which would show a Save dialog for the
         # untitled compare tab).
@@ -640,45 +694,67 @@ class Command:
 
     def on_start2(self, ed_self):
         """Called once on program start, after configs are applied and just
-        before the main form shows. The plugin is loaded because it was
-        subscribed to on_start2 via plugins.ini (set when a compare tab was
-        active). Just being loaded is enough -- all lazy events (on_save~,
-        on_close~) will now fire.
+        before the main form shows.
+
+        Performs startup cleanup: removes dead records (compare tabs that
+        were not restored by CudaText -- e.g. empty untitled tabs are
+        discarded by CudaText on restart). Then rebuilds in-memory caches,
+        re-subscribes to on_scroll, re-applies title colors, and re-applies
+        diff markers for each surviving compare tab.
 
         We use on_start2 (not on_start) because on_start fires too early --
         before session restore completes. By on_start2, all editors exist
-        and CudaText has finished restoring the modified flag/tab colors,
-        so our green color override sticks instead of being reset.
+        and CudaText has finished restoring the modified flag/tab colors."""
+        # Get the current session and cache its key.
+        try:
+            session_path = ct.app_path(ct.APP_FILE_SESSION) or ''
+        except Exception:
+            session_path = ''
+        self._current_session_key = self._session_key(session_path)
 
-        We rebuild the in-memory scroll sync set, re-subscribe to
-        on_scroll, re-apply the saved/unsaved title color, and re-apply
-        diff markers (bookmarks/decorations/gaps) for each restored
-        compare tab. Markers are in-memory and don't survive session
-        restore, so we must re-apply them here once at startup."""
-        state = self._load_state()  # prunes stale entries
-        # Rebuild scroll.tab_id set from persisted compare tab IDs so that
-        # ScrollSplittedTab.toggle() works correctly after restart.
+        state = self._load_state()
+
+        # --- Cleanup dead records ---
+        # Get all open tab IDs so we can check which compare tabs still exist.
+        open_tab_ids = set()
+        for h in ct.ed_handles():
+            e = ct.Editor(h)
+            open_tab_ids.add(str(e.get_prop(ct.PROP_TAB_ID)))
+
+        # Check the current session's compare tabs. If a compare tab ID is
+        # not in open_tab_ids, it's a dead record (CudaText didn't restore it
+        # -- e.g. it was an empty untitled tab that CudaText discards).
+        session = state['sessions'].get(self._current_session_key, {})
+        dead_keys = [k for k in session if k not in open_tab_ids]
+        for k in dead_keys:
+            del session[k]
+        if not session and self._current_session_key in state['sessions']:
+            # Clean up empty session.
+            del state['sessions'][self._current_session_key]
+        if dead_keys:
+            self._save_state(state)
+
+        # --- Rebuild in-memory caches and apply colors/markers ---
         self.scroll.tab_id = set()
-        for tab_id_str, entry in state['compare_tabs'].items():
+        self._compare_tab_ids = set()
+        for tab_id_str, entry in session.items():
+            if not isinstance(entry, dict):
+                continue
             try:
                 self.scroll.tab_id.add(int(tab_id_str))
             except (ValueError, TypeError):
                 pass
-            # Populate the saved-state cache from disk so _set_saved_state
-            # can debounce writes correctly.
-            if isinstance(entry, dict):
-                self._saved_cache[tab_id_str] = entry.get('saved', True)
+            self._compare_tab_ids.add(tab_id_str)
+            # Populate the saved-state cache from disk.
+            self._saved_cache[tab_id_str] = entry.get('saved', True)
             # Find an editor for this compare tab and re-apply diff markers.
-            target = tab_id_str
             for h in ct.ed_handles():
                 e = ct.Editor(h)
-                if str(e.get_prop(ct.PROP_TAB_ID)) == target:
+                if str(e.get_prop(ct.PROP_TAB_ID)) == tab_id_str:
                     self._refresh_ex(e)
                     break
             # Re-apply the title color based on the persisted 'saved' flag.
-            # CudaText colors all restored tabs red by default (modified);
-            # we override to green if the tab was in 'saved' state before exit.
-            if isinstance(entry, dict) and entry.get('saved', True):
+            if entry.get('saved', True):
                 self._apply_color_to_tab(tab_id_str, 0x00A000)  # green
         # Re-subscribe to on_scroll event if sync_scroll is enabled.
         if self.cfg.get('sync_scroll') and self.scroll.tab_id:
@@ -1141,7 +1217,7 @@ class Command:
             caption=_('Compare with tab')
             )
 
-        handles = ct.ed_handles()[:30] # avoid too much menu items when user opens 100 files
+        handles = ct.ed_handles()
 
         paths = []
         if len(handles) > 1:
@@ -1259,13 +1335,13 @@ class Command:
                 entry.get('secondary_orig_tab_id'),
                 entry.get('primary_orig_name', ''),
                 entry.get('secondary_orig_name', ''),
-                entry.get('session', ''),
+                self._current_session_key,
                 entry.get('saved', True)
             )
             return
 
-        # If no more compare tabs are open, disable autostart so the
-        # plugin does not load on next startup (no overhead).
+        # If no more compare tabs are open in the current session,
+        # disable autostart so the plugin does not load on next startup.
         state = self._load_state()
-        if not state['compare_tabs']:
+        if not state['sessions'].get(self._current_session_key, {}):
             self._disable_autostart()
