@@ -1,3 +1,6 @@
+2026.07.31 (by @badrelmers)
+- fix: untitled tab identification now uses PROP_TAB_ID (extracted from the display string) instead of full title+ID string comparison -- title changes between menu build and menu action no longer break "Compare with tab" #6392
+- fix: tabmenu_editor_ok (current-tab exclusion) also uses tab ID for untitled tabs instead of name string
 2026.07.30 (by @badrelmers)
 - fix: "two sides are identical" dialog no longer shown on automatic refreshes (startup, auto-refresh, theme change) -- only shown on manual Refresh command and initial compare
 - fix: green title color no longer reset to red after restart -- startup logic moved from on_start to on_start2 (fires after session restore completes)

@@ -360,7 +360,26 @@ class Command:
         return U_PREFIX + e.get_prop(ct.PROP_TAB_TITLE) + ' [%d]'%e.get_prop(ct.PROP_TAB_ID)
 
     def is_match_name(self, e, name):
+        """Check if editor 'e' matches the given 'name' identifier.
+
+        For untitled tabs: extracts the tab ID from the [id] suffix in the
+        name string and matches on ID alone. This is robust against title
+        changes between menu build and menu action execution -- only the
+        persistent, immutable PROP_TAB_ID is compared.
+
+        For titled tabs: matches by filename (the file's identity)."""
         if name.startswith(U_PREFIX):
+            # Extract the tab ID from the [id] suffix at the end of the string.
+            # format_untitled always appends ' [ID]' at the end, so the last
+            # [...] is always the ID. rfind finds it even if the title itself
+            # contains brackets.
+            i = name.rfind('[')
+            j = name.rfind(']')
+            if i > 0 and j > i:
+                id_str = name[i+1:j]
+                if id_str.isdigit():
+                    return str(e.get_prop(ct.PROP_TAB_ID)) == id_str
+            # Fallback: full string comparison (for old/odd-format strings)
             return name == self.format_untitled(e)
         fn = e.get_filename()
         if fn:
@@ -1070,13 +1089,31 @@ class Command:
             return self.format_untitled(e)
 
     def tabmenu_editor_ok(self, e, disabled_fn):
+        """Check if editor 'e' is a valid candidate for the 'Compare with tab'
+        list. Returns False if the tab should be excluded (not linked, not
+        text, or is the disabled/current tab).
+
+        For untitled tabs, compares by tab ID (extracted from disabled_fn)
+        instead of full name string, so title changes don't cause the
+        current tab to appear in its own compare list."""
         if not e.get_prop(ct.PROP_EDITORS_LINKED):
             return False
         if e.get_prop(ct.PROP_KIND) != 'text':
             return False
-        fn = self.get_name(e)
-        if bool(disabled_fn) and (fn==disabled_fn):
-            return False
+        if bool(disabled_fn):
+            if disabled_fn.startswith(U_PREFIX):
+                # Untitled tab: compare by tab ID, not full name string.
+                i = disabled_fn.rfind('[')
+                j = disabled_fn.rfind(']')
+                if i > 0 and j > i:
+                    id_str = disabled_fn[i+1:j]
+                    if id_str.isdigit() and str(e.get_prop(ct.PROP_TAB_ID)) == id_str:
+                        return False
+            else:
+                # Titled tab: compare by filename.
+                fn = e.get_filename()
+                if fn and fn == disabled_fn:
+                    return False
         return True
 
     def tabmenu_init(self, cur_ed: ct.Editor):
