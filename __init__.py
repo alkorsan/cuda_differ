@@ -8,11 +8,45 @@ import cudatext_cmd as ct_cmd
 import cudax_lib as ctx
 
 from . import differ as df
-from .scroll import ScrollSplittedTab
-from .ui import DifferDialog, file_history
 
 from cudax_lib import get_translation
 _ = get_translation(__file__)  # I18N
+
+
+class ScrollSplittedTab:
+    """Manages synchronized scrolling for split compare tabs. Inlined from
+    scroll.py to reduce file count -- small enough to live in __init__.py."""
+
+    keep_caret_visible = False
+
+    def __init__(self, name):
+        self.name = name
+        self.tab_id = set()
+
+    def toggle(self, on=True):
+        act = ct.PROC_EVENTS_SUB if on and ct.ed.get_prop(ct.PROP_TAB_ID) in self.tab_id else ct.PROC_EVENTS_UNSUB
+        ct.app_proc(act, self.name+';on_scroll;;')
+
+    def on_scroll(self, ed_self):
+        if ed_self.get_prop(ct.PROP_SPLIT)[0] == '-':
+            return
+
+        pos_v = ed_self.get_prop(ct.PROP_SCROLL_VERT_INFO)['smooth_pos']
+        pos_h = ed_self.get_prop(ct.PROP_SCROLL_HORZ_INFO)['smooth_pos']
+
+        hndl_self = ed_self.get_prop(ct.PROP_HANDLE_SELF)
+        hndl_primary = ed_self.get_prop(ct.PROP_HANDLE_PRIMARY)
+        hndl_secondary = ed_self.get_prop(ct.PROP_HANDLE_SECONDARY)
+        if hndl_self == hndl_primary:
+            hndl_opposit = hndl_secondary
+        else:
+            hndl_opposit = hndl_primary
+        e = ct.Editor(hndl_opposit)
+
+        e.set_prop(ct.PROP_SCROLL_VERT_INFO, {'smooth_pos': pos_v})
+        e.set_prop(ct.PROP_SCROLL_HORZ_INFO, {'smooth_pos': pos_h})
+
+        e.cmd(ct_cmd.cmd_RepaintEditor)
 
 
 DIFF_TAG = 148
@@ -106,8 +140,7 @@ DIFF_TAB_COUNT = 1
 #         "saved": true
 #       }
 #     }
-#   },
-#   "file_history": ["path1", "path2", ...]
+#   }
 # }
 # session_key is the session file path, relative to the settings folder if
 # the session is inside it (at any depth), or the full path if outside.
@@ -145,7 +178,6 @@ class Command:
         self.scroll = ScrollSplittedTab(__name__)
         self.cfg = self.get_config()
         self.diff = df.Differ()
-        self.diff_dlg = DifferDialog()
         # Set to True by on_exit_pre when CudaText is about to exit, so that
         # on_close (which fires next, once per closing tab) can skip
         # temp-file deletion and let compare tabs persist across restarts.
@@ -196,13 +228,11 @@ class Command:
             with open(STATE_FILE, 'r', encoding='utf8') as f:
                 data = json.load(f)
         except (OSError, ValueError):
-            return {'sessions': {}, 'file_history': []}
+            return {'sessions': {}}
         if not isinstance(data, dict):
-            return {'sessions': {}, 'file_history': []}
+            return {'sessions': {}}
         if not isinstance(data.get('sessions'), dict):
             data['sessions'] = {}
-        if not isinstance(data.get('file_history'), list):
-            data['file_history'] = []
         return data
 
     def _save_state(self, state):
@@ -323,12 +353,6 @@ class Command:
             self.config()
             self.scroll.toggle(self.cfg['sync_scroll'])
             # self.scroll.enable_sync_caret = self.cfg['enable_sync_caret']
-
-    def choose_files(self):
-        files = self.diff_dlg.run()
-        if files is None:
-            return
-        self.set_files(*files)
 
     def on_cli(self, fn1, fn2):
         self.set_files(fn1, fn2)
@@ -471,7 +495,7 @@ class Command:
         # Set a readable combined title (just the basenames/titles, no tab IDs).
         title0 = os.path.basename(orig_names[0]) if orig_names[0] else _('Untitled')
         title1 = os.path.basename(orig_names[1]) if orig_names[1] else _('Untitled')
-        ct.ed.set_prop(ct.PROP_TAB_TITLE, '{} | {}'.format(title0, title1))
+        ct.ed.set_prop(ct.PROP_TAB_TITLE, 'Diff: {} | {}'.format(title0, title1))
 
         # Set lexers from the originals.
         if lexers[0] is not None:
@@ -978,10 +1002,6 @@ class Command:
 
         return config
 
-    def clear_history(self):
-        file_history.clear()
-        file_history.save()
-
     @property
     def focused(self):
         hndl_self = ct.ed.get_prop(ct.PROP_HANDLE_SELF)
@@ -1250,7 +1270,13 @@ class Command:
 
         ct.menu_proc(self.menuid_withtab, ct.MENU_SET_ENABLED, command=cur_ok and bool(paths))
         ct.menu_proc(self.menuid_withfile, ct.MENU_SET_ENABLED, command=cur_ok)
-        ct.menu_proc(self.menuid_withfocused, ct.MENU_SET_ENABLED, command=cur_ok and not cur_is_focused)
+        # "Compare with focused tab" is disabled when:
+        # - current tab is not a valid compare candidate (cur_ok)
+        # - current tab IS the focused tab (nothing to compare with itself)
+        # - focused tab is a Differ-managed compare tab (can't compare with a diff tab)
+        focused_is_diff = self._is_compare_tab(ct.ed.get_prop(ct.PROP_TAB_ID))
+        ct.menu_proc(self.menuid_withfocused, ct.MENU_SET_ENABLED,
+            command=cur_ok and not cur_is_focused and not focused_is_diff)
 
         # Add a separator and "Refresh" entry at the end of the context menu.
         # Only enabled when the current tab is a compare tab managed by Differ.

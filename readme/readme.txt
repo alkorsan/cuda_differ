@@ -24,10 +24,6 @@ synced back to the original files automatically.
 
 All commands are in the "Plugins / Differ" menu.
 
-Choose files...
-    Opens a dialog to pick two files to compare. The dialog suggests
-    recently used files and files currently open in CudaText.
-
 Compare current document with file...
     Compares the file in the active tab with another file you pick from
     a dialog.
@@ -75,10 +71,6 @@ Copy current line to the left
 
 Config...
     Opens the options dialog.
-
-Clear recents history
-    Clears the list of recently compared files shown in the "Choose files"
-    dialog.
 
 
 == Tab context menu ==
@@ -152,8 +144,6 @@ Available options include:
 - Sync caret between the two sides
 - Number of context lines in unified diff output
 - Detail comparison of changed lines (character-level highlights)
-- Maximum number of recent files in the "Choose files" dialog
-- Maximum number of recently opened files kept in history.json
 
 
 == Notes ==

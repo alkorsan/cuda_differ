@@ -1,4 +1,10 @@
 2026.07.31 (by @badrelmers)
+* change: compare tab title now starts with "Diff:" for clarity (e.g. "Diff: foo.txt | bar.txt")
+- fix: "Compare with focused tab" disabled when the focused tab is a Differ compare tab (prevented error when comparing a normal tab with a diff tab)
+- fix: removed "Choose files..." command and "Clear recents history" command (no longer needed)
+* change: inlined scroll.py into __init__.py and deleted the file (small enough to not need a separate file)
+* change: deleted ui.py (DifferDialog and FileHistory no longer needed after removing "Choose files...")
+* change: removed file_history key from the state JSON (no longer used after removing the file-picker dialog)
 - fix: untitled tab identification now uses PROP_TAB_ID (extracted from the display string) instead of full title+ID string comparison -- title changes between menu build and menu action no longer break "Compare with tab" #6392
 - fix: tabmenu_editor_ok (current-tab exclusion) also uses tab ID for untitled tabs instead of name string
 * change: state file restructured -- sessions are now the parent key with diff tabs nested inside, enabling per-session cleanup of dead records on startup
