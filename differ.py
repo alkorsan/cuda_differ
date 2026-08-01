@@ -13,6 +13,11 @@ A_DECOR_YELLOW = '-y'
 A_DECOR_RED = '-r'
 B_DECOR_YELLOW = '+y'
 B_DECOR_GREEN = '+g'
+# Alignment event: a pair of lines (one in A, one in B) that must be kept
+# at the same visual Y position. Used by __init__.py to add compensating
+# gaps when word-wrap is on and the two lines wrap to a different number
+# of visual rows.
+ALIGN = '='
 
 
 class Differ:
@@ -26,10 +31,17 @@ class Differ:
     -* / +* paint changed line in file a / b
               return (id, y)
     -^ / +^ gap in file a / b
-              return (id, y, nline)
+              return (id, y, start, end)
+              Gap is inserted after line `y-1` (i.e. between lines y-1 and y)
+              and compensates for the lines [start, end) on the OTHER side.
+              (start/end are line indices in the other file.)
          -- detail paint deleted symbols in file a
          ++ detail paint added symbols in file b
               return (id, y, x, nlen)
+         = visually-aligned line pair (a_line, b_line)
+              return (id, a_line, b_line)
+              Consumed by __init__.py to add a compensating gap when the two
+              lines wrap to a different number of visual rows.
     """
     def __init__(self, a='', b=''):
         self.withdetail = True
@@ -45,15 +57,25 @@ class Differ:
         self.diffmap = []
         diff = SequenceMatcher(None, self.a, self.b)
         for tag, i1, i2, j1, j2 in diff.get_opcodes():
-            delta = i1-i2-j1+j2
             if tag != 'equal':
                 self.diffmap.append([i1, i2, j1, j2])
-            if tag == 'delete':
-                yield (B_GAP, j2, abs(delta))
+            if tag == 'equal':
+                # Yield ALIGN for each matched pair so the wrapper can add
+                # compensating gaps when wrap is on.
+                for k in range(i2 - i1):
+                    yield (ALIGN, i1 + k, j1 + k)
+            elif tag == 'delete':
+                # Lines i1..i2-1 in A are deleted; gap in B after line j1-1.
+                # (j1 == j2 for 'delete'.) The gap compensates for A lines
+                # [i1, i2).
+                yield (B_GAP, j1, i1, i2)
                 for y in range(i1, i2):
                     yield (A_LINE_DEL, y)
             elif tag == 'insert':
-                yield (A_GAP, i2, delta)
+                # Lines j1..j2-1 in B are inserted; gap in A after line i1-1.
+                # (i1 == i2 for 'insert'.) The gap compensates for B lines
+                # [j1, j2).
+                yield (A_GAP, i1, j1, j2)
                 for y in range(j1, j2):
                     yield (B_LINE_ADD, y)
             elif tag == 'replace':
@@ -61,17 +83,8 @@ class Differ:
                     yield from self._fancy_replace(self.a, i1, i2,
                                                    self.b, j1, j2)
                 else:
-                    if delta > 0:
-                        yield (A_GAP, i2, delta)
-                    elif delta < 0:
-                        yield (B_GAP, j2, abs(delta))
-
-                    for y in range(i1, i2):
-                        yield (A_LINE_CHANGE, y)
-                        yield (A_DECOR_YELLOW, y)
-                    for y in range(j1, j2):
-                        yield (B_LINE_CHANGE, y)
-                        yield (B_DECOR_YELLOW, y)
+                    yield from self._plain_replace_simple(self.a, i1, i2,
+                                                          self.b, j1, j2)
 
     def unidiff(self, a, b, f1, f2, n):
         return ''.join(unified_diff(a, b, f1, f2, n=n))
@@ -125,6 +138,10 @@ class Differ:
                   (A_DECOR_RED, best_i)
             yield (B_DECOR_YELLOW, best_j) if decb == 0 else \
                   (B_DECOR_GREEN, best_j)
+        # The best pair (best_i, best_j) is the visually-matched anchor of
+        # this replace block. Yield ALIGN so the wrapper can add a
+        # compensating gap when the two lines wrap to different heights.
+        yield (ALIGN, best_i, best_j)
         yield from self._fancy_helper(a, best_i+1, ahi, b, best_j+1, bhi)
 
     def _fancy_helper(self, a, alo, ahi, b, blo, bhi):
@@ -132,23 +149,53 @@ class Differ:
             if blo < bhi:
                 yield from self._fancy_replace(a, alo, ahi, b, blo, bhi)
             else:
-                if ahi-alo > 0:
-                    yield (B_GAP, blo, ahi-alo)
+                # Only A lines (blo == bhi). Gap in B after line blo-1,
+                # compensating for A lines [alo, ahi).
+                yield (B_GAP, blo, alo, ahi)
                 for y in range(alo, ahi):
                     yield (A_LINE_DEL, y)
         elif blo < bhi:
-            if bhi-blo > 0:
-                yield (A_GAP, ahi, bhi-blo)
+            # Only B lines (alo == ahi). Gap in A after line alo-1,
+            # compensating for B lines [blo, bhi).
+            yield (A_GAP, alo, blo, bhi)
             for y in range(blo, bhi):
                 yield (B_LINE_ADD, y)
 
     def _plain_replace(self, a, alo, ahi, b, blo, bhi):
+        """Fallback when no good match is found inside a 'replace' block.
+        Pairs up the first min(da, db) lines so the wrapper can keep them
+        visually aligned, then adds a single gap on the appropriate side for
+        the leftover lines."""
         da, db = ahi-alo, bhi-blo
+        common = min(da, db)
+        for k in range(common):
+            yield (ALIGN, alo + k, blo + k)
         if da > db:
-            yield (B_GAP, bhi, da-db)
+            # Extra A lines: [alo+common, ahi). Gap in B after line bhi-1.
+            yield (B_GAP, bhi, alo + common, ahi)
         elif db > da:
-            yield (A_GAP, ahi, db-da)
+            # Extra B lines: [blo+common, bhi). Gap in A after line ahi-1.
+            yield (A_GAP, ahi, blo + common, bhi)
         for y in range(blo, bhi):
             yield (B_LINE_ADD, y)
         for y in range(alo, ahi):
             yield (A_LINE_DEL, y)
+
+    def _plain_replace_simple(self, a, alo, ahi, b, blo, bhi):
+        """Non-detailed replace (withdetail=False). Same pairing strategy as
+        _plain_replace, but marks all lines as A_LINE_CHANGE/B_LINE_CHANGE
+        with yellow decor (preserving the original non-detailed look)."""
+        da, db = ahi-alo, bhi-blo
+        common = min(da, db)
+        for k in range(common):
+            yield (ALIGN, alo + k, blo + k)
+        if da > db:
+            yield (B_GAP, bhi, alo + common, ahi)
+        elif db > da:
+            yield (A_GAP, ahi, blo + common, bhi)
+        for y in range(alo, ahi):
+            yield (A_LINE_CHANGE, y)
+            yield (A_DECOR_YELLOW, y)
+        for y in range(blo, bhi):
+            yield (B_LINE_CHANGE, y)
+            yield (B_DECOR_YELLOW, y)

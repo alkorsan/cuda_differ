@@ -611,6 +611,13 @@ class Command:
         if state == ct.APPSTATE_THEME_SYNTAX:
             self.get_config()
             self._refresh_ex(ct.ed)  # automatic -- no dialog
+        elif state == ct.EDSTATE_WRAP:
+            # Word-wrap mode changed on one of the split halves. The
+            # inter-line gaps were sized for the previous wrap state, so
+            # we must re-apply them with wrap-aware sizes to keep both
+            # sides visually aligned.
+            if self._is_compare_tab(ed_self.get_prop(ct.PROP_TAB_ID)):
+                self._refresh_ex(ed_self)  # automatic -- no dialog
 
     def on_scroll(self, ed_self):
         if self._is_compare_tab(ed_self.get_prop(ct.PROP_TAB_ID)):
@@ -890,6 +897,16 @@ class Command:
                 ct.msg_box(t, ct.MB_OK)
             return
 
+        # NOTE: Do NOT force word-wrap off here. The user may legitimately
+        # want to compare files with wrap on (it makes long lines easier to
+        # read). Instead, we detect the wrap state below and size the
+        # inter-line gaps using the actual number of wrapped visual rows,
+        # so the two sides stay visually aligned even when corresponding
+        # lines wrap to different heights. See _get_wrap_counts and the
+        # A_GAP/B_GAP/ALIGN handling in the loop below.
+        # a_ed.set_prop(ct.PROP_WRAP, ct.WRAP_OFF)
+        # b_ed.set_prop(ct.PROP_WRAP, ct.WRAP_OFF)
+
         self.clear(a_ed)
         self.clear(b_ed)
         self.config()
@@ -902,6 +919,25 @@ class Command:
 
         self.diff.withdetail = self.cfg.get('compare_with_details')
         self.diff.ratio = self.cfg.get('ratio')
+
+        # Detect word-wrap on either side. When wrap is on, gaps must be
+        # sized by the actual number of visual rows on the opposite side
+        # (not by logical line count), and matched line pairs that wrap to
+        # different heights need an extra compensating gap.
+        wrap_a = a_ed.get_prop(ct.PROP_WRAP)
+        wrap_b = b_ed.get_prop(ct.PROP_WRAP)
+        wrap_on = (wrap_a != ct.WRAP_OFF) or (wrap_b != ct.WRAP_OFF)
+        if wrap_on:
+            wrap_counts_a = self._get_wrap_counts(a_ed)
+            wrap_counts_b = self._get_wrap_counts(b_ed)
+            __, line_h_a = a_ed.get_prop(ct.PROP_CELL_SIZE)
+            __, line_h_b = b_ed.get_prop(ct.PROP_CELL_SIZE)
+        else:
+            wrap_counts_a = None
+            wrap_counts_b = None
+            line_h_a = 0
+            line_h_b = 0
+        color_gaps = self.cfg.get('color_gaps')
 
         for d in self.diff.compare():
             diff_id, y = d[0], d[1]
@@ -916,9 +952,46 @@ class Command:
             elif diff_id == df.B_LINE_CHANGE:
                 self.set_bookmark2(b_ed, y, NKIND_CHANGED)
             elif diff_id == df.A_GAP:
-                self.set_gap(a_ed, y, d[2])
+                # d = (A_GAP, a_line_after, b_start, b_end)
+                # Gap in A inserted after line a_line_after-1, compensating
+                # for B lines [b_start, b_end) which exist on the B side
+                # but have no counterpart on the A side.
+                a_line_after, b_start, b_end = d[1], d[2], d[3]
+                if wrap_on:
+                    total_visual = self._sum_visual_rows(
+                        wrap_counts_b, b_start, b_end)
+                    self._add_raw_gap(a_ed, a_line_after - 1,
+                                      total_visual * line_h_a, color_gaps)
+                else:
+                    self.set_gap(a_ed, a_line_after, b_end - b_start)
             elif diff_id == df.B_GAP:
-                self.set_gap(b_ed, y, d[2])
+                # d = (B_GAP, b_line_after, a_start, a_end)
+                # Gap in B inserted after line b_line_after-1, compensating
+                # for A lines [a_start, a_end).
+                b_line_after, a_start, a_end = d[1], d[2], d[3]
+                if wrap_on:
+                    total_visual = self._sum_visual_rows(
+                        wrap_counts_a, a_start, a_end)
+                    self._add_raw_gap(b_ed, b_line_after - 1,
+                                      total_visual * line_h_b, color_gaps)
+                else:
+                    self.set_gap(b_ed, b_line_after, a_end - a_start)
+            elif diff_id == df.ALIGN:
+                # d = (ALIGN, a_line, b_line) -- a pair of lines that must
+                # stay at the same visual Y. When wrap is on and the two
+                # lines wrap to a different number of visual rows, add a
+                # compensating gap on the shorter side (after the matched
+                # line) so the NEXT matched pair stays aligned.
+                if wrap_on:
+                    a_line, b_line = d[1], d[2]
+                    va = self._visual_rows(wrap_counts_a, a_line)
+                    vb = self._visual_rows(wrap_counts_b, b_line)
+                    if va > vb:
+                        self._add_raw_gap(b_ed, b_line,
+                                          (va - vb) * line_h_b, color_gaps)
+                    elif vb > va:
+                        self._add_raw_gap(a_ed, a_line,
+                                          (vb - va) * line_h_a, color_gaps)
             elif diff_id == df.A_SYMBOL_DEL:
                 self.set_attr(a_ed, d[2], y, d[3], self.cfg.get('color_deleted'))
             elif diff_id == df.B_SYMBOL_ADD:
@@ -950,6 +1023,85 @@ class Command:
               size=h_size,
               color=self.cfg.get('color_gaps')
               )
+
+    def _add_raw_gap(self, e, line_index, pixel_size, color):
+        """Add a gap at the given line index with an explicit pixel size.
+        `line_index` follows the e.gap() convention: the gap is inserted
+        between `line_index` and `line_index+1` (i.e. after `line_index`).
+        Use -1 for a gap before the first line. Compared to set_gap(), this
+        takes an explicit pixel size instead of computing n*line_height,
+        which is needed when wrap is on and the gap must match the actual
+        number of wrapped visual rows on the opposite side."""
+        e.gap(ct.GAP_ADD, line_index, 0,
+              tag=DIFF_TAG,
+              size=pixel_size,
+              color=color
+              )
+
+    def _get_wrap_counts(self, ed):
+        """Return a list where wrap_counts[i] = number of visual rows that
+        line i occupies on screen. Uses Editor.get_wrapinfo() to query the
+        editor's current word-wrap state. For a non-wrapped editor every
+        line has 1 visual row. The returned list is indexed by logical line
+        index (0-based) and has the same length as the editor's line count.
+        Used to size inter-line gaps correctly when word-wrap is on: a gap
+        that compensates for N missing logical lines must actually be
+        (sum of those lines' visual rows) * line_height pixels tall,
+        otherwise the two compare sides drift apart visually."""
+        line_count = ed.get_line_count()
+        if line_count <= 0:
+            return []
+        counts = [1] * line_count
+        # Force CudaText to refresh its internal WrapInfo structure before
+        # we query it. After text changes CudaText usually detects the
+        # change automatically, but not always -- EDACTION_UPDATE with
+        # param1="1" forces it. Wrapped in try/except in case the constant
+        # or action is unavailable in an older CudaText build.
+        try:
+            ed.action(ct.EDACTION_UPDATE, "1")
+        except Exception:
+            pass
+        try:
+            info = ed.get_wrapinfo()
+        except Exception:
+            return counts
+        if not info:
+            return counts
+        temp = [0] * line_count
+        for item in info:
+            if isinstance(item, dict):
+                line = item.get('line', -1)
+            else:
+                continue
+            if 0 <= line < line_count:
+                temp[line] += 1
+        for i in range(line_count):
+            if temp[i] > 0:
+                counts[i] = temp[i]
+        return counts
+
+    @staticmethod
+    def _visual_rows(wrap_counts, line_index):
+        """Visual row count for a single line, with bounds-safe fallback."""
+        if wrap_counts is None:
+            return 1
+        if 0 <= line_index < len(wrap_counts):
+            return wrap_counts[line_index]
+        return 1
+
+    @staticmethod
+    def _sum_visual_rows(wrap_counts, line_start, line_end):
+        """Total visual rows for lines [line_start, line_end). Used to size
+        a gap that compensates for a whole block of missing lines."""
+        if wrap_counts is None:
+            return max(0, line_end - line_start)
+        total = 0
+        for i in range(line_start, line_end):
+            if 0 <= i < len(wrap_counts):
+                total += wrap_counts[i]
+            else:
+                total += 1
+        return total
 
     def set_decor(self, e, row, text, color):
         e.decor(ct.DECOR_SET, row, DIFF_TAG, text, color, bold=True)

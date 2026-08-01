@@ -18,6 +18,10 @@ synced back to the original files automatically.
   CudaText with a compare tab open, it is restored when you start again.
 - Provides synchronized scrolling so both sides stay aligned as you
   navigate.
+- Supports word-wrap: you can turn wrap on in a compare tab and the two
+  sides stay visually aligned even when corresponding lines wrap to
+  different heights. Toggling wrap mode re-applies the alignment
+  automatically.
 
 
 == Commands ==

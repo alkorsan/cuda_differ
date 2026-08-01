@@ -1,3 +1,10 @@
+2026.08.01 (by @badrelmers)
++ add: word-wrap is now supported in compare tabs -- the two sides stay visually aligned even when long lines wrap to different heights
+* change: inter-line gaps (A_GAP/B_GAP) are now sized by the actual number of wrapped visual rows on the opposite side, instead of by logical line count, so corresponding diff blocks line up correctly with wrap on
++ add: new ALIGN event in differ.py for every visually-matched line pair (equal lines, fancy-replace best pairs, plain-replace first-min pairs); the wrapper adds a compensating gap on the shorter side when the two matched lines wrap to a different number of rows
++ add: on_state now handles EDSTATE_WRAP -- toggling word-wrap mode in a compare tab automatically re-applies the gaps with wrap-aware sizes
++ add: helper _get_wrap_counts() uses Editor.get_wrapinfo() to compute the per-line visual-row count
+
 2026.07.31 (by @badrelmers)
 - fix: removed unnecessary PROP_WRAP reset in refresh (was overriding the wrap mode copied from originals)
 * change: gap_color default now fetched from theme (LightBG5) like changed_color/added_color/deleted_color, instead of being empty/COLOR_NONE
