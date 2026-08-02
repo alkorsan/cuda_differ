@@ -1,4 +1,5 @@
-from difflib import SequenceMatcher, unified_diff
+from difflib import SequenceMatcher as DefaultSequenceMatcher, unified_diff
+from .patiencediff import PatienceSequenceMatcher
 
 
 A_LINE_DEL = '-'
@@ -46,6 +47,8 @@ class Differ:
     def __init__(self, a='', b=''):
         self.withdetail = True
         self.ratio = 0.75
+        self.use_patience_diff = False
+        self.autojunk = True
         self.set_seqs(a, b)
         self.diffmap = []
 
@@ -55,7 +58,10 @@ class Differ:
 
     def compare(self):
         self.diffmap = []
-        diff = SequenceMatcher(None, self.a, self.b)
+        if self.use_patience_diff:
+            diff = PatienceSequenceMatcher(None, self.a, self.b)
+        else:
+            diff = DefaultSequenceMatcher(None, self.a, self.b, autojunk=self.autojunk)
         for tag, i1, i2, j1, j2 in diff.get_opcodes():
             if tag != 'equal':
                 self.diffmap.append([i1, i2, j1, j2])
@@ -91,7 +97,10 @@ class Differ:
 
     def _fancy_replace(self, a, alo, ahi, b, blo, bhi):
         best_ratio, cutoff = self.ratio-0.01, self.ratio
-        diff = SequenceMatcher(None)
+        if self.use_patience_diff:
+            diff = PatienceSequenceMatcher(None)
+        else:
+            diff = DefaultSequenceMatcher(None, autojunk=self.autojunk)
         eqi, eqj = None, None
         for j in range(blo, bhi):
             bj = b[j]

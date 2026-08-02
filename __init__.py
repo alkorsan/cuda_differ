@@ -123,6 +123,18 @@ OPTS_META = [
      'frm': 'int',
      'chp': 'config',
      },
+    {'opt': 'differ.use_patience_diff',
+     'cmt': _('Use patience diff algorithm instead of the default difflib (produces more human-readable diffs in some cases)'),
+     'def': False,
+     'frm': 'bool',
+     'chp': 'config',
+     },
+    {'opt': 'differ.autojunk',
+     'cmt': _('Enable autojunk heuristic in difflib SequenceMatcher (only applies when use_patience_diff is false; PatienceSequenceMatcher does not support autojunk)'),
+     'def': True,
+     'frm': 'bool',
+     'chp': 'config',
+     },
 ]
 
 DIFF_TAB_COUNT = 1
@@ -919,6 +931,8 @@ class Command:
 
         self.diff.withdetail = self.cfg.get('compare_with_details')
         self.diff.ratio = self.cfg.get('ratio')
+        self.diff.use_patience_diff = self.cfg.get('use_patience_diff')
+        self.diff.autojunk = self.cfg.get('autojunk')
 
         # Detect word-wrap on either side. When wrap is on, gaps must be
         # sized by the actual number of visual rows on the opposite side
@@ -1183,6 +1197,10 @@ class Command:
                 get_opt('enable_auto_refresh', False),
             'diff_context':
                 get_opt('diff_context', 3),
+            'use_patience_diff':
+                get_opt('use_patience_diff', False),
+            'autojunk':
+                get_opt('autojunk', True),
         }
 
         new_nkind(NKIND_DELETED, config.get('color_deleted'))

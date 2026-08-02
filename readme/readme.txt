@@ -183,6 +183,22 @@ Configuration (chapter "config"):
   Number of unchanged context lines shown around each change in the
   unified diff output (produced by the "Diff current document with..."
   commands). Default: 3.
+- Use patience diff (differ.use_patience_diff)
+  When enabled, uses the patience diff algorithm (via the embedded
+  patiencediff library) instead of Python's default difflib. Patience
+  diff tends to produce more human-readable diffs in some cases -- it
+  anchors on unique matching lines, which can avoid noisy re-indenting
+  when blocks of code are moved. Default: false.
+- Autojunk heuristic (differ.autojunk)
+  Controls the autojunk parameter of difflib's SequenceMatcher. When
+  enabled (the Python default), items that appear more than 1% of the
+  time and at least 200 times are automatically treated as "junk" and
+  ignored for matching. This speeds up diffing of large files with many
+  repeated lines but can occasionally cause subtle differences to be
+  missed. Disable it if you suspect the diff is skipping matches due
+  to frequent repeated lines. This option only applies when
+  use_patience_diff is false -- PatienceSequenceMatcher does not
+  support autojunk. Default: true.
 
 
 == Notes ==
