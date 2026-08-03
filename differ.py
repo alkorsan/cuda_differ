@@ -21,6 +21,105 @@ B_DECOR_GREEN = '+g'
 ALIGN = '='
 
 
+def _format_range_unified(start, stop):
+    """Convert a (start, stop) line range to unified-diff hunk-header format.
+
+    Verbatim copy of ``difflib._format_range_unified``. It is a private helper
+    in CPython, so we keep our own to stay independent of internal renames.
+    """
+    beginning = start + 1  # lines start numbering with one
+    length = stop - start
+    if length == 1:
+        return '{}'.format(beginning)
+    if not length:
+        beginning -= 1  # empty ranges begin at line just before the range
+    return '{},{}'.format(beginning, length)
+
+
+# Why this function exists instead of calling ``difflib.unified_diff`` directly:
+# ``difflib.unified_diff`` builds its internal ``SequenceMatcher`` with the
+# default ``autojunk=True`` and does not expose any way to change it -- see
+# https://github.com/python/cpython/issues/118150. The plugin has a
+# user-facing ``autojunk`` config option that already controls the side-by-side
+# compare path (``Differ.compare`` and ``Differ._fancy_replace``); without this
+# wrapper, the unified-diff path (the "Diff with file..." / "Diff with tab..."
+# commands) would silently ignore that option when the user sets
+# ``autojunk=False``.
+#
+# Usage policy (see ``Differ.unidiff``):
+#   * When ``self.autojunk`` is True (the default), we call
+#     ``difflib.unified_diff`` directly -- the stdlib already builds its
+#     ``SequenceMatcher`` with ``autojunk=True``, so there is nothing to
+#     override. This keeps the hot path on stdlib code (zero maintenance,
+#     automatic benefit from any future CPython improvement), and our
+#     reimplementation only runs when the user explicitly opts out of the
+#     heuristic.
+#   * When ``self.autojunk`` is False, we fall back to ``_unified_diff``
+#     below, which is the only way to forward ``autojunk=False`` today.
+#
+# Why we did NOT use the monkey-patch workaround suggested in that issue
+# (``unittest.mock.patch`` on ``SequenceMatcher.__init__`` combined with
+# ``functools.partialmethod(..., autojunk=False)``):
+#   * ``unittest.mock`` is a testing tool; pulling it into production code
+#     just to override one keyword is heavy and surprising to readers.
+#   * Patching a stdlib class is global for the duration of the ``with``
+#     block -- any other thread/call that hits ``SequenceMatcher`` meanwhile
+#     is affected too.
+#   * The snippet hardcodes ``autojunk=False`` and therefore cannot honor a
+#     user config of ``autojunk=True`` without extra conditionals; in our
+#     setup that means we'd be patching even on the default path, paying the
+#     cost and risk for no benefit.
+#   * Forward compatibility: if CPython ever adds ``autojunk`` to
+#     ``unified_diff`` (the very point of the issue above), ``partialmethod``'s
+#     preset ``autojunk=False`` would silently override the new parameter's
+#     default whenever the caller does not pass it explicitly, masking the
+#     stdlib behavior. Our reimplementation has no such issue -- and once
+#     CPython ships ``autojunk`` on ``unified_diff``, we can delete this
+#     function and call ``difflib.unified_diff(..., autojunk=autojunk)``
+#     directly in both branches.
+#
+# Implementation is a verbatim copy of ``difflib.unified_diff`` from CPython
+# with two differences:
+#   1. ``SequenceMatcher(None, a, b, autojunk=autojunk)`` instead of
+#      ``SequenceMatcher(None, a, b)`` -- the whole point.
+#   2. ``fromfiledate``/``tofiledate`` of ``None`` fall back to an empty
+#      string instead of the current system timestamp. The plugin never
+#      passes dates, so this is a non-issue here; if you need timestamps,
+#      format them yourself and pass them as strings.
+def _unified_diff(a, b, fromfile='', tofile='',
+                  fromfiledate='', tofiledate='',
+                  n=3, lineterm='\n', autojunk=True):
+    if fromfiledate is None:
+        fromfiledate = ''
+    if tofiledate is None:
+        tofiledate = ''
+
+    started = False
+    for group in DefaultSequenceMatcher(
+            None, a, b, autojunk=autojunk).get_grouped_opcodes(n):
+        if not started:
+            started = True
+            fromdate = '\t{}'.format(fromfiledate) if fromfiledate else ''
+            todate = '\t{}'.format(tofiledate) if tofiledate else ''
+            yield '--- {}{}{}'.format(fromfile, fromdate, lineterm)
+            yield '+++ {}{}{}'.format(tofile, todate, lineterm)
+        first, last = group[0], group[-1]
+        file1_range = _format_range_unified(first[1], last[2])
+        file2_range = _format_range_unified(first[3], last[4])
+        yield '@@ -{} +{} @@{}'.format(file1_range, file2_range, lineterm)
+        for tag, i1, i2, j1, j2 in group:
+            if tag == 'equal':
+                for line in a[i1:i2]:
+                    yield ' ' + line
+                continue
+            if tag in {'replace', 'delete'}:
+                for line in a[i1:i2]:
+                    yield '-' + line
+            if tag in {'replace', 'insert'}:
+                for line in b[j1:j2]:
+                    yield '+' + line
+
+
 class Differ:
     """
     compare function return tuples for paint text
@@ -93,7 +192,17 @@ class Differ:
                                                           self.b, j1, j2)
 
     def unidiff(self, a, b, f1, f2, n):
-        return ''.join(unified_diff(a, b, f1, f2, n=n))
+        # autojunk=True matches the stdlib default -> call difflib.unified_diff
+        # directly (no reimplementation on the hot path). Only when the user
+        # opts out (autojunk=False) do we need _unified_diff to forward the
+        # kwarg, since difflib.unified_diff does not expose it -- see
+        # https://github.com/python/cpython/issues/118150 and the comment on
+        # _unified_diff above.
+        if self.autojunk:
+            diff = unified_diff(a, b, f1, f2, n=n)
+        else:
+            diff = _unified_diff(a, b, f1, f2, n=n, autojunk=False)
+        return ''.join(diff)
 
     def _fancy_replace(self, a, alo, ahi, b, blo, bhi):
         best_ratio, cutoff = self.ratio-0.01, self.ratio
