@@ -146,7 +146,10 @@ class Differ:
     def __init__(self, a='', b=''):
         self.withdetail = True
         self.ratio = 0.75
-        self.use_patience_diff = False
+        # 'difflib' (Python stdlib SequenceMatcher) or 'patience'
+        # (PatienceSequenceMatcher). Replaces the former boolean
+        # use_patience_diff; default is 'patience'.
+        self.diff_algorithm = 'patience'
         self.autojunk = True
         self.set_seqs(a, b)
         self.diffmap = []
@@ -157,7 +160,7 @@ class Differ:
 
     def compare(self):
         self.diffmap = []
-        if self.use_patience_diff:
+        if self.diff_algorithm == 'patience':
             diff = PatienceSequenceMatcher(None, self.a, self.b)
         else:
             diff = DefaultSequenceMatcher(None, self.a, self.b, autojunk=self.autojunk)
@@ -206,7 +209,7 @@ class Differ:
 
     def _fancy_replace(self, a, alo, ahi, b, blo, bhi):
         best_ratio, cutoff = self.ratio-0.01, self.ratio
-        if self.use_patience_diff:
+        if self.diff_algorithm == 'patience':
             diff = PatienceSequenceMatcher(None)
         else:
             diff = DefaultSequenceMatcher(None, autojunk=self.autojunk)

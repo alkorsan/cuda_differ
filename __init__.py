@@ -123,14 +123,44 @@ OPTS_META = [
      'frm': 'int',
      'chp': 'config',
      },
-    {'opt': 'differ.use_patience_diff',
-     'cmt': _('Use patience diff algorithm instead of the default difflib (produces more human-readable diffs in some cases)'),
-     'def': False,
-     'frm': 'bool',
+    # --- diff_algorithm dropdown ------------------------------------------------
+    # Method 2 (used here): value/label pairs via 'str2s' + 'dct'.
+    #   The dropdown shows the second element of each tuple; on save, the keys
+    #   ('difflib'/'patience') are extracted, so the stored value is the raw
+    #   plain string. load_definitions auto-derives 'jdc' from 'dct', so 'jdc'
+    #   does not need to be set by hand. Use this when you want friendlier
+    #   dropdown labels than the raw config value.
+    #
+    # Method 1 (alternative, kept here as a reminder): plain string list via
+    # 'strs' + 'lst'. The combobox is populated straight from 'lst'; on save
+    # the raw string itself is stored. Minimal, no separate labels.
+    #
+    #     {'opt': 'differ.diff_algorithm',
+    #      'cmt': _('Diff algorithm to use. Patience anchors on unique matching '
+    #               'lines and often produces more human-readable diffs when '
+    #               'blocks of code are moved; difflib is Python\'s stdlib '
+    #               'SequenceMatcher. Default: patience.'),
+    #      'def': 'patience',
+    #      'frm': 'strs',
+    #      'lst': ['difflib', 'patience'],
+    #      'chp': 'config',
+    #      },
+    # ----------------------------------------------------------------------------
+    {'opt': 'differ.diff_algorithm',
+     'cmt': _('Diff algorithm to use. Patience anchors on unique matching '
+              'lines and often produces more human-readable diffs when blocks '
+              'of code are moved; difflib is Python\'s stdlib '
+              'SequenceMatcher. Default: patience.'),
+     'def': 'patience',
+     'frm': 'str2s',
+     'dct': [('patience', _('Patience Diff')),
+             ('difflib',  _('Python difflib stdlib'))],
      'chp': 'config',
      },
     {'opt': 'differ.autojunk',
-     'cmt': _('Enable autojunk heuristic in difflib SequenceMatcher (only applies when use_patience_diff is false; PatienceSequenceMatcher does not support autojunk)'),
+     'cmt': _('Enable autojunk heuristic in difflib SequenceMatcher (only '
+              'applies when diff_algorithm is "difflib"; '
+              'PatienceSequenceMatcher does not support autojunk)'),
      'def': True,
      'frm': 'bool',
      'chp': 'config',
@@ -931,7 +961,7 @@ class Command:
 
         self.diff.withdetail = self.cfg.get('compare_with_details')
         self.diff.ratio = self.cfg.get('ratio')
-        self.diff.use_patience_diff = self.cfg.get('use_patience_diff')
+        self.diff.diff_algorithm = self.cfg.get('diff_algorithm')
         self.diff.autojunk = self.cfg.get('autojunk')
 
         # Detect word-wrap on either side. When wrap is on, gaps must be
@@ -1197,8 +1227,8 @@ class Command:
                 get_opt('enable_auto_refresh', False),
             'diff_context':
                 get_opt('diff_context', 3),
-            'use_patience_diff':
-                get_opt('use_patience_diff', False),
+            'diff_algorithm':
+                get_opt('diff_algorithm', 'patience'),
             'autojunk':
                 get_opt('autojunk', True),
         }
