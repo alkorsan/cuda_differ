@@ -1,6 +1,7 @@
 import time
 from difflib import SequenceMatcher as DefaultSequenceMatcher, unified_diff
 from .myers import MyersSequenceMatcher, InlineMyersSequenceMatcher
+from .myers import find_common_prefix, find_common_suffix
 from .patiencediff import PatienceSequenceMatcher
 from .vscode_diff import VSCodeSequenceMatcher
 
@@ -152,9 +153,19 @@ class Differ:
               Consumed by __init__.py to add a compensating gap when the two
               lines wrap to a different number of visual rows.
     """
+    # Internal: skip character-level diff for line pairs whose combined
+    # "middle" (after common prefix/suffix trimming) exceeds this many
+    # characters. For completely different long lines, the char diff would
+    # be O(N*P) in pure Python and would highlight the entire line anyway
+    # (no useful detail). This guard is NOT user-configurable -- it is a
+    # pure performance/quality tradeoff that matches what WinMerge and VS
+    # Code do internally (they use native C++ diff engines, so they don't
+    # need this guard, but the visual result is the same: very different
+    # long lines show as whole-line changed, not char-by-char).
+    _CHAR_DIFF_MAX_MIDDLE = 1000
+
     def __init__(self, a='', b=''):
         self.withdetail = True
-        self.ratio = 0.75
         # 'myers'   (MyersSequenceMatcher — O(NP) Wu/Manber/Myers/Miller
         #            1989 with common prefix/suffix trimming and a
         #            non-matching-line discard preprocessing pass;
@@ -305,7 +316,7 @@ class Differ:
                     yield (B_LINE_ADD, y)
             elif tag == 'replace':
                 if self.withdetail:
-                    yield from self._fancy_replace(self.a, i1, i2,
+                    yield from self._replace_block(self.a, i1, i2,
                                                    self.b, j1, j2)
                 else:
                     yield from self._plain_replace_simple(self.a, i1, i2,
@@ -333,76 +344,107 @@ class Differ:
             diff = _unified_diff(a, b, f1, f2, n=n, autojunk=False)
         return ''.join(diff)
 
-    def _fancy_replace(self, a, alo, ahi, b, blo, bhi):
-        best_ratio, cutoff = self.ratio-0.01, self.ratio
+    def _replace_block(self, a, alo, ahi, b, blo, bhi):
+        """Process a 'replace' opcode: a[alo:ahi] is replaced by b[blo:bhi].
+
+        This is the WinMerge/VS Code approach: pair lines by position
+        (1st with 1st, 2nd with 2nd, etc.) and do character-level diff on
+        each pair. No recursive "find best pair" search, no ratio
+        threshold, no ratio_percent config option. The line-level diff
+        (Myers/VSCode/Patience/difflib) already found the LCS, so the
+        REPLACE block is already well-aligned -- positional pairing is
+        correct and optimal.
+
+        For each positionally-paired line:
+          - If the two lines are identical: yield ALIGN only (no highlight,
+            matching VS Code which shows identical lines in a REPLACE block
+            as unchanged context).
+          - If the two lines differ: do character-level diff and yield
+            A_LINE_CHANGE/B_LINE_CHANGE + A_SYMBOL_DEL/B_SYMBOL_ADD events.
+            A length-based guard (_CHAR_DIFF_MAX_MIDDLE) skips char diff
+            for very long lines with no common prefix/suffix (the char
+            highlights would be unreadable and the O(N*P) cost is too high
+            in pure Python); these are marked as whole-line changed.
+
+        Leftover lines (when one side has more lines than the other) get
+        a gap on the shorter side and A_LINE_DEL / B_LINE_ADD events.
+        """
+        da, db = ahi - alo, bhi - blo
+        common = min(da, db)
+
+        # Create ONE char-level diff matcher, reused across all pairs.
         if self.diff_algorithm == 'myers':
-            # InlineMyersSequenceMatcher is the right Myers variant for
-            # character-level diffing: its preprocessing pass uses 3-element
-            # k-mers instead of single elements, which is what makes the
-            # preprocessing effective on character sequences (where single
-            # elements are rarely unique). Meld uses this same class for
-            # its inline/character-level highlighting. The base
-            # MyersSequenceMatcher's 1-element preprocessing is correct but
-            # ineffective for characters -- 'a' appears everywhere, so
-            # almost nothing gets discarded and the full O(NP) runs on the
-            # raw strings. InlineMyersSequenceMatcher is 2-4x faster on
-            # medium/long lines and produces more meaningful character-level
-            # diffs. For the main line-level diff (Differ.compare) we still
-            # use MyersSequenceMatcher because lines are usually unique
-            # enough that 1-element preprocessing is appropriate.
             diff = InlineMyersSequenceMatcher(None)
         elif self.diff_algorithm == 'patience':
             diff = PatienceSequenceMatcher(None)
         else:
             diff = DefaultSequenceMatcher(None, autojunk=self.autojunk)
-        eqi, eqj = None, None
-        for j in range(blo, bhi):
-            bj = b[j]
-            diff.set_seq2(bj)
-            for i in range(alo, ahi):
-                ai = a[i]
-                if ai == bj:
-                    if eqi is None:
-                        eqi, eqj = i, j
-                    continue
-                diff.set_seq1(ai)
-                if diff.real_quick_ratio() > best_ratio and \
-                        diff.quick_ratio() > best_ratio and \
-                        diff.ratio() > best_ratio:
-                    best_ratio, best_i, best_j = diff.ratio(), i, j
-        if best_ratio < cutoff:
-            if eqi is None:
-                yield from self._plain_replace(a, alo, ahi, b, blo, bhi)
-                return
-            best_i, best_j, best_ratio = eqi, eqj, 1.0
-        else:
-            eqi = None
-        yield from self._fancy_helper(a, alo, best_i, b, blo, best_j)
-        aelt, belt = a[best_i], b[best_j]
-        if eqi is None:
-            yield from self._char_diff_pair(a, best_i, b, best_j, diff)
-        # The best pair (best_i, best_j) is the visually-matched anchor of
-        # this replace block. Yield ALIGN so the wrapper can add a
-        # compensating gap when the two lines wrap to different heights.
-        yield (ALIGN, best_i, best_j)
-        yield from self._fancy_helper(a, best_i+1, ahi, b, best_j+1, bhi)
+
+        for k in range(common):
+            ai, bj = alo + k, blo + k
+            a_line, b_line = a[ai], b[bj]
+
+            if a_line == b_line:
+                # Identical lines in a REPLACE block: no highlight,
+                # just align (matching VS Code).
+                yield (ALIGN, ai, bj)
+                continue
+
+            # Check if char diff is worth doing. Compute the common
+            # prefix/suffix (O(log N) each), then check the "middle"
+            # size. If the middle is too large (both lines are long and
+            # very different), skip char diff -- the whole line would be
+            # highlighted anyway, and O(N*P) in pure Python is too slow.
+            prefix = find_common_prefix(a_line, b_line)
+            if prefix > 0:
+                a_mid = a_line[prefix:]
+                b_mid = b_line[prefix:]
+            else:
+                a_mid = a_line
+                b_mid = b_line
+            if len(a_mid) > 0 and len(b_mid) > 0:
+                suffix = find_common_suffix(a_mid, b_mid)
+            else:
+                suffix = 0
+            middle_a = len(a_mid) - suffix
+            middle_b = len(b_mid) - suffix
+
+            if middle_a + middle_b > self._CHAR_DIFF_MAX_MIDDLE:
+                # Lines are too different -- mark as whole-line changed
+                # without char highlights (same visual result, much
+                # faster). This matches WinMerge/VS Code behavior for
+                # very different long lines.
+                yield (A_LINE_CHANGE, ai)
+                yield (B_LINE_CHANGE, bj)
+                yield (A_DECOR_RED, ai)
+                yield (B_DECOR_GREEN, bj)
+            else:
+                # Do character-level diff on this pair.
+                yield from self._char_diff_pair(a, ai, b, bj, diff)
+
+            yield (ALIGN, ai, bj)
+
+        # Handle leftover lines (one side has more lines than the other).
+        if da > db:
+            # Extra A lines: [alo+common, ahi). Gap in B after line bhi-1.
+            yield (B_GAP, bhi, alo + common, ahi)
+            for y in range(alo + common, ahi):
+                yield (A_LINE_DEL, y)
+        elif db > da:
+            # Extra B lines: [blo+common, bhi). Gap in A after line ahi-1.
+            yield (A_GAP, ahi, blo + common, bhi)
+            for y in range(blo + common, bhi):
+                yield (B_LINE_ADD, y)
 
     def _char_diff_pair(self, a, ai, b, bj, diff):
         """Yield character-level diff events for a single line pair
         a[ai] vs b[bj].
 
-        This is the core of the "changed line with char highlights"
-        display: the line is marked as A_LINE_CHANGE / B_LINE_CHANGE
-        (yellow/red/green decor based on whether char-level deletes or
-        inserts were found), and the specific character ranges that
-        differ are emitted as A_SYMBOL_DEL / B_SYMBOL_ADD events so the
-        wrapper can highlight them inline.
-
-        Used by both _fancy_replace (for the best-matched pair in a
-        replace block) and _plain_replace (for each positionally-paired
-        line in the fallback path). The 'diff' matcher is passed in
-        from the caller so it can be reused across multiple pairs
-        without re-creating the matcher each time.
+        The line is marked as A_LINE_CHANGE / B_LINE_CHANGE (yellow/red/
+        green decor based on whether char-level deletes or inserts were
+        found), and the specific character ranges that differ are emitted
+        as A_SYMBOL_DEL / B_SYMBOL_ADD events so the wrapper can highlight
+        them inline.
         """
         diff.set_seqs(a[ai], b[bj])
         deca, decb = 0, 0
@@ -424,71 +466,11 @@ class Differ:
         yield (A_DECOR_YELLOW, ai) if deca == 0 else (A_DECOR_RED, ai)
         yield (B_DECOR_YELLOW, bj) if decb == 0 else (B_DECOR_GREEN, bj)
 
-    def _fancy_helper(self, a, alo, ahi, b, blo, bhi):
-        if alo < ahi:
-            if blo < bhi:
-                yield from self._fancy_replace(a, alo, ahi, b, blo, bhi)
-            else:
-                # Only A lines (blo == bhi). Gap in B after line blo-1,
-                # compensating for A lines [alo, ahi).
-                yield (B_GAP, blo, alo, ahi)
-                for y in range(alo, ahi):
-                    yield (A_LINE_DEL, y)
-        elif blo < bhi:
-            # Only B lines (alo == ahi). Gap in A after line alo-1,
-            # compensating for B lines [blo, bhi).
-            yield (A_GAP, alo, blo, bhi)
-            for y in range(blo, bhi):
-                yield (B_LINE_ADD, y)
-
-    def _plain_replace(self, a, alo, ahi, b, blo, bhi):
-        """Fallback when no good match is found inside a 'replace' block.
-
-        Pairs up the first min(da, db) lines by position and does
-        character-level diff on each pair (like WinMerge and VS Code),
-        then adds a single gap on the appropriate side for the leftover
-        lines. This ensures that even when no line pair meets the ratio
-        threshold, the user still sees char-level highlights on the
-        positionally-paired lines -- matching the behavior of WinMerge
-        and VS Code, which always do char diff on paired lines
-        regardless of similarity."""
-        da, db = ahi - alo, bhi - blo
-        common = min(da, db)
-
-        # Create a char-level diff matcher (same algorithm selection as
-        # _fancy_replace). Reused across all paired lines for efficiency.
-        if self.diff_algorithm == 'myers':
-            diff = InlineMyersSequenceMatcher(None)
-        elif self.diff_algorithm == 'patience':
-            diff = PatienceSequenceMatcher(None)
-        else:
-            diff = DefaultSequenceMatcher(None, autojunk=self.autojunk)
-
-        # Pair up lines by position and do char-level diff on each pair.
-        # This is the key difference from the old _plain_replace which
-        # yielded plain A_LINE_DEL + B_LINE_ADD (no char highlights).
-        for k in range(common):
-            ai, bj = alo + k, blo + k
-            yield from self._char_diff_pair(a, ai, b, bj, diff)
-            yield (ALIGN, ai, bj)
-
-        # Handle leftover lines (one side has more lines than the other).
-        if da > db:
-            # Extra A lines: [alo+common, ahi). Gap in B after line bhi-1.
-            yield (B_GAP, bhi, alo + common, ahi)
-            for y in range(alo + common, ahi):
-                yield (A_LINE_DEL, y)
-        elif db > da:
-            # Extra B lines: [blo+common, bhi). Gap in A after line ahi-1.
-            yield (A_GAP, ahi, blo + common, bhi)
-            for y in range(blo + common, bhi):
-                yield (B_LINE_ADD, y)
-
     def _plain_replace_simple(self, a, alo, ahi, b, blo, bhi):
-        """Non-detailed replace (withdetail=False). Same pairing strategy as
-        _plain_replace, but marks all lines as A_LINE_CHANGE/B_LINE_CHANGE
-        with yellow decor (preserving the original non-detailed look)."""
-        da, db = ahi-alo, bhi-blo
+        """Non-detailed replace (withdetail=False). Pairs lines by position
+        and marks all as A_LINE_CHANGE/B_LINE_CHANGE with yellow decor
+        (no char-level highlights)."""
+        da, db = ahi - alo, bhi - blo
         common = min(da, db)
         for k in range(common):
             yield (ALIGN, alo + k, blo + k)

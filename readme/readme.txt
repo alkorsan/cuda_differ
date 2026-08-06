@@ -165,13 +165,6 @@ Configuration (chapter "config"):
   When enabled, changed lines are compared character-by-character and
   the specific changed characters are highlighted within the line.
   When disabled, changed lines are highlighted as a whole. Default: true.
-- Similarity threshold in percents (differ.ratio_percents)
-  Controls how aggressive the character-level comparison is when
-  deciding whether two lines should be treated as "changed" (similar
-  but not identical) or as separate "deleted + added" lines. A higher
-  value means lines must be more similar to be considered "changed";
-  a lower value means more lines will be shown as changed (with
-  character-level detail). Range: 1-100. Default: 75.
 - Keep carets visible on sync (differ.enable_sync_caret)
   When enabled, moving the cursor in one side also moves the cursor in
   the other side to the corresponding difference block. Default: false.
