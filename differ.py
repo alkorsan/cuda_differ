@@ -3,6 +3,7 @@ from difflib import SequenceMatcher as DefaultSequenceMatcher, unified_diff
 from .myers import MyersSequenceMatcher, InlineMyersSequenceMatcher
 from .patiencediff import PatienceSequenceMatcher
 from .vscode_diff import VSCodeSequenceMatcher
+from .char_diff import char_diff
 
 
 # Internal benchmark toggle. When set to True, Differ.compare() prints the
@@ -171,12 +172,67 @@ class Differ:
         self.a = a
         self.b = b
 
+    # Threshold for the "trivial equal block" check in _realign_opcodes.
+    # If the EQUAL block between an INSERT and a DELETE (or vice versa)
+    # has this many or fewer non-whitespace characters total, it is
+    # absorbed into a single REPLACE block. The value 4 matches VS Code's
+    # removeVeryShortMatchingLinesBetweenDiffs threshold.
+    _REALIGN_TRIVIAL_THRESHOLD = 4
+
+    def _realign_opcodes(self, opcodes):
+        """Merge INSERT+EQUAL(trivial)+DELETE (or DELETE+EQUAL(trivial)+INSERT)
+        into a single REPLACE.
+
+        Myers' O(NP) and difflib's SequenceMatcher both produce LCS-based
+        diffs. When there are multiple valid LCS of the same length, they
+        may pick a different one than VS Code's DP algorithm (which uses
+        equality scoring that prefers longer matches). The most visible
+        symptom: an INSERT+EQUAL+DELETE sequence where the EQUAL block is
+        a trivial line (empty line, whitespace) and the INSERT/DELETE
+        blocks contain meaningful lines that could have been paired.
+
+        This method detects that pattern and merges it into a single
+        REPLACE. Then _replace_block pairs lines by position and naturally
+        matches identical lines.
+
+        The merge only happens when the EQUAL block is "trivial": its
+        total non-whitespace content is <= _REALIGN_TRIVIAL_THRESHOLD
+        characters. This is a no-op for algorithms that don't produce
+        this pattern (VS Code, patience).
+        """
+        if len(opcodes) < 3:
+            return opcodes
+        result = list(opcodes)
+        i = 1
+        while i < len(result) - 1:
+            prev = result[i - 1]
+            cur = result[i]
+            nxt = result[i + 1]
+            if (cur[0] == 'equal' and
+                    prev[0] in ('insert', 'delete') and
+                    nxt[0] in ('insert', 'delete') and
+                    prev[0] != nxt[0]):
+                _, ei1, ei2, ej1, ej2 = cur
+                equal_text = ''.join(self.a[ei1:ei2])
+                non_ws = equal_text.replace(' ', '').replace('\t', '')
+                non_ws = non_ws.replace('\n', '').replace('\r', '')
+                if len(non_ws) <= self._REALIGN_TRIVIAL_THRESHOLD:
+                    merged = ('replace',
+                              prev[1], nxt[2],
+                              prev[3], nxt[4])
+                    result[i - 1:i + 2] = [merged]
+                    if i > 1:
+                        i -= 1
+                    continue
+            i += 1
+        return result
+
     def compare(self):
         # Benchmark: when _BENCHMARK is True, measure the total time from
         # when the generator starts executing until it is fully consumed
         # (or closed).
         _bm_start = time.perf_counter() if _BENCHMARK else None
-        
+
         self.diffmap = []
         if self.diff_algorithm == 'myers':
             diff = MyersSequenceMatcher(None, self.a, self.b)
@@ -186,7 +242,8 @@ class Differ:
             diff = PatienceSequenceMatcher(None, self.a, self.b)
         else:
             diff = DefaultSequenceMatcher(None, self.a, self.b, autojunk=self.autojunk)
-        for tag, i1, i2, j1, j2 in diff.get_opcodes():
+        opcodes = self._realign_opcodes(diff.get_opcodes())
+        for tag, i1, i2, j1, j2 in opcodes:
             if tag != 'equal':
                 self.diffmap.append([i1, i2, j1, j2])
             if tag == 'equal':
@@ -246,20 +303,13 @@ class Differ:
         each pair. No recursive "find best pair" search, no ratio
         threshold, no ratio_percent config option.
 
-        For character-level diffing, we use InlineMyersSequenceMatcher
-        (from myers.py, ported from Meld). Its 3-element k-mer
-        preprocessing pass discards non-matching characters BEFORE
-        running the O(NP) Myers algorithm, making it fast enough that
-        no timeout is needed -- even 5000-char completely-different
-        lines diff in ~3ms. This is the same approach Meld uses for its
-        inline/character-level highlighting.
-
-        (WinMerge uses a 500ms timeout with its C++ O(NP) implementation
-        at stringdiffs.cpp line 25; VS Code uses a timeout with its
-        TypeScript Myers at myersDiffAlgorithm.ts line 46-48. Both need
-        timeouts because they don't have the k-mer preprocessing that
-        InlineMyersSequenceMatcher has. We don't need a timeout because
-        the preprocessing makes it fast enough.)
+        For character-level diffing, we use the WinMerge approach (ported
+        to char_diff.py): word-level Myers diff + byte-level prefix/suffix
+        refinement. This is much faster than running Myers directly on
+        characters because:
+          - Word-level Myers runs on a small array (5-50 tokens per line)
+          - Byte-level refinement is O(N) per diff region
+        See char_diff.py for details and source references.
 
         For each positionally-paired line:
           - If the two lines are identical: yield ALIGN only (no highlight,
@@ -274,12 +324,6 @@ class Differ:
         da, db = ahi - alo, bhi - blo
         common = min(da, db)
 
-        # Create ONE char-level diff matcher, reused across all pairs.
-        # InlineMyersSequenceMatcher is the right Myers variant for
-        # character-level diffing: its 3-element k-mer preprocessing
-        # makes it 100-500x faster than raw Myers on character sequences.
-        matcher = InlineMyersSequenceMatcher(None)
-
         for k in range(common):
             ai, bj = alo + k, blo + k
             a_line, b_line = a[ai], b[bj]
@@ -290,9 +334,8 @@ class Differ:
                 yield (ALIGN, ai, bj)
                 continue
 
-            # Character-level diff using InlineMyersSequenceMatcher.
-            matcher.set_seqs(a_line, b_line)
-            ops = matcher.get_opcodes()
+            # Character-level diff using WinMerge's word-level approach.
+            ops = char_diff(a_line, b_line)
             yield from self._char_diff_pair(ai, bj, ops)
 
             yield (ALIGN, ai, bj)
