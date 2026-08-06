@@ -43,3 +43,83 @@ restart
 it gets colored like if we enabled compare on it !!!!!!!!!!
 and the diff tab is not colored
 
+_____________
+
+
+use this colors for white theme
+//   "differ.changed_color": "#f0bf5e",
+  // "differ.added_color": "#a2ffa2",
+  // "differ.deleted_color": "#ffd7d7",
+  // "differ.gap_color": "#c0c0c0",
+or
+  "differ.changed_color": "#f8dfad",
+  "differ.added_color": "#b3ffb3",
+  "differ.deleted_color": "#ffc4c4",
+  "differ.gap_color": "#e3e3e3",
+_______________________
+
+add right click menu only on diff tab that enables:
+Line details
+Ignore CR/LF
+Ignore Case
+Ignore Whitespace at the begning
+Ignore Whitespace at the end
+Ignore Blank lines
+Ignore Code page
+Ignore Numbers
+
+Swap View
+Refresh/Recompare
+___
+implement this https://marketplace.visualstudio.com/items?itemName=ryu1kn.partial-diff
+___
+
+add micromap and force it show deleted added and changed not only changed
+find why there is an orange line near micromap
+
+add use auto junk option and make default true
+
+
+remove the colored squares in left bar, it s not needed and may only slow things more
+
+bug :on_state do not fire for differ
+
+  
+___
+add ignore white space and ignore lines like winmerge using this
+class difflib.SequenceMatcher(isjunk=None, a='', b='', autojunk=True)
+Optional argument isjunk must be None (the default) or a one-argument function that takes a sequence element and returns true if and only if the element is “junk” and should be ignored. Passing None for isjunk is equivalent to passing lambda x: False; in other words, no elements are ignored. For example, pass:
+
+lambda x: x in " \t"
+if you’re comparing lines as sequences of characters, and don’t want to synch up on blanks or hard tabs.
+  
+____________
+i opened an issue about this here
+https://github.com/Alexey-T/CudaText/issues/6398#top
+when cudatext starts and there is a diff tab but the tab is not focused, the _refresh_ex code sets gaps incorrectly because ed.get_wrapinfo() returns nothing , EDACTION_UPDATE did not fix the problem
+
+there a changelog in api that says: fix: Editor.action: EDACTION_UPDATE did not work sometimes (cmd_RepaintEditor worked better)
+
+but ed.cmd(cmd_RepaintEditor) did not fix the problem too
+
+the api says:
+Notes:
+  - When you perform some caret-positioning command (e.g. "cCommand_GotoTextEnd") in not yet painted editor-control, it doesn't run OK. Reason: editor must be properly inited which happens on first painting. If you need to place the caret on form showing ("dlg_proc" API), do it in form's "on_show" event. Maybe you need also to start a timer ("timer_proc" API) which will run the caret command.
+
+so maybe this is the problem
+how can i know that the editor was properly inited? i found no event for that
+
+i used timer_proc to fix it and i wait 20s but get_wrapinfo is always empty, 
+
+get_wrapinfo return data after restart only if the tab is focused which is not a solution because of tabs flickering if i force focus the wanted tabs after restarts
+
+ 
+______________________
+splitlines(False) change to true and why it have no effect
+
+
+
+if there a diff tab then i switch session, the session manager ask to save the diff tab if i respond no, the diff tab get deleted from differ json; think in a better fix
+
+
+_________________________
