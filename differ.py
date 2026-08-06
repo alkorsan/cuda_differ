@@ -1,6 +1,13 @@
+import time
 from difflib import SequenceMatcher as DefaultSequenceMatcher, unified_diff
 from .patiencediff import PatienceSequenceMatcher
 from .vscode_diff import VSCodeSequenceMatcher
+
+
+# Internal benchmark toggle. When set to True, Differ.compare() prints the
+# total time elapsed from when the generator starts executing until it is
+# fully consumed (or closed).
+_BENCHMARK = True
 
 
 A_LINE_DEL = '-'
@@ -161,6 +168,11 @@ class Differ:
         self.b = b
 
     def compare(self):
+        # Benchmark: when _BENCHMARK is True, measure the total time from
+        # when the generator starts executing until it is fully consumed
+        # (or closed).
+        _bm_start = time.perf_counter() if _BENCHMARK else None
+        
         self.diffmap = []
         if self.diff_algorithm == 'vscode':
             diff = VSCodeSequenceMatcher(None, self.a, self.b)
@@ -197,6 +209,15 @@ class Differ:
                 else:
                     yield from self._plain_replace_simple(self.a, i1, i2,
                                                           self.b, j1, j2)
+        if _bm_start is not None:
+            _bm_elapsed = time.perf_counter() - _bm_start
+            print('Differ: compare took {:.1f}ms '
+                  '(algo={}, a={}lines, b={}lines, '
+                  'opcodes={}diffs, events_generated)'.format(
+                      _bm_elapsed * 1000,
+                      self.diff_algorithm,
+                      len(self.a), len(self.b),
+                      len(self.diffmap)))
 
     def unidiff(self, a, b, f1, f2, n):
         # autojunk=True matches the stdlib default -> call difflib.unified_diff
