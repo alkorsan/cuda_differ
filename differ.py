@@ -1,5 +1,6 @@
 import time
 from difflib import SequenceMatcher as DefaultSequenceMatcher, unified_diff
+from .myers import MyersSequenceMatcher
 from .patiencediff import PatienceSequenceMatcher
 from .vscode_diff import VSCodeSequenceMatcher
 
@@ -154,11 +155,15 @@ class Differ:
     def __init__(self, a='', b=''):
         self.withdetail = True
         self.ratio = 0.75
-        # 'vscode' (VS Code-style DP/Myers diff with equality scoring —
-        #     default, best quality for duplicated-line files),
+        # 'myers'   (MyersSequenceMatcher — O(NP) Wu/Manber/Myers/Miller
+        #            1989 with common prefix/suffix trimming and a
+        #            non-matching-line discard preprocessing pass;
+        #            default, fastest in the common case),
+        # 'vscode'  (VS Code-style DP/Myers diff with equality scoring —
+        #            best quality for duplicated-line files, slowest),
         # 'patience' (PatienceSequenceMatcher — anchors on unique lines),
         # or 'difflib' (Python stdlib SequenceMatcher with autojunk).
-        self.diff_algorithm = 'vscode'
+        self.diff_algorithm = 'myers'
         self.autojunk = True
         self.set_seqs(a, b)
         self.diffmap = []
@@ -174,7 +179,9 @@ class Differ:
         _bm_start = time.perf_counter() if _BENCHMARK else None
         
         self.diffmap = []
-        if self.diff_algorithm == 'vscode':
+        if self.diff_algorithm == 'myers':
+            diff = MyersSequenceMatcher(None, self.a, self.b)
+        elif self.diff_algorithm == 'vscode':
             diff = VSCodeSequenceMatcher(None, self.a, self.b)
         elif self.diff_algorithm == 'patience':
             diff = PatienceSequenceMatcher(None, self.a, self.b)
@@ -234,7 +241,9 @@ class Differ:
 
     def _fancy_replace(self, a, alo, ahi, b, blo, bhi):
         best_ratio, cutoff = self.ratio-0.01, self.ratio
-        if self.diff_algorithm == 'patience':
+        if self.diff_algorithm == 'myers':
+            diff = MyersSequenceMatcher(None)
+        elif self.diff_algorithm == 'patience':
             diff = PatienceSequenceMatcher(None)
         else:
             diff = DefaultSequenceMatcher(None, autojunk=self.autojunk)

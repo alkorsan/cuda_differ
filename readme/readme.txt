@@ -185,7 +185,15 @@ Configuration (chapter "config"):
   commands). Default: 3.
 - Diff algorithm (differ.diff_algorithm)
   Selects the diff algorithm used by the side-by-side compare view and the
-  unified-diff commands. Three choices are offered in a dropdown:
+  unified-diff commands. Four choices are offered in a dropdown:
+    * myers   -- Myers O(NP) sequence comparison algorithm
+      (Wu/Manber/Myers/Miller 1989), ported from Meld. Includes two
+      preprocessing optimizations: common prefix/suffix trimming (binary
+      search) and discarding lines that do not appear in the other file
+      (only when worthwhile, i.e. more than 10 lines are discarded). Also
+      includes a post-processing pass that backward-scans matching chunks
+      to combine adjacent blocks that can be merged. This is the fastest
+      option and the default.
     * vscode   -- VS Code's diff algorithm (ported from Microsoft's VS Code
       source). Uses dynamic programming (O(MN) LCS with equality scoring
       and consecutive-diagonal bonus) for files with fewer than 1700
@@ -194,12 +202,12 @@ Configuration (chapter "config"):
       (shift/join adjacent diffs to natural boundaries, absorb tiny equal
       blocks between large changes). This algorithm produces the best
       alignment on files with many duplicated lines, where both patience
-      and difflib can fail. This is the default.
+      and difflib can fail, but is the slowest.
     * patience -- anchors on unique matching lines, often more
       human-readable when blocks of code are moved or re-indented
       (via the embedded patiencediff library).
     * difflib  -- Python's standard difflib SequenceMatcher.
-  Default: vscode.
+  Default: myers.
 - Autojunk heuristic (differ.autojunk)
   Controls the autojunk parameter of difflib's SequenceMatcher. When
   enabled (the Python default), items that appear more than 1% of the
@@ -208,8 +216,9 @@ Configuration (chapter "config"):
   repeated lines but can occasionally cause subtle differences to be
   missed. Disable it if you suspect the diff is skipping matches due
   to frequent repeated lines. This option only applies when
-  diff_algorithm is "difflib" -- PatienceSequenceMatcher and
-  VSCodeSequenceMatcher do not support autojunk. Default: true.
+  diff_algorithm is "difflib" -- MyersSequenceMatcher,
+  PatienceSequenceMatcher and VSCodeSequenceMatcher do not support
+  autojunk. Default: true.
 
 
 == Notes ==

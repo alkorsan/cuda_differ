@@ -147,13 +147,18 @@ OPTS_META = [
     #      },
     # ----------------------------------------------------------------------------
     {'opt': 'differ.diff_algorithm',
-     'cmt': _('Diff algorithm to use. VS Code uses dynamic programming '
-              'with equality scoring (best for files with duplicated lines); '
-              'Patience anchors on unique matching lines; difflib is '
-              'Python\'s stdlib SequenceMatcher. Default: VS Code.'),
-     'def': 'vscode',
+     'cmt': _('Diff algorithm to use. Myers is an O(NP) algorithm '
+              '(Wu/Manber/Myers/Miller 1989) with common prefix/suffix '
+              'trimming and non-matching-line discard preprocessing; '
+              'it is the fastest option and the default. VS Code uses '
+              'dynamic programming with equality scoring (best for files '
+              'with duplicated lines, slowest); Patience anchors on unique '
+              'matching lines; difflib is Python\'s stdlib SequenceMatcher. '
+              'Default: Myers.'),
+     'def': 'myers',
      'frm': 'str2s',
-     'dct': [('vscode',   _('VS Code (DP + Myers)')),
+     'dct': [('myers',    _('Myers (O(NP), fastest)')),
+             ('vscode',   _('VS Code (DP + Myers)')),
              ('patience', _('Patience Diff')),
              ('difflib',  _('Python difflib stdlib'))],
      'chp': 'config',
@@ -161,8 +166,8 @@ OPTS_META = [
     {'opt': 'differ.autojunk',
      'cmt': _('Enable autojunk heuristic in difflib SequenceMatcher (only '
               'applies when diff_algorithm is "difflib"; '
-              'PatienceSequenceMatcher and VSCodeSequenceMatcher do not '
-              'support autojunk)'),
+              'MyersSequenceMatcher, PatienceSequenceMatcher and '
+              'VSCodeSequenceMatcher do not support autojunk)'),
      'def': True,
      'frm': 'bool',
      'chp': 'config',
@@ -1230,7 +1235,7 @@ class Command:
             'diff_context':
                 get_opt('diff_context', 3),
             'diff_algorithm':
-                get_opt('diff_algorithm', 'vscode'),
+                get_opt('diff_algorithm', 'myers'),
             'autojunk':
                 get_opt('autojunk', True),
         }
