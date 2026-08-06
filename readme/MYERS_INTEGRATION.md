@@ -66,13 +66,25 @@ this one line.
 
 ### 2. `differ.py` — three small additions
 
-- Added `from .myers import MyersSequenceMatcher` to the imports.
+- Added `from .myers import MyersSequenceMatcher, InlineMyersSequenceMatcher`
+  to the imports.
 - Changed `Differ.__init__`'s `self.diff_algorithm = 'vscode'` to
   `self.diff_algorithm = 'myers'`.
 - Added a `myers` branch in `Differ.compare()` (uses
   `MyersSequenceMatcher(None, self.a, self.b)` for the line-level diff).
-- Added a `myers` branch in `Differ._fancy_replace()` (uses
-  `MyersSequenceMatcher(None)` for the character-level detail diff).
+- Added a `myers` branch in `Differ._fancy_replace()` that uses
+  **`InlineMyersSequenceMatcher(None)`** (not `MyersSequenceMatcher`) for
+  the character-level detail diff. `InlineMyersSequenceMatcher` is the
+  Myers variant Meld designed specifically for character-level (inline)
+  diffing — its preprocessing pass uses 3-element k-mers instead of
+  single elements, which makes the preprocessing effective on character
+  sequences (where single characters are rarely unique). See the comment
+  in `_fancy_replace` for the full rationale. Benchmarks show it is 2-4×
+  faster than `MyersSequenceMatcher` on medium/long lines for
+  character-level diffing, and produces more meaningful character-level
+  diffs. The main line-level diff path still uses `MyersSequenceMatcher`
+  because lines are usually unique enough that 1-element preprocessing
+  is appropriate.
 - Updated the algorithm-selection comment.
 
 ### 3. `__init__.py` — config UI changes
