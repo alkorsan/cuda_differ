@@ -16,10 +16,10 @@ This document explains every change made to integrate `MyersSequenceMatcher`
 
 ## Files modified
 
-### 1. `myers.py` — minimal one-call change
+### 1. `myers.py` — minimal one-call change + two state-reset lines
 
-**The single change:** added one `super().__init__(...)` call at the
-start of `MyersSequenceMatcher.__init__`:
+**Change 1 (super().__init__):** added one `super().__init__(...)` call at
+the start of `MyersSequenceMatcher.__init__`:
 
 ```python
 super().__init__(isjunk=None, a="", b="", autojunk=False)
@@ -39,7 +39,7 @@ detail diffing** inside a 'replace' block — see `Differ._fancy_replace` in
 `differ.py`:
 
 ```python
-diff = MyersSequenceMatcher(None)
+diff = InlineMyersSequenceMatcher(None)
 diff.set_seq2(bj)              # <-- inherited from difflib
 diff.set_seq1(ai)              # <-- inherited from difflib
 diff.real_quick_ratio()        # <-- inherited from difflib
@@ -56,13 +56,56 @@ fix.)
 
 The fix initializes all difflib attributes properly. `autojunk=False` is
 passed explicitly because Myers does not implement the autojunk heuristic
-and must not silently apply it inside the inherited `__chain_b` / 
+and must not silently apply it inside the inherited `__chain_b` /
 `quick_ratio` code paths.
 
-The change is otherwise a no-op for the main line-level diff path (which
-Myers owns end-to-end) and is fully compatible with future upstream
-merges — if upstream ever adds its own `super().__init__()`, you can drop
-this one line.
+**Change 2 (lines_discarded reset):** added `self.lines_discarded = False`
+to the early-return paths in BOTH `preprocess_discard_nonmatching_lines`
+methods (the base `MyersSequenceMatcher` and `InlineMyersSequenceMatcher`):
+
+```python
+if len(a) == 0 or len(b) == 0:        # base class
+    self.aindex = []
+    self.bindex = []
+    self.lines_discarded = False       # <-- added
+    return (a, b)
+
+if len(a) <= 2 and len(b) <= 2:        # InlineMyersSequenceMatcher
+    self.aindex = []
+    self.bindex = []
+    self.lines_discarded = False       # <-- added
+    return (a, b)
+```
+
+**Why this change is needed:**
+
+Both early-return paths reset `aindex`/`bindex` to `[]` but did NOT reset
+`lines_discarded`. When `_fancy_replace` reuses the matcher via
+`set_seq1`/`set_seq2` (one matcher per replace block, reused for every
+line pair), the following sequence triggers an `IndexError`:
+
+1. First line pair: long, similar lines (e.g. long HTML lines with
+   scattered differences) → k-mer preprocessing activates →
+   `lines_discarded = True`, `aindex` populated.
+2. Later line pair: two lines that, after common prefix/suffix trimming,
+   are both ≤ 2 chars with at least one matching char (e.g. two HTML
+   lines that differ only in a 2-char middle that's a permutation:
+   `<span>ab</span>` vs `<span>ba</span>`) → early return →
+   `aindex = []`, but `lines_discarded` STAYS `True` from step 1.
+3. `build_matching_blocks` enters the `lines_discarded` branch (because
+   `lines_discarded` is True) and tries `aindex[x]` on an empty list →
+   `IndexError: list index out of range`.
+
+This is a **latent bug in the upstream Meld code** — it doesn't manifest
+in Meld because Meld creates a fresh matcher per diff call and never
+reuses via `set_seq1`/`set_seq2`. The differ plugin's matcher reuse in
+`_fancy_replace` exposes it. The fix ensures `lines_discarded` is always
+consistent with `aindex`/`bindex`.
+
+Both changes are otherwise no-ops for the main line-level diff path
+(which Myers owns end-to-end) and are fully compatible with future
+upstream merges — if upstream ever adds its own `super().__init__()`
+and/or `lines_discarded` resets, you can drop these lines.
 
 ### 2. `differ.py` — three small additions
 

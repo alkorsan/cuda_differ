@@ -126,6 +126,13 @@ class MyersSequenceMatcher(difflib.SequenceMatcher):
         if len(a) == 0 or len(b) == 0:
             self.aindex = []
             self.bindex = []
+            # Reset lines_discarded so build_matching_blocks does not enter
+            # the discarded-lines branch with empty aindex/bindex. Without
+            # this, reusing the matcher via set_seq1/set_seq2 (which
+            # differ._fancy_replace does for character-level detail diffing)
+            # would leave lines_discarded=True from a previous call while
+            # aindex is now empty, causing IndexError at aindex[x].
+            self.lines_discarded = False
             return (a, b)
 
         def index_matching(a, b):
@@ -333,6 +340,12 @@ class InlineMyersSequenceMatcher(MyersSequenceMatcher):
         if len(a) <= 2 and len(b) <= 2:
             self.aindex = []
             self.bindex = []
+            # Reset lines_discarded -- see the base class for the rationale.
+            # Without this, reusing the matcher via set_seq1/set_seq2 (which
+            # differ._fancy_replace does) would leave lines_discarded=True
+            # from a previous long-string call while aindex is now empty,
+            # causing IndexError at aindex[x] in build_matching_blocks.
+            self.lines_discarded = False
             return (a, b)
 
         def index_matching_kmers(a, b):
