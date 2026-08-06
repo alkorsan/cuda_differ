@@ -1,7 +1,6 @@
 import time
 from difflib import SequenceMatcher as DefaultSequenceMatcher, unified_diff
 from .myers import MyersSequenceMatcher, InlineMyersSequenceMatcher
-from .myers import find_common_prefix, find_common_suffix
 from .patiencediff import PatienceSequenceMatcher
 from .vscode_diff import VSCodeSequenceMatcher
 
@@ -153,17 +152,6 @@ class Differ:
               Consumed by __init__.py to add a compensating gap when the two
               lines wrap to a different number of visual rows.
     """
-    # Internal: skip character-level diff for line pairs whose combined
-    # "middle" (after common prefix/suffix trimming) exceeds this many
-    # characters. For completely different long lines, the char diff would
-    # be O(N*P) in pure Python and would highlight the entire line anyway
-    # (no useful detail). This guard is NOT user-configurable -- it is a
-    # pure performance/quality tradeoff that matches what WinMerge and VS
-    # Code do internally (they use native C++ diff engines, so they don't
-    # need this guard, but the visual result is the same: very different
-    # long lines show as whole-line changed, not char-by-char).
-    _CHAR_DIFF_MAX_MIDDLE = 1000
-
     def __init__(self, a='', b=''):
         self.withdetail = True
         # 'myers'   (MyersSequenceMatcher — O(NP) Wu/Manber/Myers/Miller
@@ -183,88 +171,6 @@ class Differ:
         self.a = a
         self.b = b
 
-    # Threshold for the "trivial equal block" check in _realign_opcodes.
-    # If the EQUAL block between an INSERT and a DELETE (or vice versa)
-    # has this many or fewer non-whitespace characters total, it is
-    # absorbed into a single REPLACE block. The value 4 matches VS Code's
-    # removeVeryShortMatchingLinesBetweenDiffs threshold. This means
-    # empty lines, whitespace-only lines, and very short lines like '{'
-    # or '}' will be absorbed; meaningful lines like 'delete-only' will
-    # not (they have 11 non-ws chars).
-    _REALIGN_TRIVIAL_THRESHOLD = 4
-
-    def _realign_opcodes(self, opcodes):
-        """Merge INSERT+EQUAL(trivial)+DELETE (or DELETE+EQUAL(trivial)+INSERT)
-        into a single REPLACE.
-
-        Myers' O(NP) and difflib's SequenceMatcher both produce LCS-based
-        diffs. When there are multiple valid LCS of the same length, they
-        may pick a different one than VS Code's DP algorithm (which uses
-        equality scoring that prefers longer matches). The most visible
-        symptom: an INSERT+EQUAL+DELETE sequence where the EQUAL block is
-        a trivial line (empty line, whitespace, '{', '}') and the
-        INSERT/DELETE blocks contain meaningful lines that could have been
-        paired. Example:
-
-            A:  insert-only \n  delete-only  delllll  \n  end
-            B:  insert-only insertttt delete-only  \n   \n  end
-
-        Myers produces:  INSERT B[10:12] + EQUAL A[10]<->B[12]('\n') + DELETE A[11:13]
-            (matches the empty '\n' instead of 'delete-only')
-
-        VS Code produces: REPLACE A[10]<->B[10] + EQUAL A[11]<->B[11] + REPLACE A[12]<->B[12]
-            (matches 'delete-only' — the meaningful line)
-
-        Both are valid LCS of length 4, but VS Code's is more intuitive.
-        This method detects the Myers pattern and merges it into a single
-        REPLACE. Then _fancy_replace (called in compare() for 'replace'
-        tags) finds the best line-level alignment within the REPLACE block,
-        naturally matching identical lines like 'delete-only' (ratio 1.0).
-
-        The merge only happens when the EQUAL block is "trivial": its
-        total non-whitespace content is <= _REALIGN_TRIVIAL_THRESHOLD
-        characters. This prevents absorbing meaningful equal lines.
-
-        This is a no-op for algorithms that don't produce the
-        INSERT+EQUAL+DELETE pattern (VS Code, patience).
-        """
-        if len(opcodes) < 3:
-            return opcodes
-        result = list(opcodes)
-        i = 1
-        while i < len(result) - 1:
-            prev = result[i - 1]
-            cur = result[i]
-            nxt = result[i + 1]
-            # Pattern: (INSERT or DELETE) + EQUAL + (DELETE or INSERT)
-            # The two non-equal opcodes must be different types (one
-            # INSERT, one DELETE) -- otherwise there's nothing to merge.
-            if (cur[0] == 'equal' and
-                    prev[0] in ('insert', 'delete') and
-                    nxt[0] in ('insert', 'delete') and
-                    prev[0] != nxt[0]):
-                # Check if the EQUAL block is trivial
-                _, ei1, ei2, ej1, ej2 = cur
-                equal_text = ''.join(self.a[ei1:ei2])
-                non_ws = equal_text.replace(' ', '').replace('\t', '')
-                non_ws = non_ws.replace('\n', '').replace('\r', '')
-                if len(non_ws) <= self._REALIGN_TRIVIAL_THRESHOLD:
-                    # Merge prev + cur + nxt into a single REPLACE.
-                    # The new REPLACE spans from prev's start to nxt's end
-                    # on both sides.
-                    merged = ('replace',
-                              prev[1], nxt[2],  # a_start, a_end
-                              prev[3], nxt[4])  # b_start, b_end
-                    result[i - 1:i + 2] = [merged]
-                    # Don't advance i -- the merged REPLACE might be
-                    # adjacent to another mergeable pattern.
-                    # But step back to re-check from i-1.
-                    if i > 1:
-                        i -= 1
-                    continue
-            i += 1
-        return result
-
     def compare(self):
         # Benchmark: when _BENCHMARK is True, measure the total time from
         # when the generator starts executing until it is fully consumed
@@ -280,19 +186,7 @@ class Differ:
             diff = PatienceSequenceMatcher(None, self.a, self.b)
         else:
             diff = DefaultSequenceMatcher(None, self.a, self.b, autojunk=self.autojunk)
-        opcodes = diff.get_opcodes()
-        # Post-process: merge INSERT+EQUAL(trivial)+DELETE (or
-        # DELETE+EQUAL(trivial)+INSERT) into a single REPLACE. This fixes
-        # the LCS tie-breaking issue where Myers (and difflib) match a
-        # trivial line (empty line, whitespace, '{', '}') instead of a
-        # meaningful line, producing INSERT+EQUAL+DELETE instead of
-        # REPLACE+EQUAL+REPLACE. After merging, _fancy_replace finds the
-        # best line-level alignment within the REPLACE block and naturally
-        # matches identical lines. VSCode and patience don't produce this
-        # pattern so the merge is a no-op for them. See
-        # _realign_opcodes for details.
-        opcodes = self._realign_opcodes(opcodes)
-        for tag, i1, i2, j1, j2 in opcodes:
+        for tag, i1, i2, j1, j2 in diff.get_opcodes():
             if tag != 'equal':
                 self.diffmap.append([i1, i2, j1, j2])
             if tag == 'equal':
@@ -350,10 +244,22 @@ class Differ:
         This is the WinMerge/VS Code approach: pair lines by position
         (1st with 1st, 2nd with 2nd, etc.) and do character-level diff on
         each pair. No recursive "find best pair" search, no ratio
-        threshold, no ratio_percent config option. The line-level diff
-        (Myers/VSCode/Patience/difflib) already found the LCS, so the
-        REPLACE block is already well-aligned -- positional pairing is
-        correct and optimal.
+        threshold, no ratio_percent config option.
+
+        For character-level diffing, we use InlineMyersSequenceMatcher
+        (from myers.py, ported from Meld). Its 3-element k-mer
+        preprocessing pass discards non-matching characters BEFORE
+        running the O(NP) Myers algorithm, making it fast enough that
+        no timeout is needed -- even 5000-char completely-different
+        lines diff in ~3ms. This is the same approach Meld uses for its
+        inline/character-level highlighting.
+
+        (WinMerge uses a 500ms timeout with its C++ O(NP) implementation
+        at stringdiffs.cpp line 25; VS Code uses a timeout with its
+        TypeScript Myers at myersDiffAlgorithm.ts line 46-48. Both need
+        timeouts because they don't have the k-mer preprocessing that
+        InlineMyersSequenceMatcher has. We don't need a timeout because
+        the preprocessing makes it fast enough.)
 
         For each positionally-paired line:
           - If the two lines are identical: yield ALIGN only (no highlight,
@@ -361,10 +267,6 @@ class Differ:
             as unchanged context).
           - If the two lines differ: do character-level diff and yield
             A_LINE_CHANGE/B_LINE_CHANGE + A_SYMBOL_DEL/B_SYMBOL_ADD events.
-            A length-based guard (_CHAR_DIFF_MAX_MIDDLE) skips char diff
-            for very long lines with no common prefix/suffix (the char
-            highlights would be unreadable and the O(N*P) cost is too high
-            in pure Python); these are marked as whole-line changed.
 
         Leftover lines (when one side has more lines than the other) get
         a gap on the shorter side and A_LINE_DEL / B_LINE_ADD events.
@@ -373,12 +275,10 @@ class Differ:
         common = min(da, db)
 
         # Create ONE char-level diff matcher, reused across all pairs.
-        if self.diff_algorithm == 'myers':
-            diff = InlineMyersSequenceMatcher(None)
-        elif self.diff_algorithm == 'patience':
-            diff = PatienceSequenceMatcher(None)
-        else:
-            diff = DefaultSequenceMatcher(None, autojunk=self.autojunk)
+        # InlineMyersSequenceMatcher is the right Myers variant for
+        # character-level diffing: its 3-element k-mer preprocessing
+        # makes it 100-500x faster than raw Myers on character sequences.
+        matcher = InlineMyersSequenceMatcher(None)
 
         for k in range(common):
             ai, bj = alo + k, blo + k
@@ -390,37 +290,10 @@ class Differ:
                 yield (ALIGN, ai, bj)
                 continue
 
-            # Check if char diff is worth doing. Compute the common
-            # prefix/suffix (O(log N) each), then check the "middle"
-            # size. If the middle is too large (both lines are long and
-            # very different), skip char diff -- the whole line would be
-            # highlighted anyway, and O(N*P) in pure Python is too slow.
-            prefix = find_common_prefix(a_line, b_line)
-            if prefix > 0:
-                a_mid = a_line[prefix:]
-                b_mid = b_line[prefix:]
-            else:
-                a_mid = a_line
-                b_mid = b_line
-            if len(a_mid) > 0 and len(b_mid) > 0:
-                suffix = find_common_suffix(a_mid, b_mid)
-            else:
-                suffix = 0
-            middle_a = len(a_mid) - suffix
-            middle_b = len(b_mid) - suffix
-
-            if middle_a + middle_b > self._CHAR_DIFF_MAX_MIDDLE:
-                # Lines are too different -- mark as whole-line changed
-                # without char highlights (same visual result, much
-                # faster). This matches WinMerge/VS Code behavior for
-                # very different long lines.
-                yield (A_LINE_CHANGE, ai)
-                yield (B_LINE_CHANGE, bj)
-                yield (A_DECOR_RED, ai)
-                yield (B_DECOR_GREEN, bj)
-            else:
-                # Do character-level diff on this pair.
-                yield from self._char_diff_pair(a, ai, b, bj, diff)
+            # Character-level diff using InlineMyersSequenceMatcher.
+            matcher.set_seqs(a_line, b_line)
+            ops = matcher.get_opcodes()
+            yield from self._char_diff_pair(ai, bj, ops)
 
             yield (ALIGN, ai, bj)
 
@@ -436,9 +309,9 @@ class Differ:
             for y in range(blo + common, bhi):
                 yield (B_LINE_ADD, y)
 
-    def _char_diff_pair(self, a, ai, b, bj, diff):
-        """Yield character-level diff events for a single line pair
-        a[ai] vs b[bj].
+    def _char_diff_pair(self, ai, bj, ops):
+        """Yield character-level diff events for a single line pair,
+        given the char-level opcodes from char_diff().
 
         The line is marked as A_LINE_CHANGE / B_LINE_CHANGE (yellow/red/
         green decor based on whether char-level deletes or inserts were
@@ -446,21 +319,20 @@ class Differ:
         as A_SYMBOL_DEL / B_SYMBOL_ADD events so the wrapper can highlight
         them inline.
         """
-        diff.set_seqs(a[ai], b[bj])
         deca, decb = 0, 0
-        for tag, ai1, ai2, bj1, bj2 in diff.get_opcodes():
-            la, lb = ai2 - ai1, bj2 - bj1
+        for tag, a_start, a_end, b_start, b_end in ops:
+            la, lb = a_end - a_start, b_end - b_start
             if tag == 'delete':
                 deca += 1
-                yield (A_SYMBOL_DEL, ai, ai1, la)
+                yield (A_SYMBOL_DEL, ai, a_start, la)
             elif tag == 'insert':
                 decb += 1
-                yield (B_SYMBOL_ADD, bj, bj1, lb)
+                yield (B_SYMBOL_ADD, bj, b_start, lb)
             elif tag == 'replace':
                 deca += 1
                 decb += 1
-                yield (A_SYMBOL_DEL, ai, ai1, la)
-                yield (B_SYMBOL_ADD, bj, bj1, lb)
+                yield (A_SYMBOL_DEL, ai, a_start, la)
+                yield (B_SYMBOL_ADD, bj, b_start, lb)
         yield (A_LINE_CHANGE, ai)
         yield (B_LINE_CHANGE, bj)
         yield (A_DECOR_YELLOW, ai) if deca == 0 else (A_DECOR_RED, ai)

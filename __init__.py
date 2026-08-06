@@ -99,6 +99,12 @@ OPTS_META = [
      'frm': 'bool',
      'chp': 'config',
      },
+    {'opt': 'differ.ratio_percents',
+     'cmt': _('Measure of the sequences’ similarity, in percents'),
+     'def':  75,
+     'frm': 'int',
+     'chp': 'config',
+     },
     {'opt': 'differ.enable_sync_caret',
      'cmt': _('Keep carets in both editors visible on current screen area'),
      'def':  False,
@@ -961,6 +967,7 @@ class Command:
         self.scroll.toggle(self.cfg.get('sync_scroll'))
 
         self.diff.withdetail = self.cfg.get('compare_with_details')
+        self.diff.ratio = self.cfg.get('ratio')
         self.diff.diff_algorithm = self.cfg.get('diff_algorithm')
         self.diff.autojunk = self.cfg.get('autojunk')
 
@@ -1219,6 +1226,8 @@ class Command:
                 get_opt('sync_scroll', DEFAULT_SYNC_SCROLL == '1'),
             'compare_with_details':
                 get_opt('compare_with_details', True),
+            'ratio':
+                get_opt('ratio_percents',  75)/100,
             'enable_sync_caret':
                 get_opt('enable_sync_caret', False),
             'enable_auto_refresh':
