@@ -172,6 +172,88 @@ class Differ:
         self.a = a
         self.b = b
 
+    # Threshold for the "trivial equal block" check in _realign_opcodes.
+    # If the EQUAL block between an INSERT and a DELETE (or vice versa)
+    # has this many or fewer non-whitespace characters total, it is
+    # absorbed into a single REPLACE block. The value 4 matches VS Code's
+    # removeVeryShortMatchingLinesBetweenDiffs threshold. This means
+    # empty lines, whitespace-only lines, and very short lines like '{'
+    # or '}' will be absorbed; meaningful lines like 'delete-only' will
+    # not (they have 11 non-ws chars).
+    _REALIGN_TRIVIAL_THRESHOLD = 4
+
+    def _realign_opcodes(self, opcodes):
+        """Merge INSERT+EQUAL(trivial)+DELETE (or DELETE+EQUAL(trivial)+INSERT)
+        into a single REPLACE.
+
+        Myers' O(NP) and difflib's SequenceMatcher both produce LCS-based
+        diffs. When there are multiple valid LCS of the same length, they
+        may pick a different one than VS Code's DP algorithm (which uses
+        equality scoring that prefers longer matches). The most visible
+        symptom: an INSERT+EQUAL+DELETE sequence where the EQUAL block is
+        a trivial line (empty line, whitespace, '{', '}') and the
+        INSERT/DELETE blocks contain meaningful lines that could have been
+        paired. Example:
+
+            A:  insert-only \n  delete-only  delllll  \n  end
+            B:  insert-only insertttt delete-only  \n   \n  end
+
+        Myers produces:  INSERT B[10:12] + EQUAL A[10]<->B[12]('\n') + DELETE A[11:13]
+            (matches the empty '\n' instead of 'delete-only')
+
+        VS Code produces: REPLACE A[10]<->B[10] + EQUAL A[11]<->B[11] + REPLACE A[12]<->B[12]
+            (matches 'delete-only' — the meaningful line)
+
+        Both are valid LCS of length 4, but VS Code's is more intuitive.
+        This method detects the Myers pattern and merges it into a single
+        REPLACE. Then _fancy_replace (called in compare() for 'replace'
+        tags) finds the best line-level alignment within the REPLACE block,
+        naturally matching identical lines like 'delete-only' (ratio 1.0).
+
+        The merge only happens when the EQUAL block is "trivial": its
+        total non-whitespace content is <= _REALIGN_TRIVIAL_THRESHOLD
+        characters. This prevents absorbing meaningful equal lines.
+
+        This is a no-op for algorithms that don't produce the
+        INSERT+EQUAL+DELETE pattern (VS Code, patience).
+        """
+        if len(opcodes) < 3:
+            return opcodes
+        result = list(opcodes)
+        i = 1
+        while i < len(result) - 1:
+            prev = result[i - 1]
+            cur = result[i]
+            nxt = result[i + 1]
+            # Pattern: (INSERT or DELETE) + EQUAL + (DELETE or INSERT)
+            # The two non-equal opcodes must be different types (one
+            # INSERT, one DELETE) -- otherwise there's nothing to merge.
+            if (cur[0] == 'equal' and
+                    prev[0] in ('insert', 'delete') and
+                    nxt[0] in ('insert', 'delete') and
+                    prev[0] != nxt[0]):
+                # Check if the EQUAL block is trivial
+                _, ei1, ei2, ej1, ej2 = cur
+                equal_text = ''.join(self.a[ei1:ei2])
+                non_ws = equal_text.replace(' ', '').replace('\t', '')
+                non_ws = non_ws.replace('\n', '').replace('\r', '')
+                if len(non_ws) <= self._REALIGN_TRIVIAL_THRESHOLD:
+                    # Merge prev + cur + nxt into a single REPLACE.
+                    # The new REPLACE spans from prev's start to nxt's end
+                    # on both sides.
+                    merged = ('replace',
+                              prev[1], nxt[2],  # a_start, a_end
+                              prev[3], nxt[4])  # b_start, b_end
+                    result[i - 1:i + 2] = [merged]
+                    # Don't advance i -- the merged REPLACE might be
+                    # adjacent to another mergeable pattern.
+                    # But step back to re-check from i-1.
+                    if i > 1:
+                        i -= 1
+                    continue
+            i += 1
+        return result
+
     def compare(self):
         # Benchmark: when _BENCHMARK is True, measure the total time from
         # when the generator starts executing until it is fully consumed
@@ -187,7 +269,19 @@ class Differ:
             diff = PatienceSequenceMatcher(None, self.a, self.b)
         else:
             diff = DefaultSequenceMatcher(None, self.a, self.b, autojunk=self.autojunk)
-        for tag, i1, i2, j1, j2 in diff.get_opcodes():
+        opcodes = diff.get_opcodes()
+        # Post-process: merge INSERT+EQUAL(trivial)+DELETE (or
+        # DELETE+EQUAL(trivial)+INSERT) into a single REPLACE. This fixes
+        # the LCS tie-breaking issue where Myers (and difflib) match a
+        # trivial line (empty line, whitespace, '{', '}') instead of a
+        # meaningful line, producing INSERT+EQUAL+DELETE instead of
+        # REPLACE+EQUAL+REPLACE. After merging, _fancy_replace finds the
+        # best line-level alignment within the REPLACE block and naturally
+        # matches identical lines. VSCode and patience don't produce this
+        # pattern so the merge is a no-op for them. See
+        # _realign_opcodes for details.
+        opcodes = self._realign_opcodes(opcodes)
+        for tag, i1, i2, j1, j2 in opcodes:
             if tag != 'equal':
                 self.diffmap.append([i1, i2, j1, j2])
             if tag == 'equal':
