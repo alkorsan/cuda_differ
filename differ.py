@@ -1,5 +1,6 @@
 from difflib import SequenceMatcher as DefaultSequenceMatcher, unified_diff
 from .patiencediff import PatienceSequenceMatcher
+from .vscode_diff import VSCodeSequenceMatcher
 
 
 A_LINE_DEL = '-'
@@ -146,10 +147,11 @@ class Differ:
     def __init__(self, a='', b=''):
         self.withdetail = True
         self.ratio = 0.75
-        # 'difflib' (Python stdlib SequenceMatcher) or 'patience'
-        # (PatienceSequenceMatcher). Replaces the former boolean
-        # use_patience_diff; default is 'patience'.
-        self.diff_algorithm = 'patience'
+        # 'vscode' (VS Code-style DP/Myers diff with equality scoring —
+        #     default, best quality for duplicated-line files),
+        # 'patience' (PatienceSequenceMatcher — anchors on unique lines),
+        # or 'difflib' (Python stdlib SequenceMatcher with autojunk).
+        self.diff_algorithm = 'vscode'
         self.autojunk = True
         self.set_seqs(a, b)
         self.diffmap = []
@@ -160,7 +162,9 @@ class Differ:
 
     def compare(self):
         self.diffmap = []
-        if self.diff_algorithm == 'patience':
+        if self.diff_algorithm == 'vscode':
+            diff = VSCodeSequenceMatcher(None, self.a, self.b)
+        elif self.diff_algorithm == 'patience':
             diff = PatienceSequenceMatcher(None, self.a, self.b)
         else:
             diff = DefaultSequenceMatcher(None, self.a, self.b, autojunk=self.autojunk)

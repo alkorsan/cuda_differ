@@ -147,20 +147,22 @@ OPTS_META = [
     #      },
     # ----------------------------------------------------------------------------
     {'opt': 'differ.diff_algorithm',
-     'cmt': _('Diff algorithm to use. Patience anchors on unique matching '
-              'lines and often produces more human-readable diffs when blocks '
-              'of code are moved; difflib is Python\'s stdlib '
-              'SequenceMatcher. Default: patience.'),
-     'def': 'patience',
+     'cmt': _('Diff algorithm to use. VS Code uses dynamic programming '
+              'with equality scoring (best for files with duplicated lines); '
+              'Patience anchors on unique matching lines; difflib is '
+              'Python\'s stdlib SequenceMatcher. Default: VS Code.'),
+     'def': 'vscode',
      'frm': 'str2s',
-     'dct': [('patience', _('Patience Diff')),
+     'dct': [('vscode',   _('VS Code (DP + Myers)')),
+             ('patience', _('Patience Diff')),
              ('difflib',  _('Python difflib stdlib'))],
      'chp': 'config',
      },
     {'opt': 'differ.autojunk',
      'cmt': _('Enable autojunk heuristic in difflib SequenceMatcher (only '
               'applies when diff_algorithm is "difflib"; '
-              'PatienceSequenceMatcher does not support autojunk)'),
+              'PatienceSequenceMatcher and VSCodeSequenceMatcher do not '
+              'support autojunk)'),
      'def': True,
      'frm': 'bool',
      'chp': 'config',
@@ -1228,7 +1230,7 @@ class Command:
             'diff_context':
                 get_opt('diff_context', 3),
             'diff_algorithm':
-                get_opt('diff_algorithm', 'patience'),
+                get_opt('diff_algorithm', 'vscode'),
             'autojunk':
                 get_opt('autojunk', True),
         }
