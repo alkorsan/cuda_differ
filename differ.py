@@ -380,32 +380,49 @@ class Differ:
         yield from self._fancy_helper(a, alo, best_i, b, blo, best_j)
         aelt, belt = a[best_i], b[best_j]
         if eqi is None:
-            diff.set_seqs(aelt, belt)
-            deca, decb = 0, 0
-            for tag, ai1, ai2, bj1, bj2 in diff.get_opcodes():
-                la, lb = ai2 - ai1, bj2 - bj1
-                if tag == 'delete':
-                    deca += 1
-                    yield (A_SYMBOL_DEL, best_i, ai1, la)
-                elif tag == 'insert':
-                    decb += 1
-                    yield (B_SYMBOL_ADD, best_j, bj1, lb)
-                elif tag == 'replace':
-                    deca += 1
-                    decb += 1
-                    yield (A_SYMBOL_DEL, best_i, ai1, la)
-                    yield (B_SYMBOL_ADD, best_j, bj1, lb)
-            yield (A_LINE_CHANGE, best_i)
-            yield (B_LINE_CHANGE, best_j)
-            yield (A_DECOR_YELLOW, best_i) if deca == 0 else \
-                  (A_DECOR_RED, best_i)
-            yield (B_DECOR_YELLOW, best_j) if decb == 0 else \
-                  (B_DECOR_GREEN, best_j)
+            yield from self._char_diff_pair(a, best_i, b, best_j, diff)
         # The best pair (best_i, best_j) is the visually-matched anchor of
         # this replace block. Yield ALIGN so the wrapper can add a
         # compensating gap when the two lines wrap to different heights.
         yield (ALIGN, best_i, best_j)
         yield from self._fancy_helper(a, best_i+1, ahi, b, best_j+1, bhi)
+
+    def _char_diff_pair(self, a, ai, b, bj, diff):
+        """Yield character-level diff events for a single line pair
+        a[ai] vs b[bj].
+
+        This is the core of the "changed line with char highlights"
+        display: the line is marked as A_LINE_CHANGE / B_LINE_CHANGE
+        (yellow/red/green decor based on whether char-level deletes or
+        inserts were found), and the specific character ranges that
+        differ are emitted as A_SYMBOL_DEL / B_SYMBOL_ADD events so the
+        wrapper can highlight them inline.
+
+        Used by both _fancy_replace (for the best-matched pair in a
+        replace block) and _plain_replace (for each positionally-paired
+        line in the fallback path). The 'diff' matcher is passed in
+        from the caller so it can be reused across multiple pairs
+        without re-creating the matcher each time.
+        """
+        diff.set_seqs(a[ai], b[bj])
+        deca, decb = 0, 0
+        for tag, ai1, ai2, bj1, bj2 in diff.get_opcodes():
+            la, lb = ai2 - ai1, bj2 - bj1
+            if tag == 'delete':
+                deca += 1
+                yield (A_SYMBOL_DEL, ai, ai1, la)
+            elif tag == 'insert':
+                decb += 1
+                yield (B_SYMBOL_ADD, bj, bj1, lb)
+            elif tag == 'replace':
+                deca += 1
+                decb += 1
+                yield (A_SYMBOL_DEL, ai, ai1, la)
+                yield (B_SYMBOL_ADD, bj, bj1, lb)
+        yield (A_LINE_CHANGE, ai)
+        yield (B_LINE_CHANGE, bj)
+        yield (A_DECOR_YELLOW, ai) if deca == 0 else (A_DECOR_RED, ai)
+        yield (B_DECOR_YELLOW, bj) if decb == 0 else (B_DECOR_GREEN, bj)
 
     def _fancy_helper(self, a, alo, ahi, b, blo, bhi):
         if alo < ahi:
@@ -426,23 +443,46 @@ class Differ:
 
     def _plain_replace(self, a, alo, ahi, b, blo, bhi):
         """Fallback when no good match is found inside a 'replace' block.
-        Pairs up the first min(da, db) lines so the wrapper can keep them
-        visually aligned, then adds a single gap on the appropriate side for
-        the leftover lines."""
-        da, db = ahi-alo, bhi-blo
+
+        Pairs up the first min(da, db) lines by position and does
+        character-level diff on each pair (like WinMerge and VS Code),
+        then adds a single gap on the appropriate side for the leftover
+        lines. This ensures that even when no line pair meets the ratio
+        threshold, the user still sees char-level highlights on the
+        positionally-paired lines -- matching the behavior of WinMerge
+        and VS Code, which always do char diff on paired lines
+        regardless of similarity."""
+        da, db = ahi - alo, bhi - blo
         common = min(da, db)
+
+        # Create a char-level diff matcher (same algorithm selection as
+        # _fancy_replace). Reused across all paired lines for efficiency.
+        if self.diff_algorithm == 'myers':
+            diff = InlineMyersSequenceMatcher(None)
+        elif self.diff_algorithm == 'patience':
+            diff = PatienceSequenceMatcher(None)
+        else:
+            diff = DefaultSequenceMatcher(None, autojunk=self.autojunk)
+
+        # Pair up lines by position and do char-level diff on each pair.
+        # This is the key difference from the old _plain_replace which
+        # yielded plain A_LINE_DEL + B_LINE_ADD (no char highlights).
         for k in range(common):
-            yield (ALIGN, alo + k, blo + k)
+            ai, bj = alo + k, blo + k
+            yield from self._char_diff_pair(a, ai, b, bj, diff)
+            yield (ALIGN, ai, bj)
+
+        # Handle leftover lines (one side has more lines than the other).
         if da > db:
             # Extra A lines: [alo+common, ahi). Gap in B after line bhi-1.
             yield (B_GAP, bhi, alo + common, ahi)
+            for y in range(alo + common, ahi):
+                yield (A_LINE_DEL, y)
         elif db > da:
             # Extra B lines: [blo+common, bhi). Gap in A after line ahi-1.
             yield (A_GAP, ahi, blo + common, bhi)
-        for y in range(blo, bhi):
-            yield (B_LINE_ADD, y)
-        for y in range(alo, ahi):
-            yield (A_LINE_DEL, y)
+            for y in range(blo + common, bhi):
+                yield (B_LINE_ADD, y)
 
     def _plain_replace_simple(self, a, alo, ahi, b, blo, bhi):
         """Non-detailed replace (withdetail=False). Same pairing strategy as
