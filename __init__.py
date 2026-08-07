@@ -147,17 +147,20 @@ OPTS_META = [
     #      },
     # ----------------------------------------------------------------------------
     {'opt': 'differ.diff_algorithm',
-     'cmt': _('Diff algorithm to use. Myers is an O(NP) algorithm '
-              '(Wu/Manber/Myers/Miller 1989) with common prefix/suffix '
-              'trimming and non-matching-line discard preprocessing; '
-              'it is the fastest option and the default. VS Code uses '
-              'dynamic programming with equality scoring (best for files '
-              'with duplicated lines, slowest); Patience anchors on unique '
-              'matching lines; difflib is Python\'s stdlib SequenceMatcher. '
-              'Default: Myers.'),
-     'def': 'myers',
+     'cmt': _('Diff algorithm to use. Hybrid combines patience anchoring '
+              'on unique lines with Myers for the gaps (best quality for '
+              'both unique and duplicated lines); it is the default. '
+              'Myers is an O(NP) algorithm (Wu/Manber/Myers/Miller 1989) '
+              'with common prefix/suffix trimming and non-matching-line '
+              'discard preprocessing. VS Code uses dynamic programming '
+              'with equality scoring (best for files with duplicated lines, '
+              'slowest); Patience anchors on unique matching lines; '
+              'difflib is Python\'s stdlib SequenceMatcher. '
+              'Default: Hybrid.'),
+     'def': 'hybrid',
      'frm': 'str2s',
-     'dct': [('myers',    _('Myers (O(NP), fastest)')),
+     'dct': [('hybrid',    _('Hybrid (Patience + Myers)')),
+             ('myers',    _('Myers (O(NP), fastest)')),
              ('vscode',   _('VS Code (DP + Myers)')),
              ('patience', _('Patience Diff')),
              ('difflib',  _('Python difflib stdlib'))],
@@ -166,8 +169,9 @@ OPTS_META = [
     {'opt': 'differ.autojunk',
      'cmt': _('Enable autojunk heuristic in difflib SequenceMatcher (only '
               'applies when diff_algorithm is "difflib"; '
-              'MyersSequenceMatcher, PatienceSequenceMatcher and '
-              'VSCodeSequenceMatcher do not support autojunk)'),
+              'HybridSequenceMatcher, MyersSequenceMatcher, '
+              'PatienceSequenceMatcher and VSCodeSequenceMatcher do not '
+              'support autojunk)'),
      'def': True,
      'frm': 'bool',
      'chp': 'config',
@@ -1235,7 +1239,7 @@ class Command:
             'diff_context':
                 get_opt('diff_context', 3),
             'diff_algorithm':
-                get_opt('diff_algorithm', 'myers'),
+                get_opt('diff_algorithm', 'hybrid'),
             'autojunk':
                 get_opt('autojunk', True),
         }

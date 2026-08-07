@@ -14,8 +14,9 @@ def HybridSequenceMatcher(isjunk=None, a='', b=''):
     'def on_change_slow'), then fills gaps with Myers (finds matches
     in non-unique regions like repeated 'dsds'/'ff' blocks).
 
-    This is what Beyond Compare and WinMerge do: patience anchoring
-    for unique lines, LCS/Myers for the gaps. No hacks, no size limits.
+    This combines the strengths of both algorithms: patience correctly
+    anchors unique lines that Myers' LCS might skip, while Myers handles
+    regions with no unique lines (where patience matches nothing).
     """
     patience_matcher = PatienceSequenceMatcher(isjunk, a, b)
     patience_blocks = patience_matcher.get_matching_blocks()
@@ -232,15 +233,17 @@ class Differ:
     """
     def __init__(self, a='', b=''):
         self.withdetail = True
+        # 'hybrid'   (HybridSequenceMatcher — patience anchoring on
+        #             unique lines + Myers for the gaps; default,
+        #             best quality for both unique and duplicated lines),
         # 'myers'   (MyersSequenceMatcher — O(NP) Wu/Manber/Myers/Miller
         #            1989 with common prefix/suffix trimming and a
-        #            non-matching-line discard preprocessing pass;
-        #            default, fastest in the common case),
+        #            non-matching-line discard preprocessing pass),
         # 'vscode'  (VS Code-style DP/Myers diff with equality scoring —
         #            best quality for duplicated-line files, slowest),
         # 'patience' (PatienceSequenceMatcher — anchors on unique lines),
         # or 'difflib' (Python stdlib SequenceMatcher with autojunk).
-        self.diff_algorithm = 'myers'
+        self.diff_algorithm = 'hybrid'
         self.autojunk = True
         self.set_seqs(a, b)
         self.diffmap = []
@@ -355,6 +358,7 @@ class Differ:
                             continue
                 i += 1
 
+        """
         # Pass 3: absorb trivial lines from the edges of an EQUAL block
         # that sits between a REPLACE and the next non-EQUAL block.
         # In difflib opcodes, an EQUAL block can contain multiple lines,
@@ -401,7 +405,9 @@ class Differ:
                     # more trivial lines to absorb
                     continue
             i += 1
-
+        
+        """
+        
         return result
 
     def compare(self):
@@ -411,8 +417,10 @@ class Differ:
         _bm_start = time.perf_counter() if _BENCHMARK else None
 
         self.diffmap = []
-        if self.diff_algorithm == 'myers':
+        if self.diff_algorithm == 'hybrid':
             diff = HybridSequenceMatcher(None, self.a, self.b)
+        elif self.diff_algorithm == 'myers':
+            diff = MyersSequenceMatcher(None, self.a, self.b)
         elif self.diff_algorithm == 'vscode':
             diff = VSCodeSequenceMatcher(None, self.a, self.b)
         elif self.diff_algorithm == 'patience':
