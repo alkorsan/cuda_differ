@@ -325,6 +325,55 @@ class Differ:
                     continue
             i += 1
 
+        # Pass 4: re-align REPLACE blocks that contain lines with exact
+        # matches in other REPLACE blocks. Myers' LCS sometimes matches
+        # a line with a similar (but not equal) line instead of its exact
+        # counterpart. This causes identical lines (like 'def
+        # on_change_slow') to end up in different REPLACE blocks instead
+        # of being matched as EQUAL. We detect this and merge the blocks
+        # so _replace_block can re-diff and find the exact match.
+        # LIMIT: only merge if the intervening blocks total <= 30 lines,
+        # to avoid merging huge sections (which would fall back to
+        # positional pairing and defeat the purpose).
+        i = 0
+        while i < len(result):
+            if result[i][0] != 'replace':
+                i += 1
+                continue
+            _, ri1, ri2, rj1, rj2 = result[i]
+            found_merge = False
+            for ai in range(ri1, ri2):
+                a_line = self.a[ai]
+                a_non_ws = a_line.replace(' ', '').replace('\t', '')
+                a_non_ws = a_non_ws.replace('\n', '').replace('\r', '')
+                if len(a_non_ws) < 5:
+                    continue
+                for k in range(i + 1, len(result)):
+                    if result[k][0] != 'replace':
+                        continue
+                    # Check merge distance: count lines in intervening blocks
+                    intervening = 0
+                    for m in range(i + 1, k):
+                        intervening += max(result[m][2] - result[m][1],
+                                           result[m][4] - result[m][3])
+                    if intervening > 30:
+                        break  # too far, stop searching
+                    _, _, _, kj1, kj2 = result[k]
+                    for bj in range(kj1, kj2):
+                        if self.b[bj] == a_line:
+                            merged = ('replace',
+                                      result[i][1], result[k][2],
+                                      result[i][3], result[k][4])
+                            result[i:k + 1] = [merged]
+                            found_merge = True
+                            break
+                    if found_merge:
+                        break
+                if found_merge:
+                    break
+            if not found_merge:
+                i += 1
+
         return result
 
     def compare(self):
@@ -450,27 +499,57 @@ class Differ:
             return
 
         # Different line counts (da != db): need to find the best alignment.
-        # For large blocks, use positional pairing (fast). For small blocks,
-        # use ratio-based best-pair search directly (no line-level diff
-        # needed — _find_best_pairs handles equal lines via ratio 1.0).
+        # For large blocks, run a line-level Myers diff to find exact-match
+        # anchor points, then use positional pairing for sub-REPLACE blocks.
+        # This is needed for Pass 4 merged blocks (where identical lines
+        # like 'def on_change_slow' need to be re-matched after merging).
+        # For small blocks, use ratio-based best-pair search.
         if da > self._BEST_PAIR_MAX_LINES or db > self._BEST_PAIR_MAX_LINES:
-            common = min(da, db)
-            for k in range(common):
-                ai, bj = alo + k, blo + k
-                if a[ai] == b[bj]:
-                    yield (ALIGN, ai, bj)
-                else:
-                    ops = char_diff(a[ai], b[bj])
-                    yield from self._char_diff_pair(ai, bj, ops)
-                    yield (ALIGN, ai, bj)
-            if da > db:
-                yield (B_GAP, bhi, alo + common, ahi)
-                for y in range(alo + common, ahi):
-                    yield (A_LINE_DEL, y)
-            elif db > da:
-                yield (A_GAP, ahi, blo + common, bhi)
-                for y in range(blo + common, bhi):
-                    yield (B_LINE_ADD, y)
+            # Run line-level diff to find exact matches (anchor points).
+            # Use PatienceSequenceMatcher instead of MyersSequenceMatcher
+            # because patience diff anchors on unique matching lines,
+            # correctly matching identical lines like 'def on_change_slow'
+            # that Myers' LCS might skip in favor of a different LCS of
+            # the same length. This matches Beyond Compare/WinMerge behavior.
+            sub_a = a[alo:ahi]
+            sub_b = b[blo:bhi]
+            matcher = PatienceSequenceMatcher(None, sub_a, sub_b)
+            sub_ops = matcher.get_opcodes()
+            for tag, i1, i2, j1, j2 in sub_ops:
+                abs_i1, abs_i2 = alo + i1, alo + i2
+                abs_j1, abs_j2 = blo + j1, blo + j2
+                if tag == 'equal':
+                    for k in range(i2 - i1):
+                        yield (ALIGN, abs_i1 + k, abs_j1 + k)
+                elif tag == 'delete':
+                    yield (B_GAP, abs_j1, abs_i1, abs_i2)
+                    for y in range(abs_i1, abs_i2):
+                        yield (A_LINE_DEL, y)
+                elif tag == 'insert':
+                    yield (A_GAP, abs_i1, abs_j1, abs_j2)
+                    for y in range(abs_j1, abs_j2):
+                        yield (B_LINE_ADD, y)
+                elif tag == 'replace':
+                    # Sub-REPLACE: positional pairing + char_diff
+                    sub_da = abs_i2 - abs_i1
+                    sub_db = abs_j2 - abs_j1
+                    common = min(sub_da, sub_db)
+                    for k in range(common):
+                        ai, bj = abs_i1 + k, abs_j1 + k
+                        if a[ai] == b[bj]:
+                            yield (ALIGN, ai, bj)
+                        else:
+                            ops = char_diff(a[ai], b[bj])
+                            yield from self._char_diff_pair(ai, bj, ops)
+                            yield (ALIGN, ai, bj)
+                    if sub_da > sub_db:
+                        yield (B_GAP, abs_j2, abs_i1 + common, abs_i2)
+                        for y in range(abs_i1 + common, abs_i2):
+                            yield (A_LINE_DEL, y)
+                    elif sub_db > sub_da:
+                        yield (A_GAP, abs_i2, abs_j1 + common, abs_j2)
+                        for y in range(abs_j1 + common, abs_j2):
+                            yield (B_LINE_ADD, y)
             return
 
         # Small block with da != db: use ratio-based best-pair search
