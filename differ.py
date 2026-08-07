@@ -178,31 +178,43 @@ class Differ:
     # absorbed into a single REPLACE block. The value 4 matches VS Code's
     # removeVeryShortMatchingLinesBetweenDiffs threshold.
     _REALIGN_TRIVIAL_THRESHOLD = 4
+    # Minimum combined size for a REPLACE block to be considered "large
+    # enough" to absorb a short EQUAL block between it and the next
+    # REPLACE. Matches VS Code's
+    # removeVeryShortMatchingLinesBetweenDiffs threshold (line 350):
+    # before.seq1Range.length + before.seq2Range.length > 5
+    _REALIGN_MIN_LARGE_REPLACE = 6
 
     def _realign_opcodes(self, opcodes):
-        """Merge INSERT+EQUAL(trivial)+DELETE (or DELETE+EQUAL(trivial)+INSERT)
-        into a single REPLACE.
+        """Post-process opcodes to match VS Code's alignment quality.
 
-        Myers' O(NP) and difflib's SequenceMatcher both produce LCS-based
-        diffs. When there are multiple valid LCS of the same length, they
-        may pick a different one than VS Code's DP algorithm (which uses
-        equality scoring that prefers longer matches). The most visible
-        symptom: an INSERT+EQUAL+DELETE sequence where the EQUAL block is
-        a trivial line (empty line, whitespace) and the INSERT/DELETE
-        blocks contain meaningful lines that could have been paired.
+        Two transformations (both ported from VS Code's
+        heuristicSequenceOptimizations.ts):
 
-        This method detects that pattern and merges it into a single
-        REPLACE. Then _replace_block pairs lines by position and naturally
-        matches identical lines.
+        1. Merge INSERT+EQUAL(trivial)+DELETE (or DELETE+EQUAL(trivial)+
+           INSERT) into a single REPLACE. This fixes the LCS tie-breaking
+           issue where Myers matches a trivial line (empty, whitespace)
+           instead of a meaningful line, causing identical lines to show
+           as one added + one deleted instead of paired.
 
-        The merge only happens when the EQUAL block is "trivial": its
-        total non-whitespace content is <= _REALIGN_TRIVIAL_THRESHOLD
-        characters. This is a no-op for algorithms that don't produce
-        this pattern (VS Code, patience).
+        2. Absorb short EQUAL blocks (<= 4 non-whitespace chars) between
+           two REPLACE blocks into a single REPLACE, if at least one of
+           the REPLACE blocks is "large" (combined lines > 5). This is
+           VS Code's removeVeryShortMatchingLinesBetweenDiffs (line 325).
+           It prevents Myers from fragmenting a large REPLACE region into
+           multiple pieces by matching short trivial lines (like '\n' or
+           '}') inside it. Without this, A[272] in test_2a.py would be
+           in a separate REPLACE block from the lines around it, causing
+           positional pairing to misalign it with the wrong B line.
+
+        Both are no-ops for VS Code's own algorithm (it doesn't produce
+        these patterns) and for patience (same).
         """
         if len(opcodes) < 3:
             return opcodes
         result = list(opcodes)
+
+        # Pass 1: merge INSERT+EQUAL(trivial)+DELETE patterns
         i = 1
         while i < len(result) - 1:
             prev = result[i - 1]
@@ -225,6 +237,91 @@ class Differ:
                         i -= 1
                     continue
             i += 1
+
+        # Pass 2: absorb short EQUAL blocks between two non-EQUAL blocks
+        # (VS Code's removeVeryShortMatchingLinesBetweenDiffs, line 325).
+        # If a short EQUAL (<= 4 non-whitespace chars) sits between two
+        # non-EQUAL blocks and at least one of them is "large" (> 5
+        # combined lines), join the two non-EQUAL blocks into one REPLACE,
+        # absorbing the EQUAL. Iterate until no more changes (VS Code
+        # repeats up to 10 times).
+        changed = True
+        iterations = 0
+        while changed and iterations < 10:
+            changed = False
+            iterations += 1
+            i = 1
+            while i < len(result) - 1:
+                prev = result[i - 1]
+                cur = result[i]
+                nxt = result[i + 1]
+                if (cur[0] == 'equal' and
+                        prev[0] != 'equal' and
+                        nxt[0] != 'equal'):
+                    _, ei1, ei2, ej1, ej2 = cur
+                    equal_text = ''.join(self.a[ei1:ei2])
+                    non_ws = equal_text.replace(' ', '').replace('\t', '')
+                    non_ws = non_ws.replace('\n', '').replace('\r', '')
+                    if len(non_ws) <= self._REALIGN_TRIVIAL_THRESHOLD:
+                        prev_size = (prev[2] - prev[1]) + (prev[4] - prev[3])
+                        nxt_size = (nxt[2] - nxt[1]) + (nxt[4] - nxt[3])
+                        if prev_size > 5 or nxt_size > 5:
+                            # Join prev and nxt into one REPLACE,
+                            # absorbing the EQUAL
+                            merged = ('replace',
+                                      prev[1], nxt[2],
+                                      prev[3], nxt[4])
+                            result[i - 1:i + 2] = [merged]
+                            changed = True
+                            if i > 1:
+                                i -= 1
+                            continue
+                i += 1
+
+        # Pass 3: absorb trivial lines from the edges of an EQUAL block
+        # that sits between a REPLACE and the next non-EQUAL block.
+        # In difflib opcodes, an EQUAL block can contain multiple lines,
+        # some trivial (e.g. '}', '\n') and some meaningful (e.g.
+        # 'self._save_state(state)'). VS Code's algorithm works on
+        # changed regions only, so it treats the gap as one unit and
+        # absorbs it if the total non-ws is <= 4. We need to be smarter:
+        # split the EQUAL block and absorb only the trivial prefix/suffix
+        # lines, keeping the meaningful middle as EQUAL.
+        #
+        # Example: EQUAL = ['}', 'self._save_state(state)']
+        #   non_ws = '}self._save_state(state)' = 25 chars (> 4, not trivial)
+        #   But the first line '}' is trivial (1 non-ws char).
+        #   We split into: absorb '}' into prev REPLACE, keep
+        #   'self._save_state(state)' as EQUAL.
+        i = 1
+        while i < len(result):
+            prev = result[i - 1]
+            cur = result[i]
+            if cur[0] == 'equal' and prev[0] == 'replace':
+                _, ei1, ei2, ej1, ej2 = cur
+                prev_size = (prev[2] - prev[1]) + (prev[4] - prev[3])
+                if prev_size <= 5:
+                    i += 1
+                    continue
+                # Check if the first line of the EQUAL block is trivial
+                if ei2 - ei1 == 0:
+                    i += 1
+                    continue
+                first_line = self.a[ei1]
+                first_non_ws = first_line.replace(' ', '').replace('\t', '')
+                first_non_ws = first_non_ws.replace('\n', '').replace('\r', '')
+                if len(first_non_ws) <= self._REALIGN_TRIVIAL_THRESHOLD:
+                    # Absorb the first line into the prev REPLACE
+                    merged = ('replace',
+                              prev[1], ei1 + 1,
+                              prev[3], ej1 + 1)
+                    remaining = ('equal', ei1 + 1, ei2, ej1 + 1, ej2)
+                    result[i - 1:i + 1] = [merged, remaining]
+                    # Don't advance i -- the remaining EQUAL might have
+                    # more trivial lines to absorb
+                    continue
+            i += 1
+
         return result
 
     def compare(self):
