@@ -325,16 +325,35 @@ class Differ:
                     continue
             i += 1
 
-        # Pass 4: re-align REPLACE blocks that contain lines with exact
-        # matches in other REPLACE blocks. Myers' LCS sometimes matches
-        # a line with a similar (but not equal) line instead of its exact
-        # counterpart. This causes identical lines (like 'def
-        # on_change_slow') to end up in different REPLACE blocks instead
-        # of being matched as EQUAL. We detect this and merge the blocks
+        # Pass 4: re-align REPLACE blocks that contain UNIQUE lines with
+        # exact matches in other REPLACE blocks. Myers' LCS sometimes
+        # matches a unique line with a similar (but not equal) line
+        # instead of its exact counterpart, when both are valid LCS
+        # choices. We detect this by checking if any line in a REPLACE
+        # block is unique in both self.a and self.b AND has an exact
+        # match in a later REPLACE block. If so, we merge the blocks
         # so _replace_block can re-diff and find the exact match.
-        # LIMIT: only merge if the intervening blocks total <= 30 lines,
-        # to avoid merging huge sections (which would fall back to
-        # positional pairing and defeat the purpose).
+        #
+        # Unlike the previous hack (which used "intervening > 30" and
+        # checked any line >= 5 chars), this only triggers for lines
+        # that are UNIQUE in both files — the same condition patience
+        # diff uses for anchoring. This is principled: unique lines
+        # have exactly one possible match, so if Myers didn't match
+        # them, it made a suboptimal LCS choice.
+        #
+        # No distance limit: unique lines should always be matched,
+        # regardless of how far apart they are.
+        # Precompute line counts for efficiency (avoids O(N) count()
+        # calls inside the loop, making this O(N) instead of O(N²)).
+        from collections import Counter
+        a_counts = Counter(self.a)
+        b_counts = Counter(self.b)
+        # Precompute index of unique lines in b for O(1) lookup
+        b_index = {}
+        for idx, line in enumerate(self.b):
+            if b_counts.get(line, 0) == 1:
+                b_index[line] = idx
+
         i = 0
         while i < len(result):
             if result[i][0] != 'replace':
@@ -344,30 +363,34 @@ class Differ:
             found_merge = False
             for ai in range(ri1, ri2):
                 a_line = self.a[ai]
+                # Skip trivial lines
                 a_non_ws = a_line.replace(' ', '').replace('\t', '')
                 a_non_ws = a_non_ws.replace('\n', '').replace('\r', '')
                 if len(a_non_ws) < 5:
                     continue
+                # Check if this line is UNIQUE in self.a and self.b
+                # (using precomputed counts — O(1) lookup)
+                if a_counts.get(a_line, 0) != 1:
+                    continue
+                if b_counts.get(a_line, 0) != 1:
+                    continue
+                # Find the exact match position in self.b
+                # (O(1) using precomputed index)
+                bj = b_index.get(a_line)
+                if bj is None:
+                    continue
+                # Check if bj is in a LATER REPLACE block
                 for k in range(i + 1, len(result)):
                     if result[k][0] != 'replace':
                         continue
-                    # Check merge distance: count lines in intervening blocks
-                    intervening = 0
-                    for m in range(i + 1, k):
-                        intervening += max(result[m][2] - result[m][1],
-                                           result[m][4] - result[m][3])
-                    if intervening > 30:
-                        break  # too far, stop searching
                     _, _, _, kj1, kj2 = result[k]
-                    for bj in range(kj1, kj2):
-                        if self.b[bj] == a_line:
-                            merged = ('replace',
-                                      result[i][1], result[k][2],
-                                      result[i][3], result[k][4])
-                            result[i:k + 1] = [merged]
-                            found_merge = True
-                            break
-                    if found_merge:
+                    if kj1 <= bj < kj2:
+                        # Found! Merge blocks i through k
+                        merged = ('replace',
+                                  result[i][1], result[k][2],
+                                  result[i][3], result[k][4])
+                        result[i:k + 1] = [merged]
+                        found_merge = True
                         break
                 if found_merge:
                     break
@@ -498,76 +521,15 @@ class Differ:
                     yield (ALIGN, ai, bj)
             return
 
-        # Different line counts (da != db): need to find the best alignment.
-        # For large blocks, run a line-level Myers diff to find exact-match
-        # anchor points, then use positional pairing for sub-REPLACE blocks.
-        # This is needed for Pass 4 merged blocks (where identical lines
-        # like 'def on_change_slow' need to be re-matched after merging).
-        # For small blocks, use ratio-based best-pair search.
-        if da > self._BEST_PAIR_MAX_LINES or db > self._BEST_PAIR_MAX_LINES:
-            # Run line-level diff to find exact matches (anchor points).
-            # Use PatienceSequenceMatcher instead of MyersSequenceMatcher
-            # because patience diff anchors on unique matching lines,
-            # correctly matching identical lines like 'def on_change_slow'
-            # that Myers' LCS might skip in favor of a different LCS of
-            # the same length. This matches Beyond Compare/WinMerge behavior.
-            sub_a = a[alo:ahi]
-            sub_b = b[blo:bhi]
-            matcher = PatienceSequenceMatcher(None, sub_a, sub_b)
-            sub_ops = matcher.get_opcodes()
-            for tag, i1, i2, j1, j2 in sub_ops:
-                abs_i1, abs_i2 = alo + i1, alo + i2
-                abs_j1, abs_j2 = blo + j1, blo + j2
-                if tag == 'equal':
-                    for k in range(i2 - i1):
-                        yield (ALIGN, abs_i1 + k, abs_j1 + k)
-                elif tag == 'delete':
-                    yield (B_GAP, abs_j1, abs_i1, abs_i2)
-                    for y in range(abs_i1, abs_i2):
-                        yield (A_LINE_DEL, y)
-                elif tag == 'insert':
-                    yield (A_GAP, abs_i1, abs_j1, abs_j2)
-                    for y in range(abs_j1, abs_j2):
-                        yield (B_LINE_ADD, y)
-                elif tag == 'replace':
-                    # Sub-REPLACE: positional pairing + char_diff
-                    sub_da = abs_i2 - abs_i1
-                    sub_db = abs_j2 - abs_j1
-                    common = min(sub_da, sub_db)
-                    for k in range(common):
-                        ai, bj = abs_i1 + k, abs_j1 + k
-                        if a[ai] == b[bj]:
-                            yield (ALIGN, ai, bj)
-                        else:
-                            ops = char_diff(a[ai], b[bj])
-                            yield from self._char_diff_pair(ai, bj, ops)
-                            yield (ALIGN, ai, bj)
-                    if sub_da > sub_db:
-                        yield (B_GAP, abs_j2, abs_i1 + common, abs_i2)
-                        for y in range(abs_i1 + common, abs_i2):
-                            yield (A_LINE_DEL, y)
-                    elif sub_db > sub_da:
-                        yield (A_GAP, abs_i2, abs_j1 + common, abs_j2)
-                        for y in range(abs_j1 + common, abs_j2):
-                            yield (B_LINE_ADD, y)
-            return
-
-        # Small block with da != db: use ratio-based best-pair search
-        # directly. _find_best_pairs finds the best-matching pair by
-        # char-level ratio (exact matches get ratio 1.0 and are paired
-        # first), then recurses on the parts before and after. This
-        # aligns similar (but not equal) lines like VS Code does, and
-        # correctly pairs identical lines (like 'delete-only') without
-        # needing a separate line-level diff + _realign_opcodes pass.
+        # Different line counts (da != db): use _find_best_pairs which
+        # finds the best-matching pair by char-level similarity (exact
+        # matches first, then prefix/suffix ratio), then recurses.
+        # _find_best_pairs is efficient because:
+        # - The first pass scans for unique exact matches (O(N*M) worst
+        #   case but short-circuits on first match; in practice most
+        #   blocks have few or no unique matches)
+        # - The prefix/suffix search only runs if no exact match found
         yield from self._find_best_pairs(a, alo, ahi, b, blo, bhi)
-
-    # Maximum lines per side for the ratio-based best-pair search.
-    # Blocks larger than this use positional pairing (fast). The value
-    # 20 means typical code diffs (1-20 lines per REPLACE block) get
-    # high-quality char-level alignment, while large minified/data files
-    # get fast positional pairing. At 20 lines per side, the worst case
-    # is 20*20=400 difflib.ratio() calls per block (C-optimized, ~0.4ms).
-    _BEST_PAIR_MAX_LINES = 20
 
     def _find_best_pairs(self, a, alo, ahi, b, blo, bhi):
         """Find the best line alignment within a sub-REPLACE block.
@@ -604,74 +566,102 @@ class Differ:
                     yield (A_LINE_DEL, y)
             return
 
-        # Size guard: large blocks use positional pairing
-        if da > self._BEST_PAIR_MAX_LINES or db > self._BEST_PAIR_MAX_LINES:
-            common = min(da, db)
-            for k in range(common):
-                ai, bj = alo + k, blo + k
-                if a[ai] == b[bj]:
-                    yield (ALIGN, ai, bj)
-                else:
-                    ops = char_diff(a[ai], b[bj])
-                    yield from self._char_diff_pair(ai, bj, ops)
-                    yield (ALIGN, ai, bj)
-            if da > db:
-                yield (B_GAP, bhi, alo + common, ahi)
-                for y in range(alo + common, ahi):
-                    yield (A_LINE_DEL, y)
-            elif db > da:
-                yield (A_GAP, ahi, blo + common, bhi)
-                for y in range(blo + common, bhi):
-                    yield (B_LINE_ADD, y)
-            return
-
         # Find the best-matching pair by char-level similarity.
-        # Use common-prefix length as the primary metric (fast O(N) per
-        # pair, and accurately identifies lines that share a long prefix
-        # — the common case in code diffs where a line is slightly
-        # modified). Break ties with common-suffix length, then total
-        # matching chars (real_quick_ratio). This avoids the expensive
-        # difflib.ratio() call (which uses find_longest_match and takes
-        # ~0.3ms per pair, adding ~30s on a 33k-line file).
+        # Strategy: find ALL unique exact matches first, then pick the
+        # LONGEST one as the anchor (longer lines are more specific and
+        # better anchors — 'def on_change_slow(self, ed_self):' is a
+        # better anchor than 'else:'). If no unique exact match, fall
+        # back to prefix/suffix ratio search.
         best_score = -1
         best_prefix = 0
         best_i, best_j = alo, blo
-        max_prefix_any = 0  # track the max prefix across ALL pairs
+        max_prefix_any = 0
+
+        # First pass: find all unique exact matches and pick the longest.
+        # Use a dict-based approach for O(N+M) instead of O(N*M):
+        # build a map of unique lines in a[alo:ahi], then scan b[blo:bhi].
+        from collections import Counter
+        sub_a_counts = Counter(a[alo:ahi])
+        sub_b_counts = Counter(b[blo:bhi])
+        best_exact_len = 0
+        best_exact_i, best_exact_j = -1, -1
+        # Build index of unique lines in sub_a
+        sub_a_unique = {}
+        for i in range(alo, ahi):
+            line = a[i]
+            if sub_a_counts.get(line, 0) == 1 and line not in sub_a_unique:
+                non_ws = line.replace(' ', '').replace('\t', '')
+                non_ws = non_ws.replace('\n', '').replace('\r', '')
+                if len(non_ws) >= 3:
+                    sub_a_unique[line] = i
+        # Scan sub_b for matches
         for j in range(blo, bhi):
-            bj_line = b[j]
-            for i in range(alo, ahi):
-                ai_line = a[i]
-                if ai_line == bj_line:
-                    # Exact match -- use it immediately
-                    best_i, best_j, best_score = i, j, 1000000
-                    best_prefix = 1000000
-                    max_prefix_any = 1000000
-                    break
-                # Common prefix length
-                min_len = min(len(ai_line), len(bj_line))
-                prefix = 0
-                while prefix < min_len and ai_line[prefix] == bj_line[prefix]:
-                    prefix += 1
-                if prefix > max_prefix_any:
-                    max_prefix_any = prefix
-                # Common suffix length (only if there's a mismatch)
-                if prefix < min_len:
-                    suffix = 0
-                    while (suffix < min_len - prefix and
-                           ai_line[len(ai_line)-1-suffix] == bj_line[len(bj_line)-1-suffix]):
-                        suffix += 1
-                else:
-                    suffix = min(len(ai_line), len(bj_line)) - prefix
-                # Score: prefix is most important (lines starting the same
-                # are likely the "same" line), then suffix, then total.
-                # Scale prefix heavily to prefer long-prefix matches.
-                score = prefix * 100 + suffix
-                if score > best_score:
-                    best_score, best_i, best_j = score, i, j
-                    best_prefix = prefix
-            else:
-                continue
-            break  # found exact match
+            line = b[j]
+            if sub_b_counts.get(line, 0) == 1 and line in sub_a_unique:
+                if len(line) > best_exact_len:
+                    best_exact_len = len(line)
+                    best_exact_i = sub_a_unique[line]
+                    best_exact_j = j
+
+        if best_exact_i >= 0:
+            # Use the longest unique exact match as anchor
+            best_i, best_j = best_exact_i, best_exact_j
+            best_score = 1000000
+            best_prefix = 1000000
+            max_prefix_any = 1000000
+        else:
+            # No unique exact match — use prefix/suffix ratio search.
+            # For large blocks, this O(N*M) search is too slow, so fall
+            # back to positional pairing. The exact-match pass above
+            # already handles the important case (unique lines).
+            if (ahi - alo) > 50 or (bhi - blo) > 50:
+                # Positional pairing for large blocks without unique matches
+                common = min(ahi - alo, bhi - blo)
+                for k in range(common):
+                    ai, bj = alo + k, blo + k
+                    if a[ai] == b[bj]:
+                        yield (ALIGN, ai, bj)
+                    else:
+                        ops = char_diff(a[ai], b[bj])
+                        yield from self._char_diff_pair(ai, bj, ops)
+                        yield (ALIGN, ai, bj)
+                if (ahi - alo) > (bhi - blo):
+                    yield (B_GAP, bhi, alo + common, ahi)
+                    for y in range(alo + common, ahi):
+                        yield (A_LINE_DEL, y)
+                elif (bhi - blo) > (ahi - alo):
+                    yield (A_GAP, ahi, blo + common, bhi)
+                    for y in range(blo + common, bhi):
+                        yield (B_LINE_ADD, y)
+                return
+            for j in range(blo, bhi):
+                bj_line = b[j]
+                for i in range(alo, ahi):
+                    ai_line = a[i]
+                    if ai_line == bj_line:
+                        continue  # skip exact matches (already checked)
+                    # Common prefix length
+                    min_len = min(len(ai_line), len(bj_line))
+                    prefix = 0
+                    while prefix < min_len and ai_line[prefix] == bj_line[prefix]:
+                        prefix += 1
+                    if prefix > max_prefix_any:
+                        max_prefix_any = prefix
+                    # Common suffix length (only if there's a mismatch)
+                    if prefix < min_len:
+                        suffix = 0
+                        while (suffix < min_len - prefix and
+                               ai_line[len(ai_line)-1-suffix] == bj_line[len(bj_line)-1-suffix]):
+                            suffix += 1
+                    else:
+                        suffix = min(len(ai_line), len(bj_line)) - prefix
+                    # Score: prefix is most important (lines starting the same
+                    # are likely the "same" line), then suffix, then total.
+                    # Scale prefix heavily to prefer long-prefix matches.
+                    score = prefix * 100 + suffix
+                    if score > best_score:
+                        best_score, best_i, best_j = score, i, j
+                        best_prefix = prefix
 
         # Minimum similarity threshold: only pair lines if the BEST pair
         # shares a meaningful common prefix (>= 3 chars). This matches VS
