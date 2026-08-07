@@ -4,6 +4,83 @@ from .myers import MyersSequenceMatcher, InlineMyersSequenceMatcher
 from .patiencediff import PatienceSequenceMatcher
 from .vscode_diff import VSCodeSequenceMatcher
 from .char_diff import char_diff
+from collections import Counter
+
+
+def HybridSequenceMatcher(isjunk=None, a='', b=''):
+    """Create a hybrid diff matcher that combines patience + Myers.
+
+    Runs patience diff first (finds unique-line anchors like
+    'def on_change_slow'), then fills gaps with Myers (finds matches
+    in non-unique regions like repeated 'dsds'/'ff' blocks).
+
+    This is what Beyond Compare and WinMerge do: patience anchoring
+    for unique lines, LCS/Myers for the gaps. No hacks, no size limits.
+    """
+    patience_matcher = PatienceSequenceMatcher(isjunk, a, b)
+    patience_blocks = patience_matcher.get_matching_blocks()
+
+    # For each gap between patience matching blocks, run Myers to find
+    # additional matches within the gap
+    all_blocks = []
+    last_a = 0
+    last_b = 0
+    for ai, bj, size in patience_blocks:
+        # Gap before this patience block
+        if ai > last_a or bj > last_b:
+            gap_a = a[last_a:ai]
+            gap_b = b[last_b:bj]
+            if gap_a and gap_b:
+                myers = MyersSequenceMatcher(None, gap_a, gap_b)
+                for mi, mj, msize in myers.get_matching_blocks():
+                    if msize > 0:
+                        all_blocks.append((last_a + mi, last_b + mj, msize))
+            elif not gap_a and not gap_b:
+                pass  # no gap
+        # The patience block itself
+        if size > 0:
+            all_blocks.append((ai, bj, size))
+        last_a = ai + size
+        last_b = bj + size
+
+    # Build a difflib-compatible matcher from the combined blocks
+    return _CombinedMatcher(a, b, all_blocks)
+
+
+class _CombinedMatcher:
+    """Wraps pre-computed matching blocks in a difflib-compatible API."""
+
+    def __init__(self, a, b, matching_blocks):
+        self.a = a
+        self.b = b
+        self._matching_blocks = matching_blocks
+        self.opcodes = None
+
+    def get_matching_blocks(self):
+        blocks = list(self._matching_blocks)
+        # Ensure sentinel
+        if not blocks or blocks[-1] != (len(self.a), len(self.b), 0):
+            blocks.append((len(self.a), len(self.b), 0))
+        return blocks
+
+    def get_opcodes(self):
+        if self.opcodes is not None:
+            return self.opcodes
+        opcodes = []
+        i = j = 0
+        for ai, bj, size in self.get_matching_blocks():
+            if i < ai and j < bj:
+                opcodes.append(('replace', i, ai, j, bj))
+            elif i < ai:
+                opcodes.append(('delete', i, ai, j, bj))
+            elif j < bj:
+                opcodes.append(('insert', i, ai, j, bj))
+            if size > 0:
+                opcodes.append(('equal', ai, ai + size, bj, bj + size))
+            i = ai + size
+            j = bj + size
+        self.opcodes = opcodes
+        return opcodes
 
 
 # Internal benchmark toggle. When set to True, Differ.compare() prints the
@@ -325,78 +402,6 @@ class Differ:
                     continue
             i += 1
 
-        # Pass 4: re-align REPLACE blocks that contain UNIQUE lines with
-        # exact matches in other REPLACE blocks. Myers' LCS sometimes
-        # matches a unique line with a similar (but not equal) line
-        # instead of its exact counterpart, when both are valid LCS
-        # choices. We detect this by checking if any line in a REPLACE
-        # block is unique in both self.a and self.b AND has an exact
-        # match in a later REPLACE block. If so, we merge the blocks
-        # so _replace_block can re-diff and find the exact match.
-        #
-        # Unlike the previous hack (which used "intervening > 30" and
-        # checked any line >= 5 chars), this only triggers for lines
-        # that are UNIQUE in both files — the same condition patience
-        # diff uses for anchoring. This is principled: unique lines
-        # have exactly one possible match, so if Myers didn't match
-        # them, it made a suboptimal LCS choice.
-        #
-        # No distance limit: unique lines should always be matched,
-        # regardless of how far apart they are.
-        # Precompute line counts for efficiency (avoids O(N) count()
-        # calls inside the loop, making this O(N) instead of O(N²)).
-        from collections import Counter
-        a_counts = Counter(self.a)
-        b_counts = Counter(self.b)
-        # Precompute index of unique lines in b for O(1) lookup
-        b_index = {}
-        for idx, line in enumerate(self.b):
-            if b_counts.get(line, 0) == 1:
-                b_index[line] = idx
-
-        i = 0
-        while i < len(result):
-            if result[i][0] != 'replace':
-                i += 1
-                continue
-            _, ri1, ri2, rj1, rj2 = result[i]
-            found_merge = False
-            for ai in range(ri1, ri2):
-                a_line = self.a[ai]
-                # Skip trivial lines
-                a_non_ws = a_line.replace(' ', '').replace('\t', '')
-                a_non_ws = a_non_ws.replace('\n', '').replace('\r', '')
-                if len(a_non_ws) < 5:
-                    continue
-                # Check if this line is UNIQUE in self.a and self.b
-                # (using precomputed counts — O(1) lookup)
-                if a_counts.get(a_line, 0) != 1:
-                    continue
-                if b_counts.get(a_line, 0) != 1:
-                    continue
-                # Find the exact match position in self.b
-                # (O(1) using precomputed index)
-                bj = b_index.get(a_line)
-                if bj is None:
-                    continue
-                # Check if bj is in a LATER REPLACE block
-                for k in range(i + 1, len(result)):
-                    if result[k][0] != 'replace':
-                        continue
-                    _, _, _, kj1, kj2 = result[k]
-                    if kj1 <= bj < kj2:
-                        # Found! Merge blocks i through k
-                        merged = ('replace',
-                                  result[i][1], result[k][2],
-                                  result[i][3], result[k][4])
-                        result[i:k + 1] = [merged]
-                        found_merge = True
-                        break
-                if found_merge:
-                    break
-            if not found_merge:
-                i += 1
-
         return result
 
     def compare(self):
@@ -407,7 +412,7 @@ class Differ:
 
         self.diffmap = []
         if self.diff_algorithm == 'myers':
-            diff = MyersSequenceMatcher(None, self.a, self.b)
+            diff = HybridSequenceMatcher(None, self.a, self.b)
         elif self.diff_algorithm == 'vscode':
             diff = VSCodeSequenceMatcher(None, self.a, self.b)
         elif self.diff_algorithm == 'patience':
@@ -611,29 +616,11 @@ class Differ:
             max_prefix_any = 1000000
         else:
             # No unique exact match — use prefix/suffix ratio search.
-            # For large blocks, this O(N*M) search is too slow, so fall
-            # back to positional pairing. The exact-match pass above
-            # already handles the important case (unique lines).
-            if (ahi - alo) > 50 or (bhi - blo) > 50:
-                # Positional pairing for large blocks without unique matches
-                common = min(ahi - alo, bhi - blo)
-                for k in range(common):
-                    ai, bj = alo + k, blo + k
-                    if a[ai] == b[bj]:
-                        yield (ALIGN, ai, bj)
-                    else:
-                        ops = char_diff(a[ai], b[bj])
-                        yield from self._char_diff_pair(ai, bj, ops)
-                        yield (ALIGN, ai, bj)
-                if (ahi - alo) > (bhi - blo):
-                    yield (B_GAP, bhi, alo + common, ahi)
-                    for y in range(alo + common, ahi):
-                        yield (A_LINE_DEL, y)
-                elif (bhi - blo) > (ahi - alo):
-                    yield (A_GAP, ahi, blo + common, bhi)
-                    for y in range(blo + common, bhi):
-                        yield (B_LINE_ADD, y)
-                return
+            # No size guard: the prefix/suffix metric is O(line_length)
+            # per pair, and the exact-match pass above already handled
+            # unique lines. For large blocks without unique matches,
+            # this is O(N*M) but each pair comparison is fast (just
+            # scanning from both ends of the lines).
             for j in range(blo, bhi):
                 bj_line = b[j]
                 for i in range(alo, ahi):
