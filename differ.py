@@ -555,7 +555,9 @@ class Differ:
         # difflib.ratio() call (which uses find_longest_match and takes
         # ~0.3ms per pair, adding ~30s on a 33k-line file).
         best_score = -1
+        best_prefix = 0
         best_i, best_j = alo, blo
+        max_prefix_any = 0  # track the max prefix across ALL pairs
         for j in range(blo, bhi):
             bj_line = b[j]
             for i in range(alo, ahi):
@@ -563,12 +565,16 @@ class Differ:
                 if ai_line == bj_line:
                     # Exact match -- use it immediately
                     best_i, best_j, best_score = i, j, 1000000
+                    best_prefix = 1000000
+                    max_prefix_any = 1000000
                     break
                 # Common prefix length
                 min_len = min(len(ai_line), len(bj_line))
                 prefix = 0
                 while prefix < min_len and ai_line[prefix] == bj_line[prefix]:
                     prefix += 1
+                if prefix > max_prefix_any:
+                    max_prefix_any = prefix
                 # Common suffix length (only if there's a mismatch)
                 if prefix < min_len:
                     suffix = 0
@@ -583,9 +589,59 @@ class Differ:
                 score = prefix * 100 + suffix
                 if score > best_score:
                     best_score, best_i, best_j = score, i, j
+                    best_prefix = prefix
             else:
                 continue
             break  # found exact match
+
+        # Minimum similarity threshold: only pair lines if the BEST pair
+        # shares a meaningful common prefix (>= 3 chars). This matches VS
+        # Code's behavior — VS Code does NOT pair completely different
+        # lines (like 'dsds' vs '\n' or 'ff' vs 'ss'); it shows them
+        # as separate delete + add. Without this threshold, the diff
+        # looks confusing because unrelated lines get marked as "changed"
+        # (orange/yellow) instead of separate red+green.
+        # The threshold of 3 means: '"""Register' (9 common chars) pairs,
+        # but 'dsds' vs '\n' (0 common chars) does NOT pair.
+        # Exception: if the block is 1xN or Nx1 (one side has a single
+        # line), pair positionally ONLY if the opposing first line is
+        # non-trivial (has >= 3 non-whitespace chars). This matches VS
+        # Code: it pairs 'dsds' with 'ggg' (both non-trivial) but shows
+        # 'dsds' as deleted when the opposing side starts with '\n'.
+        if best_prefix < 3 and best_prefix != 1000000:
+            if da == 1 or db == 1:
+                # Single-line block: check if the opposing first line
+                # is non-trivial (>= 3 non-ws chars)
+                if da == 1 and db >= 1:
+                    opp_line = b[blo]
+                elif db == 1 and da >= 1:
+                    opp_line = a[alo]
+                else:
+                    opp_line = ''
+                opp_non_ws = opp_line.replace(' ', '').replace('\t', '')
+                opp_non_ws = opp_non_ws.replace('\n', '').replace('\r', '')
+                if len(opp_non_ws) >= 3:
+                    # Non-trivial opposing line: pair positionally
+                    pass
+                else:
+                    # Trivial opposing line: show as delete + add
+                    for i in range(alo, ahi):
+                        yield (B_GAP, blo, i, i + 1)
+                        yield (A_LINE_DEL, i)
+                    for j in range(blo, bhi):
+                        yield (A_GAP, ahi, j, j + 1)
+                        yield (B_LINE_ADD, j)
+                    return
+            else:
+                # Multi-line block with no good match: show all as
+                # separate delete + add
+                for i in range(alo, ahi):
+                    yield (B_GAP, blo, i, i + 1)
+                    yield (A_LINE_DEL, i)
+                for j in range(blo, bhi):
+                    yield (A_GAP, ahi, j, j + 1)
+                    yield (B_LINE_ADD, j)
+                return
 
         # Recurse on the part before the best pair
         yield from self._find_best_pairs(a, alo, best_i, b, blo, best_j)
