@@ -6,6 +6,107 @@ from .vscode_diff import VSCodeSequenceMatcher
 from .char_diff import char_diff
 from collections import Counter
 
+try:
+    import cudatext as _ct
+    _HAS_NATIVE_DIFF = hasattr(_ct, 'diff_proc')
+except ImportError:
+    _HAS_NATIVE_DIFF = False
+
+
+class CudaDiffNativeMatcher:
+    """Difflib-compatible wrapper around cudatext.diff_proc().
+
+    Calls the native Free Pascal diff engine (Myers or Histogram, ported
+    from JGit) exposed at cudatext.diff_proc(). The native engine is
+    dramatically faster than any of the pure-Python matchers on large
+    files (10-30x speedup is typical).
+
+    This class exposes the same minimal interface Differ.compare() uses
+    from the other matchers: get_opcodes() returning a list of
+    (tag, i1, i2, j1, j2) tuples with tag in
+    {'equal', 'delete', 'insert', 'replace'}.
+
+    The native API takes two LF-joined strings and returns exactly that
+    opcode format, so this wrapper is essentially a type adapter:
+    list-of-lines -> LF-joined-string -> native call -> opcodes.
+
+    NOTE: cudatext.diff_proc expects strings with line terminators
+    attached (keepends=True). The plugin already stores sequences that
+    way (see __init__.py: splitlines(True)), so we just join with ''.
+    """
+
+    # Algorithm IDs defined in CudaText's proc_py_const.pas.
+    # Mirrored here so the plugin does not depend on the constants being
+    # exported through the cudatext Python module at import time (older
+    # CudaText builds do not have them).
+    _ALGO_MYERS = 0
+    _ALGO_HISTOGRAM = 1
+
+    def __init__(self, isjunk=None, a='', b='', algo=1):
+        """Create a native diff matcher.
+
+        Args:
+            isjunk: ignored (kept for difflib API compatibility; the
+                native engine does not support junk heuristics).
+            a, b: sequences of lines (list of str, each with its line
+                terminator attached -- i.e. keepends=True).
+            algo: CudaDiffNativeMatcher._ALGO_MYERS (0) or
+                  CudaDiffNativeMatcher._ALGO_HISTOGRAM (1, default).
+        """
+        self.a = a
+        self.b = b
+        self._algo = algo
+        self.opcodes = None
+
+    def get_matching_blocks(self):
+        """Return list of (i, j, n) matching blocks, difflib-style.
+
+        Derived from get_opcodes() -- equal runs become matching blocks,
+        with a sentinel (len(a), len(b), 0) at the end.
+        """
+        blocks = []
+        for tag, i1, i2, j1, j2 in self.get_opcodes():
+            if tag == 'equal':
+                blocks.append((i1, j1, i2 - i1))
+        blocks.append((len(self.a), len(self.b), 0))
+        return blocks
+
+    def get_opcodes(self):
+        """Return difflib-compatible opcodes by calling cudatext.diff_proc.
+
+        Returns:
+            list of (tag, i1, i2, j1, j2) tuples where tag is a lowercase
+            string. Identical in format to difflib.SequenceMatcher.get_opcodes().
+        """
+        if self.opcodes is not None:
+            return self.opcodes
+        # diff_proc(id, param1, param2, algo, flags, cancel)
+        #   id = DIF_TEXTS (1)
+        #   param1, param2 = LF-separated strings
+        #   algo = 0 (Myers) or 1 (Histogram)
+        #   flags = 0 (no ignore flags; ignore options are not wired yet)
+        #   cancel = None (cancellation not wired yet)
+        # Returns: list of (tag, i1, i2, j1, j2) tuples.
+        text_a = ''.join(self.a)
+        text_b = ''.join(self.b)
+        result = _ct.diff_proc(
+            1,                       # DIF_TEXTS
+            text_a,
+            text_b,
+            self._algo,
+            0,                       # flags: DIFF_IGN_NONE
+            None,                    # cancel callback: none
+        )
+        # The native API returns None when cancelled; without a cancel
+        # callback this cannot happen, but be defensive.
+        if result is None:
+            # Fall back to a single REPLACE covering everything so the
+            # caller's opcode-walking loop still produces sensible output
+            # (everything painted as changed) instead of crashing.
+            result = [('replace', 0, len(self.a), 0, len(self.b))]
+        self.opcodes = result
+        return result
+
 
 def HybridSequenceMatcher(isjunk=None, a='', b=''):
     """Create a hybrid diff matcher that combines patience + Myers.
@@ -233,17 +334,39 @@ class Differ:
     """
     def __init__(self, a='', b=''):
         self.withdetail = True
-        # 'hybrid'   (HybridSequenceMatcher — patience anchoring on
-        #             unique lines + Myers for the gaps; default,
-        #             best quality for both unique and duplicated lines),
-        # 'myers'   (MyersSequenceMatcher — O(NP) Wu/Manber/Myers/Miller
-        #            1989 with common prefix/suffix trimming and a
-        #            non-matching-line discard preprocessing pass),
-        # 'vscode'  (VS Code-style DP/Myers diff with equality scoring —
-        #            best quality for duplicated-line files, slowest),
-        # 'patience' (PatienceSequenceMatcher — anchors on unique lines),
-        # or 'difflib' (Python stdlib SequenceMatcher with autojunk).
-        self.diff_algorithm = 'hybrid'
+        # Algorithm key stored in self.diff_algorithm. One of:
+        #
+        #   'native_histogram' (CudaDiffNativeMatcher with Histogram algo —
+        #                       native Pascal port of JGit HistogramDiff;
+        #                       patience-like anchoring on unique lines with
+        #                       graceful fallback when no unique lines exist;
+        #                       fast and high-quality; recommended default),
+        #   'native_myers'    (CudaDiffNativeMatcher with Myers algo —
+        #                       native Pascal port of JGit MyersDiff;
+        #                       linear-space middle-snake Myers; the
+        #                       algorithm git uses for `git diff --myers`),
+        #   'hybrid'          (HybridSequenceMatcher — pure-Python patience
+        #                       anchoring on unique lines + Myers for the
+        #                       gaps; best pure-Python quality),
+        #   'myers'           (MyersSequenceMatcher — pure-Python O(NP)
+        #                       Wu/Manber/Myers/Miller 1989 with common
+        #                       prefix/suffix trimming and a
+        #                       non-matching-line discard preprocessing pass),
+        #   'vscode'          (VSCodeSequenceMatcher — pure-Python VS Code-
+        #                       style DP/Myers with equality scoring;
+        #                       slowest, best quality for duplicated-line
+        #                       files),
+        #   'patience'        (PatienceSequenceMatcher — pure-Python
+        #                       patience diff; anchors on unique lines),
+        #   'difflib'         (Python stdlib SequenceMatcher with autojunk).
+        #
+        # The 'native_*' keys call into the built-in cudatext.diff_proc()
+        # API and run in compiled Pascal code. They are typically 10-30x
+        # faster than their pure-Python equivalents on large files.
+        # The other keys are pure-Python implementations kept as fallbacks
+        # (useful when running on a CudaText build that does not yet have
+        # the native diff_proc API, or for algorithm quality comparison).
+        self.diff_algorithm = 'native_histogram'
         self.autojunk = True
         self.set_seqs(a, b)
         self.diffmap = []
@@ -417,7 +540,19 @@ class Differ:
         _bm_start = time.perf_counter() if _BENCHMARK else None
 
         self.diffmap = []
-        if self.diff_algorithm == 'hybrid':
+        if self.diff_algorithm == 'native_histogram':
+            if not _HAS_NATIVE_DIFF:
+                diff = HybridSequenceMatcher(None, self.a, self.b)
+            else:
+                diff = CudaDiffNativeMatcher(
+                    None, self.a, self.b, algo=CudaDiffNativeMatcher._ALGO_HISTOGRAM)
+        elif self.diff_algorithm == 'native_myers':
+            if not _HAS_NATIVE_DIFF:
+                diff = MyersSequenceMatcher(None, self.a, self.b)
+            else:
+                diff = CudaDiffNativeMatcher(
+                    None, self.a, self.b, algo=CudaDiffNativeMatcher._ALGO_MYERS)
+        elif self.diff_algorithm == 'hybrid':
             diff = HybridSequenceMatcher(None, self.a, self.b)
         elif self.diff_algorithm == 'myers':
             diff = MyersSequenceMatcher(None, self.a, self.b)
