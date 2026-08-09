@@ -373,17 +373,6 @@ class Differ:
         # the native diff_proc API, or for algorithm quality comparison).
         self.diff_algorithm = 'native_histogram'
         self.autojunk = True
-        # Maximum line length (in characters) for char-level diffing. When
-        # either line in a changed pair exceeds this threshold, char_diff
-        # is SKIPPED and the pair is marked as "changed" (yellow) without
-        # char-level highlights. This prevents pathological slowdowns on
-        # HTML/minified files where a single inline <script> or <style>
-        # block can be 10KB+ on one line, causing word-level Myers to
-        # take 10+ seconds for a single line pair. 2000 chars is a good
-        # default: it covers all normal code lines (even long ones) while
-        # catching the pathological cases. Set to 0 to disable char_diff
-        # entirely (fastest, but no inline char highlights).
-        self.char_diff_max_line_length = 2000
         self.set_seqs(a, b)
         self.diffmap = []
 
@@ -391,35 +380,48 @@ class Differ:
         self.a = a
         self.b = b
 
-    def _should_skip_char_diff(self, line_a, line_b):
-        """Check if char-level diff should be skipped for this line pair.
+    def _char_diff(self, line_a, line_b):
+        """Compute char-level diff between two single-line strings.
 
-        Returns True if either line exceeds self.char_diff_max_line_length,
-        or if char_diff_max_line_length is 0 (char_diff disabled entirely).
-        This guards against pathological slowdowns on very long lines
-        (e.g. inline <script> blocks in HTML, minified JS) where word-level
-        Myers takes seconds or minutes for a single line pair.
+        Dispatches to the native cudatext.diff_proc(DIF_CHARS) API when
+        the selected algorithm is one of the native ones (native_histogram,
+        native_myers). Falls back to the pure-Python char_diff.char_diff()
+        for all other algorithms (hybrid, myers, vscode, patience, difflib).
+
+        This split lets us compare native vs Python char-diff quality on
+        the same input by just switching the diff_algorithm config option.
+        The Python path is also the fallback for CudaText builds that do
+        not yet have the DIF_CHARS API.
+
+        Returns: list of (tag, a_start, a_end, b_start, b_end) tuples
+        where tag is 'equal'/'delete'/'insert'/'replace' and offsets are
+        character positions into line_a / line_b. Same format as
+        difflib.SequenceMatcher.get_opcodes() operating on characters.
         """
-        threshold = self.char_diff_max_line_length
-        if threshold <= 0:
-            return True  # char_diff disabled entirely
-        if len(line_a) > threshold or len(line_b) > threshold:
-            return True
-        return False
-
-    def _yield_changed_pair_no_chardiff(self, ai, bj):
-        """Yield line-change events for a pair without char-level detail.
-
-        Used when char_diff is skipped (lines too long or disabled).
-        Produces the same A_LINE_CHANGE / B_LINE_CHANGE / decor events
-        as _char_diff_pair, but without A_SYMBOL_DEL / B_SYMBOL_ADD
-        (char-level highlights). Lines are marked yellow (changed, no
-        char detail) instead of red/green (changed with char detail).
-        """
-        yield (A_LINE_CHANGE, ai)
-        yield (B_LINE_CHANGE, bj)
-        yield (A_DECOR_YELLOW, ai)
-        yield (B_DECOR_YELLOW, bj)
+        if self.diff_algorithm in ('native_histogram', 'native_myers') and _HAS_NATIVE_DIFF:
+            Profiler.start('char_diff:native_call')
+            try:
+                result = _ct.diff_proc(
+                    2,                   # DIF_CHARS
+                    line_a,
+                    line_b,
+                    0,                   # algo: unused for DIF_CHARS
+                    0,                   # flags: DIFF_IGN_NONE (no ignore flags yet)
+                    None,                # cancel: none
+                )
+            finally:
+                Profiler.stop('char_diff:native_call')
+            if result is None:
+                # Cancelled (shouldn't happen without a cancel callback)
+                # — fall back to a single REPLACE covering everything.
+                result = [('replace', 0, len(line_a), 0, len(line_b))]
+            return result
+        else:
+            Profiler.start('char_diff:python_call')
+            try:
+                return char_diff(line_a, line_b)
+            finally:
+                Profiler.stop('char_diff:python_call')
 
     # Threshold for the "trivial equal block" check in _realign_opcodes.
     # If the EQUAL block between an INSERT and a DELETE (or vice versa)
@@ -738,16 +740,9 @@ class Differ:
                 ai, bj = alo + k, blo + k
                 if a[ai] == b[bj]:
                     yield (ALIGN, ai, bj)
-                elif self._should_skip_char_diff(a[ai], b[bj]):
-                    # Line too long for char-level diff — skip to avoid
-                    # pathological slowdown on HTML/minified content.
-                    Profiler.start('char_diff:skipped')
-                    yield from self._yield_changed_pair_no_chardiff(ai, bj)
-                    Profiler.stop('char_diff:skipped')
-                    yield (ALIGN, ai, bj)
                 else:
                     Profiler.start('char_diff:per_line')
-                    ops = char_diff(a[ai], b[bj])
+                    ops = self._char_diff(a[ai], b[bj])
                     Profiler.stop('char_diff:per_line')
                     yield from self._char_diff_pair(ai, bj, ops)
                     yield (ALIGN, ai, bj)
@@ -949,14 +944,9 @@ class Differ:
         a_line, b_line = a[best_i], b[best_j]
         if a_line == b_line:
             yield (ALIGN, best_i, best_j)
-        elif self._should_skip_char_diff(a_line, b_line):
-            Profiler.start('char_diff:skipped')
-            yield from self._yield_changed_pair_no_chardiff(best_i, best_j)
-            Profiler.stop('char_diff:skipped')
-            yield (ALIGN, best_i, best_j)
         else:
             Profiler.start('char_diff:per_line')
-            ops = char_diff(a_line, b_line)
+            ops = self._char_diff(a_line, b_line)
             Profiler.stop('char_diff:per_line')
             yield from self._char_diff_pair(best_i, best_j, ops)
             yield (ALIGN, best_i, best_j)

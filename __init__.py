@@ -195,20 +195,6 @@ OPTS_META = [
      'frm': 'bool',
      'chp': 'config',
      },
-    {'opt': 'differ.char_diff_max_line_length',
-     'cmt': _('Maximum line length (in characters) for char-level diffing. '
-              'When either line in a changed pair exceeds this threshold, '
-              'char-level highlighting is SKIPPED and the pair is marked as '
-              'changed (yellow) without inline char highlights. This prevents '
-              'pathological slowdowns on HTML/minified files where a single '
-              'inline <script> or <style> block can be 10KB+ on one line. '
-              'Set to 0 to disable char-level diffing entirely (fastest, but '
-              'no inline char highlights on any line). '
-              'Default: 2000.'),
-     'def': 2000,
-     'frm': 'int',
-     'chp': 'config',
-     },
 ]
 
 DIFF_TAB_COUNT = 1
@@ -1044,7 +1030,6 @@ class Command:
         self.diff.ratio = self.cfg.get('ratio')
         self.diff.diff_algorithm = self.cfg.get('diff_algorithm')
         self.diff.autojunk = self.cfg.get('autojunk')
-        self.diff.char_diff_max_line_length = self.cfg.get('char_diff_max_line_length', 2000)
 
         # Detect word-wrap on either side. When wrap is on, gaps must be
         # sized by the actual number of visual rows on the opposite side
@@ -1374,8 +1359,6 @@ class Command:
                 get_opt('autojunk', True),
             'enable_profiling':
                 get_opt('enable_profiling', False),
-            'char_diff_max_line_length':
-                get_opt('char_diff_max_line_length', 2000),
         }
 
         new_nkind(NKIND_DELETED, config.get('color_deleted'))
