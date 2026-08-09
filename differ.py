@@ -4,6 +4,7 @@ from .myers import MyersSequenceMatcher, InlineMyersSequenceMatcher
 from .patiencediff import PatienceSequenceMatcher
 from .vscode_diff import VSCodeSequenceMatcher
 from .char_diff import char_diff
+from .profiling import Profiler
 from collections import Counter
 
 try:
@@ -87,8 +88,11 @@ class CudaDiffNativeMatcher:
         #   flags = 0 (no ignore flags; ignore options are not wired yet)
         #   cancel = None (cancellation not wired yet)
         # Returns: list of (tag, i1, i2, j1, j2) tuples.
+        Profiler.start('native:join_strings')
         text_a = ''.join(self.a)
         text_b = ''.join(self.b)
+        Profiler.stop('native:join_strings')
+        Profiler.start('native:diff_proc_call')
         result = _ct.diff_proc(
             1,                       # DIF_TEXTS
             text_a,
@@ -97,6 +101,7 @@ class CudaDiffNativeMatcher:
             0,                       # flags: DIFF_IGN_NONE
             None,                    # cancel callback: none
         )
+        Profiler.stop('native:diff_proc_call')
         # The native API returns None when cancelled; without a cancel
         # callback this cannot happen, but be defensive.
         if result is None:
@@ -539,7 +544,10 @@ class Differ:
         # (or closed).
         _bm_start = time.perf_counter() if _BENCHMARK else None
 
+        Profiler.start('compare:total')
+
         self.diffmap = []
+        Profiler.start('compare:algorithm')
         if self.diff_algorithm == 'native_histogram':
             if not _HAS_NATIVE_DIFF:
                 diff = HybridSequenceMatcher(None, self.a, self.b)
@@ -562,7 +570,20 @@ class Differ:
             diff = PatienceSequenceMatcher(None, self.a, self.b)
         else:
             diff = DefaultSequenceMatcher(None, self.a, self.b, autojunk=self.autojunk)
-        opcodes = self._realign_opcodes(diff.get_opcodes())
+
+        # For native matchers, get_opcodes() calls diff_proc (the native
+        # engine) — this is where the actual algorithm runs. For Python
+        # matchers, get_opcodes() runs the Python algorithm. Profiling
+        # both under the same name so the report shows algorithm time
+        # regardless of which algorithm was selected.
+        opcodes = diff.get_opcodes()
+        Profiler.stop('compare:algorithm')
+
+        Profiler.start('compare:realign_opcodes')
+        opcodes = self._realign_opcodes(opcodes)
+        Profiler.stop('compare:realign_opcodes')
+
+        Profiler.start('compare:event_generation')
         for tag, i1, i2, j1, j2 in opcodes:
             if tag != 'equal':
                 self.diffmap.append([i1, i2, j1, j2])
@@ -592,6 +613,10 @@ class Differ:
                 else:
                     yield from self._plain_replace_simple(self.a, i1, i2,
                                                           self.b, j1, j2)
+        Profiler.stop('compare:event_generation')
+
+        Profiler.stop('compare:total')
+
         if _bm_start is not None:
             _bm_elapsed = time.perf_counter() - _bm_start
             print('Differ: compare took {:.1f}ms '
@@ -635,18 +660,26 @@ class Differ:
           6. Sub-REPLACE blocks: call _find_best_pairs to align similar
              lines by char-level ratio, then do char_diff on each pair.
         """
+        Profiler.start('replace_block:total')
         da, db = ahi - alo, bhi - blo
         if da == 0 and db == 0:
+            Profiler.stop('replace_block:total')
             return
         if da == 0:
+            Profiler.start('replace_block:insert_only')
             yield (A_GAP, alo, blo, bhi)
             for y in range(blo, bhi):
                 yield (B_LINE_ADD, y)
+            Profiler.stop('replace_block:insert_only')
+            Profiler.stop('replace_block:total')
             return
         if db == 0:
+            Profiler.start('replace_block:delete_only')
             yield (B_GAP, blo, alo, ahi)
             for y in range(alo, ahi):
                 yield (A_LINE_DEL, y)
+            Profiler.stop('replace_block:delete_only')
+            Profiler.stop('replace_block:total')
             return
 
         # Fast path: when both sides have the same number of lines, use
@@ -658,15 +691,20 @@ class Differ:
         # da != db, because that's when positional pairing might misalign
         # similar lines.
         if da == db:
+            Profiler.start('replace_block:positional_pair')
             common = min(da, db)
             for k in range(common):
                 ai, bj = alo + k, blo + k
                 if a[ai] == b[bj]:
                     yield (ALIGN, ai, bj)
                 else:
+                    Profiler.start('char_diff:per_line')
                     ops = char_diff(a[ai], b[bj])
+                    Profiler.stop('char_diff:per_line')
                     yield from self._char_diff_pair(ai, bj, ops)
                     yield (ALIGN, ai, bj)
+            Profiler.stop('replace_block:positional_pair')
+            Profiler.stop('replace_block:total')
             return
 
         # Different line counts (da != db): use _find_best_pairs which
@@ -678,6 +716,7 @@ class Differ:
         #   blocks have few or no unique matches)
         # - The prefix/suffix search only runs if no exact match found
         yield from self._find_best_pairs(a, alo, ahi, b, blo, bhi)
+        Profiler.stop('replace_block:total')
 
     def _find_best_pairs(self, a, alo, ahi, b, blo, bhi):
         """Find the best line alignment within a sub-REPLACE block.
@@ -728,6 +767,7 @@ class Differ:
         # First pass: find all unique exact matches and pick the longest.
         # Use a dict-based approach for O(N+M) instead of O(N*M):
         # build a map of unique lines in a[alo:ahi], then scan b[blo:bhi].
+        Profiler.start('find_best_pairs:exact_match_search')
         from collections import Counter
         sub_a_counts = Counter(a[alo:ahi])
         sub_b_counts = Counter(b[blo:bhi])
@@ -750,6 +790,7 @@ class Differ:
                     best_exact_len = len(line)
                     best_exact_i = sub_a_unique[line]
                     best_exact_j = j
+        Profiler.stop('find_best_pairs:exact_match_search')
 
         if best_exact_i >= 0:
             # Use the longest unique exact match as anchor
@@ -764,6 +805,16 @@ class Differ:
             # unique lines. For large blocks without unique matches,
             # this is O(N*M) but each pair comparison is fast (just
             # scanning from both ends of the lines).
+            #
+            # THIS IS THE LIKELY BOTTLENECK for large files with many
+            # REPLACE blocks where da != db. Each pair comparison scans
+            # the prefix AND suffix character-by-character. For a block
+            # with 1000 lines on each side, that's 1M comparisons, each
+            # potentially scanning hundreds of chars. And this is
+            # RECURSIVE — after finding the best pair, it recurses on
+            # both sides, so the total work can be O(N*M*D) where D is
+            # the number of differences.
+            Profiler.start('find_best_pairs:prefix_suffix_search')
             for j in range(blo, bhi):
                 bj_line = b[j]
                 for i in range(alo, ahi):
@@ -792,6 +843,7 @@ class Differ:
                     if score > best_score:
                         best_score, best_i, best_j = score, i, j
                         best_prefix = prefix
+            Profiler.stop('find_best_pairs:prefix_suffix_search')
 
         # Minimum similarity threshold: only pair lines if the BEST pair
         # shares a meaningful common prefix (>= 3 chars). This matches VS
@@ -850,7 +902,9 @@ class Differ:
         if a_line == b_line:
             yield (ALIGN, best_i, best_j)
         else:
+            Profiler.start('char_diff:per_line')
             ops = char_diff(a_line, b_line)
+            Profiler.stop('char_diff:per_line')
             yield from self._char_diff_pair(best_i, best_j, ops)
             yield (ALIGN, best_i, best_j)
 
