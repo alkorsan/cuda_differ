@@ -7,11 +7,25 @@ from .char_diff import char_diff
 from .profiling import Profiler
 from collections import Counter
 
+# Import cudatext and detect whether the native diff_proc API is available.
+# The constants (DIF_TEXTS, DIF_CHARS, DIFF_ALGO_MYERS, DIFF_ALGO_HISTOGRAM)
+# are pulled from cudatext when available; literal fallbacks are used only
+# when cudatext itself is not importable (e.g. running unit tests outside
+# CudaText). When _HAS_NATIVE_DIFF is True, diff_proc exists and the
+# constants are guaranteed to exist too (they were added in the same PR).
 try:
     import cudatext as _ct
     _HAS_NATIVE_DIFF = hasattr(_ct, 'diff_proc')
-except ImportError:
+    _DIF_TEXTS = _ct.DIF_TEXTS
+    _DIF_CHARS = _ct.DIF_CHARS
+    _DIFF_ALGO_MYERS = _ct.DIFF_ALGO_MYERS
+    _DIFF_ALGO_HISTOGRAM = _ct.DIFF_ALGO_HISTOGRAM
+except (ImportError, AttributeError):
     _HAS_NATIVE_DIFF = False
+    _DIF_TEXTS = 1
+    _DIF_CHARS = 2
+    _DIFF_ALGO_MYERS = 0
+    _DIFF_ALGO_HISTOGRAM = 1
 
 
 class CudaDiffNativeMatcher:
@@ -36,12 +50,9 @@ class CudaDiffNativeMatcher:
     way (see __init__.py: splitlines(True)), so we just join with ''.
     """
 
-    # Algorithm IDs defined in CudaText's proc_py_const.pas.
-    # Mirrored here so the plugin does not depend on the constants being
-    # exported through the cudatext Python module at import time (older
-    # CudaText builds do not have them).
-    _ALGO_MYERS = 0
-    _ALGO_HISTOGRAM = 1
+    # Algorithm IDs — pulled from cudatext module constants (see above).
+    _ALGO_MYERS = _DIFF_ALGO_MYERS
+    _ALGO_HISTOGRAM = _DIFF_ALGO_HISTOGRAM
 
     def __init__(self, isjunk=None, a='', b='', algo=1):
         """Create a native diff matcher.
@@ -81,25 +92,18 @@ class CudaDiffNativeMatcher:
         """
         if self.opcodes is not None:
             return self.opcodes
-        # diff_proc(id, param1, param2, algo, flags, cancel)
-        #   id = DIF_TEXTS (1)
-        #   param1, param2 = LF-separated strings
-        #   algo = 0 (Myers) or 1 (Histogram)
-        #   flags = 0 (no ignore flags; ignore options are not wired yet)
-        #   cancel = None (cancellation not wired yet)
-        # Returns: list of (tag, i1, i2, j1, j2) tuples.
         Profiler.start('native:join_strings')
         text_a = ''.join(self.a)
         text_b = ''.join(self.b)
         Profiler.stop('native:join_strings')
         Profiler.start('native:diff_proc_call')
         result = _ct.diff_proc(
-            1,                       # DIF_TEXTS
+            _DIF_TEXTS,
             text_a,
             text_b,
             self._algo,
-            0,                       # flags: DIFF_IGN_NONE
-            None,                    # cancel callback: none
+            0,                   # flags: DIFF_IGN_NONE (no ignore flags yet)
+            None,                # cancel: none
         )
         Profiler.stop('native:diff_proc_call')
         # The native API returns None when cancelled; without a cancel
@@ -402,7 +406,7 @@ class Differ:
             Profiler.start('char_diff:native_call')
             try:
                 result = _ct.diff_proc(
-                    2,                   # DIF_CHARS
+                    _DIF_CHARS,
                     line_a,
                     line_b,
                     0,                   # algo: unused for DIF_CHARS

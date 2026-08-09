@@ -185,29 +185,30 @@ Configuration (chapter "config"):
   commands). Default: 3.
 - Diff algorithm (differ.diff_algorithm)
   Selects the diff algorithm used by the side-by-side compare view and the
-  unified-diff commands. Four choices are offered in a dropdown:
-    * myers   -- Myers O(NP) sequence comparison algorithm
-      (Wu/Manber/Myers/Miller 1989), ported from Meld. Includes two
-      preprocessing optimizations: common prefix/suffix trimming (binary
-      search) and discarding lines that do not appear in the other file
-      (only when worthwhile, i.e. more than 10 lines are discarded). Also
-      includes a post-processing pass that backward-scans matching chunks
-      to combine adjacent blocks that can be merged. This is the fastest
-      option and the default.
-    * vscode   -- VS Code's diff algorithm (ported from Microsoft's VS Code
-      source). Uses dynamic programming (O(MN) LCS with equality scoring
-      and consecutive-diagonal bonus) for files with fewer than 1700
-      combined lines, and Myers diff (O(ND) with snake optimization) for
-      larger files. Includes VS Code's heuristic post-processing
-      (shift/join adjacent diffs to natural boundaries, absorb tiny equal
-      blocks between large changes). This algorithm produces the best
-      alignment on files with many duplicated lines, where both patience
-      and difflib can fail, but is the slowest.
-    * patience -- anchors on unique matching lines, often more
-      human-readable when blocks of code are moved or re-indented
-      (via the embedded patiencediff library).
-    * difflib  -- Python's standard difflib SequenceMatcher.
-  Default: myers.
+  unified-diff commands. Seven choices are offered in a dropdown:
+    * native_histogram -- Native Histogram diff (port of JGit's
+      HistogramDiff, the algorithm git uses for `git diff --histogram`).
+      Runs in compiled Free Pascal code via cudatext.diff_proc(). Behaves
+      like Patience diff when unique common lines exist, with graceful
+      fallback when they don't. Fast and high-quality. This is the default
+      and recommended option.
+    * native_myers -- Native Myers diff (port of JGit's MyersDiff with
+      linear-space middle-snake optimization, the algorithm git uses for
+      `git diff --myers`). Runs in compiled Free Pascal code via
+      cudatext.diff_proc().
+    * hybrid -- Pure-Python Hybrid (Patience anchoring on unique lines +
+      Myers for the gaps). Best pure-Python quality.
+    * myers -- Pure-Python Myers O(NP) (Wu/Manber/Myers/Miller 1989),
+      ported from Meld.
+    * vscode -- Pure-Python VS Code diff algorithm. Best alignment on
+      files with many duplicated lines, but slowest.
+    * patience -- Pure-Python Patience diff (via the embedded
+      patiencediff library).
+    * difflib -- Python's standard difflib SequenceMatcher.
+  The native algorithms require a CudaText build that includes the
+  diff_proc API. If the API is not available, they silently fall back to
+  the closest Python equivalent (native_histogram -> hybrid, native_myers
+  -> myers). Default: native_histogram.
 - Autojunk heuristic (differ.autojunk)
   Controls the autojunk parameter of difflib's SequenceMatcher. When
   enabled (the Python default), items that appear more than 1% of the
@@ -219,6 +220,12 @@ Configuration (chapter "config"):
   diff_algorithm is "difflib" -- MyersSequenceMatcher,
   PatienceSequenceMatcher and VSCodeSequenceMatcher do not support
   autojunk. Default: true.
+- Enable profiling (differ.enable_profiling)
+  When enabled, prints a detailed timing report to the console after each
+  compare, breaking down time spent in the diff algorithm, opcode
+  realignment, event generation, char-level diffing (native vs Python),
+  and UI painting (bookmarks, decor, gaps, attributes). Use for debugging
+  performance issues only -- adds small overhead. Default: false.
 
 
 == Notes ==
