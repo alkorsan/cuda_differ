@@ -626,9 +626,19 @@ class Differ:
         opcodes = diff.get_opcodes()
         Profiler.stop('compare:algorithm')
 
-        Profiler.start('compare:realign_opcodes')
-        opcodes = self._realign_opcodes(opcodes)
-        Profiler.stop('compare:realign_opcodes')
+        # _realign_opcodes fixes LCS tie-breaking issues where Myers
+        # matches trivial lines (empty, whitespace) instead of meaningful
+        # ones. This is needed for Python Myers/difflib (which produce
+        # INSERT+EQUAL(trivial)+DELETE patterns). Native Histogram doesn't
+        # produce these patterns (its anchoring prevents them), so skip
+        # the realignment for native algorithms to save the Python loop
+        # overhead. Native Myers with TOO_EXPENSIVE heuristic may produce
+        # suboptimal splits, but the realignment won't fix those (they're
+        # different from the LCS tie-breaking issue).
+        if self.diff_algorithm not in ('native_histogram', 'native_myers'):
+            Profiler.start('compare:realign_opcodes')
+            opcodes = self._realign_opcodes(opcodes)
+            Profiler.stop('compare:realign_opcodes')
 
         Profiler.start('compare:event_generation')
         for tag, i1, i2, j1, j2 in opcodes:
@@ -757,11 +767,6 @@ class Differ:
         # Different line counts (da != db): use _find_best_pairs which
         # finds the best-matching pair by char-level similarity (exact
         # matches first, then prefix/suffix ratio), then recurses.
-        # _find_best_pairs is efficient because:
-        # - The first pass scans for unique exact matches (O(N*M) worst
-        #   case but short-circuits on first match; in practice most
-        #   blocks have few or no unique matches)
-        # - The prefix/suffix search only runs if no exact match found
         yield from self._find_best_pairs(a, alo, ahi, b, blo, bhi)
         Profiler.stop('replace_block:total')
 
