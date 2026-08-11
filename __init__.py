@@ -949,16 +949,18 @@ class Command:
         if not self._is_compare_tab(tab_id):
             return  # not a compare tab we manage -- skip
 
+        # Load config FIRST so the profiling check below sees the current
+        # value of enable_profiling. Without this, the first compare after
+        # enabling profiling in the config dialog would not be profiled
+        # (self.cfg would still have the old value).
+        self.config()
+
         # Enable/disable profiling based on config. reset() clears any
         # stale data from a previous compare so the report only shows
         # this compare's timings.
         _profiling_was_enabled = Profiler.is_enabled()
         _profiling_enabled_here = False
         if not _profiling_was_enabled:
-            # Read config lazily — only enable profiling if the config
-            # option is on AND we haven't been globally enabled already.
-            # This allows external code to force-enable profiling by
-            # calling enable_profiling(True) before triggering a compare.
             try:
                 _do_profile = self.cfg.get('enable_profiling', False)
             except Exception:
@@ -969,211 +971,197 @@ class Command:
         if Profiler.is_enabled():
             reset_profiling()
 
-        Profiler.start('refresh:total')
+        # Wrap the entire compare in try/finally so the profiling report
+        # is always printed — even if the compare crashes with an exception.
+        try:
+            Profiler.start('refresh:total')
 
-        a_ed = ct.Editor(ed.get_prop(ct.PROP_HANDLE_PRIMARY))
-        b_ed = ct.Editor(ed.get_prop(ct.PROP_HANDLE_SECONDARY))
+            a_ed = ct.Editor(ed.get_prop(ct.PROP_HANDLE_PRIMARY))
+            b_ed = ct.Editor(ed.get_prop(ct.PROP_HANDLE_SECONDARY))
 
-        Profiler.start('refresh:get_text')
-        a_text_all = a_ed.get_text_all()
-        b_text_all = b_ed.get_text_all()
-        Profiler.stop('refresh:get_text')
+            Profiler.start('refresh:get_text')
+            a_text_all = a_ed.get_text_all()
+            b_text_all = b_ed.get_text_all()
+            Profiler.stop('refresh:get_text')
 
-        if not a_text_all.endswith('\n'):
-            a_text_all += '\n'
-        if not b_text_all.endswith('\n'):
-            b_text_all += '\n'
+            if not a_text_all.endswith('\n'):
+                a_text_all += '\n'
+            if not b_text_all.endswith('\n'):
+                b_text_all += '\n'
 
-        if a_text_all == b_text_all:
+            if a_text_all == b_text_all:
+                Profiler.start('refresh:clear')
+                self.clear(a_ed)
+                self.clear(b_ed)
+                Profiler.stop('refresh:clear')
+                self.diff.diffmap = []
+                if show_dialog:
+                    t = _('The two sides are identical.')
+                    ct.msg_box(t, ct.MB_OK)
+                Profiler.stop('refresh:total')
+                return
+
+            # NOTE: Do NOT force word-wrap off here. The user may legitimately
+            # want to compare files with wrap on (it makes long lines easier to
+            # read). Instead, we detect the wrap state below and size the
+            # inter-line gaps using the actual number of wrapped visual rows,
+            # so the two sides stay visually aligned even when corresponding
+            # lines wrap to different heights. See _get_wrap_counts and the
+            # A_GAP/B_GAP/ALIGN handling in the loop below.
+            # a_ed.set_prop(ct.PROP_WRAP, ct.WRAP_OFF)
+            # b_ed.set_prop(ct.PROP_WRAP, ct.WRAP_OFF)
+
             Profiler.start('refresh:clear')
             self.clear(a_ed)
             self.clear(b_ed)
             Profiler.stop('refresh:clear')
-            self.diff.diffmap = []
-            if show_dialog:
-                t = _('The two sides are identical.')
-                ct.msg_box(t, ct.MB_OK)
+
+            # config() was already called above (before the profiling check).
+            # Don't call it again here.
+            Profiler.start('refresh:splitlines')
+            self.diff.set_seqs(a_text_all.splitlines(True),
+                               b_text_all.splitlines(True))
+            Profiler.stop('refresh:splitlines')
+
+            self.scroll.tab_id.add(tab_id)
+            self.scroll.toggle(self.cfg.get('sync_scroll'))
+
+            self.diff.withdetail = self.cfg.get('compare_with_details')
+            self.diff.ratio = self.cfg.get('ratio')
+            self.diff.diff_algorithm = self.cfg.get('diff_algorithm')
+            self.diff.autojunk = self.cfg.get('autojunk')
+
+            # Detect word-wrap on either side. When wrap is on, gaps must be
+            # sized by the actual number of visual rows on the opposite side
+            # (not by logical line count), and matched line pairs that wrap to
+            # different heights need an extra compensating gap.
+            wrap_a = a_ed.get_prop(ct.PROP_WRAP)
+            wrap_b = b_ed.get_prop(ct.PROP_WRAP)
+            wrap_on = (wrap_a != ct.WRAP_OFF) or (wrap_b != ct.WRAP_OFF)
+            if wrap_on:
+                Profiler.start('refresh:wrap_counts')
+                wrap_counts_a = self._get_wrap_counts(a_ed)
+                wrap_counts_b = self._get_wrap_counts(b_ed)
+                __, line_h_a = a_ed.get_prop(ct.PROP_CELL_SIZE)
+                __, line_h_b = b_ed.get_prop(ct.PROP_CELL_SIZE)
+                Profiler.stop('refresh:wrap_counts')
+            else:
+                wrap_counts_a = None
+                wrap_counts_b = None
+                line_h_a = 0
+                line_h_b = 0
+            color_gaps = self.cfg.get('color_gaps')
+
+            # The for loop below consumes events from diff.compare() (a
+            # generator) and paints each event. Profiling the loop as a whole
+            # captures both compare time (inside the generator) and paint time
+            # (inside the loop body). The paint:* sub-sections break down the
+            # paint time by operation type. The compare:* sub-sections (from
+            # differ.py) break down the compare time by algorithm phase.
+            Profiler.start('refresh:compare_and_paint')
+            for d in self.diff.compare():
+                diff_id, y = d[0], d[1]
+                if diff_id == df.A_LINE_DEL:
+                    Profiler.start('paint:bookmark')
+                    self.set_bookmark2(a_ed, y, NKIND_DELETED)
+                    Profiler.stop('paint:bookmark')
+                    Profiler.start('paint:decor')
+                    self.set_decor(a_ed, y, DECOR_CHAR, self.cfg.get('color_deleted'))
+                    Profiler.stop('paint:decor')
+                elif diff_id == df.B_LINE_ADD:
+                    Profiler.start('paint:bookmark')
+                    self.set_bookmark2(b_ed, y, NKIND_ADDED)
+                    Profiler.stop('paint:bookmark')
+                    Profiler.start('paint:decor')
+                    self.set_decor(b_ed, y, DECOR_CHAR, self.cfg.get('color_added'))
+                    Profiler.stop('paint:decor')
+                elif diff_id == df.A_LINE_CHANGE:
+                    Profiler.start('paint:bookmark')
+                    self.set_bookmark2(a_ed, y, NKIND_CHANGED)
+                    Profiler.stop('paint:bookmark')
+                elif diff_id == df.B_LINE_CHANGE:
+                    Profiler.start('paint:bookmark')
+                    self.set_bookmark2(b_ed, y, NKIND_CHANGED)
+                    Profiler.stop('paint:bookmark')
+                elif diff_id == df.A_GAP:
+                    a_line_after, b_start, b_end = d[1], d[2], d[3]
+                    if wrap_on:
+                        Profiler.start('paint:wrap_calc')
+                        total_visual = self._sum_visual_rows(
+                            wrap_counts_b, b_start, b_end)
+                        Profiler.stop('paint:wrap_calc')
+                        Profiler.start('paint:gap')
+                        self._add_raw_gap(a_ed, a_line_after - 1,
+                                          total_visual * line_h_a, color_gaps)
+                        Profiler.stop('paint:gap')
+                    else:
+                        Profiler.start('paint:gap')
+                        self.set_gap(a_ed, a_line_after, b_end - b_start)
+                        Profiler.stop('paint:gap')
+                elif diff_id == df.B_GAP:
+                    b_line_after, a_start, a_end = d[1], d[2], d[3]
+                    if wrap_on:
+                        Profiler.start('paint:wrap_calc')
+                        total_visual = self._sum_visual_rows(
+                            wrap_counts_a, a_start, a_end)
+                        Profiler.stop('paint:wrap_calc')
+                        Profiler.start('paint:gap')
+                        self._add_raw_gap(b_ed, b_line_after - 1,
+                                          total_visual * line_h_b, color_gaps)
+                        Profiler.stop('paint:gap')
+                    else:
+                        Profiler.start('paint:gap')
+                        self.set_gap(b_ed, b_line_after, a_end - a_start)
+                        Profiler.stop('paint:gap')
+                elif diff_id == df.ALIGN:
+                    if wrap_on:
+                        a_line, b_line = d[1], d[2]
+                        Profiler.start('paint:wrap_calc')
+                        va = self._visual_rows(wrap_counts_a, a_line)
+                        vb = self._visual_rows(wrap_counts_b, b_line)
+                        Profiler.stop('paint:wrap_calc')
+                        Profiler.start('paint:gap')
+                        if va > vb:
+                            self._add_raw_gap(b_ed, b_line,
+                                              (va - vb) * line_h_b, color_gaps)
+                        elif vb > va:
+                            self._add_raw_gap(a_ed, a_line,
+                                              (vb - va) * line_h_a, color_gaps)
+                        Profiler.stop('paint:gap')
+                elif diff_id == df.A_SYMBOL_DEL:
+                    Profiler.start('paint:attr')
+                    self.set_attr(a_ed, d[2], y, d[3], self.cfg.get('color_deleted'))
+                    Profiler.stop('paint:attr')
+                elif diff_id == df.B_SYMBOL_ADD:
+                    Profiler.start('paint:attr')
+                    self.set_attr(b_ed, d[2], y, d[3], self.cfg.get('color_added'))
+                    Profiler.stop('paint:attr')
+                elif diff_id == df.A_DECOR_YELLOW:
+                    Profiler.start('paint:decor')
+                    self.set_decor(a_ed, y, DECOR_CHAR, self.cfg.get('color_changed'))
+                    Profiler.stop('paint:decor')
+                elif diff_id == df.B_DECOR_YELLOW:
+                    Profiler.start('paint:decor')
+                    self.set_decor(b_ed, y, DECOR_CHAR, self.cfg.get('color_changed'))
+                    Profiler.stop('paint:decor')
+                elif diff_id == df.A_DECOR_RED:
+                    Profiler.start('paint:decor')
+                    self.set_decor(a_ed, y, DECOR_CHAR, self.cfg.get('color_deleted'))
+                    Profiler.stop('paint:decor')
+                elif diff_id == df.B_DECOR_GREEN:
+                    Profiler.start('paint:decor')
+                    self.set_decor(b_ed, y, DECOR_CHAR, self.cfg.get('color_added'))
+                    Profiler.stop('paint:decor')
+            Profiler.stop('refresh:compare_and_paint')
+
             Profiler.stop('refresh:total')
+        finally:
+            # Always print the profiling report — even if the compare
+            # crashed with an exception. This ensures you can see WHERE
+            # the time was spent (or where it crashed) even on big files.
             if _profiling_enabled_here:
                 profiling_report()
                 enable_profiling(False)
-            return
-
-        # NOTE: Do NOT force word-wrap off here. The user may legitimately
-        # want to compare files with wrap on (it makes long lines easier to
-        # read). Instead, we detect the wrap state below and size the
-        # inter-line gaps using the actual number of wrapped visual rows,
-        # so the two sides stay visually aligned even when corresponding
-        # lines wrap to different heights. See _get_wrap_counts and the
-        # A_GAP/B_GAP/ALIGN handling in the loop below.
-        # a_ed.set_prop(ct.PROP_WRAP, ct.WRAP_OFF)
-        # b_ed.set_prop(ct.PROP_WRAP, ct.WRAP_OFF)
-
-        Profiler.start('refresh:clear')
-        self.clear(a_ed)
-        self.clear(b_ed)
-        Profiler.stop('refresh:clear')
-
-        Profiler.start('refresh:config')
-        self.config()
-        Profiler.stop('refresh:config')
-
-        Profiler.start('refresh:splitlines')
-        self.diff.set_seqs(a_text_all.splitlines(True),
-                           b_text_all.splitlines(True))
-        Profiler.stop('refresh:splitlines')
-
-        self.scroll.tab_id.add(tab_id)
-        self.scroll.toggle(self.cfg.get('sync_scroll'))
-
-        self.diff.withdetail = self.cfg.get('compare_with_details')
-        self.diff.ratio = self.cfg.get('ratio')
-        self.diff.diff_algorithm = self.cfg.get('diff_algorithm')
-        self.diff.autojunk = self.cfg.get('autojunk')
-
-        # Detect word-wrap on either side. When wrap is on, gaps must be
-        # sized by the actual number of visual rows on the opposite side
-        # (not by logical line count), and matched line pairs that wrap to
-        # different heights need an extra compensating gap.
-        wrap_a = a_ed.get_prop(ct.PROP_WRAP)
-        wrap_b = b_ed.get_prop(ct.PROP_WRAP)
-        wrap_on = (wrap_a != ct.WRAP_OFF) or (wrap_b != ct.WRAP_OFF)
-        if wrap_on:
-            Profiler.start('refresh:wrap_counts')
-            wrap_counts_a = self._get_wrap_counts(a_ed)
-            wrap_counts_b = self._get_wrap_counts(b_ed)
-            __, line_h_a = a_ed.get_prop(ct.PROP_CELL_SIZE)
-            __, line_h_b = b_ed.get_prop(ct.PROP_CELL_SIZE)
-            Profiler.stop('refresh:wrap_counts')
-        else:
-            wrap_counts_a = None
-            wrap_counts_b = None
-            line_h_a = 0
-            line_h_b = 0
-        color_gaps = self.cfg.get('color_gaps')
-
-        # The for loop below consumes events from diff.compare() (a
-        # generator) and paints each event. Profiling the loop as a whole
-        # captures both compare time (inside the generator) and paint time
-        # (inside the loop body). The paint:* sub-sections break down the
-        # paint time by operation type. The compare:* sub-sections (from
-        # differ.py) break down the compare time by algorithm phase.
-        Profiler.start('refresh:compare_and_paint')
-        for d in self.diff.compare():
-            diff_id, y = d[0], d[1]
-            if diff_id == df.A_LINE_DEL:
-                Profiler.start('paint:bookmark')
-                self.set_bookmark2(a_ed, y, NKIND_DELETED)
-                Profiler.stop('paint:bookmark')
-                Profiler.start('paint:decor')
-                self.set_decor(a_ed, y, DECOR_CHAR, self.cfg.get('color_deleted'))
-                Profiler.stop('paint:decor')
-            elif diff_id == df.B_LINE_ADD:
-                Profiler.start('paint:bookmark')
-                self.set_bookmark2(b_ed, y, NKIND_ADDED)
-                Profiler.stop('paint:bookmark')
-                Profiler.start('paint:decor')
-                self.set_decor(b_ed, y, DECOR_CHAR, self.cfg.get('color_added'))
-                Profiler.stop('paint:decor')
-            elif diff_id == df.A_LINE_CHANGE:
-                Profiler.start('paint:bookmark')
-                self.set_bookmark2(a_ed, y, NKIND_CHANGED)
-                Profiler.stop('paint:bookmark')
-            elif diff_id == df.B_LINE_CHANGE:
-                Profiler.start('paint:bookmark')
-                self.set_bookmark2(b_ed, y, NKIND_CHANGED)
-                Profiler.stop('paint:bookmark')
-            elif diff_id == df.A_GAP:
-                # d = (A_GAP, a_line_after, b_start, b_end)
-                # Gap in A inserted after line a_line_after-1, compensating
-                # for B lines [b_start, b_end) which exist on the B side
-                # but have no counterpart on the A side.
-                a_line_after, b_start, b_end = d[1], d[2], d[3]
-                if wrap_on:
-                    Profiler.start('paint:wrap_calc')
-                    total_visual = self._sum_visual_rows(
-                        wrap_counts_b, b_start, b_end)
-                    Profiler.stop('paint:wrap_calc')
-                    Profiler.start('paint:gap')
-                    self._add_raw_gap(a_ed, a_line_after - 1,
-                                      total_visual * line_h_a, color_gaps)
-                    Profiler.stop('paint:gap')
-                else:
-                    Profiler.start('paint:gap')
-                    self.set_gap(a_ed, a_line_after, b_end - b_start)
-                    Profiler.stop('paint:gap')
-            elif diff_id == df.B_GAP:
-                # d = (B_GAP, b_line_after, a_start, a_end)
-                # Gap in B inserted after line b_line_after-1, compensating
-                # for A lines [a_start, a_end).
-                b_line_after, a_start, a_end = d[1], d[2], d[3]
-                if wrap_on:
-                    Profiler.start('paint:wrap_calc')
-                    total_visual = self._sum_visual_rows(
-                        wrap_counts_a, a_start, a_end)
-                    Profiler.stop('paint:wrap_calc')
-                    Profiler.start('paint:gap')
-                    self._add_raw_gap(b_ed, b_line_after - 1,
-                                      total_visual * line_h_b, color_gaps)
-                    Profiler.stop('paint:gap')
-                else:
-                    Profiler.start('paint:gap')
-                    self.set_gap(b_ed, b_line_after, a_end - a_start)
-                    Profiler.stop('paint:gap')
-            elif diff_id == df.ALIGN:
-                # d = (ALIGN, a_line, b_line) -- a pair of lines that must
-                # stay at the same visual Y. When wrap is on and the two
-                # lines wrap to a different number of visual rows, add a
-                # compensating gap on the shorter side (after the matched
-                # line) so the NEXT matched pair stays aligned.
-                if wrap_on:
-                    a_line, b_line = d[1], d[2]
-                    Profiler.start('paint:wrap_calc')
-                    va = self._visual_rows(wrap_counts_a, a_line)
-                    vb = self._visual_rows(wrap_counts_b, b_line)
-                    Profiler.stop('paint:wrap_calc')
-                    Profiler.start('paint:gap')
-                    if va > vb:
-                        self._add_raw_gap(b_ed, b_line,
-                                          (va - vb) * line_h_b, color_gaps)
-                    elif vb > va:
-                        self._add_raw_gap(a_ed, a_line,
-                                          (vb - va) * line_h_a, color_gaps)
-                    Profiler.stop('paint:gap')
-            elif diff_id == df.A_SYMBOL_DEL:
-                Profiler.start('paint:attr')
-                self.set_attr(a_ed, d[2], y, d[3], self.cfg.get('color_deleted'))
-                Profiler.stop('paint:attr')
-            elif diff_id == df.B_SYMBOL_ADD:
-                Profiler.start('paint:attr')
-                self.set_attr(b_ed, d[2], y, d[3], self.cfg.get('color_added'))
-                Profiler.stop('paint:attr')
-            elif diff_id == df.A_DECOR_YELLOW:
-                Profiler.start('paint:decor')
-                self.set_decor(a_ed, y, DECOR_CHAR, self.cfg.get('color_changed'))
-                Profiler.stop('paint:decor')
-            elif diff_id == df.B_DECOR_YELLOW:
-                Profiler.start('paint:decor')
-                self.set_decor(b_ed, y, DECOR_CHAR, self.cfg.get('color_changed'))
-                Profiler.stop('paint:decor')
-            elif diff_id == df.A_DECOR_RED:
-                Profiler.start('paint:decor')
-                self.set_decor(a_ed, y, DECOR_CHAR, self.cfg.get('color_deleted'))
-                Profiler.stop('paint:decor')
-            elif diff_id == df.B_DECOR_GREEN:
-                Profiler.start('paint:decor')
-                self.set_decor(b_ed, y, DECOR_CHAR, self.cfg.get('color_added'))
-                Profiler.stop('paint:decor')
-        Profiler.stop('refresh:compare_and_paint')
-
-        Profiler.stop('refresh:total')
-
-        # If we enabled profiling for this compare, print the report and
-        # disable it again so subsequent compares (which may be triggered
-        # automatically by on_change_slow etc.) don't accumulate overhead.
-        if _profiling_enabled_here:
-            profiling_report()
-            enable_profiling(False)
 
     def set_attr(self, e, x, y, nlen, bg):
         e.attr(ct.MARKERS_ADD, DIFF_TAG,

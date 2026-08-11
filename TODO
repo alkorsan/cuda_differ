@@ -123,3 +123,12 @@ if there a diff tab then i switch session, the session manager ask to save the d
 
 
 _________________________
+
+add collapsing of unchanged regions, so review of a huge file with three small hunks does not means scrolling through everything 
+
+_______________________
+
+rewrite the pythonpplugin to do like beyound compare:
+Standard alignment (default) — a proprietary divide-and-conquer scheme that aligns "by comparing successively smaller sections of each file. Parts of the alignment can be shown before the entire comparison is finished" alignment — i.e. it is incremental/streaming, chosen so huge files paint progressively.
+https://sparkles-docs.pages.dev/research/diff-review/beyond-compare.html
+
