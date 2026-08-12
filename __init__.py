@@ -226,16 +226,19 @@ MODULE_NAME = __name__.split('.')[-1]  # e.g. 'cuda_differ'
 _homedir = os.path.expanduser('~')
 
 def collapse_filename(fn):
+    """Shorten a filename by replacing the home directory with '~'."""
     if (fn+'/').startswith(_homedir+'/'):
         fn = fn.replace(_homedir, '~', 1)
     return fn
 
 
 def get_opt(key, def_val: tp.Any = ''):
+    """Read a 'differ.*' option from the plugin's JSON settings file."""
     return ctx.get_opt('differ.' + key, def_val, user_json=JSONFILE)
 
 
 def msg(s, level=0):
+    """Print a plugin message to the console. level: 0=info, 1=warning, 2=error."""
     if level == 0:
         print(PLG_NAME + ':', s)
     elif level == 1:
@@ -397,6 +400,9 @@ class Command:
         ct.ini_proc(ct.INI_DELETE_KEY, PLUGINS_INI, PLUGINS_INI_SECTION, MODULE_NAME)
 
     def change_config(self):
+        """Open the options dialog (cuda_options_editor or cuda_prefs) for
+        the 'differ.*' settings. After the dialog closes, reload config and
+        re-apply sync scroll setting."""
         try:
             import cuda_options_editor as op_ed
         except ImportError:
@@ -451,6 +457,7 @@ class Command:
         self.set_files(fn0, fn)
 
     def compare_with_tab(self):
+        """Compare current document with another open tab, picked from a menu."""
         name0 = self.get_name(ct.ed)
         names = []
         for h in ct.ed_handles():
@@ -468,6 +475,8 @@ class Command:
         self.set_files(name0, name)
 
     def diff_with(self):
+        """Create a unified-diff output (read-only tab) comparing current
+        document with a file picked from a dialog."""
         fn0 = self.get_name(ct.ed)
         fn = ct.dlg_file(True, '!', '', '')
         if not fn:
@@ -487,6 +496,8 @@ class Command:
         self.create_diff(a, b, fn0, fn)
 
     def diff_with_tab(self):
+        """Create a unified-diff output comparing current document with
+        another open tab, picked from a menu."""
         name0 = self.get_name(ct.ed)
 
         names = []
@@ -511,6 +522,8 @@ class Command:
         self.create_diff(a, b, name0, name)
 
     def format_untitled(self, e):
+        """Return a display name for an untitled tab: 'untitled:TITLE [TAB_ID]'.
+        The [TAB_ID] suffix is used by is_match_name for robust identification."""
         return U_PREFIX + e.get_prop(ct.PROP_TAB_TITLE) + ' [%d]'%e.get_prop(ct.PROP_TAB_ID)
 
     def is_match_name(self, e, name):
@@ -662,6 +675,8 @@ class Command:
         self.refresh()
 
     def create_diff(self, txt0, txt1, fn0, fn1):
+        """Create a read-only unified-diff tab from two text strings.
+        Used by diff_with and diff_with_tab commands."""
         if txt0 and txt0[-1] != '\n': txt0 += '\n'
         if txt1 and txt1[-1] != '\n': txt1 += '\n'
         a = txt0.splitlines(True)
@@ -680,6 +695,8 @@ class Command:
         ct.ed.set_prop(ct.PROP_SAVE_HISTORY, False)
 
     def on_state(self, ed_self, state):
+        """Handle theme syntax changes (reload config + refresh) and word-wrap
+        state changes (re-apply gaps with wrap-aware sizes)."""
         if state == ct.APPSTATE_THEME_SYNTAX:
             self.get_config()
             self._refresh_ex(ct.ed)  # automatic -- no dialog
@@ -692,10 +709,12 @@ class Command:
                 self._refresh_ex(ed_self)  # automatic -- no dialog
 
     def on_scroll(self, ed_self):
+        """Forward scroll events to ScrollSplittedTab for synchronized scrolling."""
         if self._is_compare_tab(ed_self.get_prop(ct.PROP_TAB_ID)):
             self.scroll.on_scroll(ed_self)
 
     def on_caret(self, ed_self):
+        """Mirror caret to opposite editor when sync_caret is enabled."""
         if self.cfg.get('enable_sync_caret', False):
             self.sync_caret()
 
@@ -925,6 +944,7 @@ class Command:
     '''
 
     def on_tab_menu(self, ed_self):
+        """Build the right-click tab context menu (Compare with..., Refresh, etc.)."""
         self.tabmenu_init(ed_self)
 
     def refresh(self):
@@ -1164,6 +1184,8 @@ class Command:
                 enable_profiling(False)
 
     def set_attr(self, e, x, y, nlen, bg):
+        """Add a character-range attribute (background highlight) on editor e
+        at line y, column x, for nlen characters. Used for char-level diffs."""
         e.attr(ct.MARKERS_ADD, DIFF_TAG,
                x,
                y,
@@ -1173,7 +1195,8 @@ class Command:
                )
 
     def set_gap(self, e, row, n=1):
-        "set gap line after row line"
+        """Add a gap of n line-heights after 'row' on editor e. Used to
+        compensate for inserted/deleted lines on the opposite side."""
         __, h = e.get_prop(ct.PROP_CELL_SIZE)
         h_size = h * n
         e.gap(ct.GAP_ADD, row-1, 0,
@@ -1262,9 +1285,14 @@ class Command:
         return total
 
     def set_decor(self, e, row, text, color):
+        """Set a line decorator (margin symbol) on editor e at row.
+        Shows a colored DECOR_CHAR in the left margin to mark changed/added/
+        deleted lines."""
         e.decor(ct.DECOR_SET, row, DIFF_TAG, text, color, bold=True)
 
     def set_bookmark2(self, e, row, nk):
+        """Set a bookmark of kind 'nk' (NKIND_DELETED/ADDED/CHANGED) at row.
+        Bookmarks are used for navigation (jump next/prev) and line highlighting."""
         e.bookmark(ct.BOOKMARK2_SET, row,
                    nkind=nk,
                    text="",
@@ -1274,6 +1302,8 @@ class Command:
                    )
 
     def clear(self, e):
+        """Remove all diff markers, gaps, decorators, and bookmarks tagged
+        with DIFF_TAG from editor e. Called before re-applying a fresh diff."""
         if e is None:
             return
         e.attr(ct.MARKERS_DELETE_BY_TAG, DIFF_TAG)
@@ -1282,6 +1312,8 @@ class Command:
         e.bookmark(ct.BOOKMARK2_DELETE_BY_TAG, 0, tag=DIFF_TAG)
 
     def config(self):
+        """Reload config from disk if the JSON file or theme has changed.
+        Caches the result in self.cfg to avoid repeated disk reads."""
         opt_time = os.path.getmtime(JSONPATH) if os.path.exists(JSONPATH) else 0
         theme_name = ct.app_proc(ct.PROC_THEME_SYNTAX_GET, '')
         if self.cfg.get('opt_time') == opt_time and \
@@ -1291,6 +1323,9 @@ class Command:
 
     @staticmethod
     def get_config():
+        """Read all differ.* options from JSON + current theme, and return
+        a config dict. Also registers bookmark kinds (NKIND_*) with their
+        colors so CudaText can render them."""
 
         def get_color(key, default_color):
             s = get_opt(key, '')
@@ -1357,6 +1392,9 @@ class Command:
 
     @property
     def focused(self):
+        """Return (focused_index, (a_ed, b_ed)) where focused_index is 0 if
+        the primary (left) editor is focused, 1 if the secondary (right).
+        """
         hndl_self = ct.ed.get_prop(ct.PROP_HANDLE_SELF)
         hndl_primary = ct.ed.get_prop(ct.PROP_HANDLE_PRIMARY)
         hndl_secondary = ct.ed.get_prop(ct.PROP_HANDLE_SECONDARY)
@@ -1367,6 +1405,8 @@ class Command:
             return 1, eds
 
     def jump(self, to_next=True):
+        """Jump caret to the next (or previous) diff hunk in the focused editor.
+        Wraps around at the end/start of the diffmap."""
         if not self.diff.diffmap:
             self.refresh()
         cnt = len(self.diff.diffmap)
@@ -1411,13 +1451,17 @@ class Command:
         eds[1].set_caret(0, to2, id=ct.CARET_SET_ONE)
 
     def jump_next(self):
+        """Jump to the next diff hunk."""
         self.jump()
 
     def jump_prev(self):
+        """Jump to the previous diff hunk."""
         self.jump(False)
 
     @property
     def get_current_change(self):
+        """Return the diffmap entry [a0, a1, b0, b1] containing the caret
+        in the focused editor, or None if the caret is not inside a diff hunk."""
         if not self.diff.diffmap:
             self.refresh()
         fc, eds = self.focused
@@ -1428,6 +1472,7 @@ class Command:
                 return dif
 
     def select_current(self):
+        """Select the lines of the current diff hunk in both editors."""
         cur_change = self.get_current_change
         if not cur_change:
             return
@@ -1439,6 +1484,8 @@ class Command:
         self.cfg['enable_sync_caret'] = esc
 
     def copy(self, to_right=True):
+        """Copy the current diff hunk's text from left to right (or right to
+        left), replacing the opposite side's text. Then refresh diff markers."""
         fc, eds = self.focused
         current = self.get_current_change
         if not current:
@@ -1460,12 +1507,17 @@ class Command:
         self.refresh()
 
     def copy_right(self):
+        """Copy current hunk from left editor to right editor."""
         self.copy(True)
 
     def copy_left(self):
+        """Copy current hunk from right editor to left editor."""
         self.copy(False)
 
     def copy_line(self, to_right=True):
+        """Copy the caret's line(s) from left to right (or right to left),
+        inserting at the current hunk's position. Unlike copy(), this works
+        on the current caret line, not the whole hunk."""
         fc, eds = self.focused
         current = self.get_current_change
 
@@ -1499,16 +1551,23 @@ class Command:
         self.refresh()
 
     def copy_line_right(self):
+        """Copy caret line from left editor to right editor."""
         self.copy_line(True)
 
     def copy_line_left(self):
+        """Copy caret line from right editor to left editor."""
         self.copy_line(False)
 
     @staticmethod
     def set_focus_to_opposite_panel():
+        """Toggle focus between the two split editors."""
         ct.ed.cmd(ct_cmd.cmd_ToggleFocusSplitEditors)
 
     def sync_caret(self):
+        """Mirror the caret position to the opposite editor. If the caret is
+        inside a diff hunk, jump the opposite caret to the hunk's start.
+        Otherwise, map the caret line through the diffmap to the corresponding
+        line on the opposite side."""
         if not self.diff.diffmap:
             return
         fc, eds = self.focused
@@ -1531,6 +1590,8 @@ class Command:
                 return
 
     def get_name(self, e):
+        """Return a display name for editor e: filename for real files,
+        or 'untitled:TITLE [TAB_ID]' for untitled tabs."""
         fn = e.get_filename()
         if fn:
             return fn
@@ -1566,6 +1627,9 @@ class Command:
         return True
 
     def tabmenu_init(self, cur_ed: ct.Editor):
+        """Build the right-click tab context menu: 'Compare with...',
+        'Compare with focused tab', 'Compare with tab' (submenu of all
+        open tabs), and 'Refresh'. Only shown for valid compare candidates."""
         cur_fn = self.get_name(cur_ed)
         path_focused = self.get_name(ct.ed)
 
@@ -1642,10 +1706,13 @@ class Command:
             command=self._is_compare_tab(cur_ed.get_prop(ct.PROP_TAB_ID)))
 
     def tabmenu_chooser(self):
+        """Launch 'Compare with...' via a 100ms timer (needed because menu
+        callbacks can't call dlg_file directly)."""
         callback = 'module=cuda_differ;cmd=tabmenu_chooser_timer;info=_;'
         ct.timer_proc(ct.TIMER_START_ONE, callback, 100)
 
     def tabmenu_chooser_timer(self, tag='', info=''):
+        """Timer callback that actually opens the file dialog."""
         self.compare_with()
 
     def tabmenu_chooser_tab(self):
@@ -1655,6 +1722,7 @@ class Command:
         ct.timer_proc(ct.TIMER_START_ONE, callback, 100)
 
     def tabmenu_chooser_tab_timer(self, tag='', info=''):
+        """Timer callback that actually opens the tab-picker dialog."""
         self.compare_with_tab()
 
     def tabmenu_refresh(self):
@@ -1663,17 +1731,22 @@ class Command:
         ct.timer_proc(ct.TIMER_START_ONE, callback, 100)
 
     def tabmenu_refresh_timer(self, tag='', info=''):
+        """Timer callback that actually runs the refresh."""
         self.refresh()
 
     def tabmenu_files(self, info):
+        """Launch a compare between two files specified in 'info' (format:
+        'fn0::fn1') via a 100ms timer."""
         callback = 'module=cuda_differ;cmd=tabmenu_files_timer;info='+info+';'
         ct.timer_proc(ct.TIMER_START_ONE, callback, 100)
 
     def tabmenu_files_timer(self, tag='', info=''):
+        """Timer callback that actually calls set_files with the two filenames."""
         fn0, fn1 = info.split('::', maxsplit=1)
         self.set_files(fn0, fn1)
 
     def select_all_diff(self):
+        """Select all diff hunks in the focused editor as multi-caret selections."""
         if not self.diff.diffmap:
             self.refresh()
         if len(self.diff.diffmap) == 0:

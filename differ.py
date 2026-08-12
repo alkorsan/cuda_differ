@@ -159,15 +159,26 @@ def HybridSequenceMatcher(isjunk=None, a='', b=''):
 
 
 class _CombinedMatcher:
-    """Wraps pre-computed matching blocks in a difflib-compatible API."""
+    """Wraps pre-computed matching blocks in a difflib-compatible API.
+
+    Used by HybridSequenceMatcher to present its combined patience+Myers
+    matching blocks through the same get_opcodes()/get_matching_blocks()
+    interface that Differ.compare() expects."""
 
     def __init__(self, a, b, matching_blocks):
+        """Store the two sequences and their pre-computed matching blocks.
+
+        Args:
+            a, b: the two line sequences being compared.
+            matching_blocks: list of (i, j, n) tuples from patience+Myers.
+        """
         self.a = a
         self.b = b
         self._matching_blocks = matching_blocks
         self.opcodes = None
 
     def get_matching_blocks(self):
+        """Return matching blocks with a sentinel at the end."""
         blocks = list(self._matching_blocks)
         # Ensure sentinel
         if not blocks or blocks[-1] != (len(self.a), len(self.b), 0):
@@ -175,6 +186,11 @@ class _CombinedMatcher:
         return blocks
 
     def get_opcodes(self):
+        """Convert matching blocks to difflib-style opcodes.
+
+        Walks the matching blocks in order, emitting 'replace'/'delete'/
+        'insert' for gaps between blocks and 'equal' for each block.
+        """
         if self.opcodes is not None:
             return self.opcodes
         opcodes = []
@@ -287,6 +303,9 @@ def _format_range_unified(start, stop):
 def _unified_diff(a, b, fromfile='', tofile='',
                   fromfiledate='', tofiledate='',
                   n=3, lineterm='\n', autojunk=True):
+    """Produce unified diff output, same as difflib.unified_diff but with
+    explicit autojunk control. See the long comment above for why this
+    exists."""
     if fromfiledate is None:
         fromfiledate = ''
     if tofiledate is None:
@@ -342,6 +361,12 @@ class Differ:
               lines wrap to a different number of visual rows.
     """
     def __init__(self, a='', b=''):
+        """Initialize the Differ with two line sequences.
+
+        Sets default options: native_histogram algorithm, autojunk on,
+        detailed compare on. The algorithm can be changed later via
+        self.diff_algorithm before calling compare().
+        """
         self.withdetail = True
         # Algorithm key stored in self.diff_algorithm. One of:
         #
@@ -381,6 +406,7 @@ class Differ:
         self.diffmap = []
 
     def set_seqs(self, a, b):
+        """Set the two line sequences to compare."""
         self.a = a
         self.b = b
 
@@ -586,6 +612,16 @@ class Differ:
         return result
 
     def compare(self):
+        """Generator that yields diff events for side-by-side display.
+
+        Runs the selected diff algorithm, applies _realign_opcodes (for
+        non-native algorithms), then walks the opcodes and yields events
+        (A_LINE_DEL, B_LINE_ADD, A_GAP, B_GAP, ALIGN, A_SYMBOL_DEL, etc.)
+        that __init__.py consumes to paint the compare view.
+
+        Also populates self.diffmap with [i1, i2, j1, j2] for each
+        non-equal opcode, used by jump()/copy()/select_current().
+        """
         # Benchmark: when _BENCHMARK is True, measure the total time from
         # when the generator starts executing until it is fully consumed
         # (or closed).
@@ -685,6 +721,12 @@ class Differ:
                       len(self.diffmap)))
 
     def unidiff(self, a, b, f1, f2, n):
+        """Produce a unified diff string from two line sequences.
+
+        Uses difflib.unified_diff when autojunk=True (the default), or
+        _unified_diff when autojunk=False (to forward the flag to
+        SequenceMatcher). See the comment on _unified_diff for why.
+        """
         # autojunk=True matches the stdlib default -> call difflib.unified_diff
         # directly (no reimplementation on the hot path). Only when the user
         # opts out (autojunk=False) do we need _unified_diff to forward the
@@ -700,22 +742,28 @@ class Differ:
     def _replace_block(self, a, alo, ahi, b, blo, bhi):
         """Process a 'replace' opcode: a[alo:ahi] is replaced by b[blo:bhi].
 
-        Runs a line-level diff WITHIN the REPLACE block to find exactly-
-        equal lines (anchor points), then for sub-REPLACE blocks where
-        lines are similar but not equal, finds the best-matching line
-        pairs by char-level similarity (difflib ratio). This matches VS
-        Code's behavior of aligning similar lines within a REPLACE block.
+        Aligns lines within a REPLACE block for visual display. Two paths:
 
-        Algorithm:
-          1. Run MyersSequenceMatcher on a[alo:ahi] vs b[blo:bhi] to find
-             exactly-equal lines.
-          2. Apply _realign_opcodes to fix INSERT+EQUAL(trivial)+DELETE
-             patterns within the sub-block.
-          3. EQUAL sub-blocks: yield ALIGN.
-          4. DELETE sub-blocks: yield A_LINE_DEL + B_GAP.
-          5. INSERT sub-blocks: yield B_LINE_ADD + A_GAP.
-          6. Sub-REPLACE blocks: call _find_best_pairs to align similar
-             lines by char-level ratio, then do char_diff on each pair.
+        Fast path (da == db): positional pairing — pair 1st line of A with
+        1st line of B, 2nd with 2nd, etc. For each pair, if lines are
+        identical yield ALIGN; otherwise run char_diff and yield the
+        char-level changes. This is the common case and avoids the O(N*M)
+        prefix/suffix search.
+
+        Slow path (da != db): _find_best_pairs — find the best-matching
+        line pair by (1) exact unique match (longest wins), then (2) common
+        prefix/suffix length scoring. Recurse on the parts before and after
+        the best pair. This aligns similar-but-not-equal lines (e.g.
+        'def foo(self):' with 'def bar(self):') so char_diff highlights
+        only the differing characters.
+
+        Note: the line-level diff algorithm (cudadiff.pas / Myers) already
+        found ALL exactly-equal lines and emitted them as separate EQUAL
+        opcodes. So this function does NOT re-run Myers — the exact-match
+        search in _find_best_pairs only finds matches that Myers missed
+        (rare, can happen with the TOO_EXPENSIVE heuristic). The main
+        value of _find_best_pairs is the prefix/suffix scoring for
+        similar-but-not-equal lines, which Myers does not do.
         """
         Profiler.start('replace_block:total')
         da, db = ahi - alo, bhi - blo
@@ -744,7 +792,7 @@ class Differ:
         # a line-level Myers diff + _realign_opcodes on every REPLACE
         # block. For large files (e.g. 33k-line HTML), most REPLACE blocks
         # have da == db, so this keeps performance at ~30s instead of ~80s.
-        # The ratio-based search (_find_best_pairs) is only needed when
+        # The prefix/suffix search (_find_best_pairs) is only needed when
         # da != db, because that's when positional pairing might misalign
         # similar lines.
         if da == db:
@@ -765,31 +813,32 @@ class Differ:
             return
 
         # Different line counts (da != db): use _find_best_pairs which
-        # finds the best-matching pair by char-level similarity (exact
-        # matches first, then prefix/suffix ratio), then recurses.
+        # finds the best-matching pair by exact unique match (longest
+        # wins) or prefix/suffix length scoring, then recurses.
         yield from self._find_best_pairs(a, alo, ahi, b, blo, bhi)
         Profiler.stop('replace_block:total')
 
     def _find_best_pairs(self, a, alo, ahi, b, blo, bhi):
         """Find the best line alignment within a sub-REPLACE block.
 
-        For small blocks (<= _BEST_PAIR_MAX_LINES lines per side): find
-        the best-matching line pair by char-level similarity (difflib
-        ratio), do char_diff on that pair, then recurse on the parts
-        before and after. No ratio threshold -- we always pick the best
-        pair, even if its ratio is low. For completely different lines
-        (ratio ~0), this gives the same result as positional pairing.
+        Finds the best-matching line pair using two strategies:
+        1. Exact unique match: build a dict of unique lines in a[alo:ahi],
+           scan b[blo:bhi] for matches, pick the LONGEST match as anchor.
+           O(N+M) via Counter-based uniqueness check.
+        2. If no exact match: prefix/suffix length scoring. For each (i,j)
+           pair, compute common prefix length + common suffix length.
+           Score = prefix*100 + suffix. Pick the highest-scoring pair.
+           O(N*M) per block but each comparison is O(line_length).
 
-        For large blocks: use positional pairing (1st with 1st, etc.)
-        to avoid the O(N*M) ratio search. This trades alignment quality
-        for speed on large files.
+        After finding the best pair, do char_diff on it, then recurse on
+        the parts before and after. A minimum prefix threshold (>= 3 chars)
+        prevents pairing completely unrelated lines.
 
-        This approach is fast because:
-        - difflib's ratio() uses C-optimized quick_ratio/real_quick_ratio
-          filters that skip most pairs without computing the full ratio
-        - The size guard limits the search to small blocks
-        - For completely different lines, the filters skip all pairs
-          after the first, so it's O(N+M) not O(N*M)
+        The line-level diff (cudadiff.pas) already found all exactly-equal
+        lines, so the exact-match search here mainly catches rare cases
+        where the TOO_EXPENSIVE heuristic produced a suboptimal REPLACE.
+        The main value is the prefix/suffix scoring for similar-but-not-
+        equal lines, which the line-level diff does not do.
         """
         da, db = ahi - alo, bhi - blo
         if da == 0:
@@ -810,7 +859,7 @@ class Differ:
         # LONGEST one as the anchor (longer lines are more specific and
         # better anchors — 'def on_change_slow(self, ed_self):' is a
         # better anchor than 'else:'). If no unique exact match, fall
-        # back to prefix/suffix ratio search.
+        # back to prefix/suffix length scoring.
         best_score = -1
         best_prefix = 0
         best_i, best_j = alo, blo
@@ -851,7 +900,7 @@ class Differ:
             best_prefix = 1000000
             max_prefix_any = 1000000
         else:
-            # No unique exact match — use prefix/suffix ratio search.
+            # No unique exact match — use prefix/suffix length scoring.
             # No size guard: the prefix/suffix metric is O(line_length)
             # per pair, and the exact-match pass above already handled
             # unique lines. For large blocks without unique matches,
