@@ -203,6 +203,40 @@ OPTS_META = [
      'frm': 'bool',
      'chp': 'config',
      },
+    {'opt': 'differ.show_micromap',
+     'cmt': _('Show the micromap (mini-map of changes) in the compare '
+              'tab. The micromap is a thin colored strip in the scrollbar '
+              'area that shows the location of added/deleted/changed lines, '
+              'giving a bird\'s-eye overview of the diff. '
+              'Default: on.'),
+     'def': True,
+     'frm': 'bool',
+     'chp': 'config',
+     },
+    {'opt': 'differ.micromap_show_line_states',
+     'cmt': _('When enabled, the micromap shows per-line state colors '
+              '(added/deleted/changed) at line granularity. When disabled, '
+              'the micromap shows only a single overview color. '
+              'Sets the "micromap_line_states" key in user.json. '
+              'Default: off.'),
+     'def': False,
+     'frm': 'bool',
+     'chp': 'config',
+     },
+    {'opt': 'differ.micromap_on_scrollbar',
+     'cmt': _('Merge the micromap into the editor scrollbar so the two '
+              'appear as a single bar (instead of the micromap being a '
+              'separate strip). Requires "scrollbar_themed": true in '
+              'user.json — the themed scrollbar API is what allows the '
+              'micromap to render inside the scrollbar. '
+              'This is a user.json-only option (not a differ.* setting) — '
+              'set "micromap_on_scrollbar": true directly in '
+              'settings/user.json to enable. Also set '
+              '"scrollbar_themed": true in the same file.'),
+     'def': False,
+     'frm': 'bool',
+     'chp': 'config',
+     },
 ]
 
 DIFF_TAB_COUNT = 1
@@ -1368,6 +1402,25 @@ class Command:
            self.cfg.get('theme_name') == theme_name:
             return
         self.cfg = self.get_config()
+        # Apply micromap options that write to user.json (not cuda_differ.json).
+        # These must be re-applied whenever config is reloaded.
+        self._apply_micromap_user_json()
+
+    def _apply_micromap_user_json(self):
+        """Apply micromap-related options that live in user.json (not
+        cuda_differ.json). These are CudaText core options, not Differ
+        plugin options, so they need to be written to user.json via
+        cudax_lib.set_opt.
+
+        Currently handles:
+        - micromap_show_line_states -> sets 'micromap_line_states' in user.json
+          (true when show_line_states is on, false when off)
+        """
+        try:
+            line_states = self.cfg.get('micromap_show_line_states', False)
+            ctx.set_opt('micromap_line_states', bool(line_states))
+        except Exception as ex:
+            msg('failed to set micromap_line_states in user.json: {}'.format(ex), level=1)
 
     @staticmethod
     def get_config():
@@ -1430,6 +1483,10 @@ class Command:
                 get_opt('autojunk', True),
             'enable_profiling':
                 get_opt('enable_profiling', False),
+            'show_micromap':
+                get_opt('show_micromap', True),
+            'micromap_show_line_states':
+                get_opt('micromap_show_line_states', False),
         }
 
         new_nkind(NKIND_DELETED, config.get('color_deleted'))
