@@ -6,8 +6,16 @@ import cudatext as ct
 import cudatext_cmd as ct_cmd
 import cudax_lib as ctx
 
-from . import differ as df
+from . import differ_native as dfn
+from . import differ_python as dfp
 from .profiling import Profiler, enable_profiling, profiling_report, reset_profiling
+
+# df is used as a namespace for event constants (A_LINE_DEL, B_LINE_ADD, etc.).
+# Both differ_native and differ_python define identical constants, so we alias
+# df to differ_native for backwards-compatible constant access. The Differ
+# class itself is chosen at runtime based on the configured algorithm — see
+# Command._create_differ below.
+df = dfn
 
 from cudax_lib import get_translation
 _ = get_translation(__file__)  # I18N
@@ -251,7 +259,7 @@ class Command:
     def __init__(self):
         self.scroll = ScrollSplittedTab(__name__)
         self.cfg = self.get_config()
-        self.diff = df.Differ()
+        self.diff = self._create_differ()
         # Set to True by on_exit_pre when CudaText is about to exit, so that
         # on_close (which fires next, once per closing tab) can skip
         # temp-file deletion and let compare tabs persist across restarts.
@@ -953,6 +961,40 @@ class Command:
         tabs managed by this plugin."""
         self._refresh_ex(ct.ed, show_dialog=True)
 
+    def _create_differ(self):
+        """Create the appropriate Differ instance based on the configured
+        algorithm. Returns a differ_native.Differ for native algorithms
+        (when the native API is available), or a differ_python.Differ for
+        all Python algorithms and as a fallback when native is unavailable.
+        """
+        algo = self.cfg.get('diff_algorithm', 'native_histogram')
+        if algo in ('native_histogram', 'native_myers') and dfn._HAS_NATIVE_DIFF:
+            return dfn.Differ()
+        return dfp.Differ()
+
+    def _ensure_correct_differ(self):
+        """Check if self.diff matches the configured algorithm type, and
+        swap it if not. Called at the start of _refresh_ex so the Differ
+        is always the right type before a compare runs. Preserves the
+        sequences and options from the old Differ."""
+        algo = self.cfg.get('diff_algorithm', 'native_histogram')
+        want_native = algo in ('native_histogram', 'native_myers') and dfn._HAS_NATIVE_DIFF
+        is_native = isinstance(self.diff, dfn.Differ)
+        if want_native == is_native:
+            return  # already the right type
+        # Swap: preserve sequences and options
+        old_a = getattr(self.diff, 'a', '')
+        old_b = getattr(self.diff, 'b', '')
+        old_withdetail = getattr(self.diff, 'withdetail', True)
+        old_autojunk = getattr(self.diff, 'autojunk', True)
+        old_ratio = getattr(self.diff, 'ratio', 0.75)
+        self.diff = dfn.Differ() if want_native else dfp.Differ()
+        self.diff.set_seqs(old_a, old_b)
+        self.diff.withdetail = old_withdetail
+        self.diff.autojunk = old_autojunk
+        self.diff.ratio = old_ratio
+        self.diff.diff_algorithm = algo
+
     def _refresh_ex(self, ed, show_dialog=False):
         """Core refresh logic. 'ed' is any editor belonging to the compare
         tab. Only applies to compare tabs managed by this plugin.
@@ -1038,6 +1080,12 @@ class Command:
 
             # config() was already called above (before the profiling check).
             # Don't call it again here.
+
+            # Ensure the Differ instance matches the configured algorithm
+            # type (native vs Python). Swaps if the user changed the
+            # algorithm in config since the last compare.
+            self._ensure_correct_differ()
+
             Profiler.start('refresh:splitlines')
             self.diff.set_seqs(a_text_all.splitlines(True),
                                b_text_all.splitlines(True))

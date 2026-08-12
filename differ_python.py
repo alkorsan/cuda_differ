@@ -1,3 +1,15 @@
+"""Differ module for Python algorithms (hybrid, myers, vscode, patience, difflib).
+
+This file is self-contained: it contains everything needed to run the
+pure-Python diff algorithms. It does NOT depend on differ_native.py.
+
+For native algorithms (native_histogram, native_myers), use
+differ_native.py instead — the native engine is 10-30x faster.
+
+Code is intentionally duplicated from differ_native.py to allow
+independent evolution of the native and Python codepaths.
+"""
+
 import time
 from difflib import SequenceMatcher as DefaultSequenceMatcher, unified_diff
 from .myers import MyersSequenceMatcher, InlineMyersSequenceMatcher
@@ -6,115 +18,6 @@ from .vscode_diff import VSCodeSequenceMatcher
 from .char_diff import char_diff
 from .profiling import Profiler
 from collections import Counter
-
-# Import cudatext and detect whether the native diff_proc API is available.
-# The constants (DIF_TEXTS, DIF_CHARS, DIFF_ALGO_MYERS, DIFF_ALGO_HISTOGRAM)
-# are pulled from cudatext when available; literal fallbacks are used only
-# when cudatext itself is not importable (e.g. running unit tests outside
-# CudaText). When _HAS_NATIVE_DIFF is True, diff_proc exists and the
-# constants are guaranteed to exist too (they were added in the same PR).
-try:
-    import cudatext as _ct
-    _HAS_NATIVE_DIFF = hasattr(_ct, 'diff_proc')
-    _DIF_TEXTS = _ct.DIF_TEXTS
-    _DIF_CHARS = _ct.DIF_CHARS
-    _DIFF_ALGO_MYERS = _ct.DIFF_ALGO_MYERS
-    _DIFF_ALGO_HISTOGRAM = _ct.DIFF_ALGO_HISTOGRAM
-except (ImportError, AttributeError):
-    _HAS_NATIVE_DIFF = False
-    _DIF_TEXTS = 1
-    _DIF_CHARS = 2
-    _DIFF_ALGO_MYERS = 0
-    _DIFF_ALGO_HISTOGRAM = 1
-
-
-class CudaDiffNativeMatcher:
-    """Difflib-compatible wrapper around cudatext.diff_proc().
-
-    Calls the native Free Pascal diff engine (Myers or Histogram, ported
-    from JGit) exposed at cudatext.diff_proc(). The native engine is
-    dramatically faster than any of the pure-Python matchers on large
-    files (10-30x speedup is typical).
-
-    This class exposes the same minimal interface Differ.compare() uses
-    from the other matchers: get_opcodes() returning a list of
-    (tag, i1, i2, j1, j2) tuples with tag in
-    {'equal', 'delete', 'insert', 'replace'}.
-
-    The native API takes two LF-joined strings and returns exactly that
-    opcode format, so this wrapper is essentially a type adapter:
-    list-of-lines -> LF-joined-string -> native call -> opcodes.
-
-    NOTE: cudatext.diff_proc expects strings with line terminators
-    attached (keepends=True). The plugin already stores sequences that
-    way (see __init__.py: splitlines(True)), so we just join with ''.
-    """
-
-    # Algorithm IDs — pulled from cudatext module constants (see above).
-    _ALGO_MYERS = _DIFF_ALGO_MYERS
-    _ALGO_HISTOGRAM = _DIFF_ALGO_HISTOGRAM
-
-    def __init__(self, isjunk=None, a='', b='', algo=1):
-        """Create a native diff matcher.
-
-        Args:
-            isjunk: ignored (kept for difflib API compatibility; the
-                native engine does not support junk heuristics).
-            a, b: sequences of lines (list of str, each with its line
-                terminator attached -- i.e. keepends=True).
-            algo: CudaDiffNativeMatcher._ALGO_MYERS (0) or
-                  CudaDiffNativeMatcher._ALGO_HISTOGRAM (1, default).
-        """
-        self.a = a
-        self.b = b
-        self._algo = algo
-        self.opcodes = None
-
-    def get_matching_blocks(self):
-        """Return list of (i, j, n) matching blocks, difflib-style.
-
-        Derived from get_opcodes() -- equal runs become matching blocks,
-        with a sentinel (len(a), len(b), 0) at the end.
-        """
-        blocks = []
-        for tag, i1, i2, j1, j2 in self.get_opcodes():
-            if tag == 'equal':
-                blocks.append((i1, j1, i2 - i1))
-        blocks.append((len(self.a), len(self.b), 0))
-        return blocks
-
-    def get_opcodes(self):
-        """Return difflib-compatible opcodes by calling cudatext.diff_proc.
-
-        Returns:
-            list of (tag, i1, i2, j1, j2) tuples where tag is a lowercase
-            string. Identical in format to difflib.SequenceMatcher.get_opcodes().
-        """
-        if self.opcodes is not None:
-            return self.opcodes
-        Profiler.start('native:join_strings')
-        text_a = ''.join(self.a)
-        text_b = ''.join(self.b)
-        Profiler.stop('native:join_strings')
-        Profiler.start('native:diff_proc_call')
-        result = _ct.diff_proc(
-            _DIF_TEXTS,
-            text_a,
-            text_b,
-            self._algo,
-            0,                   # flags: DIFF_IGN_NONE (no ignore flags yet)
-            None,                # cancel: none
-        )
-        Profiler.stop('native:diff_proc_call')
-        # The native API returns None when cancelled; without a cancel
-        # callback this cannot happen, but be defensive.
-        if result is None:
-            # Fall back to a single REPLACE covering everything so the
-            # caller's opcode-walking loop still produces sensible output
-            # (everything painted as changed) instead of crashing.
-            result = [('replace', 0, len(self.a), 0, len(self.b))]
-        self.opcodes = result
-        return result
 
 
 def HybridSequenceMatcher(isjunk=None, a='', b=''):
@@ -216,6 +119,11 @@ class _CombinedMatcher:
 _BENCHMARK = True
 
 
+# --- Event constants ---
+# These are the event IDs yielded by Differ.compare(). __init__.py
+# consumes them to paint the side-by-side compare view.
+# They are duplicated in differ_native.py — both modules define the
+# same constants so they can be used independently.
 A_LINE_DEL = '-'
 B_LINE_ADD = '+'
 A_LINE_CHANGE = '-*'
@@ -255,51 +163,16 @@ def _format_range_unified(start, stop):
 # default ``autojunk=True`` and does not expose any way to change it -- see
 # https://github.com/python/cpython/issues/118150. The plugin has a
 # user-facing ``autojunk`` config option that already controls the side-by-side
-# compare path (``Differ.compare`` and ``Differ._fancy_replace``); without this
-# wrapper, the unified-diff path (the "Diff with file..." / "Diff with tab..."
-# commands) would silently ignore that option when the user sets
-# ``autojunk=False``.
-#
-# Usage policy (see ``Differ.unidiff``):
-#   * When ``self.autojunk`` is True (the default), we call
-#     ``difflib.unified_diff`` directly -- the stdlib already builds its
-#     ``SequenceMatcher`` with ``autojunk=True``, so there is nothing to
-#     override. This keeps the hot path on stdlib code (zero maintenance,
-#     automatic benefit from any future CPython improvement), and our
-#     reimplementation only runs when the user explicitly opts out of the
-#     heuristic.
-#   * When ``self.autojunk`` is False, we fall back to ``_unified_diff``
-#     below, which is the only way to forward ``autojunk=False`` today.
-#
-# Why we did NOT use the monkey-patch workaround suggested in that issue
-# (``unittest.mock.patch`` on ``SequenceMatcher.__init__`` combined with
-# ``functools.partialmethod(..., autojunk=False)``):
-#   * ``unittest.mock`` is a testing tool; pulling it into production code
-#     just to override one keyword is heavy and surprising to readers.
-#   * Patching a stdlib class is global for the duration of the ``with``
-#     block -- any other thread/call that hits ``SequenceMatcher`` meanwhile
-#     is affected too.
-#   * The snippet hardcodes ``autojunk=False`` and therefore cannot honor a
-#     user config of ``autojunk=True`` without extra conditionals; in our
-#     setup that means we'd be patching even on the default path, paying the
-#     cost and risk for no benefit.
-#   * Forward compatibility: if CPython ever adds ``autojunk`` to
-#     ``unified_diff`` (the very point of the issue above), ``partialmethod``'s
-#     preset ``autojunk=False`` would silently override the new parameter's
-#     default whenever the caller does not pass it explicitly, masking the
-#     stdlib behavior. Our reimplementation has no such issue -- and once
-#     CPython ships ``autojunk`` on ``unified_diff``, we can delete this
-#     function and call ``difflib.unified_diff(..., autojunk=autojunk)``
-#     directly in both branches.
+# compare path; without this wrapper, the unified-diff path (the "Diff with
+# file..." / "Diff with tab..." commands) would silently ignore that option
+# when the user sets ``autojunk=False``.
 #
 # Implementation is a verbatim copy of ``difflib.unified_diff`` from CPython
 # with two differences:
 #   1. ``SequenceMatcher(None, a, b, autojunk=autojunk)`` instead of
 #      ``SequenceMatcher(None, a, b)`` -- the whole point.
 #   2. ``fromfiledate``/``tofiledate`` of ``None`` fall back to an empty
-#      string instead of the current system timestamp. The plugin never
-#      passes dates, so this is a non-issue here; if you need timestamps,
-#      format them yourself and pass them as strings.
+#      string instead of the current system timestamp.
 def _unified_diff(a, b, fromfile='', tofile='',
                   fromfiledate='', tofiledate='',
                   n=3, lineterm='\n', autojunk=True):
@@ -338,8 +211,17 @@ def _unified_diff(a, b, fromfile='', tofile='',
 
 
 class Differ:
-    """
-    compare function return tuples for paint text
+    """Differ for Python algorithms (hybrid, myers, vscode, patience, difflib).
+
+    Handles all non-native algorithms. For native algorithms
+    (native_histogram, native_myers), use differ_native.Differ instead.
+
+    This class is self-contained: it does not import from differ_native.
+    Code that overlaps with differ_native.Differ (event constants,
+    _replace_block, _find_best_pairs, _char_diff_pair, unidiff, etc.) is
+    duplicated intentionally to allow independent evolution.
+
+    compare() function return tuples for paint text:
     id can be:
           - paint deleted line in file a
               return (id, y)
@@ -360,25 +242,17 @@ class Differ:
               Consumed by __init__.py to add a compensating gap when the two
               lines wrap to a different number of visual rows.
     """
+
     def __init__(self, a='', b=''):
         """Initialize the Differ with two line sequences.
 
-        Sets default options: native_histogram algorithm, autojunk on,
-        detailed compare on. The algorithm can be changed later via
+        Sets default options: hybrid algorithm, autojunk on, detailed
+        compare on. The algorithm can be changed later via
         self.diff_algorithm before calling compare().
         """
         self.withdetail = True
         # Algorithm key stored in self.diff_algorithm. One of:
         #
-        #   'native_histogram' (CudaDiffNativeMatcher with Histogram algo —
-        #                       native Pascal port of JGit HistogramDiff;
-        #                       patience-like anchoring on unique lines with
-        #                       graceful fallback when no unique lines exist;
-        #                       fast and high-quality; recommended default),
-        #   'native_myers'    (CudaDiffNativeMatcher with Myers algo —
-        #                       native Pascal port of JGit MyersDiff;
-        #                       linear-space middle-snake Myers; the
-        #                       algorithm git uses for `git diff --myers`),
         #   'hybrid'          (HybridSequenceMatcher — pure-Python patience
         #                       anchoring on unique lines + Myers for the
         #                       gaps; best pure-Python quality),
@@ -394,14 +268,11 @@ class Differ:
         #                       patience diff; anchors on unique lines),
         #   'difflib'         (Python stdlib SequenceMatcher with autojunk).
         #
-        # The 'native_*' keys call into the built-in cudatext.diff_proc()
-        # API and run in compiled Pascal code. They are typically 10-30x
-        # faster than their pure-Python equivalents on large files.
-        # The other keys are pure-Python implementations kept as fallbacks
-        # (useful when running on a CudaText build that does not yet have
-        # the native diff_proc API, or for algorithm quality comparison).
-        self.diff_algorithm = 'native_histogram'
+        # These are pure-Python implementations. For native algorithms
+        # (10-30x faster), use differ_native.Differ instead.
+        self.diff_algorithm = 'hybrid'
         self.autojunk = True
+        self.ratio = 0.75  # kept for API compat with __init__.py; unused
         self.set_seqs(a, b)
         self.diffmap = []
 
@@ -413,45 +284,20 @@ class Differ:
     def _char_diff(self, line_a, line_b):
         """Compute char-level diff between two single-line strings.
 
-        Dispatches to the native cudatext.diff_proc(DIF_CHARS) API when
-        the selected algorithm is one of the native ones (native_histogram,
-        native_myers). Falls back to the pure-Python char_diff.char_diff()
-        for all other algorithms (hybrid, myers, vscode, patience, difflib).
-
-        This split lets us compare native vs Python char-diff quality on
-        the same input by just switching the diff_algorithm config option.
-        The Python path is also the fallback for CudaText builds that do
-        not yet have the DIF_CHARS API.
+        Always uses the pure-Python char_diff.char_diff() — this Differ
+        is Python-only. The native DIF_CHARS path is in
+        differ_native.Differ._char_diff.
 
         Returns: list of (tag, a_start, a_end, b_start, b_end) tuples
         where tag is 'equal'/'delete'/'insert'/'replace' and offsets are
         character positions into line_a / line_b. Same format as
         difflib.SequenceMatcher.get_opcodes() operating on characters.
         """
-        if self.diff_algorithm in ('native_histogram', 'native_myers') and _HAS_NATIVE_DIFF:
-            Profiler.start('char_diff:native_call')
-            try:
-                result = _ct.diff_proc(
-                    _DIF_CHARS,
-                    line_a,
-                    line_b,
-                    0,                   # algo: unused for DIF_CHARS
-                    0,                   # flags: DIFF_IGN_NONE (no ignore flags yet)
-                    None,                # cancel: none
-                )
-            finally:
-                Profiler.stop('char_diff:native_call')
-            if result is None:
-                # Cancelled (shouldn't happen without a cancel callback)
-                # — fall back to a single REPLACE covering everything.
-                result = [('replace', 0, len(line_a), 0, len(line_b))]
-            return result
-        else:
-            Profiler.start('char_diff:python_call')
-            try:
-                return char_diff(line_a, line_b)
-            finally:
-                Profiler.stop('char_diff:python_call')
+        Profiler.start('char_diff:python_call')
+        try:
+            return char_diff(line_a, line_b)
+        finally:
+            Profiler.stop('char_diff:python_call')
 
     # Threshold for the "trivial equal block" check in _realign_opcodes.
     # If the EQUAL block between an INSERT and a DELETE (or vice versa)
@@ -606,18 +452,17 @@ class Differ:
                     # more trivial lines to absorb
                     continue
             i += 1
-        
+
         """
-        
         return result
 
     def compare(self):
         """Generator that yields diff events for side-by-side display.
 
-        Runs the selected diff algorithm, applies _realign_opcodes (for
-        non-native algorithms), then walks the opcodes and yields events
-        (A_LINE_DEL, B_LINE_ADD, A_GAP, B_GAP, ALIGN, A_SYMBOL_DEL, etc.)
-        that __init__.py consumes to paint the compare view.
+        Runs the selected Python diff algorithm, applies _realign_opcodes
+        to fix LCS tie-breaking issues, then walks the opcodes and yields
+        events (A_LINE_DEL, B_LINE_ADD, A_GAP, B_GAP, ALIGN, A_SYMBOL_DEL,
+        etc.) that __init__.py consumes to paint the compare view.
 
         Also populates self.diffmap with [i1, i2, j1, j2] for each
         non-equal opcode, used by jump()/copy()/select_current().
@@ -631,19 +476,7 @@ class Differ:
 
         self.diffmap = []
         Profiler.start('compare:algorithm')
-        if self.diff_algorithm == 'native_histogram':
-            if not _HAS_NATIVE_DIFF:
-                diff = HybridSequenceMatcher(None, self.a, self.b)
-            else:
-                diff = CudaDiffNativeMatcher(
-                    None, self.a, self.b, algo=CudaDiffNativeMatcher._ALGO_HISTOGRAM)
-        elif self.diff_algorithm == 'native_myers':
-            if not _HAS_NATIVE_DIFF:
-                diff = MyersSequenceMatcher(None, self.a, self.b)
-            else:
-                diff = CudaDiffNativeMatcher(
-                    None, self.a, self.b, algo=CudaDiffNativeMatcher._ALGO_MYERS)
-        elif self.diff_algorithm == 'hybrid':
+        if self.diff_algorithm == 'hybrid':
             diff = HybridSequenceMatcher(None, self.a, self.b)
         elif self.diff_algorithm == 'myers':
             diff = MyersSequenceMatcher(None, self.a, self.b)
@@ -652,29 +485,19 @@ class Differ:
         elif self.diff_algorithm == 'patience':
             diff = PatienceSequenceMatcher(None, self.a, self.b)
         else:
+            # Default: difflib stdlib SequenceMatcher
             diff = DefaultSequenceMatcher(None, self.a, self.b, autojunk=self.autojunk)
 
-        # For native matchers, get_opcodes() calls diff_proc (the native
-        # engine) — this is where the actual algorithm runs. For Python
-        # matchers, get_opcodes() runs the Python algorithm. Profiling
-        # both under the same name so the report shows algorithm time
-        # regardless of which algorithm was selected.
         opcodes = diff.get_opcodes()
         Profiler.stop('compare:algorithm')
 
         # _realign_opcodes fixes LCS tie-breaking issues where Myers
         # matches trivial lines (empty, whitespace) instead of meaningful
         # ones. This is needed for Python Myers/difflib (which produce
-        # INSERT+EQUAL(trivial)+DELETE patterns). Native Histogram doesn't
-        # produce these patterns (its anchoring prevents them), so skip
-        # the realignment for native algorithms to save the Python loop
-        # overhead. Native Myers with TOO_EXPENSIVE heuristic may produce
-        # suboptimal splits, but the realignment won't fix those (they're
-        # different from the LCS tie-breaking issue).
-        if self.diff_algorithm not in ('native_histogram', 'native_myers'):
-            Profiler.start('compare:realign_opcodes')
-            opcodes = self._realign_opcodes(opcodes)
-            Profiler.stop('compare:realign_opcodes')
+        # INSERT+EQUAL(trivial)+DELETE patterns).
+        Profiler.start('compare:realign_opcodes')
+        opcodes = self._realign_opcodes(opcodes)
+        Profiler.stop('compare:realign_opcodes')
 
         Profiler.start('compare:event_generation')
         for tag, i1, i2, j1, j2 in opcodes:
@@ -757,11 +580,11 @@ class Differ:
         'def foo(self):' with 'def bar(self):') so char_diff highlights
         only the differing characters.
 
-        Note: the line-level diff algorithm (cudadiff.pas / Myers) already
+        Note: the line-level diff algorithm (Myers/difflib) already
         found ALL exactly-equal lines and emitted them as separate EQUAL
         opcodes. So this function does NOT re-run Myers — the exact-match
         search in _find_best_pairs only finds matches that Myers missed
-        (rare, can happen with the TOO_EXPENSIVE heuristic). The main
+        (rare, can happen with suboptimal LCS tie-breaking). The main
         value of _find_best_pairs is the prefix/suffix scoring for
         similar-but-not-equal lines, which Myers does not do.
         """
@@ -834,9 +657,9 @@ class Differ:
         the parts before and after. A minimum prefix threshold (>= 3 chars)
         prevents pairing completely unrelated lines.
 
-        The line-level diff (cudadiff.pas) already found all exactly-equal
+        The line-level diff (Myers/difflib) already found all exactly-equal
         lines, so the exact-match search here mainly catches rare cases
-        where the TOO_EXPENSIVE heuristic produced a suboptimal REPLACE.
+        where suboptimal LCS tie-breaking produced a suboptimal REPLACE.
         The main value is the prefix/suffix scoring for similar-but-not-
         equal lines, which the line-level diff does not do.
         """
@@ -869,7 +692,6 @@ class Differ:
         # Use a dict-based approach for O(N+M) instead of O(N*M):
         # build a map of unique lines in a[alo:ahi], then scan b[blo:bhi].
         Profiler.start('find_best_pairs:exact_match_search')
-        from collections import Counter
         sub_a_counts = Counter(a[alo:ahi])
         sub_b_counts = Counter(b[blo:bhi])
         best_exact_len = 0
