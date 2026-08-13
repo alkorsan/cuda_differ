@@ -1308,7 +1308,7 @@ class Command:
                y,
                nlen,
                color_bg=bg,
-               show_on_map=True
+               show_on_map=1
                )
 
     def set_gap(self, e, row, n=1):
