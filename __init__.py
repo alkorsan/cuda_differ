@@ -66,6 +66,12 @@ DECOR_CHAR = '■'
 DEFAULT_SYNC_SCROLL = '1'
 U_PREFIX = 'untitled:'
 
+# Micromap column tag for diff-colored line highlights.
+# We add a custom micromap column with this tag and paint colored fragments
+# on it via set_attr(show_on_map=MICROMAP_TAG) for each changed/added/deleted
+# line. The tag value 73 is arbitrary but must be in 1..127.
+MICROMAP_TAG = 73
+
 PLG_NAME = _('Differ')
 METAJSONFILE = os.path.dirname(__file__) + os.sep + 'differ_opts.json'
 JSONFILE = 'cuda_differ.json'  # To store in settings/cuda_differ.json
@@ -205,11 +211,12 @@ OPTS_META = [
      },
     {'opt': 'differ.enable_micromap',
      'cmt': _('Enable the micromap (mini-map of changes) in compare tabs. '
-              'When enabled, sets "micromap_bookmarks": true in user.json '
-              'so the micromap shows bookmarks (the colored line markers '
-              'Differ uses for added/deleted/changed lines), clears the '
-              'default micromap columns 0 and 2, and enables the micromap '
-              'on both split editors. '
+              'When enabled, clears the default micromap columns 0, 1, 2 '
+              'on both split editors, adds a custom micromap column for '
+              'diff-colored line highlights (deleted=red, added=green, '
+              'changed=yellow), and enables the micromap. Each changed '
+              'line is painted on the micromap via attr() with the '
+              'appropriate diff color. '
               'Default: on.'),
      'def': True,
      'frm': 'bool',
@@ -1138,6 +1145,7 @@ class Command:
                 line_h_a = 0
                 line_h_b = 0
             color_gaps = self.cfg.get('color_gaps')
+            micromap_on = self.cfg.get('enable_micromap', True)
 
             # The for loop below consumes events from diff.compare() (a
             # generator) and paints each event. Profiling the loop as a whole
@@ -1155,6 +1163,11 @@ class Command:
                     Profiler.start('paint:decor')
                     self.set_decor(a_ed, y, DECOR_CHAR, self.cfg.get('color_deleted'))
                     Profiler.stop('paint:decor')
+                    if micromap_on:
+                        Profiler.start('paint:micromap')
+                        self.set_attr(a_ed, y=y, bg=self.cfg.get('color_deleted'),
+                                     mptag=MICROMAP_TAG, map_only=1)
+                        Profiler.stop('paint:micromap')
                 elif diff_id == df.B_LINE_ADD:
                     Profiler.start('paint:bookmark')
                     self.set_bookmark2(b_ed, y, NKIND_ADDED)
@@ -1162,14 +1175,29 @@ class Command:
                     Profiler.start('paint:decor')
                     self.set_decor(b_ed, y, DECOR_CHAR, self.cfg.get('color_added'))
                     Profiler.stop('paint:decor')
+                    if micromap_on:
+                        Profiler.start('paint:micromap')
+                        self.set_attr(b_ed, y=y, bg=self.cfg.get('color_added'),
+                                     mptag=MICROMAP_TAG, map_only=1)
+                        Profiler.stop('paint:micromap')
                 elif diff_id == df.A_LINE_CHANGE:
                     Profiler.start('paint:bookmark')
                     self.set_bookmark2(a_ed, y, NKIND_CHANGED)
                     Profiler.stop('paint:bookmark')
+                    if micromap_on:
+                        Profiler.start('paint:micromap')
+                        self.set_attr(a_ed, y=y, bg=self.cfg.get('color_changed'),
+                                     mptag=MICROMAP_TAG, map_only=1)
+                        Profiler.stop('paint:micromap')
                 elif diff_id == df.B_LINE_CHANGE:
                     Profiler.start('paint:bookmark')
                     self.set_bookmark2(b_ed, y, NKIND_CHANGED)
                     Profiler.stop('paint:bookmark')
+                    if micromap_on:
+                        Profiler.start('paint:micromap')
+                        self.set_attr(b_ed, y=y, bg=self.cfg.get('color_changed'),
+                                     mptag=MICROMAP_TAG, map_only=1)
+                        Profiler.stop('paint:micromap')
                 elif diff_id == df.A_GAP:
                     a_line_after, b_start, b_end = d[1], d[2], d[3]
                     if wrap_on:
@@ -1250,24 +1278,47 @@ class Command:
                 profiling_report()
                 enable_profiling(False)
 
-    def set_attr(self, e, x, y, nlen, bg):
-        """Add a character-range attribute (background highlight) on editor e
-        at line y, column x, for nlen characters. Used for char-level diffs.
+    def set_attr(self, e, x=0, y=0, nlen=0, bg=0, mptag=-1, map_only=0):
+        """Add a colored attribute (background highlight) on editor e.
 
-        show_on_map=-1: don't show this attribute on the micromap. The
-        micromap is already populated by bookmarks (set_bookmark2), so
-        showing attributes too would be redundant.
+        Dual-purpose function — used for both char-level text highlights
+        and whole-line micromap highlights:
 
-        map_only=0: show the attribute on the text area only (not on the
-        micromap), since the micromap is handled by bookmarks.
+        1. Char-level text highlight (existing usage):
+           set_attr(e, x=col, y=line, nlen=count, bg=color)
+           - Paints `nlen` characters starting at column `x` on line `y`.
+           - mptag=-1 (default): don't show on micromap.
+           - map_only=0 (default): show on text area only.
+
+        2. Whole-line micromap highlight (new usage):
+           set_attr(e, y=line, bg=color, mptag=MICROMAP_TAG, map_only=1)
+           - Paints the entire line `y` on the micromap column tagged
+             with MICROMAP_TAG, using `bg` as the color.
+           - map_only=1: show on micromap only, NOT on the text area
+             (the text area is already painted by char-level calls or
+             by bookmark/decor).
+
+        Args:
+            e:        Editor instance.
+            x:        Column (0-based). Default 0 (start of line).
+            y:        Line number (0-based). Required.
+            nlen:     Number of characters to highlight. Default 0.
+                      For micromap-only (map_only=1), nlen is ignored —
+                      the entire line is painted on the micromap.
+            bg:       Background color (int, e.g. 0xFF0000 for red).
+            mptag:    Micromap column tag. -1 = don't show on micromap.
+                      1..127 = show on micromap column with that tag.
+                      Use MICROMAP_TAG for diff-colored highlights.
+            map_only: 0 = text area only, 1 = micromap only,
+                      2 = both text area and micromap.
         """
         e.attr(ct.MARKERS_ADD, DIFF_TAG,
                x,
                y,
                nlen,
                color_bg=bg,
-               show_on_map=-1,  # Don't show on micromap (bookmarks handle it)
-               map_only=0       # Text area only; micromap via bookmarks
+               show_on_map=mptag,
+               map_only=map_only
                )
 
     def set_gap(self, e, row, n=1):
@@ -1396,47 +1447,30 @@ class Command:
            self.cfg.get('theme_name') == theme_name:
             return
         self.cfg = self.get_config()
-        # Apply micromap options that write to user.json (not cuda_differ.json).
-        # These must be re-applied whenever config is reloaded.
-        self._apply_micromap_user_json()
-
-    def _apply_micromap_user_json(self):
-        """Apply micromap-related options that live in user.json (not
-        cuda_differ.json). These are CudaText core options, not Differ
-        plugin options, so they need to be written to user.json via
-        cudax_lib.set_opt.
-
-        When enable_micromap is True:
-        - Sets 'micromap_bookmarks' to true in user.json, which makes the
-          micromap show bookmarks (Differ uses bookmarks to mark
-          added/deleted/changed lines).
-        When enable_micromap is False:
-        - Sets 'micromap_bookmarks' to false in user.json.
-        """
-        try:
-            enable = self.cfg.get('enable_micromap', True)
-            ctx.set_opt('micromap_bookmarks', bool(enable))
-        except Exception as ex:
-            msg('failed to set micromap_bookmarks in user.json: {}'.format(ex), level=1)
 
     def _setup_micromap(self, a_ed, b_ed):
         """Set up the micromap on both split editors when enable_micromap
-        is on. Does three things per editor:
+        is on. Per editor:
 
-        1. Delete the default micromap column 0 (line states — we don't
-           want it because Differ uses its own bookmark colors).
-        2. Delete the default micromap column 2 (unused).
+        1. Delete default micromap columns 0 (line states), 1 (bookmarks),
+           and 2 (unused) — we don't want any of these; we'll use our own
+           custom column for diff-colored line highlights.
+        2. Add a custom micromap column with tag=MICROMAP_TAG, width=100,
+           color=0xFFFFFF (white background — fragments painted on top
+           via set_attr will show their own colors).
         3. Enable PROP_MICROMAP so the micromap is visible.
 
-        When enable_micromap is off, does nothing (leaves the micromap
-        in whatever state CudaText defaults to).
+        When enable_micromap is off, does nothing.
         """
         if not self.cfg.get('enable_micromap', True):
             return
         try:
             for e in (a_ed, b_ed):
                 e.micromap(ct.MICROMAP_DELETE, 0)
+                e.micromap(ct.MICROMAP_DELETE, 1)
                 e.micromap(ct.MICROMAP_DELETE, 2)
+                e.micromap(ct.MICROMAP_DELETE, MICROMAP_TAG)  # clear if re-refreshing
+                e.micromap(ct.MICROMAP_ADD, MICROMAP_TAG, 100, 0xFFFFFF)
                 e.set_prop(ct.PROP_MICROMAP, True)
         except Exception as ex:
             msg('failed to set up micromap: {}'.format(ex), level=1)
