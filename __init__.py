@@ -203,37 +203,15 @@ OPTS_META = [
      'frm': 'bool',
      'chp': 'config',
      },
-    {'opt': 'differ.show_micromap',
-     'cmt': _('Show the micromap (mini-map of changes) in the compare '
-              'tab. The micromap is a thin colored strip in the scrollbar '
-              'area that shows the location of added/deleted/changed lines, '
-              'giving a bird\'s-eye overview of the diff. '
+    {'opt': 'differ.enable_micromap',
+     'cmt': _('Enable the micromap (mini-map of changes) in compare tabs. '
+              'When enabled, sets "micromap_bookmarks": true in user.json '
+              'so the micromap shows bookmarks (the colored line markers '
+              'Differ uses for added/deleted/changed lines), clears the '
+              'default micromap columns 0 and 2, and enables the micromap '
+              'on both split editors. '
               'Default: on.'),
      'def': True,
-     'frm': 'bool',
-     'chp': 'config',
-     },
-    {'opt': 'differ.micromap_show_line_states',
-     'cmt': _('When enabled, the micromap shows per-line state colors '
-              '(added/deleted/changed) at line granularity. When disabled, '
-              'the micromap shows only a single overview color. '
-              'Sets the "micromap_line_states" key in user.json. '
-              'Default: off.'),
-     'def': False,
-     'frm': 'bool',
-     'chp': 'config',
-     },
-    {'opt': 'differ.micromap_on_scrollbar',
-     'cmt': _('Merge the micromap into the editor scrollbar so the two '
-              'appear as a single bar (instead of the micromap being a '
-              'separate strip). Requires "scrollbar_themed": true in '
-              'user.json — the themed scrollbar API is what allows the '
-              'micromap to render inside the scrollbar. '
-              'This is a user.json-only option (not a differ.* setting) — '
-              'set "micromap_on_scrollbar": true directly in '
-              'settings/user.json to enable. Also set '
-              '"scrollbar_themed": true in the same file.'),
-     'def': False,
      'frm': 'bool',
      'chp': 'config',
      },
@@ -1056,7 +1034,6 @@ class Command:
         # this compare's timings.
         _profiling_was_enabled = Profiler.is_enabled()
         _profiling_enabled_here = False
-        _editors_locked = False  # tracked so finally can unlock on exception
         if not _profiling_was_enabled:
             try:
                 _do_profile = self.cfg.get('enable_profiling', False)
@@ -1076,6 +1053,13 @@ class Command:
             a_ed = ct.Editor(ed.get_prop(ct.PROP_HANDLE_PRIMARY))
             b_ed = ct.Editor(ed.get_prop(ct.PROP_HANDLE_SECONDARY))
 
+            # Set up the micromap on both editors when enabled. This clears
+            # the default micromap columns 0 and 2 (column 0 shows line
+            # states which we don't want; column 2 is unused) and enables
+            # the micromap so bookmarks (added/deleted/changed markers)
+            # are visible in it.
+            self._setup_micromap(a_ed, b_ed)
+
             Profiler.start('refresh:get_text')
             a_text_all = a_ed.get_text_all()
             b_text_all = b_ed.get_text_all()
@@ -1088,13 +1072,8 @@ class Command:
 
             if a_text_all == b_text_all:
                 Profiler.start('refresh:clear')
-                a_ed.action(ct.EDACTION_LOCK); b_ed.action(ct.EDACTION_LOCK)
-                try:
-                    self.clear(a_ed)
-                    self.clear(b_ed)
-                finally:
-                    # EDACTION_UNLOCK is safe to over-call (counter clamps to 0)
-                    a_ed.action(ct.EDACTION_UNLOCK); b_ed.action(ct.EDACTION_UNLOCK)
+                self.clear(a_ed)
+                self.clear(b_ed)
                 Profiler.stop('refresh:clear')
                 self.diff.diffmap = []
                 if show_dialog:
@@ -1113,19 +1092,7 @@ class Command:
             # a_ed.set_prop(ct.PROP_WRAP, ct.WRAP_OFF)
             # b_ed.set_prop(ct.PROP_WRAP, ct.WRAP_OFF)
 
-            # Lock both editors for the entire clear + paint phase.
-            # Without this, each of the ~40k bookmark/decor/attr/gap calls
-            # triggers a synchronous gutter repaint (and wrap relayout when
-            # wrap is on). With locking, CudaText defers all repainting until
-            # unlock — turning ~12s of paint:bookmark into ~0.5s.
-            # EDACTION_LOCK/UNLOCK increment/decrement an internal counter;
-            # the editor only repaints when the counter reaches 0.
-            # The unlock happens in the outer finally block so editors are
-            # always released even if the paint loop throws. EDACTION_UNLOCK
-            # is documented as safe to over-call (counter clamps to 0).
             Profiler.start('refresh:clear')
-            a_ed.action(ct.EDACTION_LOCK); b_ed.action(ct.EDACTION_LOCK)
-            _editors_locked = True
             self.clear(a_ed)
             self.clear(b_ed)
             Profiler.stop('refresh:clear')
@@ -1160,14 +1127,8 @@ class Command:
             wrap_on = (wrap_a != ct.WRAP_OFF) or (wrap_b != ct.WRAP_OFF)
             if wrap_on:
                 Profiler.start('refresh:wrap_counts')
-                # Only compute wrap counts for editors that actually have
-                # word-wrap enabled. _get_wrap_counts forces a full wrap
-                # recalculation via EDACTION_UPDATE (~1.3s per editor on
-                # 30k-line files). If only one half has wrap on, this skips
-                # the expensive call for the other. _visual_rows and
-                # _sum_visual_rows handle None as "every line = 1 visual row".
-                wrap_counts_a = self._get_wrap_counts(a_ed) if wrap_a != ct.WRAP_OFF else None
-                wrap_counts_b = self._get_wrap_counts(b_ed) if wrap_b != ct.WRAP_OFF else None
+                wrap_counts_a = self._get_wrap_counts(a_ed)
+                wrap_counts_b = self._get_wrap_counts(b_ed)
                 __, line_h_a = a_ed.get_prop(ct.PROP_CELL_SIZE)
                 __, line_h_b = b_ed.get_prop(ct.PROP_CELL_SIZE)
                 Profiler.stop('refresh:wrap_counts')
@@ -1282,17 +1243,6 @@ class Command:
 
             Profiler.stop('refresh:total')
         finally:
-            # Unlock editors if they were locked above. Must happen before
-            # the profiling report so the UI isn't frozen while printing.
-            if _editors_locked:
-                try:
-                    # EDACTION_UNLOCK counter-clamps to 0, so safe even if
-                    # the matching EDACTION_LOCK failed silently somewhere.
-                    a_ed.action(ct.EDACTION_UNLOCK)
-                    b_ed.action(ct.EDACTION_UNLOCK)
-                except Exception:
-                    pass
-                _editors_locked = False
             # Always print the profiling report — even if the compare
             # crashed with an exception. This ensures you can see WHERE
             # the time was spent (or where it crashed) even on big files.
@@ -1302,13 +1252,22 @@ class Command:
 
     def set_attr(self, e, x, y, nlen, bg):
         """Add a character-range attribute (background highlight) on editor e
-        at line y, column x, for nlen characters. Used for char-level diffs."""
+        at line y, column x, for nlen characters. Used for char-level diffs.
+
+        show_on_map=-1: don't show this attribute on the micromap. The
+        micromap is already populated by bookmarks (set_bookmark2), so
+        showing attributes too would be redundant.
+
+        map_only=0: show the attribute on the text area only (not on the
+        micromap), since the micromap is handled by bookmarks.
+        """
         e.attr(ct.MARKERS_ADD, DIFF_TAG,
                x,
                y,
                nlen,
                color_bg=bg,
-               show_on_map=1
+               show_on_map=-1,  # Don't show on micromap (bookmarks handle it)
+               map_only=0       # Text area only; micromap via bookmarks
                )
 
     def set_gap(self, e, row, n=1):
@@ -1447,15 +1406,40 @@ class Command:
         plugin options, so they need to be written to user.json via
         cudax_lib.set_opt.
 
-        Currently handles:
-        - micromap_show_line_states -> sets 'micromap_line_states' in user.json
-          (true when show_line_states is on, false when off)
+        When enable_micromap is True:
+        - Sets 'micromap_bookmarks' to true in user.json, which makes the
+          micromap show bookmarks (Differ uses bookmarks to mark
+          added/deleted/changed lines).
+        When enable_micromap is False:
+        - Sets 'micromap_bookmarks' to false in user.json.
         """
         try:
-            line_states = self.cfg.get('micromap_show_line_states', False)
-            ctx.set_opt('micromap_line_states', bool(line_states))
+            enable = self.cfg.get('enable_micromap', True)
+            ctx.set_opt('micromap_bookmarks', bool(enable))
         except Exception as ex:
-            msg('failed to set micromap_line_states in user.json: {}'.format(ex), level=1)
+            msg('failed to set micromap_bookmarks in user.json: {}'.format(ex), level=1)
+
+    def _setup_micromap(self, a_ed, b_ed):
+        """Set up the micromap on both split editors when enable_micromap
+        is on. Does three things per editor:
+
+        1. Delete the default micromap column 0 (line states — we don't
+           want it because Differ uses its own bookmark colors).
+        2. Delete the default micromap column 2 (unused).
+        3. Enable PROP_MICROMAP so the micromap is visible.
+
+        When enable_micromap is off, does nothing (leaves the micromap
+        in whatever state CudaText defaults to).
+        """
+        if not self.cfg.get('enable_micromap', True):
+            return
+        try:
+            for e in (a_ed, b_ed):
+                e.micromap(ct.MICROMAP_DELETE, 0)
+                e.micromap(ct.MICROMAP_DELETE, 2)
+                e.set_prop(ct.PROP_MICROMAP, True)
+        except Exception as ex:
+            msg('failed to set up micromap: {}'.format(ex), level=1)
 
     @staticmethod
     def get_config():
@@ -1518,10 +1502,8 @@ class Command:
                 get_opt('autojunk', True),
             'enable_profiling':
                 get_opt('enable_profiling', False),
-            'show_micromap':
-                get_opt('show_micromap', True),
-            'micromap_show_line_states':
-                get_opt('micromap_show_line_states', False),
+            'enable_micromap':
+                get_opt('enable_micromap', True),
         }
 
         new_nkind(NKIND_DELETED, config.get('color_deleted'))
