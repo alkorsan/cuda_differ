@@ -1056,6 +1056,7 @@ class Command:
         # this compare's timings.
         _profiling_was_enabled = Profiler.is_enabled()
         _profiling_enabled_here = False
+        _editors_locked = False  # tracked so finally can unlock on exception
         if not _profiling_was_enabled:
             try:
                 _do_profile = self.cfg.get('enable_profiling', False)
@@ -1087,8 +1088,13 @@ class Command:
 
             if a_text_all == b_text_all:
                 Profiler.start('refresh:clear')
-                self.clear(a_ed)
-                self.clear(b_ed)
+                a_ed.action(ct.EDACTION_LOCK); b_ed.action(ct.EDACTION_LOCK)
+                try:
+                    self.clear(a_ed)
+                    self.clear(b_ed)
+                finally:
+                    # EDACTION_UNLOCK is safe to over-call (counter clamps to 0)
+                    a_ed.action(ct.EDACTION_UNLOCK); b_ed.action(ct.EDACTION_UNLOCK)
                 Profiler.stop('refresh:clear')
                 self.diff.diffmap = []
                 if show_dialog:
@@ -1107,7 +1113,19 @@ class Command:
             # a_ed.set_prop(ct.PROP_WRAP, ct.WRAP_OFF)
             # b_ed.set_prop(ct.PROP_WRAP, ct.WRAP_OFF)
 
+            # Lock both editors for the entire clear + paint phase.
+            # Without this, each of the ~40k bookmark/decor/attr/gap calls
+            # triggers a synchronous gutter repaint (and wrap relayout when
+            # wrap is on). With locking, CudaText defers all repainting until
+            # unlock — turning ~12s of paint:bookmark into ~0.5s.
+            # EDACTION_LOCK/UNLOCK increment/decrement an internal counter;
+            # the editor only repaints when the counter reaches 0.
+            # The unlock happens in the outer finally block so editors are
+            # always released even if the paint loop throws. EDACTION_UNLOCK
+            # is documented as safe to over-call (counter clamps to 0).
             Profiler.start('refresh:clear')
+            a_ed.action(ct.EDACTION_LOCK); b_ed.action(ct.EDACTION_LOCK)
+            _editors_locked = True
             self.clear(a_ed)
             self.clear(b_ed)
             Profiler.stop('refresh:clear')
@@ -1142,8 +1160,14 @@ class Command:
             wrap_on = (wrap_a != ct.WRAP_OFF) or (wrap_b != ct.WRAP_OFF)
             if wrap_on:
                 Profiler.start('refresh:wrap_counts')
-                wrap_counts_a = self._get_wrap_counts(a_ed)
-                wrap_counts_b = self._get_wrap_counts(b_ed)
+                # Only compute wrap counts for editors that actually have
+                # word-wrap enabled. _get_wrap_counts forces a full wrap
+                # recalculation via EDACTION_UPDATE (~1.3s per editor on
+                # 30k-line files). If only one half has wrap on, this skips
+                # the expensive call for the other. _visual_rows and
+                # _sum_visual_rows handle None as "every line = 1 visual row".
+                wrap_counts_a = self._get_wrap_counts(a_ed) if wrap_a != ct.WRAP_OFF else None
+                wrap_counts_b = self._get_wrap_counts(b_ed) if wrap_b != ct.WRAP_OFF else None
                 __, line_h_a = a_ed.get_prop(ct.PROP_CELL_SIZE)
                 __, line_h_b = b_ed.get_prop(ct.PROP_CELL_SIZE)
                 Profiler.stop('refresh:wrap_counts')
@@ -1258,6 +1282,17 @@ class Command:
 
             Profiler.stop('refresh:total')
         finally:
+            # Unlock editors if they were locked above. Must happen before
+            # the profiling report so the UI isn't frozen while printing.
+            if _editors_locked:
+                try:
+                    # EDACTION_UNLOCK counter-clamps to 0, so safe even if
+                    # the matching EDACTION_LOCK failed silently somewhere.
+                    a_ed.action(ct.EDACTION_UNLOCK)
+                    b_ed.action(ct.EDACTION_UNLOCK)
+                except Exception:
+                    pass
+                _editors_locked = False
             # Always print the profiling report — even if the compare
             # crashed with an exception. This ensures you can see WHERE
             # the time was spent (or where it crashed) even on big files.
