@@ -67,11 +67,11 @@ class PaintboxOverview:
 
     def create(self, a_ed, b_ed):
         """Create the overview as a separate dialog docked to the right
-        side of the editor's parent form.
+        side of the main CudaText form.
 
-        Uses DLG_DOCK with prop='R' to dock to the right of the parent
-        form. This places the overview to the right of both split editors,
-        near the scrollbar, without affecting the editors' widths.
+        Docking to the main form (handle 0) instead of the editor's parent
+        form ensures the overview appears to the right of the entire editor
+        area (including both split editors), not between them.
 
         Args:
             a_ed: left editor (primary)
@@ -79,10 +79,6 @@ class PaintboxOverview:
         """
         self.a_ed = a_ed
         self.b_ed = b_ed
-        # Get the parent form handle (the form containing both split editors)
-        h_parent = a_ed.get_prop(ct.PROP_HANDLE_PARENT)
-        if not h_parent:
-            h_parent = 0  # main CudaText form
 
         # Create a separate dialog for the overview
         self.h_dlg = ct.dlg_proc(0, ct.DLG_CREATE)
@@ -107,8 +103,10 @@ class PaintboxOverview:
         })
         self.h_canvas = ct.dlg_proc(self.h_dlg, ct.DLG_CTL_HANDLE, index=self._ctl_index)
 
-        # Dock to the RIGHT side of the editor's parent form
-        ct.dlg_proc(self.h_dlg, ct.DLG_DOCK, prop='R', index=h_parent)
+        # Dock to the RIGHT side of the main CudaText form (handle 0).
+        # This places the overview to the right of the entire editor area,
+        # not between the two split editors.
+        ct.dlg_proc(self.h_dlg, ct.DLG_DOCK, prop='R', index=0)
         ct.dlg_proc(self.h_dlg, ct.DLG_SHOW_NONMODAL)
 
     def destroy(self):

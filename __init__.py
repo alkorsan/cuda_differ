@@ -1309,11 +1309,17 @@ class Command:
                         Profiler.stop('paint:wrap_calc')
                         Profiler.start('paint:gap')
                         if va > vb:
+                            diff_rows = va - vb
                             self._add_raw_gap(b_ed, b_line,
-                                              (va - vb) * line_h_b, color_gaps)
+                                              diff_rows * line_h_b, color_gaps)
+                            if overview is not None:
+                                overview.add_gap('b', b_line, diff_rows)
                         elif vb > va:
+                            diff_rows = vb - va
                             self._add_raw_gap(a_ed, a_line,
-                                              (vb - va) * line_h_a, color_gaps)
+                                              diff_rows * line_h_a, color_gaps)
+                            if overview is not None:
+                                overview.add_gap('a', a_line, diff_rows)
                         Profiler.stop('paint:gap')
                 elif diff_id == df.A_SYMBOL_DEL:
                     Profiler.start('paint:attr')
