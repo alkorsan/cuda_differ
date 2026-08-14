@@ -39,8 +39,10 @@ class PaintboxOverview:
     """
 
     def __init__(self):
-        self.h_dlg = None       # dialog handle
+        self.h_dlg = None       # parent form handle (or dialog handle)
         self.h_canvas = None    # paintbox canvas handle
+        self._ctl_index = None  # control index in the parent form
+        self._owns_dlg = False  # True if we created a separate dialog
         # Line states: {('a', line): color, ('b', line): color}
         self.line_states = {}
         # Gap info: list of (side, after_line, gap_lines) for each gap
@@ -60,12 +62,16 @@ class PaintboxOverview:
         self.color_cursor = 0x000000
 
     def is_created(self):
-        """Return True if the overview dialog has been created."""
+        """Return True if the overview has been created."""
         return self.h_dlg is not None
 
     def create(self, a_ed, b_ed):
-        """Create the overview dialog and dock it to the right side of
-        the editor's parent form.
+        """Create the overview by adding a paintbox control directly to
+        the editor's parent form, aligned to the right side.
+
+        Uses the direct-control approach (like cuda_breadcrumbs) instead
+        of a separate docked dialog. This ensures the paintbox appears
+        to the right of both split editors.
 
         Args:
             a_ed: left editor (primary)
@@ -78,42 +84,33 @@ class PaintboxOverview:
         if not h_parent:
             h_parent = 0  # main CudaText form
 
-        # Create the dialog
-        self.h_dlg = ct.dlg_proc(0, ct.DLG_CREATE)
-        ct.dlg_proc(self.h_dlg, ct.DLG_PROP_SET, prop={
-            'cap': 'Overview',
-            'w': OVERVIEW_WIDTH,
-            'h': 600,
-            'border': ct.DBORDER_NONE,
-            'color': self.color_bg,
-            'on_resize': self._on_resize,
-            'on_show': self._on_resize,
-        })
+        # Use the parent form as our dialog handle
+        self.h_dlg = h_parent
+        self._owns_dlg = False  # we don't own the form, just added a control
 
-        # Add paintbox control, filling the entire dialog
-        n = ct.dlg_proc(self.h_dlg, ct.DLG_CTL_ADD, 'paintbox')
-        ct.dlg_proc(self.h_dlg, ct.DLG_CTL_PROP_SET, index=n, prop={
-            'name': 'paint',
-            'align': ct.ALIGN_CLIENT,
+        # Add a paintbox control directly to the parent form,
+        # aligned to the right side.
+        self._ctl_index = ct.dlg_proc(h_parent, ct.DLG_CTL_ADD, 'paintbox')
+        ct.dlg_proc(h_parent, ct.DLG_CTL_PROP_SET, index=self._ctl_index, prop={
+            'name': 'differ_overview',
+            'align': ct.ALIGN_RIGHT,
+            'w': OVERVIEW_WIDTH,
+            'color': self.color_bg,
             'on_click': self._on_click,
             'on_mouse_down': self._on_mouse_down,
         })
-        self.h_canvas = ct.dlg_proc(self.h_dlg, ct.DLG_CTL_HANDLE, index=n)
-
-        # Dock to the RIGHT side of the editor's parent form
-        ct.dlg_proc(self.h_dlg, ct.DLG_DOCK, prop='R', index=h_parent)
-        ct.dlg_proc(self.h_dlg, ct.DLG_SHOW_NONMODAL)
+        self.h_canvas = ct.dlg_proc(h_parent, ct.DLG_CTL_HANDLE, index=self._ctl_index)
 
     def destroy(self):
-        """Undock and free the overview dialog."""
+        """Remove the paintbox control from the parent form."""
         if self.h_dlg is not None:
             try:
-                ct.dlg_proc(self.h_dlg, ct.DLG_UNDOCK)
-                ct.dlg_proc(self.h_dlg, ct.DLG_FREE)
+                ct.dlg_proc(self.h_dlg, ct.DLG_CTL_DELETE, index=self._ctl_index)
             except Exception:
                 pass
             self.h_dlg = None
             self.h_canvas = None
+            self._ctl_index = None
 
     def set_colors(self, color_bg, color_deleted, color_added, color_changed, color_gap):
         """Set the colors used for painting the overview."""
@@ -234,8 +231,8 @@ class PaintboxOverview:
             return
 
         c = self.h_canvas
-        # Get the paintbox size
-        props = ct.dlg_proc(self.h_dlg, ct.DLG_CTL_PROP_GET, name='paint')
+        # Get the paintbox size from the control properties
+        props = ct.dlg_proc(self.h_dlg, ct.DLG_CTL_PROP_GET, index=self._ctl_index)
         w = props.get('w', OVERVIEW_WIDTH)
         h = props.get('h', 600)
         if w <= 0 or h <= 0:
@@ -357,7 +354,7 @@ class PaintboxOverview:
             return
 
         # Determine which side was clicked
-        props = ct.dlg_proc(self.h_dlg, ct.DLG_CTL_PROP_GET, name='paint')
+        props = ct.dlg_proc(self.h_dlg, ct.DLG_CTL_PROP_GET, index=self._ctl_index)
         w = props.get('w', OVERVIEW_WIDTH)
         half_w = w // 2
         side = 'a' if x < half_w else 'b'

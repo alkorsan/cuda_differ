@@ -205,18 +205,34 @@ OPTS_META = [
      'chp': 'config',
      },
     {'opt': 'differ.enable_micromap',
-     'cmt': _('Enable the overview panel (gap-aware mini-map of changes) '
-              'in compare tabs. The overview is a custom paintbox docked '
-              'to the right side of the editor. Unlike the built-in '
-              'micromap, the overview accounts for the inter-line gaps '
-              'inserted for visual alignment, so it stays in sync with '
-              'what you actually see. Shows both editors side-by-side '
-              'with colored rectangles for deleted (red), added (green), '
-              'and changed (yellow) lines, plus gray rectangles for '
-              'gaps. Click the overview to scroll the corresponding '
-              'editor to that position. '
+     'cmt': _('Enable the built-in micromap (mini-map) in compare tabs. '
+              'Clears the default micromap columns 0 (line states) and '
+              '2 (selections), keeps column 1 (bookmarks — also shows '
+              'the cursor position), and paints diff-colored line '
+              'highlights on column 1 via attr(show_on_map=1). '
+              'Note: the micromap does NOT account for inter-line gaps, '
+              'so it may desync from the actual text positions when '
+              'gaps are present. For a gap-aware alternative, enable '
+              'enable_overview instead (or both). '
               'Default: on.'),
      'def': True,
+     'frm': 'bool',
+     'chp': 'config',
+     },
+    {'opt': 'differ.enable_overview',
+     'cmt': _('Enable the gap-aware overview panel in compare tabs. '
+              'The overview is a custom paintbox added to the right '
+              'side of the editor. Unlike the built-in micromap, the '
+              'overview accounts for inter-line gaps inserted for '
+              'visual alignment, so it stays in sync with what you '
+              'actually see. Shows both editors side-by-side with '
+              'colored rectangles for deleted (red), added (green), '
+              'and changed (yellow) lines, plus gray rectangles for '
+              'gaps and white for unchanged lines. Click the overview '
+              'to scroll the corresponding editor. Can be used together '
+              'with the micromap. '
+              'Default: off.'),
+     'def': False,
      'frm': 'bool',
      'chp': 'config',
      },
@@ -1067,14 +1083,19 @@ class Command:
             a_ed = ct.Editor(ed.get_prop(ct.PROP_HANDLE_PRIMARY))
             b_ed = ct.Editor(ed.get_prop(ct.PROP_HANDLE_SECONDARY))
 
+            # Set up the micromap on both editors when enabled.
+            micromap_on = self.cfg.get('enable_micromap', True)
+            if micromap_on:
+                self._setup_micromap(a_ed, b_ed)
+
             # Create or reuse the paintbox overview for this compare tab.
-            # The overview is a custom paintbox docked to the right side
+            # The overview is a custom paintbox added to the right side
             # of the editor's parent form. It shows a gap-aware mini-map
             # of both editors side-by-side (unlike the micromap, which
             # doesn't account for the gaps we insert for alignment).
             tab_id_str = str(tab_id)
             overview = self._overviews.get(tab_id_str)
-            overview_on = self.cfg.get('enable_micromap', True)
+            overview_on = self.cfg.get('enable_overview', False)
             if overview_on:
                 if overview is None:
                     overview = PaintboxOverview()
@@ -1084,7 +1105,7 @@ class Command:
                     overview.a_ed = a_ed
                     overview.b_ed = b_ed
                 overview.set_colors(
-                    self.cfg.get('color_gaps'),
+                    0xFFFFFF,  # background: white (unchanged lines)
                     self.cfg.get('color_deleted'),
                     self.cfg.get('color_added'),
                     self.cfg.get('color_changed'),
@@ -1173,7 +1194,7 @@ class Command:
                 line_h_a = 0
                 line_h_b = 0
             color_gaps = self.cfg.get('color_gaps')
-            overview_on = self.cfg.get('enable_micromap', True)
+            overview_on = self.cfg.get('enable_overview', False)
 
             # The for loop below consumes events from diff.compare() (a
             # generator) and paints each event. Profiling the loop as a whole
@@ -1189,7 +1210,9 @@ class Command:
             # input and a manual repaint).
             #
             # Overview line states and gaps are also collected for the
-            # paintbox overview (gap-aware mini-map).
+            # paintbox overview (gap-aware mini-map) when enabled.
+            # Micromap line highlights are painted via attr(show_on_map=1)
+            # when micromap is enabled.
             pending_bkm_a = []  # list of (line, nkind) for a_ed
             pending_bkm_b = []  # list of (line, nkind) for b_ed
             Profiler.start('refresh:compare_and_paint')
@@ -1200,6 +1223,11 @@ class Command:
                     Profiler.start('paint:decor')
                     self.set_decor(a_ed, y, DECOR_CHAR, self.cfg.get('color_deleted'))
                     Profiler.stop('paint:decor')
+                    if micromap_on:
+                        Profiler.start('paint:micromap')
+                        self.set_attr(a_ed, y=y, bg=self.cfg.get('color_deleted'),
+                                     mptag=1, map_only=1)
+                        Profiler.stop('paint:micromap')
                     if overview is not None:
                         overview.add_line_state('a', y, self.cfg.get('color_deleted'))
                 elif diff_id == df.B_LINE_ADD:
@@ -1207,14 +1235,29 @@ class Command:
                     Profiler.start('paint:decor')
                     self.set_decor(b_ed, y, DECOR_CHAR, self.cfg.get('color_added'))
                     Profiler.stop('paint:decor')
+                    if micromap_on:
+                        Profiler.start('paint:micromap')
+                        self.set_attr(b_ed, y=y, bg=self.cfg.get('color_added'),
+                                     mptag=1, map_only=1)
+                        Profiler.stop('paint:micromap')
                     if overview is not None:
                         overview.add_line_state('b', y, self.cfg.get('color_added'))
                 elif diff_id == df.A_LINE_CHANGE:
                     pending_bkm_a.append((y, NKIND_CHANGED))
+                    if micromap_on:
+                        Profiler.start('paint:micromap')
+                        self.set_attr(a_ed, y=y, bg=self.cfg.get('color_changed'),
+                                     mptag=1, map_only=1)
+                        Profiler.stop('paint:micromap')
                     if overview is not None:
                         overview.add_line_state('a', y, self.cfg.get('color_changed'))
                 elif diff_id == df.B_LINE_CHANGE:
                     pending_bkm_b.append((y, NKIND_CHANGED))
+                    if micromap_on:
+                        Profiler.start('paint:micromap')
+                        self.set_attr(b_ed, y=y, bg=self.cfg.get('color_changed'),
+                                     mptag=1, map_only=1)
+                        Profiler.stop('paint:micromap')
                     if overview is not None:
                         overview.add_line_state('b', y, self.cfg.get('color_changed'))
                 elif diff_id == df.A_GAP:
@@ -1479,6 +1522,42 @@ class Command:
             return
         self.cfg = self.get_config()
 
+    def _setup_micromap(self, a_ed, b_ed):
+        """Set up the micromap on both split editors when enable_micromap
+        is on. Per editor:
+
+        1. Delete default micromap columns:
+           - 0 (line states) — not needed, Differ uses its own colors
+           - 2 (selections) — disabled because we only want to see
+             compare changes, not selection highlights
+           Column 1 (bookmarks) is KEPT because it also shows the cursor
+           position (like a usual scrollbar), which is useful for
+           navigation. We paint diff-colored line highlights on column 1
+           via attr(show_on_map=1).
+        2. Enable PROP_MICROMAP so the micromap is visible.
+        3. Set PROP_MICROMAP_AT_LEFT:
+           - Left editor (a_ed): False (default) — micromap on the right
+             side, facing the right editor.
+           - Right editor (b_ed): True — micromap on the left side,
+             facing the left editor.
+           This way both micromaps are visible between the two editors,
+           in the split gutter area.
+
+        When enable_micromap is off, does nothing.
+        """
+        try:
+            for e in (a_ed, b_ed):
+                e.micromap(ct.MICROMAP_DELETE, 0)
+                e.micromap(ct.MICROMAP_DELETE, 2)
+                e.set_prop(ct.PROP_MICROMAP, True)
+            # Place the micromap on the side that faces the other editor:
+            # - a_ed (left): micromap on the right (default, PROP_MICROMAP_AT_LEFT=False)
+            # - b_ed (right): micromap on the left (PROP_MICROMAP_AT_LEFT=True)
+            a_ed.set_prop(ct.PROP_MICROMAP_AT_LEFT, False)
+            b_ed.set_prop(ct.PROP_MICROMAP_AT_LEFT, True)
+        except Exception as ex:
+            msg('failed to set up micromap: {}'.format(ex), level=1)
+
     @staticmethod
     def get_config():
         """Read all differ.* options from JSON + current theme, and return
@@ -1542,6 +1621,8 @@ class Command:
                 get_opt('enable_profiling', False),
             'enable_micromap':
                 get_opt('enable_micromap', True),
+            'enable_overview':
+                get_opt('enable_overview', False),
         }
 
         new_nkind(NKIND_DELETED, config.get('color_deleted'))
