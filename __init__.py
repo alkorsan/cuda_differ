@@ -66,12 +66,6 @@ DECOR_CHAR = '■'
 DEFAULT_SYNC_SCROLL = '1'
 U_PREFIX = 'untitled:'
 
-# Micromap column tag for diff-colored line highlights.
-# We add a custom micromap column with this tag and paint colored fragments
-# on it via set_attr(show_on_map=MICROMAP_TAG) for each changed/added/deleted
-# line. The tag value 73 is arbitrary but must be in 1..127.
-MICROMAP_TAG = 73
-
 PLG_NAME = _('Differ')
 METAJSONFILE = os.path.dirname(__file__) + os.sep + 'differ_opts.json'
 JSONFILE = 'cuda_differ.json'  # To store in settings/cuda_differ.json
@@ -212,15 +206,15 @@ OPTS_META = [
     {'opt': 'differ.enable_micromap',
      'cmt': _('Enable the micromap (mini-map of changes) in compare tabs. '
               'When enabled, clears the default micromap columns 0 (line '
-              'states), 1 (bookmarks), and 2 (selections — disabled '
-              'because we only want to see compare changes), adds a '
-              'custom micromap column for diff-colored line highlights '
-              '(deleted=red, added=green, changed=yellow), and enables '
-              'the micromap on both split editors. The left editor\'s '
-              'micromap is placed on its right side (facing the right '
-              'editor), and the right editor\'s micromap on its left '
-              'side (facing the left editor), so both micromaps are '
-              'visible between the two editors. '
+              'states) and 2 (selections — disabled because we only want '
+              'to see compare changes), keeps column 1 (bookmarks — also '
+              'shows the cursor position like a scrollbar), and paints '
+              'diff-colored line highlights on column 1 via attr() '
+              '(deleted=red, added=green, changed=yellow). The left '
+              'editor\'s micromap is placed on its right side (facing '
+              'the right editor), and the right editor\'s micromap on '
+              'its left side (facing the left editor), so both micromaps '
+              'are visible between the two editors. '
               'Default: on.'),
      'def': True,
      'frm': 'bool',
@@ -479,7 +473,7 @@ class Command:
         # Check if the file is already open in a tab.
         already_open = False
         for h in ct.ed_handles():
-            if ct.Editor(h).get_filename() == fn:
+            if ct.Editor(h).get_prop(ct.PROP_FN, '') == fn:
                 already_open = True
                 break
         if not already_open:
@@ -579,7 +573,7 @@ class Command:
                     return str(e.get_prop(ct.PROP_TAB_ID)) == id_str
             # Fallback: full string comparison (for old/odd-format strings)
             return name == self.format_untitled(e)
-        fn = e.get_filename()
+        fn = e.get_prop(ct.PROP_FN, '')
         if fn:
             return fn==name
         return False
@@ -614,7 +608,7 @@ class Command:
                 if self.is_match_name(e, name):
                     orig_tab_ids[index] = e.get_prop(ct.PROP_TAB_ID)
                     orig_texts[index] = e.get_text_all()
-                    fn = e.get_filename()
+                    fn = e.get_prop(ct.PROP_FN, '')
                     if fn:
                         orig_names[index] = fn
                     else:
@@ -850,7 +844,7 @@ class Command:
             e = ct.Editor(h)
             if str(e.get_prop(ct.PROP_TAB_ID)) == target:
                 self._apply_text_preserving_undo(e, new_text)
-                orig_fn = e.get_filename()
+                orig_fn = e.get_prop(ct.PROP_FN, '')
                 if orig_fn:
                     # Real file on disk -- save it immediately.
                     e.save()
@@ -1065,12 +1059,13 @@ class Command:
             b_ed = ct.Editor(ed.get_prop(ct.PROP_HANDLE_SECONDARY))
 
             # Set up the micromap on both editors when enabled. This clears
-            # the default micromap columns 0 (line states), 1 (bookmarks),
-            # and 2 (selections — we disable it because we only want to
-            # see compare changes, not selection highlights), adds a
-            # custom column for diff-colored line highlights, and enables
-            # the micromap. The left editor's micromap is placed on the
-            # right side (so it faces the right editor), and vice versa.
+            # the default micromap columns 0 (line states) and 2 (selections
+            # — we disable it because we only want to see compare changes,
+            # not selection highlights), keeps column 1 (bookmarks — also
+            # shows the cursor position), and enables the micromap. Diff
+            # colors are painted on column 1 via attr(show_on_map=1).
+            # The left editor's micromap is placed on the right side (so
+            # it faces the right editor), and vice versa.
             self._setup_micromap(a_ed, b_ed)
 
             Profiler.start('refresh:get_text')
@@ -1178,7 +1173,7 @@ class Command:
                     if micromap_on:
                         Profiler.start('paint:micromap')
                         self.set_attr(a_ed, y=y, bg=self.cfg.get('color_deleted'),
-                                     mptag=MICROMAP_TAG, map_only=1)
+                                     mptag=1, map_only=1)
                         Profiler.stop('paint:micromap')
                 elif diff_id == df.B_LINE_ADD:
                     pending_bkm_b.append((y, NKIND_ADDED))
@@ -1188,21 +1183,21 @@ class Command:
                     if micromap_on:
                         Profiler.start('paint:micromap')
                         self.set_attr(b_ed, y=y, bg=self.cfg.get('color_added'),
-                                     mptag=MICROMAP_TAG, map_only=1)
+                                     mptag=1, map_only=1)
                         Profiler.stop('paint:micromap')
                 elif diff_id == df.A_LINE_CHANGE:
                     pending_bkm_a.append((y, NKIND_CHANGED))
                     if micromap_on:
                         Profiler.start('paint:micromap')
                         self.set_attr(a_ed, y=y, bg=self.cfg.get('color_changed'),
-                                     mptag=MICROMAP_TAG, map_only=1)
+                                     mptag=1, map_only=1)
                         Profiler.stop('paint:micromap')
                 elif diff_id == df.B_LINE_CHANGE:
                     pending_bkm_b.append((y, NKIND_CHANGED))
                     if micromap_on:
                         Profiler.start('paint:micromap')
                         self.set_attr(b_ed, y=y, bg=self.cfg.get('color_changed'),
-                                     mptag=MICROMAP_TAG, map_only=1)
+                                     mptag=1, map_only=1)
                         Profiler.stop('paint:micromap')
                 elif diff_id == df.A_GAP:
                     a_line_after, b_start, b_end = d[1], d[2], d[3]
@@ -1319,9 +1314,13 @@ class Command:
            - map_only=0 (default): show on text area only.
 
         2. Whole-line micromap highlight (new usage):
-           set_attr(e, y=line, bg=color, mptag=MICROMAP_TAG, map_only=1)
-           - Paints the entire line `y` on the micromap column tagged
-             with MICROMAP_TAG, using `bg` as the color.
+           set_attr(e, y=line, bg=color, mptag=1, map_only=1)
+           - Paints the entire line `y` on micromap column 1 (the
+             default bookmarks column), using `bg` as the color.
+           - mptag=1: show on micromap column 1 (bookmarks column).
+             Column 1 is the default CudaText bookmarks column which
+             also shows the cursor position (like a scrollbar), so it's
+             better than a custom column.
            - map_only=1: show on micromap only, NOT on the text area
              (the text area is already painted by char-level calls or
              by bookmark/decor).
@@ -1336,7 +1335,8 @@ class Command:
             bg:       Background color (int, e.g. 0xFF0000 for red).
             mptag:    Micromap column tag. -1 = don't show on micromap.
                       1..127 = show on micromap column with that tag.
-                      Use MICROMAP_TAG for diff-colored highlights.
+                      Use 1 for diff-colored highlights (default
+                      bookmarks column, which also shows cursor position).
             map_only: 0 = text area only, 1 = micromap only,
                       2 = both text area and micromap.
         """
@@ -1471,14 +1471,14 @@ class Command:
 
         1. Delete default micromap columns:
            - 0 (line states) — not needed, Differ uses its own colors
-           - 1 (bookmarks) — not needed, we paint via attr() instead
            - 2 (selections) — disabled because we only want to see
              compare changes, not selection highlights
-        2. Add a custom micromap column with tag=MICROMAP_TAG, width=100,
-           color=0xFFFFFF (white background — fragments painted on top
-           via set_attr will show their own colors).
-        3. Enable PROP_MICROMAP so the micromap is visible.
-        4. Set PROP_MICROMAP_AT_LEFT:
+           Column 1 (bookmarks) is KEPT because it also shows the cursor
+           position (like a usual scrollbar), which is useful for
+           navigation. We paint diff-colored line highlights on column 1
+           via attr(show_on_map=1).
+        2. Enable PROP_MICROMAP so the micromap is visible.
+        3. Set PROP_MICROMAP_AT_LEFT:
            - Left editor (a_ed): False (default) — micromap on the right
              side, facing the right editor.
            - Right editor (b_ed): True — micromap on the left side,
@@ -1493,10 +1493,7 @@ class Command:
         try:
             for e in (a_ed, b_ed):
                 e.micromap(ct.MICROMAP_DELETE, 0)
-                e.micromap(ct.MICROMAP_DELETE, 1)
                 e.micromap(ct.MICROMAP_DELETE, 2)
-                e.micromap(ct.MICROMAP_DELETE, MICROMAP_TAG)  # clear if re-refreshing
-                e.micromap(ct.MICROMAP_ADD, MICROMAP_TAG, 100, 0xFFFFFF)
                 e.set_prop(ct.PROP_MICROMAP, True)
             # Place the micromap on the side that faces the other editor:
             # - a_ed (left): micromap on the right (default, PROP_MICROMAP_AT_LEFT=False)
@@ -1779,7 +1776,7 @@ class Command:
     def get_name(self, e):
         """Return a display name for editor e: filename for real files,
         or 'untitled:TITLE [TAB_ID]' for untitled tabs."""
-        fn = e.get_filename()
+        fn = e.get_prop(ct.PROP_FN, '')
         if fn:
             return fn
         else:
@@ -1808,7 +1805,7 @@ class Command:
                         return False
             else:
                 # Titled tab: compare by filename.
-                fn = e.get_filename()
+                fn = e.get_prop(ct.PROP_FN, '')
                 if fn and fn == disabled_fn:
                     return False
         return True
