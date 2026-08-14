@@ -79,7 +79,7 @@ class PaintboxOverview:
         """
         self.a_ed = a_ed
         self.b_ed = b_ed
-        h_parent = a_ed.get_prop(ct.PROP_HANDLE_PARENT)
+        h_parent = a_ed.get_prop(ct.PROP_HANDLE_PARENT2)
         if not h_parent:
             h_parent = 0
 
@@ -111,7 +111,7 @@ class PaintboxOverview:
         # secondary editor (per CudaText author's fix).
         ct.dlg_proc(self.h_dlg, ct.DLG_SHOW_NONMODAL)
         ct.dlg_proc(self.h_dlg, ct.DLG_DOCK, prop='R', index=h_parent)
-        ct.dlg_proc(self.h_dlg, ct.DLG_PROP_SET, prop={'x': 6000})
+        # ct.dlg_proc(self.h_dlg, ct.DLG_PROP_SET, prop={'x': 6000})
 
     def destroy(self):
         """Undock and free the overview dialog."""
