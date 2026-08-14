@@ -1159,13 +1159,19 @@ class Command:
             # (inside the loop body). The paint:* sub-sections break down the
             # paint time by operation type. The compare:* sub-sections (from
             # differ.py) break down the compare time by algorithm phase.
+            #
+            # Bookmarks are NOT set immediately in the loop. Instead, they
+            # are collected into pending_bkm_a / pending_bkm_b lists and
+            # appended in sorted order after the loop using BOOKMARK2_APPEND
+            # (which is much faster than BOOKMARK2_SET but requires sorted
+            # input and a manual repaint).
+            pending_bkm_a = []  # list of (line, nkind) for a_ed
+            pending_bkm_b = []  # list of (line, nkind) for b_ed
             Profiler.start('refresh:compare_and_paint')
             for d in self.diff.compare():
                 diff_id, y = d[0], d[1]
                 if diff_id == df.A_LINE_DEL:
-                    Profiler.start('paint:bookmark')
-                    self.set_bookmark2(a_ed, y, NKIND_DELETED)
-                    Profiler.stop('paint:bookmark')
+                    pending_bkm_a.append((y, NKIND_DELETED))
                     Profiler.start('paint:decor')
                     self.set_decor(a_ed, y, DECOR_CHAR, self.cfg.get('color_deleted'))
                     Profiler.stop('paint:decor')
@@ -1175,9 +1181,7 @@ class Command:
                                      mptag=MICROMAP_TAG, map_only=1)
                         Profiler.stop('paint:micromap')
                 elif diff_id == df.B_LINE_ADD:
-                    Profiler.start('paint:bookmark')
-                    self.set_bookmark2(b_ed, y, NKIND_ADDED)
-                    Profiler.stop('paint:bookmark')
+                    pending_bkm_b.append((y, NKIND_ADDED))
                     Profiler.start('paint:decor')
                     self.set_decor(b_ed, y, DECOR_CHAR, self.cfg.get('color_added'))
                     Profiler.stop('paint:decor')
@@ -1187,18 +1191,14 @@ class Command:
                                      mptag=MICROMAP_TAG, map_only=1)
                         Profiler.stop('paint:micromap')
                 elif diff_id == df.A_LINE_CHANGE:
-                    Profiler.start('paint:bookmark')
-                    self.set_bookmark2(a_ed, y, NKIND_CHANGED)
-                    Profiler.stop('paint:bookmark')
+                    pending_bkm_a.append((y, NKIND_CHANGED))
                     if micromap_on:
                         Profiler.start('paint:micromap')
                         self.set_attr(a_ed, y=y, bg=self.cfg.get('color_changed'),
                                      mptag=MICROMAP_TAG, map_only=1)
                         Profiler.stop('paint:micromap')
                 elif diff_id == df.B_LINE_CHANGE:
-                    Profiler.start('paint:bookmark')
-                    self.set_bookmark2(b_ed, y, NKIND_CHANGED)
-                    Profiler.stop('paint:bookmark')
+                    pending_bkm_b.append((y, NKIND_CHANGED))
                     if micromap_on:
                         Profiler.start('paint:micromap')
                         self.set_attr(b_ed, y=y, bg=self.cfg.get('color_changed'),
@@ -1274,6 +1274,28 @@ class Command:
                     self.set_decor(b_ed, y, DECOR_CHAR, self.cfg.get('color_added'))
                     Profiler.stop('paint:decor')
             Profiler.stop('refresh:compare_and_paint')
+
+            # Append all collected bookmarks in sorted order using
+            # BOOKMARK2_APPEND (much faster than BOOKMARK2_SET — skips
+            # duplicate search, sorting, event firing, and repainting).
+            # BOOKMARK2_APPEND requires bookmarks to be added in ascending
+            # line order, so we sort first. After appending, we manually
+            # repaint both editors via EDACTION_UPDATE.
+            Profiler.start('paint:bookmark')
+            pending_bkm_a.sort()
+            pending_bkm_b.sort()
+            for row, nk in pending_bkm_a:
+                a_ed.bookmark(ct.BOOKMARK2_APPEND, row,
+                              nkind=nk, text='', auto_del=True,
+                              show=False, tag=DIFF_TAG)
+            for row, nk in pending_bkm_b:
+                b_ed.bookmark(ct.BOOKMARK2_APPEND, row,
+                              nkind=nk, text='', auto_del=True,
+                              show=False, tag=DIFF_TAG)
+            # BOOKMARK2_APPEND doesn't repaint — force it.
+            a_ed.action(ct.EDACTION_UPDATE)
+            b_ed.action(ct.EDACTION_UPDATE)
+            Profiler.stop('paint:bookmark')
 
             Profiler.stop('refresh:total')
         finally:
@@ -1422,17 +1444,6 @@ class Command:
         Shows a colored DECOR_CHAR in the left margin to mark changed/added/
         deleted lines."""
         e.decor(ct.DECOR_SET, row, DIFF_TAG, text, color, bold=True)
-
-    def set_bookmark2(self, e, row, nk):
-        """Set a bookmark of kind 'nk' (NKIND_DELETED/ADDED/CHANGED) at row.
-        Bookmarks are used for navigation (jump next/prev) and line highlighting."""
-        e.bookmark(ct.BOOKMARK2_SET, row,
-                   nkind=nk,
-                   text="",
-                   auto_del=True,
-                   show=False,
-                   tag=DIFF_TAG
-                   )
 
     def clear(self, e):
         """Remove all diff markers, gaps, decorators, and bookmarks tagged
