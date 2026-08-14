@@ -1122,20 +1122,23 @@ class Command:
                 else:
                     overview.a_ed = a_ed
                     overview.b_ed = b_ed
-                # Get the editor text background color from the UI theme
-                # so the overview background matches the editor (works
-                # with both light and dark themes).
+                # Get the editor text background and font colors from the
+                # UI theme so the overview matches the editor (works with
+                # both light and dark themes).
                 try:
                     ui_theme = ct.app_proc(ct.PROC_THEME_UI_DICT_GET, '')
                     color_bg = ui_theme.get('EdTextBg', {}).get('color', 0xFFFFFF)
+                    color_cursor = ui_theme.get('EdTextFont', {}).get('color', 0x000000)
                 except Exception:
                     color_bg = 0xFFFFFF
+                    color_cursor = 0x000000
                 overview.set_colors(
-                    color_bg,  # background: theme editor text bg
+                    color_bg,
                     self.cfg.get('color_deleted'),
                     self.cfg.get('color_added'),
                     self.cfg.get('color_changed'),
-                    self.cfg.get('color_gaps'))
+                    self.cfg.get('color_gaps'),
+                    color_cursor)
                 overview.clear_data()
             elif overview is not None:
                 overview.destroy()
@@ -1351,26 +1354,38 @@ class Command:
                     Profiler.start('paint:attr')
                     self.set_attr(a_ed, d[2], y, d[3], self.cfg.get('color_deleted'))
                     Profiler.stop('paint:attr')
+                    if overview is not None:
+                        overview.add_line_state('a', y, self.cfg.get('color_deleted'))
                 elif diff_id == df.B_SYMBOL_ADD:
                     Profiler.start('paint:attr')
                     self.set_attr(b_ed, d[2], y, d[3], self.cfg.get('color_added'))
                     Profiler.stop('paint:attr')
+                    if overview is not None:
+                        overview.add_line_state('b', y, self.cfg.get('color_added'))
                 elif diff_id == df.A_DECOR_YELLOW:
                     Profiler.start('paint:decor')
                     self.set_decor(a_ed, y, DECOR_CHAR, self.cfg.get('color_changed'))
                     Profiler.stop('paint:decor')
+                    if overview is not None:
+                        overview.add_line_state('a', y, self.cfg.get('color_changed'))
                 elif diff_id == df.B_DECOR_YELLOW:
                     Profiler.start('paint:decor')
                     self.set_decor(b_ed, y, DECOR_CHAR, self.cfg.get('color_changed'))
                     Profiler.stop('paint:decor')
+                    if overview is not None:
+                        overview.add_line_state('b', y, self.cfg.get('color_changed'))
                 elif diff_id == df.A_DECOR_RED:
                     Profiler.start('paint:decor')
                     self.set_decor(a_ed, y, DECOR_CHAR, self.cfg.get('color_deleted'))
                     Profiler.stop('paint:decor')
+                    if overview is not None:
+                        overview.add_line_state('a', y, self.cfg.get('color_deleted'))
                 elif diff_id == df.B_DECOR_GREEN:
                     Profiler.start('paint:decor')
                     self.set_decor(b_ed, y, DECOR_CHAR, self.cfg.get('color_added'))
                     Profiler.stop('paint:decor')
+                    if overview is not None:
+                        overview.add_line_state('b', y, self.cfg.get('color_added'))
             Profiler.stop('refresh:compare_and_paint')
 
             # Append all collected bookmarks in sorted order using
@@ -1396,11 +1411,12 @@ class Command:
             Profiler.stop('paint:bookmark')
 
             # Repaint the overview with the collected line states and gaps.
-            # Set line counts first so the overview knows the total height.
+            # repaint_static() rebuilds the static bitmap, then paint()
+            # copies it + draws the cursor marker.
             if overview is not None:
                 Profiler.start('paint:overview')
                 overview.set_line_counts(a_ed.get_line_count(), b_ed.get_line_count())
-                overview.paint()
+                overview.repaint_static()
                 Profiler.stop('paint:overview')
 
             Profiler.stop('refresh:total')
