@@ -1272,6 +1272,8 @@ class Command:
                                           total_visual * line_h_a, color_gaps)
                         Profiler.stop('paint:gap')
                         if overview is not None:
+                            # Gap appears BEFORE a_line_after (between lines
+                            # a_line_after-1 and a_line_after)
                             overview.add_gap('a', a_line_after, total_visual)
                     else:
                         Profiler.start('paint:gap')

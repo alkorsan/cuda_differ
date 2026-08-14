@@ -66,12 +66,12 @@ class PaintboxOverview:
         return self.h_dlg is not None
 
     def create(self, a_ed, b_ed):
-        """Create the overview by adding a paintbox control directly to
-        the editor's parent form, aligned to the right side.
+        """Create the overview as a separate dialog docked to the right
+        side of the editor's parent form.
 
-        Uses the direct-control approach (like cuda_breadcrumbs) instead
-        of a separate docked dialog. This ensures the paintbox appears
-        to the right of both split editors.
+        Uses DLG_DOCK with prop='R' to dock to the right of the parent
+        form. This places the overview to the right of both split editors,
+        near the scrollbar, without affecting the editors' widths.
 
         Args:
             a_ed: left editor (primary)
@@ -84,28 +84,42 @@ class PaintboxOverview:
         if not h_parent:
             h_parent = 0  # main CudaText form
 
-        # Use the parent form as our dialog handle
-        self.h_dlg = h_parent
-        self._owns_dlg = False  # we don't own the form, just added a control
-
-        # Add a paintbox control directly to the parent form,
-        # aligned to the right side.
-        self._ctl_index = ct.dlg_proc(h_parent, ct.DLG_CTL_ADD, 'paintbox')
-        ct.dlg_proc(h_parent, ct.DLG_CTL_PROP_SET, index=self._ctl_index, prop={
-            'name': 'differ_overview',
-            'align': ct.ALIGN_RIGHT,
+        # Create a separate dialog for the overview
+        self.h_dlg = ct.dlg_proc(0, ct.DLG_CREATE)
+        self._owns_dlg = True
+        ct.dlg_proc(self.h_dlg, ct.DLG_PROP_SET, prop={
+            'cap': 'Overview',
             'w': OVERVIEW_WIDTH,
+            'h': 600,
+            'border': ct.DBORDER_NONE,
             'color': self.color_bg,
+            'on_resize': self._on_resize,
+            'on_show': self._on_resize,
+        })
+
+        # Add paintbox control, filling the entire dialog
+        self._ctl_index = ct.dlg_proc(self.h_dlg, ct.DLG_CTL_ADD, 'paintbox')
+        ct.dlg_proc(self.h_dlg, ct.DLG_CTL_PROP_SET, index=self._ctl_index, prop={
+            'name': 'paint',
+            'align': ct.ALIGN_CLIENT,
             'on_click': self._on_click,
             'on_mouse_down': self._on_mouse_down,
         })
-        self.h_canvas = ct.dlg_proc(h_parent, ct.DLG_CTL_HANDLE, index=self._ctl_index)
+        self.h_canvas = ct.dlg_proc(self.h_dlg, ct.DLG_CTL_HANDLE, index=self._ctl_index)
+
+        # Dock to the RIGHT side of the editor's parent form
+        ct.dlg_proc(self.h_dlg, ct.DLG_DOCK, prop='R', index=h_parent)
+        ct.dlg_proc(self.h_dlg, ct.DLG_SHOW_NONMODAL)
 
     def destroy(self):
-        """Remove the paintbox control from the parent form."""
+        """Undock and free the overview dialog."""
         if self.h_dlg is not None:
             try:
-                ct.dlg_proc(self.h_dlg, ct.DLG_CTL_DELETE, index=self._ctl_index)
+                if self._owns_dlg:
+                    ct.dlg_proc(self.h_dlg, ct.DLG_UNDOCK)
+                    ct.dlg_proc(self.h_dlg, ct.DLG_FREE)
+                else:
+                    ct.dlg_proc(self.h_dlg, ct.DLG_CTL_DELETE, index=self._ctl_index)
             except Exception:
                 pass
             self.h_dlg = None
@@ -171,6 +185,14 @@ class PaintboxOverview:
             total += gap_rows
         return max(total, 1)
 
+    def _sorted_gaps(self, side):
+        """Return gaps for the given side, sorted by after_line.
+        Gaps are collected in event order (which may not be sorted),
+        so we sort them before using in position calculations.
+        """
+        gaps = self.gaps_a if side == 'a' else self.gaps_b
+        return sorted(gaps, key=lambda g: g[0])
+
     def _line_to_visual_y(self, side, line):
         """Map a line index to its visual Y position (in visual rows),
         accounting for gaps.
@@ -181,10 +203,7 @@ class PaintboxOverview:
 
         Returns: float — visual Y position in visual-row units.
         """
-        if side == 'a':
-            gaps = self.gaps_a
-        else:
-            gaps = self.gaps_b
+        gaps = self._sorted_gaps(side)
         y = line
         for after_line, gap_rows in gaps:
             if after_line <= line:
@@ -203,10 +222,7 @@ class PaintboxOverview:
 
         Returns: int — line index (0-based).
         """
-        if side == 'a':
-            gaps = self.gaps_a
-        else:
-            gaps = self.gaps_b
+        gaps = self._sorted_gaps(side)
         remaining = visual_y
         for after_line, gap_rows in gaps:
             if after_line < remaining:
@@ -290,14 +306,14 @@ class PaintboxOverview:
         """
         if side == 'a':
             line_count = self.a_line_count
-            gaps = self.gaps_a
+            gaps = self._sorted_gaps('a')
             ed = self.a_ed
         else:
             line_count = self.b_line_count
-            gaps = self.gaps_b
+            gaps = self._sorted_gaps('b')
             ed = self.b_ed
 
-        # Build a sorted gap list for efficient traversal
+        # Build a gap map: after_line -> total gap rows at that position
         gap_map = {}
         for after_line, gap_rows in gaps:
             gap_map[after_line] = gap_map.get(after_line, 0) + gap_rows
