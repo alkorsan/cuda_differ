@@ -47,8 +47,6 @@ class PaintboxOverview:
         self._ctl_index = None  # control index in the parent form
         self._owns_dlg = False  # True if we created a separate dialog
         # Static bitmap (persistent — only repainted on compare/resize).
-        # Stores the colored line/gap rectangles so they don't need to be
-        # repainted on every scroll. See paint() for how it's used.
         self._h_static_bmp = None
         self._h_static_cnv = None
         self._static_w = 0
@@ -58,6 +56,10 @@ class PaintboxOverview:
         # Gap info: list of (after_line, gap_visual_rows) for each gap
         self.gaps_a = []  # list of (after_line, gap_visual_rows)
         self.gaps_b = []
+        # Per-line visual row counts (for wrap-aware height computation).
+        # If None, each line is 1 visual row. Set via set_wrap_counts().
+        self.wrap_counts_a = None  # list where [i] = visual rows for line i
+        self.wrap_counts_b = None
         # Editor references and line counts
         self.a_ed = None
         self.b_ed = None
@@ -199,6 +201,28 @@ class PaintboxOverview:
         self.a_line_count = a_count
         self.b_line_count = b_count
 
+    def set_wrap_counts(self, wrap_a, wrap_b):
+        """Set per-line visual row counts for wrap-aware height computation.
+
+        Args:
+            wrap_a: list where wrap_a[i] = visual rows for line i in a_ed,
+                    or None if wrapping is off (each line = 1 row).
+            wrap_b: same for b_ed.
+        """
+        self.wrap_counts_a = wrap_a
+        self.wrap_counts_b = wrap_b
+
+    def _line_visual_rows(self, side, line):
+        """Return the number of visual rows a line occupies (1 if no
+        wrapping, or wrap_counts[i] if wrapping is on)."""
+        if side == 'a':
+            wc = self.wrap_counts_a
+        else:
+            wc = self.wrap_counts_b
+        if wc is None or line < 0 or line >= len(wc):
+            return 1
+        return max(1, wc[line])
+
     def add_line_state(self, side, line, color):
         """Record that a line has a specific color (deleted/added/changed).
 
@@ -232,6 +256,10 @@ class PaintboxOverview:
     def _compute_visual_height(self, side):
         """Compute the total visual height (lines + gaps) for one side.
 
+        Each line's visual height is its wrap count (1 if no wrapping),
+        plus gap rows. This ensures both sides have equal visual heights
+        when the diff is correct.
+
         Returns: int — total visual rows for the given side.
         """
         if side == 'a':
@@ -240,7 +268,11 @@ class PaintboxOverview:
         else:
             line_count = self.b_line_count
             gaps = self.gaps_b
-        total = line_count
+        # Sum line visual rows (wrap-aware)
+        total = 0
+        for line in range(line_count):
+            total += self._line_visual_rows(side, line)
+        # Add gap rows
         for _, gap_rows in gaps:
             total += gap_rows
         return max(total, 1)
@@ -256,7 +288,7 @@ class PaintboxOverview:
 
     def _line_to_visual_y(self, side, line):
         """Map a line index to its visual Y position (in visual rows),
-        accounting for gaps.
+        accounting for both gaps and wrapping.
 
         Args:
             side: 'a' or 'b'
@@ -265,7 +297,11 @@ class PaintboxOverview:
         Returns: float — visual Y position in visual-row units.
         """
         gaps = self._sorted_gaps(side)
-        y = line
+        # Sum visual rows of all lines before this one (wrap-aware)
+        y = 0
+        for i in range(line):
+            y += self._line_visual_rows(side, i)
+        # Add gap rows for gaps at or before this line
         for after_line, gap_rows in gaps:
             if after_line <= line:
                 y += gap_rows
@@ -379,10 +415,12 @@ class PaintboxOverview:
             color = self.line_states.get((side, line))
             if color is not None:
                 py = int(vis_y * scale)
-                line_h = max(1, int(scale) + 1)
+                # Use wrap-aware line height
+                line_vr = self._line_visual_rows(side, line)
+                line_h = max(1, int(line_vr * scale) + 1)
                 ct.canvas_proc(c, ct.CANVAS_SET_BRUSH, color=color, style=ct.BRUSH_SOLID)
                 ct.canvas_proc(c, ct.CANVAS_RECT_FILL, x=x_start, y=py, x2=x_end, y2=py + line_h)
-            vis_y += 1
+            vis_y += self._line_visual_rows(side, line)
 
         # Paint any remaining gaps after the last line
         for after_line, gap_rows in gaps:
@@ -407,6 +445,19 @@ class PaintboxOverview:
         h = props.get('h', 600)
         if w <= 0 or h <= 0:
             return
+
+        # Debug: print gap data to trace desync issues
+        vis_h_a = self._compute_visual_height('a')
+        vis_h_b = self._compute_visual_height('b')
+        print('Differ overview debug:')
+        print('  a: {} lines, {} gaps, vis_h={}'.format(
+            self.a_line_count, len(self.gaps_a), vis_h_a))
+        print('  b: {} lines, {} gaps, vis_h={}'.format(
+            self.b_line_count, len(self.gaps_b), vis_h_b))
+        print('  a gaps: {}'.format(self._sorted_gaps('a')[:10]))
+        print('  b gaps: {}'.format(self._sorted_gaps('b')[:10]))
+        print('  line_states count: {}'.format(len(self.line_states)))
+
         self._free_static_bitmap()
         self._ensure_static_bitmap(w, h)
         self.paint()
