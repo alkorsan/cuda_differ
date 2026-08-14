@@ -79,7 +79,7 @@ class PaintboxOverview:
         """
         self.a_ed = a_ed
         self.b_ed = b_ed
-        h_parent = a_ed.get_prop(ct.PROP_HANDLE_PARENT2)
+        h_parent = a_ed.get_prop(ct.PROP_HANDLE_PARENT)
         if not h_parent:
             h_parent = 0
 
@@ -111,7 +111,7 @@ class PaintboxOverview:
         # secondary editor (per CudaText author's fix).
         ct.dlg_proc(self.h_dlg, ct.DLG_SHOW_NONMODAL)
         ct.dlg_proc(self.h_dlg, ct.DLG_DOCK, prop='R', index=h_parent)
-        # ct.dlg_proc(self.h_dlg, ct.DLG_PROP_SET, prop={'x': 6000})
+        ct.dlg_proc(self.h_dlg, ct.DLG_PROP_SET, prop={'x': 6000})
 
     def destroy(self):
         """Undock and free the overview dialog."""
@@ -235,8 +235,43 @@ class PaintboxOverview:
         return max(0, int(remaining))
 
     def paint(self):
-        """Repaint the entire overview. Called on resize, show, scroll,
-        and after a fresh compare.
+        """Repaint the entire overview using the bitmap API for
+        flicker-free painting.
+
+        Instead of painting directly on the paintbox canvas (which
+        flickers because each canvas_proc call is immediately visible),
+        we paint on an off-screen bitmap and then copy the entire
+        bitmap to the paintbox in one operation via CANVAS_BITMAP.
+
+        Called on resize, show, scroll (debounced), and after a
+        fresh compare.
+        """
+        if self.h_canvas is None:
+            return
+
+        # Get the paintbox size from the control properties
+        props = ct.dlg_proc(self.h_dlg, ct.DLG_CTL_PROP_GET, index=self._ctl_index)
+        w = props.get('w', OVERVIEW_WIDTH)
+        h = props.get('h', 600)
+        if w <= 0 or h <= 0:
+            return
+
+        # Create an off-screen bitmap for flicker-free painting.
+        # All drawing happens on the bitmap's canvas, then we copy
+        # the entire bitmap to the paintbox in one operation.
+        h_bmp, h_bmp_cnv = ct.bitmap_proc(0, ct.BITMAP_CREATE, w, h)
+        try:
+            self._paint_content(h_bmp_cnv, w, h)
+            # Copy the bitmap to the paintbox canvas in one operation
+            ct.canvas_proc(self.h_canvas, ct.CANVAS_BITMAP,
+                           text=str(h_bmp), x=0, y=0)
+        finally:
+            ct.bitmap_proc(h_bmp, ct.BITMAP_FREE)
+
+    def _paint_content(self, c, w, h):
+        """Paint the overview content on the given canvas (either a
+        bitmap canvas for off-screen rendering, or the paintbox canvas
+        for direct rendering).
 
         The overview shows both editors side-by-side:
         - Left half: a_ed lines + gaps
@@ -245,17 +280,6 @@ class PaintboxOverview:
         - Gaps are painted as gray rectangles
         - The cursor position is marked with a thin horizontal line
         """
-        if self.h_canvas is None:
-            return
-
-        c = self.h_canvas
-        # Get the paintbox size from the control properties
-        props = ct.dlg_proc(self.h_dlg, ct.DLG_CTL_PROP_GET, index=self._ctl_index)
-        w = props.get('w', OVERVIEW_WIDTH)
-        h = props.get('h', 600)
-        if w <= 0 or h <= 0:
-            return
-
         # Clear background
         ct.canvas_proc(c, ct.CANVAS_SET_BRUSH, color=self.color_bg, style=ct.BRUSH_SOLID)
         ct.canvas_proc(c, ct.CANVAS_RECT_FILL, x=0, y=0, x2=w, y2=h)
