@@ -66,14 +66,12 @@ class PaintboxOverview:
         return self.h_dlg is not None
 
     def create(self, a_ed, b_ed):
-        """Create the overview by adding a paintbox control directly to
-        the editor's parent form (the split container), aligned right.
+        """Create the overview as a separate dialog docked to the right
+        side of the editor's parent form.
 
-        This is the same approach cuda_breadcrumbs uses (adding a control
-        to PROP_HANDLE_PARENT), but with ALIGN_RIGHT instead of
-        ALIGN_BOTTOM. The paintbox appears to the right of both split
-        editors, within the editor's own form — not spanning the full
-        window height or affecting tab bars.
+        Per CudaText author's instructions: after DLG_DOCK with prop='R',
+        set the form's 'x' prop to a large value (e.g. 6000) to force it
+        to the right side, past the secondary editor's X position.
 
         Args:
             a_ed: left editor (primary)
@@ -81,38 +79,48 @@ class PaintboxOverview:
         """
         self.a_ed = a_ed
         self.b_ed = b_ed
-        # Get the parent form handle — the form containing both split editors.
         h_parent = a_ed.get_prop(ct.PROP_HANDLE_PARENT)
         if not h_parent:
-            h_parent = 0  # fallback to main CudaText form
+            h_parent = 0
 
-        # Use the parent form as our dialog handle
-        self.h_dlg = h_parent
-        self._owns_dlg = False  # we don't own the form, just added a control
-
-        # Add a paintbox control directly to the parent form,
-        # aligned to the right side. This places it to the right of both
-        # split editors, within the editor's form area.
-        self._ctl_index = ct.dlg_proc(h_parent, ct.DLG_CTL_ADD, 'paintbox')
-        ct.dlg_proc(h_parent, ct.DLG_CTL_PROP_SET, index=self._ctl_index, prop={
-            'name': 'differ_overview',
-            'align': ct.ALIGN_RIGHT,
+        # Create a separate dialog for the overview
+        self.h_dlg = ct.dlg_proc(0, ct.DLG_CREATE)
+        self._owns_dlg = True
+        ct.dlg_proc(self.h_dlg, ct.DLG_PROP_SET, prop={
+            'cap': 'Overview',
             'w': OVERVIEW_WIDTH,
+            'h': 600,
+            'border': ct.DBORDER_NONE,
             'color': self.color_bg,
+            'on_resize': self._on_resize,
+            'on_show': self._on_resize,
+        })
+
+        # Add paintbox control, filling the entire dialog
+        self._ctl_index = ct.dlg_proc(self.h_dlg, ct.DLG_CTL_ADD, 'paintbox')
+        ct.dlg_proc(self.h_dlg, ct.DLG_CTL_PROP_SET, index=self._ctl_index, prop={
+            'name': 'paint',
+            'align': ct.ALIGN_CLIENT,
             'on_click': self._on_click,
             'on_mouse_down': self._on_mouse_down,
         })
-        self.h_canvas = ct.dlg_proc(h_parent, ct.DLG_CTL_HANDLE, index=self._ctl_index)
+        self.h_canvas = ct.dlg_proc(self.h_dlg, ct.DLG_CTL_HANDLE, index=self._ctl_index)
+
+        # Dock to the RIGHT side of the editor's parent form, then set
+        # x to a large value to force the dialog to the right of the
+        # secondary editor (per CudaText author's fix).
+        ct.dlg_proc(self.h_dlg, ct.DLG_SHOW_NONMODAL)
+        ct.dlg_proc(self.h_dlg, ct.DLG_DOCK, prop='R', index=h_parent)
+        ct.dlg_proc(self.h_dlg, ct.DLG_PROP_SET, prop={'x': 6000})
 
     def destroy(self):
-        """Remove the overview: delete the control from the parent form."""
+        """Undock and free the overview dialog."""
         if self.h_dlg is not None:
             try:
                 if self._owns_dlg:
                     ct.dlg_proc(self.h_dlg, ct.DLG_UNDOCK)
                     ct.dlg_proc(self.h_dlg, ct.DLG_FREE)
                 else:
-                    # We added a control to the parent form — delete it.
                     ct.dlg_proc(self.h_dlg, ct.DLG_CTL_DELETE, index=self._ctl_index)
             except Exception:
                 pass

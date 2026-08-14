@@ -316,6 +316,8 @@ class Command:
         # Overview panels per compare tab ID. Each value is a
         # PaintboxOverview instance docked to the right of the editor.
         self._overviews = {}
+        # Active overview repaint timers per tab ID (for debouncing).
+        self._overview_timers = {}
 
         self.compare_menu = None
         self.menuid_sep = None
@@ -754,14 +756,30 @@ class Command:
 
     def on_scroll(self, ed_self):
         """Forward scroll events to ScrollSplittedTab for synchronized
-        scrolling, and repaint the overview (cursor position marker)."""
+        scrolling. The overview repaint is debounced via a timer to
+        avoid excessive CPU usage and flickering during continuous
+        scrolling."""
         tab_id = ed_self.get_prop(ct.PROP_TAB_ID)
         if self._is_compare_tab(tab_id):
             self.scroll.on_scroll(ed_self)
-            # Repaint the overview to update the cursor position marker.
-            overview = self._overviews.get(str(tab_id))
-            if overview is not None:
-                overview.paint()
+            # Debounce overview repaint: use a one-shot timer so we
+            # only repaint after scrolling stops for 150ms.
+            tab_id_str = str(tab_id)
+            if tab_id_str not in self._overview_timers:
+                self._overview_timers[tab_id_str] = True
+                callback = 'module=cuda_differ;cmd=_overview_repaint_timer;info={};'.format(tab_id_str)
+                ct.timer_proc(ct.TIMER_START_ONE, callback, 150)
+
+    def _overview_repaint_timer(self, tag='', info=''):
+        """Timer callback that repaints the overview for a given tab.
+        Called 150ms after the last scroll event to avoid excessive
+        repaints during continuous scrolling."""
+        if not info:
+            return
+        self._overview_timers.pop(info, None)
+        overview = self._overviews.get(info)
+        if overview is not None:
+            overview.paint()
 
     def on_caret(self, ed_self):
         """Mirror caret to opposite editor when sync_caret is enabled."""
