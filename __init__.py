@@ -1122,8 +1122,16 @@ class Command:
                 else:
                     overview.a_ed = a_ed
                     overview.b_ed = b_ed
+                # Get the editor text background color from the UI theme
+                # so the overview background matches the editor (works
+                # with both light and dark themes).
+                try:
+                    ui_theme = ct.app_proc(ct.PROC_THEME_UI_DICT_GET, '')
+                    color_bg = ui_theme.get('EdTextBg', {}).get('color', 0xFFFFFF)
+                except Exception:
+                    color_bg = 0xFFFFFF
                 overview.set_colors(
-                    0xFFFFFF,  # background: white (unchanged lines)
+                    color_bg,  # background: theme editor text bg
                     self.cfg.get('color_deleted'),
                     self.cfg.get('color_added'),
                     self.cfg.get('color_changed'),

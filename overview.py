@@ -54,12 +54,12 @@ class PaintboxOverview:
         self.a_line_count = 0
         self.b_line_count = 0
         # Colors
-        self.color_bg = 0xFFFFFF
-        self.color_deleted = 0xAAAAAA
-        self.color_added = 0xAAAAAA
-        self.color_changed = 0xAAAAAA
-        self.color_gap = 0xEEEEEE
-        self.color_cursor = 0x000000
+        self.color_bg = 0xFFFFFF       # overridden by set_colors() with theme bg
+        self.color_deleted = 0xAAAAAA  # overridden by set_colors()
+        self.color_added = 0xAAAAAA    # overridden by set_colors()
+        self.color_changed = 0xAAAAAA  # overridden by set_colors()
+        self.color_gap = 0xEEEEEE      # overridden by set_colors()
+        self.color_cursor = 0x000000   # black cursor line (visible on both themes)
 
     def is_created(self):
         """Return True if the overview has been created."""
@@ -67,11 +67,18 @@ class PaintboxOverview:
 
     def create(self, a_ed, b_ed):
         """Create the overview as a separate dialog docked to the right
-        side of the editor's parent form.
+        side of the editor's parent-of-parent form.
 
-        Per CudaText author's instructions: after DLG_DOCK with prop='R',
-        set the form's 'x' prop to a large value (e.g. 6000) to force it
-        to the right side, past the secondary editor's X position.
+        Uses PROP_HANDLE_PARENT2 (the parent of the editor's parent) for
+        docking. PROP_HANDLE_PARENT (the editor's direct parent) is the
+        split container — docking to it places the overview inside the
+        split area, causing it to jump to the middle when side panels
+        (like the Tabs sidebar) are toggled.
+
+        PROP_HANDLE_PARENT2 is the outer form that holds the split
+        container + side panels + tab bar. Docking to it keeps the
+        overview stable regardless of side panel state.
+        See: https://github.com/Alexey-T/CudaText/issues/6412#issuecomment-5295204696
 
         Args:
             a_ed: left editor (primary)
@@ -79,7 +86,13 @@ class PaintboxOverview:
         """
         self.a_ed = a_ed
         self.b_ed = b_ed
-        h_parent = a_ed.get_prop(ct.PROP_HANDLE_PARENT)
+        # PROP_HANDLE_PARENT2: parent-of-parent of the editor.
+        # PROP_HANDLE_PARENT is the split container (inner) — docking to
+        # it causes the overview to jump when side panels toggle.
+        # PROP_HANDLE_PARENT2 is the outer form — stable regardless of
+        # side panel state.
+        # See: https://github.com/Alexey-T/CudaText/issues/6412#issuecomment-5295204696
+        h_parent = a_ed.get_prop(ct.PROP_HANDLE_PARENT2)
         if not h_parent:
             h_parent = 0
 
@@ -106,9 +119,9 @@ class PaintboxOverview:
         })
         self.h_canvas = ct.dlg_proc(self.h_dlg, ct.DLG_CTL_HANDLE, index=self._ctl_index)
 
-        # Dock to the RIGHT side of the editor's parent form, then set
-        # x to a large value to force the dialog to the right of the
-        # secondary editor (per CudaText author's fix).
+        # Dock to the RIGHT side of the editor's parent-of-parent form.
+        # Set x to a large value to force the dialog past the secondary
+        # editor's X position (per CudaText author's fix).
         ct.dlg_proc(self.h_dlg, ct.DLG_SHOW_NONMODAL)
         ct.dlg_proc(self.h_dlg, ct.DLG_DOCK, prop='R', index=h_parent)
         ct.dlg_proc(self.h_dlg, ct.DLG_PROP_SET, prop={'x': 6000})
@@ -259,8 +272,12 @@ class PaintboxOverview:
         # Create an off-screen bitmap for flicker-free painting.
         # All drawing happens on the bitmap's canvas, then we copy
         # the entire bitmap to the paintbox in one operation.
-        h_bmp, h_bmp_cnv = ct.bitmap_proc(0, ct.BITMAP_CREATE, w, h)
+        # Note: BITMAP_CREATE returns a single bitmap handle; use
+        # BITMAP_GET_CANVAS to get the canvas handle (API changed:
+        # previously BITMAP_CREATE returned a 2-tuple).
+        h_bmp = ct.bitmap_proc(0, ct.BITMAP_CREATE, w, h)
         try:
+            h_bmp_cnv = ct.bitmap_proc(h_bmp, ct.BITMAP_GET_CANVAS)
             self._paint_content(h_bmp_cnv, w, h)
             # Copy the bitmap to the paintbox canvas in one operation
             ct.canvas_proc(self.h_canvas, ct.CANVAS_BITMAP,
