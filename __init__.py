@@ -1341,14 +1341,17 @@ class Command:
                             diff_rows = va - vb
                             self._add_raw_gap(b_ed, b_line,
                                               diff_rows * line_h_b, color_gaps)
-                            if overview is not None:
-                                overview.add_gap('b', b_line, diff_rows)
+                            # Note: ALIGN wrap gaps are NOT recorded in the
+                            # overview. The overview counts each line as 1
+                            # visual row regardless of wrapping, so these
+                            # gaps (which compensate for wrap differences)
+                            # would make the visual heights unequal, causing
+                            # desync. Only A_GAP/B_GAP gaps are recorded.
                         elif vb > va:
                             diff_rows = vb - va
                             self._add_raw_gap(a_ed, a_line,
                                               diff_rows * line_h_a, color_gaps)
-                            if overview is not None:
-                                overview.add_gap('a', a_line, diff_rows)
+                            # Same as above — don't record in overview.
                         Profiler.stop('paint:gap')
                 elif diff_id == df.A_SYMBOL_DEL:
                     Profiler.start('paint:attr')
