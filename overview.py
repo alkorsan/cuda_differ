@@ -9,15 +9,22 @@ Architecture:
   - PaintboxOverview creates a non-modal dialog with an 'image' control.
   - The dialog is docked to the RIGHT side of PROP_HANDLE_PARENT2.
   - The 'image' control has an embedded bitmap that handles resize/minimize/
-    restore automatically — no need for manual resize handling or temp bitmaps.
-  - Painting is done directly on the image's bitmap canvas via:
-      h_image = dlg_proc(..., DLG_CTL_HANDLE, ...)
-      h_bitmap = image_proc(h_image, IMAGE_GET_BITMAP)
-      h_canvas = bitmap_proc(h_bitmap, BITMAP_GET_CANVAS)
-  - The static/dynamic optimization is kept: the static part (line states +
-    gaps) is painted on the embedded bitmap, and the dynamic part (cursor +
-    viewport) is painted on top. On scroll, we repaint everything (the image
-    control's bitmap is persistent, so no flicker).
+    restore automatically — no need for on_act/on_resize/on_show handlers.
+  - Uses a two-bitmap optimization (see _ensure_static_bitmap / paint):
+    * Static bitmap: a separate persistent bitmap (via bitmap_proc) that
+      stores the colored line/gap rectangles. Only repainted on compare/resize
+      via repaint_static(). This is the expensive part (hundreds of
+      CANVAS_RECT_FILL calls).
+    * Dynamic: on each paint(), copy the static bitmap to the image's
+      embedded bitmap via CANVAS_BITMAP, then draw the cursor marker and
+      viewport rectangle on top. This is cheap (one bitmap copy + a few
+      CANVAS_LINE / CANVAS_RECT_FRAME calls).
+  - On scroll (debounced 150ms): paint() is called. It only copies the
+    static bitmap and draws the dynamic part — the static bitmap is reused.
+    This avoids repainting hundreds of rectangles on every scroll.
+  - On compare/resize: repaint_static() is called first, which frees the
+    old static bitmap and creates a new one with fresh content. Then
+    paint() copies it + draws the dynamic part.
 
   See: https://github.com/CudaText-addons/cuda_differ/issues/29
 """
@@ -40,10 +47,17 @@ class PaintboxOverview:
         """Initialize the overview with empty state and default colors."""
         self.h_dlg = None       # dialog handle
         self.h_image = None     # image control handle
-        self.h_bitmap = None    # embedded bitmap handle
-        self.h_canvas = None    # bitmap canvas handle
+        self.h_bitmap = None    # image's embedded bitmap handle
+        self.h_canvas = None    # image's embedded bitmap canvas handle
         self._ctl_index = None  # control index in the dialog
         self._owns_dlg = False  # True if we created a separate dialog
+        # Static bitmap (persistent — only repainted on compare/resize).
+        # Stores the colored line/gap rectangles so they don't need to be
+        # repainted on every scroll. See paint() for how it's used.
+        self._h_static_bmp = None
+        self._h_static_cnv = None
+        self._static_w = 0
+        self._static_h = 0
         # Line states: {('a', line): color, ('b', line): color}
         self.line_states = {}
         # Gap info: list of (after_line, gap_visual_rows) for each gap
@@ -103,14 +117,14 @@ class PaintboxOverview:
             'h': 600,
             'border': ct.DBORDER_NONE,
             'color': self.color_bg,
-            'on_resize': self._on_resize,
-            'on_show': self._on_resize,
-            'on_act': self._on_activate,
+            # No on_resize/on_show/on_act handlers needed — the 'image'
+            # control handles resize/minimize/restore automatically via
+            # its embedded bitmap.
         })
 
-        # Add 'image' control (replaces 'paintbox'). The image control has
-        # an embedded bitmap that handles resize/minimize/restore
-        # automatically — no flicker, no manual resize handling needed.
+        # Add 'image' control (replaces deprecated 'paintbox'). The image
+        # control has an embedded bitmap that handles resize/minimize/
+        # restore automatically — no flicker, no manual resize handling.
         self._ctl_index = ct.dlg_proc(self.h_dlg, ct.DLG_CTL_ADD, 'image')
         ct.dlg_proc(self.h_dlg, ct.DLG_CTL_PROP_SET, index=self._ctl_index, prop={
             'name': 'overview_image',
@@ -129,7 +143,8 @@ class PaintboxOverview:
         ct.dlg_proc(self.h_dlg, ct.DLG_DOCK, prop='R', index=h_parent)
 
     def destroy(self):
-        """Undock and free the overview dialog."""
+        """Undock and free the overview dialog and static bitmap."""
+        self._free_static_bitmap()
         if self.h_dlg is not None:
             try:
                 if self._owns_dlg:
@@ -144,6 +159,38 @@ class PaintboxOverview:
             self.h_bitmap = None
             self.h_canvas = None
             self._ctl_index = None
+
+    def _free_static_bitmap(self):
+        """Free the persistent static bitmap if it exists."""
+        if self._h_static_bmp is not None:
+            try:
+                ct.bitmap_proc(self._h_static_bmp, ct.BITMAP_FREE)
+            except Exception:
+                pass
+            self._h_static_bmp = None
+            self._h_static_cnv = None
+
+    def _ensure_static_bitmap(self, w, h):
+        """Create or resize the persistent static bitmap to match (w, h).
+
+        The static bitmap stores the colored line/gap rectangles (the
+        expensive part that takes hundreds of CANVAS_RECT_FILL calls).
+        It's only repainted here when the size changes or when
+        repaint_static() is called after a fresh compare.
+
+        Once created, the static bitmap is reused on every paint() call
+        — paint() just copies it to the image's embedded bitmap and draws
+        the cursor/viewport on top, which is very fast.
+        """
+        if self._h_static_bmp is not None:
+            if self._static_w == w and self._static_h == h:
+                return  # still valid, reuse
+            self._free_static_bitmap()
+        self._h_static_bmp = ct.bitmap_proc(0, ct.BITMAP_CREATE, w, h)
+        self._h_static_cnv = ct.bitmap_proc(self._h_static_bmp, ct.BITMAP_GET_CANVAS)
+        self._static_w = w
+        self._static_h = h
+        self._paint_static(self._h_static_cnv, w, h)
 
     def set_colors(self, color_bg, color_deleted, color_added, color_changed, color_gap, color_cursor=None):
         """Set the colors used for painting the overview.
@@ -278,25 +325,6 @@ class PaintboxOverview:
                 break
         return y
 
-    def _visual_y_to_line(self, side, visual_y):
-        """Map a visual Y position (in visual rows) back to a line index,
-        accounting for gaps but NOT wrapping. Kept for backwards compat.
-
-        Args:
-            side: 'a' or 'b'
-            visual_y: visual Y position in visual-row units
-
-        Returns: int — line index (0-based).
-        """
-        gaps = self._sorted_gaps(side)
-        remaining = visual_y
-        for after_line, gap_rows in gaps:
-            if after_line < remaining:
-                remaining -= gap_rows
-            else:
-                break
-        return max(0, int(remaining))
-
     def _visual_y_to_line_wrap_aware(self, side, visual_y):
         """Map a visual Y position (in visual rows) back to a line index,
         accounting for BOTH gaps AND wrapping.
@@ -357,39 +385,20 @@ class PaintboxOverview:
         h = props.get('h', 600)
         return w, h
 
-    def _ensure_bitmap_size(self, w, h):
-        """Resize the embedded bitmap to match the control size."""
-        try:
-            ct.bitmap_proc(self.h_bitmap, ct.BITMAP_SET_SIZE, w, h)
-        except Exception:
-            pass
-
-    def repaint_static(self):
-        """Force a full repaint of the static content (line states + gaps).
-        Called after a fresh compare or when colors change.
-
-        Paints the static part directly on the image's embedded bitmap,
-        then draws the dynamic part (cursor + viewport) on top.
-        """
-        if self.h_canvas is None:
-            return
-        w, h = self._get_size()
-        if w <= 0 or h <= 0:
-            return
-        self._ensure_bitmap_size(w, h)
-        self._paint_static(w, h)
-        self._paint_dynamic(w, h)
-
-    def _paint_static(self, w, h):
+    def _paint_static(self, c, w, h):
         """Paint the static part (background, line states, gaps) on the
-        embedded bitmap canvas. This is the expensive part that only needs
-        to run on compare/resize, not on scroll.
+        given canvas. This is the expensive part that only needs to run
+        on compare/resize, not on scroll.
+
+        The static bitmap stores the result of this method so it can be
+        reused on every paint() call without re-executing the expensive
+        CANVAS_RECT_FILL loop.
 
         Args:
+            c: canvas handle (static bitmap canvas)
             w: width in pixels
             h: height in pixels
         """
-        c = self.h_canvas
         # Clear background
         ct.canvas_proc(c, ct.CANVAS_SET_BRUSH, color=self.color_bg, style=ct.BRUSH_SOLID)
         ct.canvas_proc(c, ct.CANVAS_RECT_FILL, x=0, y=0, x2=w, y2=h)
@@ -464,25 +473,55 @@ class PaintboxOverview:
                 ct.canvas_proc(c, ct.CANVAS_RECT_FILL, x=x_start, y=py, x2=x_end, y2=py + gap_h)
                 vis_y += gap_rows
 
-    def paint(self):
-        """Repaint the dynamic part (cursor + viewport) on top of the
-        existing static content.
+    def repaint_static(self):
+        """Force a full repaint of the static bitmap. Called after a
+        fresh compare or when colors change.
 
-        Since the image control's embedded bitmap is persistent (handles
-        resize/minimize/restore automatically), the static content is
-        already there. We just need to repaint the dynamic part.
-
-        For simplicity and correctness, we repaint everything (static +
-        dynamic) on each paint() call. The image control's bitmap is
-        persistent and doesn't flicker, so there's no performance issue.
+        Frees the old static bitmap and creates a new one with fresh
+        content, then calls paint() to display it with the dynamic part.
         """
         if self.h_canvas is None:
             return
         w, h = self._get_size()
         if w <= 0 or h <= 0:
             return
-        self._ensure_bitmap_size(w, h)
-        self._paint_static(w, h)
+        self._free_static_bitmap()
+        self._ensure_static_bitmap(w, h)
+        self.paint()
+
+    def paint(self):
+        """Repaint the overview using the static/dynamic bitmap approach.
+
+        The static bitmap (line states + gaps) is reused — it's only
+        repainted when the diff changes (via repaint_static). On scroll,
+        this method just:
+        1. Ensures the static bitmap exists and matches current size.
+        2. Copies the static bitmap to the image's embedded bitmap via
+           CANVAS_BITMAP (fast — one bitmap copy).
+        3. Draws the dynamic part (cursor line + viewport rectangle)
+           on top of the image's bitmap (a few CANVAS_LINE / CANVAS_RECT_FRAME
+           calls).
+
+        This avoids the expensive CANVAS_RECT_FILL loop on every scroll,
+        dramatically reducing CPU usage. The image control's embedded
+        bitmap handles resize/minimize/restore automatically, so no
+        on_act/on_resize/on_show handlers are needed.
+        """
+        if self.h_canvas is None:
+            return
+
+        w, h = self._get_size()
+        if w <= 0 or h <= 0:
+            return
+
+        # Ensure static bitmap exists and matches current size
+        self._ensure_static_bitmap(w, h)
+
+        # Copy static bitmap to the image's embedded bitmap
+        ct.canvas_proc(self.h_canvas, ct.CANVAS_BITMAP,
+                       text=str(self._h_static_bmp), x=0, y=0)
+
+        # Draw dynamic part (cursor + viewport) on top
         self._paint_dynamic(w, h)
 
     def _paint_dynamic(self, w, h):
@@ -525,7 +564,7 @@ class PaintboxOverview:
         Also draws a thin cursor line at the caret position.
 
         Args:
-            c: canvas handle
+            c: canvas handle (image's embedded bitmap canvas)
             ed: editor instance
             side: 'a' or 'b'
             x_start: left X pixel
@@ -576,16 +615,6 @@ class PaintboxOverview:
             py = int(vis_y * scale)
             ct.canvas_proc(c, ct.CANVAS_SET_PEN, color=self.color_cursor, size=1)
             ct.canvas_proc(c, ct.CANVAS_LINE, x=x_start, y=py, x2=x_end, y2=py)
-
-    def _on_resize(self, id_dlg, id_ctl, data='', info=''):
-        """Called when the dialog is resized or shown. Triggers a full
-        repaint (static + dynamic)."""
-        self.paint()
-
-    def _on_activate(self, id_dlg, id_ctl, data='', info=''):
-        """Called when the dialog is activated (e.g. after window restore
-        from minimized state). Triggers a repaint."""
-        self.paint()
 
     def _on_click(self, id_dlg, id_ctl, data='', info=''):
         """Called when the image is clicked. Scrolls the corresponding
