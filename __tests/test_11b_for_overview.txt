@@ -1,0 +1,7 @@
+"""Differ module for Python algorithms (hybrid, myers, vscode, patience, difflib).
+
+This file is self-contained: it contains everything needed to run the
+pure-Python diff algorithms. It does NOT depend on differ_native.py.
+
+For native algorithms (native_histogram, native_myers), use
+differ_native.py instead — the native engine is 10-30x faster.

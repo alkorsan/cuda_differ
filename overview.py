@@ -446,7 +446,7 @@ class PaintboxOverview:
         if w <= 0 or h <= 0:
             return
 
-        # Debug: print gap data to trace desync issues
+        # Debug: print gap/line data to trace ordering issues
         vis_h_a = self._compute_visual_height('a')
         vis_h_b = self._compute_visual_height('b')
         print('Differ overview debug:')
@@ -454,9 +454,44 @@ class PaintboxOverview:
             self.a_line_count, len(self.gaps_a), vis_h_a))
         print('  b: {} lines, {} gaps, vis_h={}'.format(
             self.b_line_count, len(self.gaps_b), vis_h_b))
-        print('  a gaps: {}'.format(self._sorted_gaps('a')[:10]))
-        print('  b gaps: {}'.format(self._sorted_gaps('b')[:10]))
-        print('  line_states count: {}'.format(len(self.line_states)))
+        print('  a gaps: {}'.format(self._sorted_gaps('a')[:20]))
+        print('  b gaps: {}'.format(self._sorted_gaps('b')[:20]))
+        print('  a line_states: {}'.format(
+            sorted([(k[1], hex(v)) for k, v in self.line_states.items() if k[0] == 'a'])))
+        print('  b line_states: {}'.format(
+            sorted([(k[1], hex(v)) for k, v in self.line_states.items() if k[0] == 'b'])))
+        if self.wrap_counts_a:
+            print('  a wrap_counts: {}'.format(self.wrap_counts_a[:20]))
+        if self.wrap_counts_b:
+            print('  b wrap_counts: {}'.format(self.wrap_counts_b[:20]))
+        # Trace the exact paint order for side 'a' (last 5 lines + gaps)
+        print('  a paint trace (last 6 items):')
+        gaps_a = self._sorted_gaps('a')
+        gap_map_a = {}
+        for al, gr in gaps_a:
+            gap_map_a[al] = gap_map_a.get(al, 0) + gr
+        vy = 0
+        for line in range(self.a_line_count):
+            vr = self._line_visual_rows('a', line)
+            gap = gap_map_a.get(line, 0)
+            state = self.line_states.get(('a', line))
+            if line >= self.a_line_count - 6:
+                print('    line {}: vis_y={}, wrap={}, gap={}, state={}'.format(
+                    line, vy, vr, gap, hex(state) if state else 'none'))
+            vy += vr + gap
+        # Trace the exact paint order for side 'b'
+        print('  b paint trace (all):')
+        gap_map_b = {}
+        for al, gr in self._sorted_gaps('b'):
+            gap_map_b[al] = gap_map_b.get(al, 0) + gr
+        vy = 0
+        for line in range(self.b_line_count):
+            vr = self._line_visual_rows('b', line)
+            gap = gap_map_b.get(line, 0)
+            state = self.line_states.get(('b', line))
+            print('    line {}: vis_y={}, wrap={}, gap={}, state={}'.format(
+                line, vy, vr, gap, hex(state) if state else 'none'))
+            vy += vr + gap
 
         self._free_static_bitmap()
         self._ensure_static_bitmap(w, h)

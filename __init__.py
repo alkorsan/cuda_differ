@@ -1342,13 +1342,19 @@ class Command:
                             self._add_raw_gap(b_ed, b_line,
                                               diff_rows * line_h_b, color_gaps)
                             if overview is not None:
-                                overview.add_gap('b', b_line, diff_rows)
+                                # _add_raw_gap inserts AFTER b_line (between
+                                # b_line and b_line+1), so record as
+                                # after_line = b_line + 1 (gap appears
+                                # before line b_line+1 in paint order).
+                                overview.add_gap('b', b_line + 1, diff_rows)
                         elif vb > va:
                             diff_rows = vb - va
                             self._add_raw_gap(a_ed, a_line,
                                               diff_rows * line_h_a, color_gaps)
                             if overview is not None:
-                                overview.add_gap('a', a_line, diff_rows)
+                                # Same: gap is after a_line, so record
+                                # as after_line = a_line + 1.
+                                overview.add_gap('a', a_line + 1, diff_rows)
                         Profiler.stop('paint:gap')
                 elif diff_id == df.A_SYMBOL_DEL:
                     Profiler.start('paint:attr')
@@ -1417,8 +1423,9 @@ class Command:
                 Profiler.start('paint:overview')
                 overview.set_line_counts(a_ed.get_line_count(), b_ed.get_line_count())
                 # Pass wrap counts so the overview can compute wrap-aware
-                # visual heights (each line's visual rows = its wrap count).
-                # This keeps both sides in sync when wrapping is on.
+                # visual heights. Without this, each line is counted as 1
+                # visual row, causing desync when wrapping is on (lines
+                # that wrap to 2+ rows have more visual height than 1).
                 if wrap_on:
                     overview.set_wrap_counts(wrap_counts_a, wrap_counts_b)
                 else:
