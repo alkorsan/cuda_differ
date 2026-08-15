@@ -36,4 +36,15 @@ not yet fixed, but winmerge, vscode, beyound compare, meld, notepad++ also fails
     
 623  740 is bad it considers space as a similarity
 
+________________________________________
 
+winmerge does not colorise line 8 at word/char detail in test_8a.html , it show all the block is changed , because of the limit they put:  the word-level DP only runs below 20 480 words per side (64-bit; 2 048 on 32-bit) — beyond that the whole range becomes one change — and there is a 500 ms timeout constant. 
+test_8a.html
+    Line 8: 2974 words
+    Line 10: 2073 words
+
+test_8b.html
+    Line 8: 12243 words
+    Line 10: 2305 words
+    
+i implemented the same limit, this is important for crazy long lines

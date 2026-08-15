@@ -112,6 +112,7 @@ class PaintboxOverview:
             'color': self.color_bg,
             'on_resize': self._on_resize,
             'on_show': self._on_resize,
+            'on_act': self._on_activate,
         })
 
         # Add paintbox control, filling the entire dialog
@@ -311,7 +312,7 @@ class PaintboxOverview:
 
     def _visual_y_to_line(self, side, visual_y):
         """Map a visual Y position (in visual rows) back to a line index,
-        accounting for gaps.
+        accounting for gaps but NOT wrapping. Kept for backwards compat.
 
         Args:
             side: 'a' or 'b'
@@ -323,11 +324,46 @@ class PaintboxOverview:
         remaining = visual_y
         for after_line, gap_rows in gaps:
             if after_line < remaining:
-                # The gap is above the current position; subtract it
                 remaining -= gap_rows
             else:
                 break
         return max(0, int(remaining))
+
+    def _visual_y_to_line_wrap_aware(self, side, visual_y):
+        """Map a visual Y position (in visual rows) back to a line index,
+        accounting for BOTH gaps AND wrapping.
+
+        Walks lines in order, subtracting each line's wrap count and
+        gap rows from the visual Y until we reach the target line.
+
+        Args:
+            side: 'a' or 'b'
+            visual_y: visual Y position in visual-row units
+
+        Returns: int — line index (0-based).
+        """
+        if side == 'a':
+            line_count = self.a_line_count
+        else:
+            line_count = self.b_line_count
+        gaps = self._sorted_gaps(side)
+        gap_map = {}
+        for after_line, gap_rows in gaps:
+            gap_map[after_line] = gap_map.get(after_line, 0) + gap_rows
+
+        remaining = visual_y
+        for line in range(line_count):
+            # Subtract gap before this line
+            if line in gap_map:
+                remaining -= gap_map[line]
+                if remaining < 0:
+                    return max(0, line - 1)
+            # Subtract this line's visual rows (wrap-aware)
+            line_vr = self._line_visual_rows(side, line)
+            remaining -= line_vr
+            if remaining < 0:
+                return line
+        return max(0, line_count - 1)
 
     def _get_scale(self, h):
         """Compute the pixel-per-visual-row scale factor.
@@ -541,11 +577,16 @@ class PaintboxOverview:
             ct.bitmap_proc(h_tmp, ct.BITMAP_FREE)
 
     def _paint_cursor(self, c, w, h):
-        """Draw cursor position markers (dynamic part).
+        """Draw cursor position markers and viewport rectangles (dynamic part).
 
-        Draws a thin horizontal line at the cursor's visual Y position
-        for each editor. This is the only part that changes on scroll,
-        so it's drawn on top of the static bitmap copy.
+        Draws:
+        1. A viewport rectangle showing what the user currently sees in
+           each editor. The rectangle's height is proportional to the
+           visible portion of the file relative to the total visual height.
+        2. A thin cursor line at the caret position.
+
+        This is the only part that changes on scroll, so it's drawn on
+        top of the static bitmap copy.
 
         Args:
             c: canvas handle (temp bitmap canvas)
@@ -555,42 +596,106 @@ class PaintboxOverview:
         scale = self._get_scale(h)
         half_w = w // 2
 
-        # Cursor for left editor (a_ed) — left half
+        # Paint viewport rectangle + cursor for left editor (a_ed)
         if self.a_ed is not None:
             try:
-                caret_a = self.a_ed.get_carets()
-                if caret_a:
-                    y_a = caret_a[0][1]
-                    vis_y = self._line_to_visual_y('a', y_a)
-                    py = int(vis_y * scale)
-                    ct.canvas_proc(c, ct.CANVAS_SET_PEN, color=self.color_cursor, size=1)
-                    ct.canvas_proc(c, ct.CANVAS_LINE, x=0, y=py, x2=half_w, y2=py)
+                self._paint_viewport_and_cursor(c, self.a_ed, 'a',
+                                                0, half_w, h, scale)
             except Exception:
                 pass
 
-        # Cursor for right editor (b_ed) — right half
+        # Paint viewport rectangle + cursor for right editor (b_ed)
         if self.b_ed is not None:
             try:
-                caret_b = self.b_ed.get_carets()
-                if caret_b:
-                    y_b = caret_b[0][1]
-                    vis_y = self._line_to_visual_y('b', y_b)
-                    py = int(vis_y * scale)
-                    ct.canvas_proc(c, ct.CANVAS_SET_PEN, color=self.color_cursor, size=1)
-                    ct.canvas_proc(c, ct.CANVAS_LINE, x=half_w, y=py, x2=w, y2=py)
+                self._paint_viewport_and_cursor(c, self.b_ed, 'b',
+                                                half_w, w, h, scale)
             except Exception:
                 pass
+
+    def _paint_viewport_and_cursor(self, c, ed, side, x_start, x_end, h, scale):
+        """Paint the viewport rectangle and cursor line for one editor.
+
+        The viewport rectangle shows the range of lines currently visible
+        in the editor. Its top is at the first visible line's visual Y,
+        and its height is proportional to the number of visible visual rows.
+
+        Args:
+            c: canvas handle
+            ed: editor instance
+            side: 'a' or 'b'
+            x_start: left X pixel
+            x_end: right X pixel
+            h: total pixel height
+            scale: pixels per visual row
+        """
+        # Get the first visible line and the number of visible lines
+        # from the editor's scroll position.
+        scroll_info = ed.get_prop(ct.PROP_SCROLL_VERT_INFO)
+        if scroll_info:
+            # First visible line (0-based)
+            first_line = scroll_info.get('first_line', 0)
+            # Number of visible lines on screen
+            visible_lines = scroll_info.get('visible_lines', 1)
+        else:
+            caret = ed.get_carets()
+            if caret:
+                first_line = caret[0][1]
+                visible_lines = 1
+            else:
+                return
+
+        # Map first visible line to visual Y
+        vis_y_top = self._line_to_visual_y(side, first_line)
+        py_top = int(vis_y_top * scale)
+
+        # Compute viewport height: sum of visual rows for visible lines
+        vis_y_bottom = vis_y_top
+        for i in range(first_line, min(first_line + visible_lines,
+                                        self.a_line_count if side == 'a' else self.b_line_count)):
+            vis_y_bottom += self._line_visual_rows(side, i)
+        # Add gap rows within the visible range
+        gaps = self._sorted_gaps(side)
+        for after_line, gap_rows in gaps:
+            if first_line < after_line <= first_line + visible_lines:
+                vis_y_bottom += gap_rows
+        py_bottom = int(vis_y_bottom * scale)
+        py_height = max(2, py_bottom - py_top)
+
+        # Draw viewport rectangle (semi-transparent frame)
+        ct.canvas_proc(c, ct.CANVAS_SET_PEN, color=self.color_cursor, size=1)
+        ct.canvas_proc(c, ct.CANVAS_SET_BRUSH, color=self.color_cursor, style=ct.BRUSH_CLEAR)
+        ct.canvas_proc(c, ct.CANVAS_RECT_FRAME, x=x_start, y=py_top, x2=x_end, y2=py_top + py_height)
+
+        # Draw cursor line at caret position
+        caret = ed.get_carets()
+        if caret:
+            y_caret = caret[0][1]
+            vis_y = self._line_to_visual_y(side, y_caret)
+            py = int(vis_y * scale)
+            # Clamp to viewport
+            py = max(py_top, min(py, py_top + py_height))
+            ct.canvas_proc(c, ct.CANVAS_SET_PEN, color=self.color_cursor, size=1)
+            ct.canvas_proc(c, ct.CANVAS_LINE, x=x_start, y=py, x2=x_end, y2=py)
 
     def _on_resize(self, id_dlg, id_ctl, data='', info=''):
         """Called when the dialog is resized or shown. Triggers a full
         repaint of the static bitmap (size may have changed)."""
         self.repaint_static()
 
+    def _on_activate(self, id_dlg, id_ctl, data='', info=''):
+        """Called when the dialog is activated (e.g. after window restore
+        from minimized state). The paintbox bitmap is lost when the
+        window is minimized, so we need to repaint."""
+        self.paint()
+
     def _on_click(self, id_dlg, id_ctl, data='', info=''):
         """Called when the paintbox is clicked. Scrolls the corresponding
         editor to the clicked position.
 
         info is "x,y" — the click position in paintbox coordinates.
+        Maps the click Y to a visual row (using the same scale as painting),
+        then maps the visual row to a line index (accounting for gaps and
+        wrapping), then scrolls the editor to that line.
         """
         if not info:
             return
@@ -610,19 +715,16 @@ class PaintboxOverview:
         # Get the paintbox height
         h = props.get('h', 600)
 
-        # Map Y pixel to visual row
-        vis_h_a = self._compute_visual_height('a')
-        vis_h_b = self._compute_visual_height('b')
-        max_vis_h = max(vis_h_a, vis_h_b)
-        if max_vis_h <= 0:
+        # Map Y pixel to visual row using the same scale as painting
+        scale = self._get_scale(h)
+        if scale <= 0:
             return
-        scale = h / max_vis_h
-        visual_y = y / scale if scale > 0 else 0
+        visual_y = y / scale
 
-        # Map visual row to line index
-        line = self._visual_y_to_line(side, visual_y)
+        # Map visual row to line index (wrap + gap aware)
+        line = self._visual_y_to_line_wrap_aware(side, visual_y)
 
-        # Scroll the corresponding editor
+        # Scroll the corresponding editor to center the clicked line
         ed = self.a_ed if side == 'a' else self.b_ed
         if ed is not None:
             try:
