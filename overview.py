@@ -481,54 +481,6 @@ class PaintboxOverview:
         h = props.get('h', 600)
         if w <= 0 or h <= 0:
             return
-
-        # Debug: print gap/line data to trace ordering issues
-        vis_h_a = self._compute_visual_height('a')
-        vis_h_b = self._compute_visual_height('b')
-        print('Differ overview debug:')
-        print('  a: {} lines, {} gaps, vis_h={}'.format(
-            self.a_line_count, len(self.gaps_a), vis_h_a))
-        print('  b: {} lines, {} gaps, vis_h={}'.format(
-            self.b_line_count, len(self.gaps_b), vis_h_b))
-        print('  a gaps: {}'.format(self._sorted_gaps('a')[:20]))
-        print('  b gaps: {}'.format(self._sorted_gaps('b')[:20]))
-        print('  a line_states: {}'.format(
-            sorted([(k[1], hex(v)) for k, v in self.line_states.items() if k[0] == 'a'])))
-        print('  b line_states: {}'.format(
-            sorted([(k[1], hex(v)) for k, v in self.line_states.items() if k[0] == 'b'])))
-        if self.wrap_counts_a:
-            print('  a wrap_counts: {}'.format(self.wrap_counts_a[:20]))
-        if self.wrap_counts_b:
-            print('  b wrap_counts: {}'.format(self.wrap_counts_b[:20]))
-        # Trace the exact paint order for side 'a' (last 5 lines + gaps)
-        print('  a paint trace (last 6 items):')
-        gaps_a = self._sorted_gaps('a')
-        gap_map_a = {}
-        for al, gr in gaps_a:
-            gap_map_a[al] = gap_map_a.get(al, 0) + gr
-        vy = 0
-        for line in range(self.a_line_count):
-            vr = self._line_visual_rows('a', line)
-            gap = gap_map_a.get(line, 0)
-            state = self.line_states.get(('a', line))
-            if line >= self.a_line_count - 6:
-                print('    line {}: vis_y={}, wrap={}, gap={}, state={}'.format(
-                    line, vy, vr, gap, hex(state) if state else 'none'))
-            vy += vr + gap
-        # Trace the exact paint order for side 'b'
-        print('  b paint trace (all):')
-        gap_map_b = {}
-        for al, gr in self._sorted_gaps('b'):
-            gap_map_b[al] = gap_map_b.get(al, 0) + gr
-        vy = 0
-        for line in range(self.b_line_count):
-            vr = self._line_visual_rows('b', line)
-            gap = gap_map_b.get(line, 0)
-            state = self.line_states.get(('b', line))
-            print('    line {}: vis_y={}, wrap={}, gap={}, state={}'.format(
-                line, vy, vr, gap, hex(state) if state else 'none'))
-            vy += vr + gap
-
         self._free_static_bitmap()
         self._ensure_static_bitmap(w, h)
         self.paint()
@@ -619,6 +571,8 @@ class PaintboxOverview:
         in the editor. Its top is at the first visible line's visual Y,
         and its height is proportional to the number of visible visual rows.
 
+        Also draws a thin cursor line at the caret position.
+
         Args:
             c: canvas handle
             ed: editor instance
@@ -628,14 +582,11 @@ class PaintboxOverview:
             h: total pixel height
             scale: pixels per visual row
         """
-        # Get the first visible line and the number of visible lines
-        # from the editor's scroll position.
+        # Get scroll info: 'pos' = first visible line, 'page' = visible line count
         scroll_info = ed.get_prop(ct.PROP_SCROLL_VERT_INFO)
         if scroll_info:
-            # First visible line (0-based)
-            first_line = scroll_info.get('first_line', 0)
-            # Number of visible lines on screen
-            visible_lines = scroll_info.get('visible_lines', 1)
+            first_line = scroll_info.get('pos', 0)
+            visible_lines = scroll_info.get('page', 1)
         else:
             caret = ed.get_carets()
             if caret:
@@ -644,14 +595,14 @@ class PaintboxOverview:
             else:
                 return
 
-        # Map first visible line to visual Y
+        # Map first visible line to visual Y (wrap + gap aware)
         vis_y_top = self._line_to_visual_y(side, first_line)
         py_top = int(vis_y_top * scale)
 
         # Compute viewport height: sum of visual rows for visible lines
         vis_y_bottom = vis_y_top
-        for i in range(first_line, min(first_line + visible_lines,
-                                        self.a_line_count if side == 'a' else self.b_line_count)):
+        line_count = self.a_line_count if side == 'a' else self.b_line_count
+        for i in range(first_line, min(first_line + visible_lines, line_count)):
             vis_y_bottom += self._line_visual_rows(side, i)
         # Add gap rows within the visible range
         gaps = self._sorted_gaps(side)
@@ -661,19 +612,17 @@ class PaintboxOverview:
         py_bottom = int(vis_y_bottom * scale)
         py_height = max(2, py_bottom - py_top)
 
-        # Draw viewport rectangle (semi-transparent frame)
+        # Draw viewport rectangle (frame with transparent brush)
         ct.canvas_proc(c, ct.CANVAS_SET_PEN, color=self.color_cursor, size=1)
         ct.canvas_proc(c, ct.CANVAS_SET_BRUSH, color=self.color_cursor, style=ct.BRUSH_CLEAR)
-        ct.canvas_proc(c, ct.CANVAS_RECT_FRAME, x=x_start, y=py_top, x2=x_end, y2=py_top + py_height)
+        ct.canvas_proc(c, ct.CANVAS_RECT_FRAME, x=x_start, y=py_top, x2=x_end - 1, y2=py_top + py_height)
 
-        # Draw cursor line at caret position
+        # Draw cursor line at caret position (thin line inside the viewport)
         caret = ed.get_carets()
         if caret:
             y_caret = caret[0][1]
             vis_y = self._line_to_visual_y(side, y_caret)
             py = int(vis_y * scale)
-            # Clamp to viewport
-            py = max(py_top, min(py, py_top + py_height))
             ct.canvas_proc(c, ct.CANVAS_SET_PEN, color=self.color_cursor, size=1)
             ct.canvas_proc(c, ct.CANVAS_LINE, x=x_start, y=py, x2=x_end, y2=py)
 

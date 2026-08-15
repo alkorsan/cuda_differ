@@ -782,9 +782,16 @@ class Command:
             overview.paint()
 
     def on_caret(self, ed_self):
-        """Mirror caret to opposite editor when sync_caret is enabled."""
-        if self.cfg.get('enable_sync_caret', False):
-            self.sync_caret()
+        """Mirror caret to opposite editor when sync_caret is enabled.
+        Also repaint the overview (cursor position changed)."""
+        tab_id = ed_self.get_prop(ct.PROP_TAB_ID)
+        if self._is_compare_tab(tab_id):
+            if self.cfg.get('enable_sync_caret', False):
+                self.sync_caret()
+            # Repaint overview to update cursor position
+            overview = self._overviews.get(str(tab_id))
+            if overview is not None:
+                overview.paint()
 
     def on_change(self, ed_self):
         """Fires immediately on every keystroke. Used for:
