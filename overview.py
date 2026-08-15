@@ -496,9 +496,10 @@ class PaintboxOverview:
         repainted when the diff changes (via repaint_static). On scroll,
         this method just:
         1. Ensures the static bitmap exists and matches current size.
-        2. Copies the static bitmap to the image's embedded bitmap via
+        2. Resizes the image's embedded bitmap to match (if needed).
+        3. Copies the static bitmap to the image's embedded bitmap via
            CANVAS_BITMAP (fast — one bitmap copy).
-        3. Draws the dynamic part (cursor line + viewport rectangle)
+        4. Draws the dynamic part (cursor line + viewport rectangle)
            on top of the image's bitmap (a few CANVAS_LINE / CANVAS_RECT_FRAME
            calls).
 
@@ -516,6 +517,11 @@ class PaintboxOverview:
 
         # Ensure static bitmap exists and matches current size
         self._ensure_static_bitmap(w, h)
+
+        # Resize the image's embedded bitmap to match the control size.
+        # The image control starts with a 0x0 bitmap; we must resize it
+        # before painting on it, otherwise nothing shows (checkerboard pattern).
+        ct.bitmap_proc(self.h_bitmap, ct.BITMAP_SET_SIZE, w, h)
 
         # Copy static bitmap to the image's embedded bitmap
         ct.canvas_proc(self.h_canvas, ct.CANVAS_BITMAP,
