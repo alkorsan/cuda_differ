@@ -22,6 +22,10 @@ synced back to the original files automatically.
   sides stay visually aligned even when corresponding lines wrap to
   different heights. Toggling wrap mode re-applies the alignment
   automatically.
+- Optional gap-aware overview panel docked to the right of the compare
+  view, showing a miniature of both editors side-by-side with colored
+  diff highlights and a proportional slider that can be made
+  semi-transparent (WinMerge-style).
 
 
 == Commands ==
@@ -242,13 +246,40 @@ Configuration (chapter "config"):
   as colored 1-pixel rectangles (red=deleted, green=added,
   yellow=changed, gray=gap, background=unchanged) and is fully gap- and
   wrap-aware so colored blocks always line up with the corresponding
-  editor lines. A dithered viewport rectangle shows the visible range
-  and a thin cursor line marks the caret; click anywhere to scroll the
-  corresponding editor to that line. Uses a two-bitmap static/dynamic
-  split so scrolling only redraws the cheap dynamic part (debounced
-  150 ms). Colors come from the active UI theme (EdTextBg, EdTextFont)
-  plus the same color_* config options as the editor highlights. Can be
-  used together with the micromap. Default: false.
+  editor lines. A slider (the viewport indicator) shows the visible
+  range; its height is proportional to the visible-page vs total-
+  content ratio (like real scrollbars in browsers and editors), with a
+  minimum height of 30px so it always stays grabbable. Click anywhere
+  to scroll the corresponding editor to that line, or drag the slider
+  to scroll continuously. Uses a two-bitmap static/dynamic split so
+  scrolling only redraws the cheap dynamic part (debounced 150 ms).
+  Colors come from the active UI theme (EdTextBg) plus the same color_*
+  config options as the editor highlights. Can be used together with
+  the micromap. Default: false.
+- Enable overview slider transparency (differ.enable_overview_slider_opacity)
+  When enabled, the overview panel's slider is rendered with simulated
+  alpha blending so the colored diff lines remain visible through the
+  slider like in WinMerge. CudaText's canvas_proc API has no alpha-blend
+  primitive (only BRUSH_SOLID = opaque and BRUSH_CLEAR = no fill), so
+  transparency is simulated by precomputing the per-channel blend
+  (orig*(1-a) + fill*a) for every row of the slider using a per-row
+  segment index built when the static bitmap is painted. When
+  disabled, the slider uses a fast opaque solid fill (the old
+  behaviour). Three slider-paint methods are dispatched based on this
+  option and overview_slider_opacity: SOLID (option disabled, fastest),
+  CLEAR (option enabled AND opacity below 8%, border-only via
+  BRUSH_CLEAR), and BLENDED (option enabled AND opacity at or above 8%,
+  per-row pre-blend). Only has an effect when enable_overview is on.
+  Default: true.
+- Overview slider opacity in percent (differ.overview_slider_opacity)
+  Opacity of the overview panel slider, in percent. 0 = fully
+  transparent (slider border only via BRUSH_CLEAR, the static overview
+  shows through completely), 100 = fully opaque (solid fill).
+  Intermediate values (e.g. 40) simulate true alpha blending via
+  per-row pre-blending of the underlying overview colors with the
+  slider fill color. Values below 8 use the faster border-only path
+  instead of per-row blending. Only used when
+  enable_overview_slider_opacity is true. Range: 0-100. Default: 40.
 
 
 == Overview panel and micromap ==
@@ -286,29 +317,51 @@ Gap-aware overview panel (enable_overview, default: off)
   when word-wrap is on, each line's overview height is multiplied by
   its number of wrapped visual rows, so the overview stays aligned
   even when matching lines wrap to different heights.
-- A viewport rectangle shows the range of lines currently visible in
-  each editor, and a thin cursor line marks the caret. Because
-  Lazarus cannot do real alpha transparency, the viewport fill is
-  rendered by copying a pre-computed dithered (every-other-line
-  darkened) version of the static bitmap onto the canvas, which
-  simulates a 50% dimmed overlay while keeping the colored blocks
-  visible through the dither pattern.
+- A slider (the viewport indicator) shows the range of lines currently
+  visible in each editor. The slider height is proportional to the
+  visible-page vs total-content ratio (smooth_page / smooth_max), like
+  real scrollbars in browsers and editors, with a 30px minimum so it
+  always stays grabbable even on huge files. When the entire file
+  fits in the viewport the slider fills the whole track; when the file
+  is much taller than the viewport the slider shrinks toward 30px.
+  A 1px dark-grey border is always drawn around the slider regardless
+  of which fill strategy is active. Three horizontal grabber lines
+  (2px thick, 6px apart) are drawn in the slider's center for visual
+  grip.
 - Click anywhere in the overview to scroll the corresponding editor
   to that line. The click is mapped through the same wrap- and
   gap-aware coordinate transform used for painting, so the line you
-  click on is the line the editor jumps to.
+  click on is the line the editor jumps to. You can also drag the
+  slider to scroll continuously.
+- Slider transparency: CudaText's canvas_proc API has no alpha-blend
+  primitive (only BRUSH_SOLID = opaque and BRUSH_CLEAR = no fill), so
+  slider transparency (enable_overview_slider_opacity, default on) is
+  simulated by per-row pre-blending. When the static bitmap is painted,
+  a per-row segment index is built recording the final color of every
+  Y row (background / gap / line-state). On each dynamic paint, the
+  slider's rows are walked and each segment is filled with
+  `blend(orig_color, slider_fill, alpha)` per channel
+  (orig*(1-a) + fill*a). Three slider-paint methods are dispatched
+  based on the option values: SOLID (option disabled, fastest, one
+  CANVAS_RECT call), CLEAR (option enabled AND opacity below 8%,
+  border-only via BRUSH_CLEAR, also fast), and BLENDED (option enabled
+  AND opacity at or above 8%, per-row pre-blend, ~2*slider_height
+  CANVAS_RECT_FILL calls per paint). The 8% threshold is used because
+  at very low opacity the per-row pre-blend is visually
+  indistinguishable from no fill at all, so the faster BRUSH_CLEAR path
+  is used. The slider opacity is configurable via
+  overview_slider_opacity (default 40%).
 - Performance: the panel uses a two-bitmap split. A persistent
   "static" bitmap stores the hundreds of colored line/gap rectangles
   and is only rebuilt on compare or resize. On every scroll (debounced
   150 ms), the static bitmap is blitted to the image control's
-  embedded bitmap and only the cheap dynamic part (viewport rectangle
-  + cursor line) is redrawn on top -- so scrolling does not reissue
-  the expensive CANVAS_RECT_FILL loop.
+  embedded bitmap and only the cheap dynamic part (slider + grabber)
+  is redrawn on top -- so scrolling does not reissue the expensive
+  CANVAS_RECT_FILL loop.
 - Colors are taken from the active UI theme (EdTextBg for the
-  background, EdTextFont for the cursor / viewport border) so the
-  panel matches both light and dark themes automatically. The
-  deleted/added/changed/gap colors reuse the same color_* config
-  options as the editor highlights.
+  background) so the panel matches both light and dark themes
+  automatically. The deleted/added/changed/gap colors reuse the same
+  color_* config options as the editor highlights.
 
 
 == Notes ==

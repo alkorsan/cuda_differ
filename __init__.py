@@ -1157,23 +1157,22 @@ class Command:
                 else:
                     overview.a_ed = a_ed
                     overview.b_ed = b_ed
-                # Get the editor text background and font colors from the
-                # UI theme so the overview matches the editor (works with
-                # both light and dark themes).
+                # Get the editor text background color from the UI theme so
+                # the overview matches the editor (works with both light and
+                # dark themes). The font color (EdTextFont) is no longer
+                # used by the overview — color_cursor was removed as dead
+                # code (set but never read in any paint method).
                 try:
                     ui_theme = ct.app_proc(ct.PROC_THEME_UI_DICT_GET, '')
                     color_bg = ui_theme.get('EdTextBg', {}).get('color', 0xFFFFFF)
-                    color_cursor = ui_theme.get('EdTextFont', {}).get('color', 0x000000)
                 except Exception:
                     color_bg = 0xFFFFFF
-                    color_cursor = 0x000000
                 overview.set_colors(
                     color_bg,
                     self.cfg.get('color_deleted'),
                     self.cfg.get('color_added'),
                     self.cfg.get('color_changed'),
-                    self.cfg.get('color_gaps'),
-                    color_cursor)
+                    self.cfg.get('color_gaps'))
                 # Pass slider opacity options. Config stores opacity as
                 # int 0..100 (matches ratio_percents pattern); convert to
                 # float 0..1 for PaintboxOverview.set_slider_options().

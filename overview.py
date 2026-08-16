@@ -63,6 +63,15 @@ Architecture:
        CANVAS_RECT_FILL calls per scroll. The slider border + grabber
        lines are drawn on top, unchanged.
 
+  - SLIDER GRABBER PATTERN:
+    3 horizontal dark-grey lines, each 2px thick, spaced 6px apart
+    (center-to-center) vertically centered in the slider. Triple the
+    spacing of the old 1px-thick 2px-apart 6-line bevel pattern, with
+    the white bevel lines removed for a cleaner modern scrollbar look
+    (matches WinMerge / modern editor sliders). The 2px thickness makes
+    the lines clearly visible against any fill (solid, clear, or
+    pre-blended).
+
   See: https://github.com/CudaText-addons/cuda_differ/issues/29
 """
 
@@ -115,7 +124,6 @@ class PaintboxOverview:
         self.color_added = 0xAAAAAA    # overridden by set_colors()
         self.color_changed = 0xAAAAAA  # overridden by set_colors()
         self.color_gap = 0xEEEEEE      # overridden by set_colors()
-        self.color_cursor = 0x000000   # overridden by set_colors() with theme font color
         # Slider state for drag-to-scroll
         self._slider_top = 0
         self._slider_height = 0
@@ -140,10 +148,17 @@ class PaintboxOverview:
         # Slider fill color used by SOLID, BLENDED, and CLEAR (border only).
         # Light grey, matching the original solid-fill slider.
         self._slider_fill = 0xEAEAEA
-        # Border + grabber colors, shared by all three methods.
-        self._slider_border = 0x999999
+        # Border color, shared by all three methods. Darker than the old
+        # 0x999999 so the border stays clearly visible against any
+        # background (light theme, dark theme, or pre-blended fill).
+        self._slider_border = 0x666666
+        # Grabber line color (3 horizontal lines in the slider middle).
+        # Same dark grey as the border for visual consistency.
         self._slider_grabber_dark = 0x666666
-        self._slider_grabber_light = 0xFFFFFF
+        # Grabber geometry: 3 lines, 2px thick, 6px apart (center-to-center).
+        # Triple the original 2px spacing; 2x the original 1px thickness.
+        self._slider_grabber_thickness = 2
+        self._slider_grabber_spacing = 6
         # Min slider height in pixels — keeps the slider grabbable even
         # when the file is much taller than the viewport.
         self._slider_min_height = 30
@@ -290,7 +305,7 @@ class PaintboxOverview:
         if opacity is not None:
             self.opt_slider_opacity = max(0.0, min(1.0, float(opacity)))
 
-    def set_colors(self, color_bg, color_deleted, color_added, color_changed, color_gap, color_cursor=None):
+    def set_colors(self, color_bg, color_deleted, color_added, color_changed, color_gap):
         """Set the colors used for painting the overview.
 
         Args:
@@ -299,16 +314,12 @@ class PaintboxOverview:
             color_added: color for added lines (config color_added)
             color_changed: color for changed lines (config color_changed)
             color_gap: color for gap rectangles (config color_gaps)
-            color_cursor: color for cursor marker (theme EdTextFont).
-                          If None, keeps the previous value.
         """
         self.color_bg = color_bg
         self.color_deleted = color_deleted
         self.color_added = color_added
         self.color_changed = color_changed
         self.color_gap = color_gap
-        if color_cursor is not None:
-            self.color_cursor = color_cursor
 
     def set_line_counts(self, a_count, b_count):
         """Set the total line counts for both editors (without gaps)."""
@@ -851,26 +862,39 @@ class PaintboxOverview:
         self._paint_slider_grabber(c, w, py_top, py_height)
 
     def _paint_slider_grabber(self, c, w, py_top, py_height):
-        """Draw the 3 dark + 3 white-bevel grabber lines centered in the
-        slider. Shared by all three slider-paint methods so the visual
-        identity of the slider stays consistent regardless of which fill
+        """Draw the 3 horizontal grabber lines centered in the slider.
+
+        Pattern (matches modern scrollbar look — WinMerge, VS Code, etc.):
+          - 3 horizontal lines, evenly spaced around the slider's vertical
+            center (mid_y - spacing, mid_y, mid_y + spacing)
+          - Each line is 2px thick (pen size = 2) so it stays clearly
+            visible against any fill (solid, clear, or pre-blended)
+          - Lines are 6px apart center-to-center (triple the original
+            2px spacing), giving a clean modern look with proper
+            visual padding from the slider's top/bottom border
+          - Single dark grey color (no white bevel) for a flat modern
+            appearance instead of the old 3D bevelled look
+
+        Shared by all three slider-paint methods so the visual identity
+        of the slider stays consistent regardless of which fill
         strategy is active.
         """
         mid_y = py_top + py_height // 2
         grab_x1 = max(2, w // 4)
         grab_x2 = min(w - 3, w * 3 // 4)
+        spacing = self._slider_grabber_spacing  # 6px center-to-center
+        thickness = self._slider_grabber_thickness  # 2px per line
 
-        # Dark shadow lines
-        ct.canvas_proc(c, ct.CANVAS_SET_PEN, color=self._slider_grabber_dark, size=1)
-        ct.canvas_proc(c, ct.CANVAS_LINE, x=grab_x1, y=mid_y - 2, x2=grab_x2, y2=mid_y - 2)
-        ct.canvas_proc(c, ct.CANVAS_LINE, x=grab_x1, y=mid_y,     x2=grab_x2, y2=mid_y)
-        ct.canvas_proc(c, ct.CANVAS_LINE, x=grab_x1, y=mid_y + 2, x2=grab_x2, y2=mid_y + 2)
-
-        # White bevel lines
-        ct.canvas_proc(c, ct.CANVAS_SET_PEN, color=self._slider_grabber_light, size=1)
-        ct.canvas_proc(c, ct.CANVAS_LINE, x=grab_x1, y=mid_y - 1, x2=grab_x2, y2=mid_y - 1)
-        ct.canvas_proc(c, ct.CANVAS_LINE, x=grab_x1, y=mid_y + 1, x2=grab_x2, y2=mid_y + 1)
-        ct.canvas_proc(c, ct.CANVAS_LINE, x=grab_x1, y=mid_y + 3, x2=grab_x2, y2=mid_y + 3)
+        # 3 dark grabber lines, 2px thick, 6px apart (center-to-center).
+        # No white bevel — flat modern look.
+        ct.canvas_proc(c, ct.CANVAS_SET_PEN,
+                       color=self._slider_grabber_dark, size=thickness)
+        ct.canvas_proc(c, ct.CANVAS_LINE,
+                       x=grab_x1, y=mid_y - spacing, x2=grab_x2, y2=mid_y - spacing)
+        ct.canvas_proc(c, ct.CANVAS_LINE,
+                       x=grab_x1, y=mid_y,             x2=grab_x2, y2=mid_y)
+        ct.canvas_proc(c, ct.CANVAS_LINE,
+                       x=grab_x1, y=mid_y + spacing, x2=grab_x2, y2=mid_y + spacing)
 
     def _on_click(self, id_dlg, id_ctl, data='', info=''):
         """Called when the image is clicked. Scrolls the editor so the
