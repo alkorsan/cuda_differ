@@ -531,96 +531,73 @@ class PaintboxOverview:
         self._paint_dynamic(w, h)
 
     def _paint_dynamic(self, w, h):
-        """Draw the dynamic part: viewport rectangles and cursor lines.
+        """Draw the dynamic part: a single scrollbar slider that spans
+        the full width of the overview, showing what the user currently
+        sees in the editors.
 
-        The viewport rectangle shows the range of lines currently visible
-        in each editor. The cursor line shows the caret position.
+        The slider is drawn like a Windows scrollbar slider:
+        - Filled rectangle with border
+        - 3 horizontal grabber lines in the center
+
+        Uses editor a_ed's scroll position (both editors are scroll-synced,
+        so either one gives the same viewport position).
 
         Args:
             w: width in pixels
             h: height in pixels
         """
+        if self.a_ed is None:
+            return
+
         c = self.h_canvas
         scale = self._get_scale(h)
-        half_w = w // 2
 
-        # Paint viewport + cursor for left editor (a_ed)
-        if self.a_ed is not None:
-            try:
-                self._paint_viewport_and_cursor(c, self.a_ed, 'a',
-                                                0, half_w, h, scale)
-            except Exception:
-                pass
-
-        # Paint viewport + cursor for right editor (b_ed)
-        if self.b_ed is not None:
-            try:
-                self._paint_viewport_and_cursor(c, self.b_ed, 'b',
-                                                half_w, w, h, scale)
-            except Exception:
-                pass
-
-    def _paint_viewport_and_cursor(self, c, ed, side, x_start, x_end, h, scale):
-        """Paint the viewport rectangle and cursor line for one editor.
-
-        The viewport rectangle shows the range of lines currently visible
-        in the editor. Its top is at the first visible line's visual Y,
-        and its height is proportional to the number of visible visual rows.
-
-        Also draws a thin cursor line at the caret position.
-
-        Args:
-            c: canvas handle (image's embedded bitmap canvas)
-            ed: editor instance
-            side: 'a' or 'b'
-            x_start: left X pixel
-            x_end: right X pixel
-            h: total pixel height
-            scale: pixels per visual row
-        """
-        # Get scroll info: 'pos' = first visible line, 'page' = visible line count
-        scroll_info = ed.get_prop(ct.PROP_SCROLL_VERT_INFO)
-        if scroll_info:
-            first_line = scroll_info.get('pos', 0)
-            visible_lines = scroll_info.get('page', 1)
-        else:
-            caret = ed.get_carets()
-            if caret:
-                first_line = caret[0][1]
-                visible_lines = 1
-            else:
-                return
+        # Get scroll info from editor a_ed.
+        # 'pos' = first visible line, 'page' = visible line count.
+        scroll_info = self.a_ed.get_prop(ct.PROP_SCROLL_VERT_INFO)
+        if not scroll_info:
+            return
+        first_line = scroll_info.get('pos', 0)
+        visible_lines = scroll_info.get('page', 1)
 
         # Map first visible line to visual Y (wrap + gap aware)
-        vis_y_top = self._line_to_visual_y(side, first_line)
+        vis_y_top = self._line_to_visual_y('a', first_line)
         py_top = int(vis_y_top * scale)
 
         # Compute viewport height: sum of visual rows for visible lines
         vis_y_bottom = vis_y_top
-        line_count = self.a_line_count if side == 'a' else self.b_line_count
-        for i in range(first_line, min(first_line + visible_lines, line_count)):
-            vis_y_bottom += self._line_visual_rows(side, i)
+        for i in range(first_line, min(first_line + visible_lines, self.a_line_count)):
+            vis_y_bottom += self._line_visual_rows('a', i)
         # Add gap rows within the visible range
-        gaps = self._sorted_gaps(side)
+        gaps = self._sorted_gaps('a')
         for after_line, gap_rows in gaps:
             if first_line < after_line <= first_line + visible_lines:
                 vis_y_bottom += gap_rows
         py_bottom = int(vis_y_bottom * scale)
-        py_height = max(2, py_bottom - py_top)
+        # Ensure the slider is at least 8px tall so it's always visible
+        py_height = max(8, py_bottom - py_top)
 
-        # Draw viewport rectangle (frame with transparent brush)
-        ct.canvas_proc(c, ct.CANVAS_SET_PEN, color=self.color_cursor, size=1)
-        ct.canvas_proc(c, ct.CANVAS_SET_BRUSH, color=self.color_cursor, style=ct.BRUSH_CLEAR)
-        ct.canvas_proc(c, ct.CANVAS_RECT_FRAME, x=x_start, y=py_top, x2=x_end - 1, y2=py_top + py_height)
+        # --- Draw the scrollbar slider ---
 
-        # Draw cursor line at caret position (thin line inside the viewport)
-        caret = ed.get_carets()
-        if caret:
-            y_caret = caret[0][1]
-            vis_y = self._line_to_visual_y(side, y_caret)
-            py = int(vis_y * scale)
-            ct.canvas_proc(c, ct.CANVAS_SET_PEN, color=self.color_cursor, size=1)
-            ct.canvas_proc(c, ct.CANVAS_LINE, x=x_start, y=py, x2=x_end, y2=py)
+        # 1. Background and border (filled rectangle)
+        ct.canvas_proc(c, ct.CANVAS_SET_PEN, color=0x999999, size=1)
+        ct.canvas_proc(c, ct.CANVAS_SET_BRUSH, color=0xEAEAEA, style=ct.BRUSH_SOLID)
+        ct.canvas_proc(c, ct.CANVAS_RECT, x=0, y=py_top, x2=w - 1, y2=py_top + py_height)
+
+        # 2. Draw 3 horizontal grabber lines (dark shadow)
+        mid_y = py_top + py_height // 2
+        ct.canvas_proc(c, ct.CANVAS_SET_PEN, color=0x666666, size=1)
+        grab_x1 = max(2, w // 4)
+        grab_x2 = min(w - 3, w * 3 // 4)
+        ct.canvas_proc(c, ct.CANVAS_LINE, x=grab_x1, y=mid_y - 2, x2=grab_x2, y2=mid_y - 2)
+        ct.canvas_proc(c, ct.CANVAS_LINE, x=grab_x1, y=mid_y,     x2=grab_x2, y2=mid_y)
+        ct.canvas_proc(c, ct.CANVAS_LINE, x=grab_x1, y=mid_y + 2, x2=grab_x2, y2=mid_y + 2)
+
+        # 3. Draw 3 horizontal highlight lines (white bevel just below dark lines)
+        ct.canvas_proc(c, ct.CANVAS_SET_PEN, color=0xFFFFFF, size=1)
+        ct.canvas_proc(c, ct.CANVAS_LINE, x=grab_x1, y=mid_y - 1, x2=grab_x2, y2=mid_y - 1)
+        ct.canvas_proc(c, ct.CANVAS_LINE, x=grab_x1, y=mid_y + 1, x2=grab_x2, y2=mid_y + 1)
+        ct.canvas_proc(c, ct.CANVAS_LINE, x=grab_x1, y=mid_y + 3, x2=grab_x2, y2=mid_y + 3)
 
     def _on_click(self, id_dlg, id_ctl, data='', info=''):
         """Called when the image is clicked. Scrolls the corresponding
