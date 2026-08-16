@@ -26,18 +26,42 @@ Architecture:
     old static bitmap and creates a new one with fresh content. Then
     paint() copies it + draws the dynamic part.
 
-  - TRANSPARENT SLIDER (WinMerge-style):
-    CudaText's canvas_proc API has NO alpha-blend primitive (only
-    BRUSH_SOLID = opaque, BRUSH_CLEAR = no fill). To get a 40%-transparent
-    slider we precompute the blend: a per-row segment index
-    (_row_segments) is built in _paint_static(), recording the final color
-    of every Y row of the static bitmap (background / gap / line-state).
-    On each paint(), _paint_dynamic() walks the 30 slider rows and fills
-    each segment with `blend(orig_color, slider_fill, alpha)` — i.e.
-    per-channel `orig*(1-α) + fill*α`. This produces a pixel-exact
-    simulation of true alpha blending without needing any canvas alpha
-    support, and costs ≤60 CANVAS_RECT_FILL calls per scroll (negligible).
-    The slider border + grabber lines are drawn on top, unchanged.
+  - PROPORTIONAL SLIDER HEIGHT:
+    Like real scrollbars in browsers/editors, the slider grows/shrinks
+    based on the visible-page vs total-content ratio. CudaText reports:
+      smooth_max     = total content height (pixels, INCLUDES page)
+      smooth_page    = visible viewport height (pixels)
+      smooth_pos     = current scroll position (pixels)
+    So slider_height = h * smooth_page / smooth_max, clamped to a 30px
+    minimum so the slider stays grabbable. When the entire file fits in
+    the viewport, slider_height == h (full track). When the file is huge,
+    slider_height shrinks toward 30px. The slider_top formula
+    `py_top = h * smooth_pos / smooth_max` is unchanged — mathematically,
+    when smooth_pos reaches its max (smooth_max - smooth_page), py_top
+    becomes h - slider_height, so the slider lands flush at the bottom.
+
+  - SLIDER OPACITY (three paint methods, dispatched by _paint_dynamic):
+    CudaText canvas_proc has NO alpha-blend primitive (only BRUSH_SOLID =
+    opaque, BRUSH_CLEAR = no fill). Three methods are provided so users
+    can trade off looks vs performance:
+
+    1. SOLID (opt_slider_opacity_enabled = False):
+       Original method. One CANVAS_RECT call (pen + solid brush). Fastest.
+
+    2. CLEAR (opt_slider_opacity_enabled = True AND opacity < 8%):
+       Border-only slider via BRUSH_CLEAR. One CANVAS_RECT call with no
+       fill. Fastest transparent option — used for very low opacity.
+
+    3. BLENDED (opt_slider_opacity_enabled = True AND opacity >= 8%):
+       Per-row pre-blend. A per-row segment index (_row_segments) is built
+       in _paint_static(), recording the final color of every Y row of
+       the static bitmap (background / gap / line-state). On each paint(),
+       _paint_dynamic() walks the slider rows (py_height of them) and
+       fills each segment with `blend(orig_color, slider_fill, alpha)` —
+       per-channel `orig*(1-α) + fill*α`. This produces a pixel-exact
+       simulation of true alpha blending. Cost: ~2 * py_height
+       CANVAS_RECT_FILL calls per scroll. The slider border + grabber
+       lines are drawn on top, unchanged.
 
   See: https://github.com/CudaText-addons/cuda_differ/issues/29
 """
@@ -100,19 +124,35 @@ class PaintboxOverview:
         self._drag_offset = 0
         self._smooth_max = 0
 
-        # --- Transparent slider (WinMerge-style) ---
-        # CudaText canvas_proc has no alpha primitive. We precompute the
-        # blend per channel: result = orig*(1-α) + fill*α.
-        # Slider opacity: 0.0 = invisible, 1.0 = fully opaque.
-        # 0.6 = 60% opaque / 40% transparent — matches WinMerge's look.
-        # Tune freely; no other code needs to change.
-        self._slider_alpha = 0.6
-        self._slider_fill = 0xEAEAEA  # light grey, same as the old solid fill
+        # --- Slider opacity options (user-configurable) ---
+        # opt_slider_opacity_enabled: if False, use the OLD solid-fill
+        #   slider (fast, no blending). If True, use either BRUSH_CLEAR
+        #   (opacity < 8%) or the pre-blend method (opacity >= 8%).
+        # opt_slider_opacity: 0.0 = invisible, 1.0 = fully opaque.
+        #   Default 0.4 = 40% opaque (WinMerge-style).
+        #   See _paint_dynamic() for the dispatch logic.
+        # Threshold below which we use BRUSH_CLEAR instead of pre-blend
+        # (BRUSH_CLEAR is faster — no per-row blending loop).
+        self.opt_slider_opacity_enabled = True
+        self.opt_slider_opacity = 0.4
+        self._slider_clear_threshold = 0.08  # <8% → BRUSH_CLEAR
+
+        # Slider fill color used by SOLID, BLENDED, and CLEAR (border only).
+        # Light grey, matching the original solid-fill slider.
+        self._slider_fill = 0xEAEAEA
+        # Border + grabber colors, shared by all three methods.
+        self._slider_border = 0x999999
+        self._slider_grabber_dark = 0x666666
+        self._slider_grabber_light = 0xFFFFFF
+        # Min slider height in pixels — keeps the slider grabbable even
+        # when the file is much taller than the viewport.
+        self._slider_min_height = 30
+
         # Per-row segment index: list of length h, where each row is a
         # list of (x_start, x_end, color) tuples in paint order (later
         # entries visually overwrite earlier ones). Rebuilt only in
         # _paint_static(); consumed by _paint_dynamic(). Empty until the
-        # first static repaint completes.
+        # first static repaint completes. Only used by the BLENDED method.
         self._row_segments = []
 
     def is_created(self):
@@ -228,6 +268,27 @@ class PaintboxOverview:
         self._static_w = w
         self._static_h = h
         self._paint_static(self._h_static_cnv, w, h)
+
+    def set_slider_options(self, opacity_enabled=None, opacity=None):
+        """Configure the overview slider's transparency behaviour.
+
+        Two user-facing options:
+          - 'enable overview slider opacity' (bool, default True):
+                False → use the OLD solid-fill slider (fast, no blending).
+                True  → use BRUSH_CLEAR if opacity < 8%, else the pre-blend
+                        method (per-row simulated alpha blend).
+          - 'overview slider opacity' (float 0..1, default 0.4):
+                Slider opacity. 0 = invisible (BRUSH_CLEAR), 1 = opaque.
+                Only used when opacity_enabled is True.
+
+        Args:
+            opacity_enabled: bool or None. None = leave unchanged.
+            opacity: float in [0.0, 1.0], or None = leave unchanged.
+        """
+        if opacity_enabled is not None:
+            self.opt_slider_opacity_enabled = bool(opacity_enabled)
+        if opacity is not None:
+            self.opt_slider_opacity = max(0.0, min(1.0, float(opacity)))
 
     def set_colors(self, color_bg, color_deleted, color_added, color_changed, color_gap, color_cursor=None):
         """Set the colors used for painting the overview.
@@ -634,16 +695,26 @@ class PaintboxOverview:
         self._paint_dynamic(w, h)
 
     def _paint_dynamic(self, w, h):
-        """Draw the dynamic part: a single scrollbar slider with fixed height.
+        """Draw the dynamic part: the scrollbar slider.
 
         Uses pure pixel-based mapping (no line/gap calculations):
-        - Get the editor's total scrollable height (smooth_max) and
-          current scroll position (smooth_pos) from PROP_SCROLL_VERT_INFO.
-        - Map to overview pixels: slider_top = h * smooth_pos / smooth_max
-        - Slider height is fixed at 30px.
+        - Get the editor's total content height (smooth_max), current
+          scroll position (smooth_pos), and visible page (smooth_page)
+          from PROP_SCROLL_VERT_INFO.
+        - Map to overview pixels:
+            slider_height = h * smooth_page / smooth_max (proportional,
+                            clamped to min 30px so it stays grabbable)
+            slider_top    = h * smooth_pos / smooth_max
+        - Dispatch to one of three slider-paint methods based on options:
+            * opt_slider_opacity_enabled == False  → _paint_slider_solid
+            * opacity < 8%                          → _paint_slider_clear
+            * opacity >= 8%                         → _paint_slider_blended
 
-        This is independent of lines, gaps, and wrapping — it purely
-        maps editor pixels to overview pixels, like a real scrollbar.
+        The slider_top formula is mathematically consistent: when
+        smooth_pos reaches its max (smooth_max - smooth_page),
+        py_top = h * (smooth_max - smooth_page) / smooth_max =
+        h - slider_height, so the slider lands flush at the bottom of
+        the track. No special-casing needed for the bottom edge.
 
         Args:
             w: width in pixels
@@ -661,12 +732,24 @@ class PaintboxOverview:
 
         smooth_pos = scroll_info.get('smooth_pos', 0)
         smooth_max = scroll_info.get('smooth_max', 1)
+        smooth_page = scroll_info.get('smooth_page', 0)
 
         if smooth_max <= 0:
             smooth_max = 1
 
-        # Fixed slider height (30px)
-        py_height = 30
+        # --- Compute proportional slider height (like a real scrollbar) ---
+        # smooth_max is the total content height in pixels (includes the
+        # page size, per CudaText API docs). smooth_page is the visible
+        # viewport height. slider_height proportional to page/total,
+        # clamped to [min_height, h] so the slider always fits the track
+        # and stays grabbable.
+        min_h = self._slider_min_height
+        if smooth_page > 0:
+            py_height = int(h * smooth_page / smooth_max)
+            py_height = max(min_h, min(h, py_height))
+        else:
+            # No page info (e.g., very early init) — fall back to min.
+            py_height = min(min_h, h)
 
         # Map editor scroll position to overview pixels:
         # slider_top = overview_height * editor_scroll / editor_total
@@ -675,63 +758,119 @@ class PaintboxOverview:
         # Clamp slider within the overview
         py_top = max(0, min(py_top, h - py_height))
 
-        # --- Draw the scrollbar slider (transparent, WinMerge-style) ---
-
-        # 1. Fill the slider area with PRE-BLENDED colors, row by row.
-        #    CudaText canvas_proc has no alpha primitive, so we can't say
-        #    "draw this rect at 40% opacity". Instead we walk the per-row
-        #    segment index built in _paint_static() — each segment knows
-        #    its final color on the static bitmap — and fill it with
-        #    `blend(orig, slider_fill, alpha)`. This produces a pixel-exact
-        #    simulation of true alpha blending. Cost: ≤60
-        #    CANVAS_RECT_FILL calls per scroll (negligible vs the static
-        #    repaint's hundreds of fills).
-        alpha = self._slider_alpha
-        fill_color = self._slider_fill
-        if alpha >= 0.999:
-            # Fully opaque — use the original solid fill (fast path)
-            ct.canvas_proc(c, ct.CANVAS_SET_BRUSH, color=fill_color, style=ct.BRUSH_SOLID)
-            ct.canvas_proc(c, ct.CANVAS_RECT_FILL, x=0, y=py_top, x2=w, y2=py_top + py_height)
-        elif alpha > 0.001 and self._row_segments:
-            # Transparent slider — pre-blend per row
-            row_count = len(self._row_segments)
-            for i in range(py_height):
-                row = py_top + i
-                if 0 <= row < row_count:
-                    for x1, x2, col in self._row_segments[row]:
-                        blended = self._blend_color(col, fill_color, alpha)
-                        ct.canvas_proc(c, ct.CANVAS_SET_BRUSH, color=blended, style=ct.BRUSH_SOLID)
-                        ct.canvas_proc(c, ct.CANVAS_RECT_FILL, x=x1, y=row, x2=x2, y2=row + 1)
+        # --- Dispatch to the selected slider-paint method ---
+        if not self.opt_slider_opacity_enabled:
+            # Method 1 (OLD): solid fill — fastest, no transparency.
+            self._paint_slider_solid(c, w, py_top, py_height)
+        elif self.opt_slider_opacity < self._slider_clear_threshold:
+            # Method 2: border-only via BRUSH_CLEAR. Used for very low
+            # opacity (0..7%) because pre-blending at near-zero alpha
+            # would be wasteful — the visual difference is invisible.
+            self._paint_slider_clear(c, w, py_top, py_height)
         else:
-            # alpha ~ 0 OR no segment index yet — fall back to solid fill
-            # so the slider is always visible even before first compare.
-            ct.canvas_proc(c, ct.CANVAS_SET_BRUSH, color=fill_color, style=ct.BRUSH_SOLID)
-            ct.canvas_proc(c, ct.CANVAS_RECT_FILL, x=0, y=py_top, x2=w, y2=py_top + py_height)
-
-        # 2. Border (pen only — does not overwrite the blended fill)
-        ct.canvas_proc(c, ct.CANVAS_SET_PEN, color=0x999999, size=1)
-        ct.canvas_proc(c, ct.CANVAS_RECT_FRAME, x=0, y=py_top, x2=w - 1, y2=py_top + py_height)
-
-        # 3. Draw 3 horizontal grabber lines (dark shadow)
-        mid_y = py_top + py_height // 2
-        ct.canvas_proc(c, ct.CANVAS_SET_PEN, color=0x666666, size=1)
-        grab_x1 = max(2, w // 4)
-        grab_x2 = min(w - 3, w * 3 // 4)
-        ct.canvas_proc(c, ct.CANVAS_LINE, x=grab_x1, y=mid_y - 2, x2=grab_x2, y2=mid_y - 2)
-        ct.canvas_proc(c, ct.CANVAS_LINE, x=grab_x1, y=mid_y,     x2=grab_x2, y2=mid_y)
-        ct.canvas_proc(c, ct.CANVAS_LINE, x=grab_x1, y=mid_y + 2, x2=grab_x2, y2=mid_y + 2)
-
-        # 3. Draw 3 horizontal highlight lines (white bevel)
-        ct.canvas_proc(c, ct.CANVAS_SET_PEN, color=0xFFFFFF, size=1)
-        ct.canvas_proc(c, ct.CANVAS_LINE, x=grab_x1, y=mid_y - 1, x2=grab_x2, y2=mid_y - 1)
-        ct.canvas_proc(c, ct.CANVAS_LINE, x=grab_x1, y=mid_y + 1, x2=grab_x2, y2=mid_y + 1)
-        ct.canvas_proc(c, ct.CANVAS_LINE, x=grab_x1, y=mid_y + 3, x2=grab_x2, y2=mid_y + 3)
+            # Method 3 (NEW): per-row pre-blend — true simulated alpha.
+            self._paint_slider_blended(c, w, py_top, py_height)
 
         # Store slider geometry and scroll info for click/drag handling
         self._slider_top = py_top
         self._slider_height = py_height
         self._overview_height = h
         self._smooth_max = smooth_max
+
+    def _paint_slider_solid(self, c, w, py_top, py_height):
+        """OLD slider: opaque solid fill + border + grabber. Fastest method.
+
+        Used when opt_slider_opacity_enabled is False (the user explicitly
+        disabled the transparent look). One CANVAS_RECT call draws both
+        the fill (brush) and border (pen) in one shot.
+        """
+        ct.canvas_proc(c, ct.CANVAS_SET_PEN, color=self._slider_border, size=1)
+        ct.canvas_proc(c, ct.CANVAS_SET_BRUSH, color=self._slider_fill, style=ct.BRUSH_SOLID)
+        ct.canvas_proc(c, ct.CANVAS_RECT, x=0, y=py_top, x2=w - 1, y2=py_top + py_height)
+        self._paint_slider_grabber(c, w, py_top, py_height)
+
+    def _paint_slider_clear(self, c, w, py_top, py_height):
+        """Border-only slider via BRUSH_CLEAR (no fill). Fastest transparent
+        option — used when opacity is 0%..7%.
+
+        The static bitmap's colors show through the slider rectangle
+        completely, just outlined by the pen border. Equivalent to the
+        "empty rectangle" suggestion from the CudaText author, but only
+        used at very low opacity where the pre-blend method would be
+        wasteful (the alpha-blended fill would be visually indistinguishable
+        from no fill).
+        """
+        ct.canvas_proc(c, ct.CANVAS_SET_PEN, color=self._slider_border, size=1)
+        ct.canvas_proc(c, ct.CANVAS_SET_BRUSH, color=self._slider_fill, style=ct.BRUSH_CLEAR)
+        ct.canvas_proc(c, ct.CANVAS_RECT, x=0, y=py_top, x2=w - 1, y2=py_top + py_height)
+        self._paint_slider_grabber(c, w, py_top, py_height)
+
+    def _paint_slider_blended(self, c, w, py_top, py_height):
+        """NEW slider: per-row pre-blend + border + grabber. Simulates
+        true alpha blending without needing canvas alpha support.
+
+        Walks the slider's py_height rows and fills each segment with
+        `blend(orig_color, slider_fill, alpha)` per-channel. The segment
+        index is built in _paint_static() and records the final color
+        of every Y row of the static bitmap (background / gap / line).
+
+        Cost: ~2 * py_height CANVAS_RECT_FILL calls per paint. For a
+        30px slider that's ~60 calls; for a 100px slider (large viewport)
+        ~200 calls. All negligible vs the static repaint's hundreds.
+
+        Falls back to solid fill if the segment index isn't built yet
+        (e.g., before the first compare completes).
+        """
+        alpha = self.opt_slider_opacity
+        fill_color = self._slider_fill
+
+        if self._row_segments and alpha > 0.0:
+            # Pre-blend per row. Walk all py_height rows of the slider.
+            row_count = len(self._row_segments)
+            for i in range(py_height):
+                row = py_top + i
+                if 0 <= row < row_count:
+                    for x1, x2, col in self._row_segments[row]:
+                        blended = self._blend_color(col, fill_color, alpha)
+                        ct.canvas_proc(c, ct.CANVAS_SET_BRUSH,
+                                       color=blended, style=ct.BRUSH_SOLID)
+                        ct.canvas_proc(c, ct.CANVAS_RECT_FILL,
+                                       x=x1, y=row, x2=x2, y2=row + 1)
+        else:
+            # No segment index yet (e.g., before first compare) — fall
+            # back to a solid fill so the slider is always visible.
+            ct.canvas_proc(c, ct.CANVAS_SET_BRUSH,
+                           color=fill_color, style=ct.BRUSH_SOLID)
+            ct.canvas_proc(c, ct.CANVAS_RECT_FILL,
+                           x=0, y=py_top, x2=w, y2=py_top + py_height)
+
+        # Border (pen only — does not overwrite the blended fill)
+        ct.canvas_proc(c, ct.CANVAS_SET_PEN, color=self._slider_border, size=1)
+        ct.canvas_proc(c, ct.CANVAS_RECT_FRAME, x=0, y=py_top, x2=w - 1, y2=py_top + py_height)
+
+        self._paint_slider_grabber(c, w, py_top, py_height)
+
+    def _paint_slider_grabber(self, c, w, py_top, py_height):
+        """Draw the 3 dark + 3 white-bevel grabber lines centered in the
+        slider. Shared by all three slider-paint methods so the visual
+        identity of the slider stays consistent regardless of which fill
+        strategy is active.
+        """
+        mid_y = py_top + py_height // 2
+        grab_x1 = max(2, w // 4)
+        grab_x2 = min(w - 3, w * 3 // 4)
+
+        # Dark shadow lines
+        ct.canvas_proc(c, ct.CANVAS_SET_PEN, color=self._slider_grabber_dark, size=1)
+        ct.canvas_proc(c, ct.CANVAS_LINE, x=grab_x1, y=mid_y - 2, x2=grab_x2, y2=mid_y - 2)
+        ct.canvas_proc(c, ct.CANVAS_LINE, x=grab_x1, y=mid_y,     x2=grab_x2, y2=mid_y)
+        ct.canvas_proc(c, ct.CANVAS_LINE, x=grab_x1, y=mid_y + 2, x2=grab_x2, y2=mid_y + 2)
+
+        # White bevel lines
+        ct.canvas_proc(c, ct.CANVAS_SET_PEN, color=self._slider_grabber_light, size=1)
+        ct.canvas_proc(c, ct.CANVAS_LINE, x=grab_x1, y=mid_y - 1, x2=grab_x2, y2=mid_y - 1)
+        ct.canvas_proc(c, ct.CANVAS_LINE, x=grab_x1, y=mid_y + 1, x2=grab_x2, y2=mid_y + 1)
+        ct.canvas_proc(c, ct.CANVAS_LINE, x=grab_x1, y=mid_y + 3, x2=grab_x2, y2=mid_y + 3)
 
     def _on_click(self, id_dlg, id_ctl, data='', info=''):
         """Called when the image is clicked. Scrolls the editor so the
