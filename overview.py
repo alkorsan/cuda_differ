@@ -79,6 +79,12 @@ class PaintboxOverview:
         self.color_changed = 0xAAAAAA  # overridden by set_colors()
         self.color_gap = 0xEEEEEE      # overridden by set_colors()
         self.color_cursor = 0x000000   # overridden by set_colors() with theme font color
+        # Slider state for drag-to-scroll
+        self._slider_top = 0
+        self._slider_height = 0
+        self._overview_height = 0
+        self._dragging = False
+        self._drag_offset = 0
 
     def is_created(self):
         """Return True if the overview dialog has been created."""
@@ -131,6 +137,8 @@ class PaintboxOverview:
             'align': ct.ALIGN_CLIENT,
             'on_click': self._on_click,
             'on_mouse_down': self._on_mouse_down,
+            'on_mouse_move': self._on_mouse_move,
+            'on_mouse_up': self._on_mouse_up,
         })
 
         # Get the image control handle and its embedded bitmap + canvas
@@ -531,16 +539,14 @@ class PaintboxOverview:
         self._paint_dynamic(w, h)
 
     def _paint_dynamic(self, w, h):
-        """Draw the dynamic part: a single scrollbar slider that spans
-        the full width of the overview, showing what the user currently
-        sees in the editors.
+        """Draw the dynamic part: a single scrollbar slider.
 
-        The slider is drawn like a Windows scrollbar slider:
-        - Filled rectangle with border
-        - 3 horizontal grabber lines in the center
+        Uses the browser scrollbar model:
+        - slider_height = overview_height * (visible_lines / total_lines)
+        - slider_top = overview_height * (first_visible_line / total_lines)
 
-        Uses editor a_ed's scroll position (both editors are scroll-synced,
-        so either one gives the same viewport position).
+        This gives a constant slider height for the same document (not
+        affected by gaps or wrapping), and correct position mapping.
 
         Args:
             w: width in pixels
@@ -550,32 +556,30 @@ class PaintboxOverview:
             return
 
         c = self.h_canvas
-        scale = self._get_scale(h)
 
         # Get scroll info from editor a_ed.
-        # 'pos' = first visible line, 'page' = visible line count.
         scroll_info = self.a_ed.get_prop(ct.PROP_SCROLL_VERT_INFO)
         if not scroll_info:
             return
         first_line = scroll_info.get('pos', 0)
-        visible_lines = scroll_info.get('page', 1)
+        page = scroll_info.get('page', 1)
 
-        # Map first visible line to visual Y (wrap + gap aware)
-        vis_y_top = self._line_to_visual_y('a', first_line)
-        py_top = int(vis_y_top * scale)
+        # Use raw line counts (not gap/wrap-aware) for the slider.
+        # This gives constant slider height regardless of scroll position.
+        total_lines = max(self.a_line_count, 1)
 
-        # Compute viewport height: sum of visual rows for visible lines
-        vis_y_bottom = vis_y_top
-        for i in range(first_line, min(first_line + visible_lines, self.a_line_count)):
-            vis_y_bottom += self._line_visual_rows('a', i)
-        # Add gap rows within the visible range
-        gaps = self._sorted_gaps('a')
-        for after_line, gap_rows in gaps:
-            if first_line < after_line <= first_line + visible_lines:
-                vis_y_bottom += gap_rows
-        py_bottom = int(vis_y_bottom * scale)
-        # Ensure the slider is at least 8px tall so it's always visible
-        py_height = max(8, py_bottom - py_top)
+        # Browser scrollbar model:
+        # slider_height = h * (page / total_lines)
+        # slider_top = h * (first_line / total_lines)
+        if total_lines <= page:
+            # Entire file fits on screen — slider fills the overview
+            py_top = 0
+            py_height = h
+        else:
+            py_height = max(8, int(h * page / total_lines))
+            py_top = int(h * first_line / total_lines)
+            # Clamp slider within the overview
+            py_top = max(0, min(py_top, h - py_height))
 
         # --- Draw the scrollbar slider ---
 
@@ -593,20 +597,23 @@ class PaintboxOverview:
         ct.canvas_proc(c, ct.CANVAS_LINE, x=grab_x1, y=mid_y,     x2=grab_x2, y2=mid_y)
         ct.canvas_proc(c, ct.CANVAS_LINE, x=grab_x1, y=mid_y + 2, x2=grab_x2, y2=mid_y + 2)
 
-        # 3. Draw 3 horizontal highlight lines (white bevel just below dark lines)
+        # 3. Draw 3 horizontal highlight lines (white bevel)
         ct.canvas_proc(c, ct.CANVAS_SET_PEN, color=0xFFFFFF, size=1)
         ct.canvas_proc(c, ct.CANVAS_LINE, x=grab_x1, y=mid_y - 1, x2=grab_x2, y2=mid_y - 1)
         ct.canvas_proc(c, ct.CANVAS_LINE, x=grab_x1, y=mid_y + 1, x2=grab_x2, y2=mid_y + 1)
         ct.canvas_proc(c, ct.CANVAS_LINE, x=grab_x1, y=mid_y + 3, x2=grab_x2, y2=mid_y + 3)
 
-    def _on_click(self, id_dlg, id_ctl, data='', info=''):
-        """Called when the image is clicked. Scrolls the corresponding
-        editor to the clicked position.
+        # Store slider geometry for click/drag handling
+        self._slider_top = py_top
+        self._slider_height = py_height
+        self._overview_height = h
 
-        info is "x,y" — the click position in image coordinates.
-        Maps the click Y to a visual row (using the same scale as painting),
-        then maps the visual row to a line index (accounting for gaps and
-        wrapping), then scrolls the editor to that line.
+    def _on_click(self, id_dlg, id_ctl, data='', info=''):
+        """Called when the image is clicked. Scrolls the editor so the
+        clicked position becomes the center of the visible area.
+
+        Uses the browser scrollbar model: maps click Y directly to a
+        line index via simple ratio (no gap/wrap complexity).
         """
         if not info:
             return
@@ -617,32 +624,115 @@ class PaintboxOverview:
         except (ValueError, IndexError):
             return
 
-        # Determine which side was clicked
         w, h = self._get_size()
-        half_w = w // 2
-        side = 'a' if x < half_w else 'b'
+        total_lines = max(self.a_line_count, 1)
 
-        # Map Y pixel to visual row using the same scale as painting
-        scale = self._get_scale(h)
-        if scale <= 0:
-            return
-        visual_y = y / scale
+        # Simple ratio mapping: click_y / h = line / total_lines
+        # Center the viewport on the clicked position
+        scroll_info = self.a_ed.get_prop(ct.PROP_SCROLL_VERT_INFO) if self.a_ed else None
+        page = scroll_info.get('page', 1) if scroll_info else 1
 
-        # Map visual row to line index (wrap + gap aware)
-        line = self._visual_y_to_line_wrap_aware(side, visual_y)
+        target_line = int(y * total_lines / h) - page // 2
+        target_line = max(0, min(target_line, total_lines - 1))
 
-        # Scroll the corresponding editor to the clicked line
-        ed = self.a_ed if side == 'a' else self.b_ed
-        if ed is not None:
+        if self.a_ed is not None:
             try:
-                ed.action(ct.EDACTION_SHOW_POS, (0, line), (0, 0))
+                self.a_ed.action(ct.EDACTION_SHOW_POS, (0, target_line), (0, 0))
+            except Exception:
+                pass
+        if self.b_ed is not None:
+            try:
+                self.b_ed.action(ct.EDACTION_SHOW_POS, (0, target_line), (0, 0))
             except Exception:
                 pass
 
     def _on_mouse_down(self, id_dlg, id_ctl, data='', info=''):
-        """Called on mouse down in the image. data is a dict with
-        btn, state, x, y. We treat it like a click for scrolling."""
+        """Called on mouse down in the image. Supports click-to-scroll
+        and drag-to-scroll (like a real scrollbar).
+
+        If the click is inside the slider, start dragging.
+        If the click is outside the slider, jump to that position.
+        """
         if isinstance(data, dict):
             x = data.get('x', 0)
             y = data.get('y', 0)
-            self._on_click(id_dlg, id_ctl, info='{},{}'.format(x, y))
+        elif info:
+            try:
+                parts = info.split(',')
+                x = int(parts[0])
+                y = int(parts[1])
+            except (ValueError, IndexError):
+                return
+        else:
+            return
+
+        # Check if click is inside the slider (drag mode)
+        slider_top = getattr(self, '_slider_top', 0)
+        slider_height = getattr(self, '_slider_height', 0)
+
+        if slider_top <= y <= slider_top + slider_height:
+            # Click inside slider — start drag mode
+            self._dragging = True
+            self._drag_offset = y - slider_top
+        else:
+            # Click outside slider — jump to position
+            self._dragging = False
+            self._scroll_to_y(y, center=True)
+
+    def _on_mouse_move(self, id_dlg, id_ctl, data='', info=''):
+        """Called on mouse move. If dragging, scroll the editor to follow
+        the mouse position."""
+        if not getattr(self, '_dragging', False):
+            return
+        if isinstance(data, dict):
+            y = data.get('y', 0)
+        elif info:
+            try:
+                y = int(info.split(',')[1])
+            except (ValueError, IndexError):
+                return
+        else:
+            return
+        # Account for drag offset so the slider top follows the mouse
+        target_y = y - self._drag_offset
+        self._scroll_to_y(target_y, center=False)
+
+    def _on_mouse_up(self, id_dlg, id_ctl, data='', info=''):
+        """Called on mouse up. Stops dragging."""
+        self._dragging = False
+
+    def _scroll_to_y(self, y, center=True):
+        """Scroll the editors so that the line at overview pixel Y is
+        visible. Uses the browser scrollbar model: simple ratio mapping.
+
+        Args:
+            y: pixel Y position in the overview
+            center: if True, center the viewport on Y. If False, Y
+                    becomes the top of the viewport (used for dragging).
+        """
+        h = getattr(self, '_overview_height', 0)
+        if h <= 0:
+            w, h = self._get_size()
+        if h <= 0:
+            return
+
+        total_lines = max(self.a_line_count, 1)
+        scroll_info = self.a_ed.get_prop(ct.PROP_SCROLL_VERT_INFO) if self.a_ed else None
+        page = scroll_info.get('page', 1) if scroll_info else 1
+
+        if center:
+            target_line = int(y * total_lines / h) - page // 2
+        else:
+            target_line = int(y * total_lines / h)
+        target_line = max(0, min(target_line, total_lines - 1))
+
+        if self.a_ed is not None:
+            try:
+                self.a_ed.action(ct.EDACTION_SHOW_POS, (0, target_line), (0, 0))
+            except Exception:
+                pass
+        if self.b_ed is not None:
+            try:
+                self.b_ed.action(ct.EDACTION_SHOW_POS, (0, target_line), (0, 0))
+            except Exception:
+                pass
