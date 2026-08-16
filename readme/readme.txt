@@ -22,14 +22,6 @@ synced back to the original files automatically.
   sides stay visually aligned even when corresponding lines wrap to
   different heights. Toggling wrap mode re-applies the alignment
   automatically.
-- Optional built-in overview (mini-map) panel docked to the right of the
-  compare view, showing a gap-aware miniature of both editors side-by-side
-  with colored diff highlights. The overview's slider can be made
-  semi-transparent (WinMerge-style) so the diff colors remain visible
-  through it. The slider height is proportional to the visible-vs-total
-  ratio, just like real scrollbars in browsers and editors, with a 30px
-  minimum so it always stays grabbable. Click or drag the slider to
-  navigate.
 
 
 == Commands ==
@@ -191,46 +183,6 @@ Configuration (chapter "config"):
   Number of unchanged context lines shown around each change in the
   unified diff output (produced by the "Diff current document with..."
   commands). Default: 3.
-- Enable micromap (differ.enable_micromap)
-  When enabled, CudaText's built-in micromap (mini-map) columns are
-  shown in the split gutter between the two editors. Column 0 (line
-  states) and column 2 (selections) are cleared; column 1 (bookmarks,
-  also showing the cursor position) is kept and painted with diff-
-  colored line highlights. Note: the micromap does NOT account for
-  inter-line gaps, so it may desync from the actual text positions
-  when gaps are present -- for a gap-aware alternative, enable
-  enable_overview instead (or both). Default: true.
-- Enable overview panel (differ.enable_overview)
-  When enabled, a custom gap-aware overview (mini-map) panel is docked
-  to the right of the compare view. Unlike the built-in micromap, the
-  overview accounts for inter-line gaps inserted for visual alignment,
-  so it stays in sync with what you actually see. Shows both editors
-  side-by-side with colored rectangles for deleted (red), added
-  (green), and changed (yellow) lines, plus gray rectangles for gaps
-  and white for unchanged lines. Click the overview to scroll the
-  corresponding editor, or drag the slider to scroll continuously.
-  The slider height is proportional to the visible-page vs total-
-  content ratio (like real scrollbars in browsers and editors), with a
-  minimum height of 30px so it always stays grabbable. Can be used
-  together with the micromap. Default: false.
-- Enable overview slider transparency (differ.enable_overview_slider_opacity)
-  When enabled, the overview panel's slider is rendered with simulated
-  alpha blending (per-row pre-blend of the underlying overview colors
-  with the slider fill color), so the colored diff lines remain visible
-  through the slider like in WinMerge. When disabled, the slider uses
-  a fast opaque solid fill (the old behaviour). Note: when enabled AND
-  overview_slider_opacity is below 8%, the slider falls back to a
-  border-only style (fully see-through) for performance. Only has an
-  effect when enable_overview is on. Default: true.
-- Overview slider opacity in percent (differ.overview_slider_opacity)
-  Opacity of the overview panel slider, in percent. 0 = fully
-  transparent (slider border only, the static overview shows through
-  completely), 100 = fully opaque (solid fill). Intermediate values
-  (e.g. 40) simulate true alpha blending via per-row pre-blending of
-  the underlying overview colors with the slider fill color. Values
-  below 8 use the faster border-only path instead of per-row blending.
-  Only used when enable_overview_slider_opacity is true. Range: 0-100.
-  Default: 40.
 - Diff algorithm (differ.diff_algorithm)
   Selects the diff algorithm used by the side-by-side compare view and the
   unified-diff commands. Seven choices are offered in a dropdown:
@@ -274,6 +226,89 @@ Configuration (chapter "config"):
   realignment, event generation, char-level diffing (native vs Python),
   and UI painting (bookmarks, decor, gaps, attributes). Use for debugging
   performance issues only -- adds small overhead. Default: false.
+- Enable built-in micromap (differ.enable_micromap)
+  When enabled, switches on CudaText's native micromap (mini-map) column
+  in both halves of the compare split. The default micromap columns 0
+  (line states) and 2 (selections) are cleared; column 1 (bookmarks) is
+  kept because it also shows the cursor position. Diff-colored line
+  highlights are painted on column 1. The micromap is fast but does
+  NOT account for the inter-line gaps Differ inserts for visual
+  alignment, so it may drift out of sync with the text when gaps are
+  present -- for a gap-aware alternative, enable enable_overview
+  instead (or both). Default: true.
+- Enable gap-aware overview panel (differ.enable_overview)
+  When enabled, adds a custom image control docked to the right side of
+  the editor's outer form. The control renders both files side-by-side
+  as colored 1-pixel rectangles (red=deleted, green=added,
+  yellow=changed, gray=gap, background=unchanged) and is fully gap- and
+  wrap-aware so colored blocks always line up with the corresponding
+  editor lines. A dithered viewport rectangle shows the visible range
+  and a thin cursor line marks the caret; click anywhere to scroll the
+  corresponding editor to that line. Uses a two-bitmap static/dynamic
+  split so scrolling only redraws the cheap dynamic part (debounced
+  150 ms). Colors come from the active UI theme (EdTextBg, EdTextFont)
+  plus the same color_* config options as the editor highlights. Can be
+  used together with the micromap. Default: false.
+
+
+== Overview panel and micromap ==
+
+Differ can show one or both of two mini-map styles next to a compare tab:
+the built-in CudaText micromap and the plugin's own gap-aware overview
+panel. They can be enabled independently and used at the same time.
+
+Built-in micromap (enable_micromap, default: on)
+- Switches on CudaText's native micromap column in both halves of the
+  split. The default micromap columns 0 (line states) and 2 (selections)
+  are cleared so only diff-relevant information is shown; column 1
+  (bookmarks) is kept because it also doubles as a cursor-position
+  indicator. Diff-colored line highlights are painted on column 1 via
+  attr(show_on_map=1).
+- On the left editor the micromap is placed on the right side, on the
+  right editor on the left side, so both micromaps sit in the split
+  gutter between the two files.
+- The micromap is fast and cheap, but it does NOT account for the
+  inter-line gaps Differ inserts for visual alignment, so the colored
+  blocks can drift out of sync with the text positions when gaps are
+  present. For a gap-aware alternative, enable the overview panel.
+
+Gap-aware overview panel (enable_overview, default: off)
+- Adds a custom image control docked to the right side of the editor's
+  outer form. The control renders both files side-by-side as colored
+  1-pixel-tall rectangles: red for deleted lines (left file only),
+  green for added lines (right file only), yellow for changed lines,
+  gray for inter-line gaps, and the theme background color for
+  unchanged lines.
+- Unlike the micromap, the overview is fully gap-aware: it walks both
+  files in lock-step with the same gap bookkeeping the editor uses, so
+  a colored block in the overview always lines up with the
+  corresponding line in the editor. The overview is also wrap-aware:
+  when word-wrap is on, each line's overview height is multiplied by
+  its number of wrapped visual rows, so the overview stays aligned
+  even when matching lines wrap to different heights.
+- A viewport rectangle shows the range of lines currently visible in
+  each editor, and a thin cursor line marks the caret. Because
+  Lazarus cannot do real alpha transparency, the viewport fill is
+  rendered by copying a pre-computed dithered (every-other-line
+  darkened) version of the static bitmap onto the canvas, which
+  simulates a 50% dimmed overlay while keeping the colored blocks
+  visible through the dither pattern.
+- Click anywhere in the overview to scroll the corresponding editor
+  to that line. The click is mapped through the same wrap- and
+  gap-aware coordinate transform used for painting, so the line you
+  click on is the line the editor jumps to.
+- Performance: the panel uses a two-bitmap split. A persistent
+  "static" bitmap stores the hundreds of colored line/gap rectangles
+  and is only rebuilt on compare or resize. On every scroll (debounced
+  150 ms), the static bitmap is blitted to the image control's
+  embedded bitmap and only the cheap dynamic part (viewport rectangle
+  + cursor line) is redrawn on top -- so scrolling does not reissue
+  the expensive CANVAS_RECT_FILL loop.
+- Colors are taken from the active UI theme (EdTextBg for the
+  background, EdTextFont for the cursor / viewport border) so the
+  panel matches both light and dark themes automatically. The
+  deleted/added/changed/gap colors reuse the same color_* config
+  options as the editor highlights.
 
 
 == Notes ==
