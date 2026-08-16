@@ -1,13 +1,22 @@
 """Image-based overview panel for the Differ plugin.
 
 Replaces the micromap with a custom image control docked to the right side
-of the editor's parent-of-parent form. Unlike the micromap, the overview is
-gap-aware: it accounts for the inter-line gaps inserted by Differ for visual
-alignment, so the overview stays in sync with what the user actually sees.
+of the editor's parent form (PROP_HANDLE_PARENT). Unlike the micromap, the
+overview is gap-aware: it accounts for the inter-line gaps inserted by Differ
+for visual alignment, so the overview stays in sync with what the user
+actually sees.
 
 Architecture:
   - PaintboxOverview creates a non-modal dialog with an 'image' control.
-  - The dialog is docked to the RIGHT side of PROP_HANDLE_PARENT2.
+  - The dialog is docked to the RIGHT side of PROP_HANDLE_PARENT.
+    (Earlier versions used PROP_HANDLE_PARENT2 — the parent-of-parent.
+    That was needed because PROP_HANDLE_PARENT was the splitter, which
+    caused the overview to jump when side panels were toggled. The
+    CudaText author added a grouping panel-control for EdFirst/EdSecond/
+    Splitter, so they now are parented by that additional panel.
+    PROP_HANDLE_PARENT now returns that stable grouping panel and is the
+    recommended docking target. See:
+    https://github.com/CudaText-addons/cuda_differ/issues/29)
   - The 'image' control has an embedded bitmap that handles resize/minimize/
     restore automatically — no need for on_act/on_resize/on_show handlers.
   - Uses a two-bitmap optimization (see _ensure_static_bitmap / paint):
@@ -79,7 +88,13 @@ import cudatext as ct
 from .profiling import Profiler
 
 # Overview dialog width in pixels (docked to the right)
-OVERVIEW_WIDTH = 80
+OVERVIEW_WIDTH = 40
+# Default width of the overview panel docked to the right of the compare
+# view. Was 80px; reduced to 40px (50% smaller) — the overview shows
+# both files side-by-side at half-width each, which still gives enough
+# resolution to spot colored diff blocks while taking less horizontal
+# space. The panel is docked and resizable, so users can drag it wider
+# if they want more detail.
 
 
 class PaintboxOverview:
@@ -153,8 +168,10 @@ class PaintboxOverview:
         # background (light theme, dark theme, or pre-blended fill).
         self._slider_border = 0x666666
         # Grabber line color (3 horizontal lines in the slider middle).
-        # Same dark grey as the border for visual consistency.
-        self._slider_grabber_dark = 0x666666
+        # Lighter than the border (0x999999 vs 0x666666) so the grabber
+        # is visually distinct from the border — the border frames the
+        # slider while the grabber sits inside it as a lighter accent.
+        self._slider_grabber_dark = 0x999999
         # Grabber geometry: 3 lines, 2px thick, 6px apart (center-to-center).
         # Triple the original 2px spacing; 2x the original 1px thickness.
         self._slider_grabber_thickness = 2
@@ -176,16 +193,21 @@ class PaintboxOverview:
 
     def create(self, a_ed, b_ed):
         """Create the overview as a separate dialog docked to the right
-        side of the editor's parent-of-parent form.
+        side of the editor's parent form (PROP_HANDLE_PARENT).
 
-        Uses PROP_HANDLE_PARENT2 (the parent of the editor's parent) for
-        docking. PROP_HANDLE_PARENT (the editor's direct parent) is the
-        split container — docking to it places the overview inside the
-        split area, causing it to jump to the middle when side panels
-        (like the Tabs sidebar) are toggled. PROP_HANDLE_PARENT2 is the
-        outer form that holds the split container + side panels + tab
-        bar. Docking to it keeps the overview stable regardless of side
-        panel state.
+        Uses PROP_HANDLE_PARENT — the handle of the (borderless) dialog
+        parenting the editor. As of recent CudaText builds, an additional
+        grouping panel-control parents EdFirst/EdSecond/Splitter, so
+        PROP_HANDLE_PARENT now returns a stable handle suitable for
+        docking. Earlier versions of this plugin used PROP_HANDLE_PARENT2
+        (parent-of-parent) because PROP_HANDLE_PARENT used to be the
+        splitter itself, which caused the overview to jump to the middle
+        when side panels (like the Tabs sidebar) were toggled. With the
+        new grouping panel in place, PROP_HANDLE_PARENT2 is no longer
+        needed and is also not compatible with dlg_proc() (it returns
+        the raw TFrame Lazarus handle). The CudaText author confirmed:
+        "PROP_HANDLE_PARENT is enough for docked micromap, PROP_HANDLE_PARENT2
+        is not needed anymore."
 
         Args:
             a_ed: left editor (primary)
@@ -193,8 +215,11 @@ class PaintboxOverview:
         """
         self.a_ed = a_ed
         self.b_ed = b_ed
-        # PROP_HANDLE_PARENT2: parent-of-parent of the editor.
-        h_parent = a_ed.get_prop(ct.PROP_HANDLE_PARENT2)
+        # PROP_HANDLE_PARENT: handle of the (borderless) dialog parenting
+        # the editor. Since CudaText added the grouping panel for
+        # EdFirst/EdSecond/Splitter, this returns a stable handle suitable
+        # for DLG_DOCK. PROP_HANDLE_PARENT2 is no longer used.
+        h_parent = a_ed.get_prop(ct.PROP_HANDLE_PARENT)
         if not h_parent:
             h_parent = 0
 
@@ -698,9 +723,15 @@ class PaintboxOverview:
         # before painting on it, otherwise nothing shows (checkerboard pattern).
         ct.bitmap_proc(self.h_bitmap, ct.BITMAP_SET_SIZE, w, h)
 
-        # Copy static bitmap to the image's embedded bitmap
+        # Copy static bitmap to the image's embedded bitmap.
+        # CudaText API change (recent versions): CANVAS_BITMAP now takes
+        # the source bitmap handle as the integer param "p1", NOT as the
+        # string param "text" (the change was to avoid str-int
+        # conversions). The old form `text=str(handle)` still works on
+        # older builds but is deprecated and may be removed. Using p1
+        # works on both old and new builds.
         ct.canvas_proc(self.h_canvas, ct.CANVAS_BITMAP,
-                       text=str(self._h_static_bmp), x=0, y=0)
+                       p1=self._h_static_bmp, x=0, y=0)
 
         # Draw dynamic part (cursor + viewport) on top
         self._paint_dynamic(w, h)

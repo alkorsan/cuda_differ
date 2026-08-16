@@ -239,11 +239,11 @@ Configuration (chapter "config"):
   NOT account for the inter-line gaps Differ inserts for visual
   alignment, so it may drift out of sync with the text when gaps are
   present -- for a gap-aware alternative, enable enable_overview
-  instead (or both). Default: true.
+  instead (or both). Default: false.
 - Enable gap-aware overview panel (differ.enable_overview)
   When enabled, adds a custom image control docked to the right side of
-  the editor's outer form. The control renders both files side-by-side
-  as colored 1-pixel rectangles (red=deleted, green=added,
+  the editor's parent form (PROP_HANDLE_PARENT). The control renders both
+  files side-by-side as colored 1-pixel rectangles (red=deleted, green=added,
   yellow=changed, gray=gap, background=unchanged) and is fully gap- and
   wrap-aware so colored blocks always line up with the corresponding
   editor lines. A slider (the viewport indicator) shows the visible
@@ -255,7 +255,7 @@ Configuration (chapter "config"):
   scrolling only redraws the cheap dynamic part (debounced 150 ms).
   Colors come from the active UI theme (EdTextBg) plus the same color_*
   config options as the editor highlights. Can be used together with
-  the micromap. Default: false.
+  the micromap. Default: true.
 - Enable overview slider transparency (differ.enable_overview_slider_opacity)
   When enabled, the overview panel's slider is rendered with simulated
   alpha blending so the colored diff lines remain visible through the
@@ -285,10 +285,17 @@ Configuration (chapter "config"):
 == Overview panel and micromap ==
 
 Differ can show one or both of two mini-map styles next to a compare tab:
-the built-in CudaText micromap and the plugin's own gap-aware overview
-panel. They can be enabled independently and used at the same time.
+the plugin's own gap-aware overview panel (default: on) and the built-in
+CudaText micromap (default: off). They can be enabled independently and
+used at the same time. The overview is the recommended default because
+it stays gap-aware; the micromap is faster but does not account for
+inter-line gaps.
 
-Built-in micromap (enable_micromap, default: on)
+The overview panel's default width is 40px (was 80px; reduced by 50%
+to take less horizontal space). The panel is docked and resizable --
+drag the left edge to make it wider if you want more detail.
+
+Built-in micromap (enable_micromap, default: off)
 - Switches on CudaText's native micromap column in both halves of the
   split. The default micromap columns 0 (line states) and 2 (selections)
   are cleared so only diff-relevant information is shown; column 1
@@ -303,13 +310,13 @@ Built-in micromap (enable_micromap, default: on)
   blocks can drift out of sync with the text positions when gaps are
   present. For a gap-aware alternative, enable the overview panel.
 
-Gap-aware overview panel (enable_overview, default: off)
+Gap-aware overview panel (enable_overview, default: on)
 - Adds a custom image control docked to the right side of the editor's
-  outer form. The control renders both files side-by-side as colored
-  1-pixel-tall rectangles: red for deleted lines (left file only),
-  green for added lines (right file only), yellow for changed lines,
-  gray for inter-line gaps, and the theme background color for
-  unchanged lines.
+  parent form (PROP_HANDLE_PARENT). The control renders both files
+  side-by-side as colored 1-pixel-tall rectangles: red for deleted lines
+  (left file only), green for added lines (right file only), yellow for
+  changed lines, gray for inter-line gaps, and the theme background color
+  for unchanged lines.
 - Unlike the micromap, the overview is fully gap-aware: it walks both
   files in lock-step with the same gap bookkeeping the editor uses, so
   a colored block in the overview always lines up with the

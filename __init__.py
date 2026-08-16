@@ -214,8 +214,8 @@ OPTS_META = [
               'so it may desync from the actual text positions when '
               'gaps are present. For a gap-aware alternative, enable '
               'enable_overview instead (or both). '
-              'Default: on.'),
-     'def': True,
+              'Default: off.'),
+     'def': False,
      'frm': 'bool',
      'chp': 'config',
      },
@@ -235,8 +235,8 @@ OPTS_META = [
               '(like real scrollbars in browsers and editors), with a '
               'minimum height of 30px so it always stays grabbable. '
               'Can be used together with the micromap. '
-              'Default: off.'),
-     'def': False,
+              'Default: on.'),
+     'def': True,
      'frm': 'bool',
      'chp': 'config',
      },
@@ -1137,7 +1137,7 @@ class Command:
             b_ed = ct.Editor(ed.get_prop(ct.PROP_HANDLE_SECONDARY))
 
             # Set up the micromap on both editors when enabled.
-            micromap_on = self.cfg.get('enable_micromap', True)
+            micromap_on = self.cfg.get('enable_micromap', False)
             if micromap_on:
                 self._setup_micromap(a_ed, b_ed)
 
@@ -1148,7 +1148,7 @@ class Command:
             # doesn't account for the gaps we insert for alignment).
             tab_id_str = str(tab_id)
             overview = self._overviews.get(tab_id_str)
-            overview_on = self.cfg.get('enable_overview', False)
+            overview_on = self.cfg.get('enable_overview', True)
             if overview_on:
                 if overview is None:
                     overview = PaintboxOverview()
@@ -1265,7 +1265,7 @@ class Command:
                 line_h_a = 0
                 line_h_b = 0
             color_gaps = self.cfg.get('color_gaps')
-            overview_on = self.cfg.get('enable_overview', False)
+            overview_on = self.cfg.get('enable_overview', True)
 
             # The for loop below consumes events from diff.compare() (a
             # generator) and paints each event. Profiling the loop as a whole
@@ -1726,9 +1726,9 @@ class Command:
             'enable_profiling':
                 get_opt('enable_profiling', False),
             'enable_micromap':
-                get_opt('enable_micromap', True),
+                get_opt('enable_micromap', False),
             'enable_overview':
-                get_opt('enable_overview', False),
+                get_opt('enable_overview', True),
             # Overview slider opacity. Stored as int 0..100 (matches
             # ratio_percents pattern), passed to PaintboxOverview as a
             # float 0..1. See overview.set_slider_options().
