@@ -85,6 +85,7 @@ class PaintboxOverview:
         self._overview_height = 0
         self._dragging = False
         self._drag_offset = 0
+        self._smooth_max = 0
 
     def is_created(self):
         """Return True if the overview dialog has been created."""
@@ -539,14 +540,16 @@ class PaintboxOverview:
         self._paint_dynamic(w, h)
 
     def _paint_dynamic(self, w, h):
-        """Draw the dynamic part: a single scrollbar slider.
+        """Draw the dynamic part: a single scrollbar slider with fixed height.
 
-        Uses the browser scrollbar model:
-        - slider_height = overview_height * (visible_lines / total_lines)
-        - slider_top = overview_height * (first_visible_line / total_lines)
+        Uses pure pixel-based mapping (no line/gap calculations):
+        - Get the editor's total scrollable height (smooth_max) and
+          current scroll position (smooth_pos) from PROP_SCROLL_VERT_INFO.
+        - Map to overview pixels: slider_top = h * smooth_pos / smooth_max
+        - Slider height is fixed at 30px.
 
-        This gives a constant slider height for the same document (not
-        affected by gaps or wrapping), and correct position mapping.
+        This is independent of lines, gaps, and wrapping — it purely
+        maps editor pixels to overview pixels, like a real scrollbar.
 
         Args:
             w: width in pixels
@@ -557,29 +560,26 @@ class PaintboxOverview:
 
         c = self.h_canvas
 
-        # Get scroll info from editor a_ed.
+        # Get pixel-based scroll info from editor a_ed.
         scroll_info = self.a_ed.get_prop(ct.PROP_SCROLL_VERT_INFO)
         if not scroll_info:
             return
-        first_line = scroll_info.get('pos', 0)
-        page = scroll_info.get('page', 1)
 
-        # Use raw line counts (not gap/wrap-aware) for the slider.
-        # This gives constant slider height regardless of scroll position.
-        total_lines = max(self.a_line_count, 1)
+        smooth_pos = scroll_info.get('smooth_pos', 0)
+        smooth_max = scroll_info.get('smooth_max', 1)
 
-        # Browser scrollbar model:
-        # slider_height = h * (page / total_lines)
-        # slider_top = h * (first_line / total_lines)
-        if total_lines <= page:
-            # Entire file fits on screen — slider fills the overview
-            py_top = 0
-            py_height = h
-        else:
-            py_height = max(8, int(h * page / total_lines))
-            py_top = int(h * first_line / total_lines)
-            # Clamp slider within the overview
-            py_top = max(0, min(py_top, h - py_height))
+        if smooth_max <= 0:
+            smooth_max = 1
+
+        # Fixed slider height (30px)
+        py_height = 30
+
+        # Map editor scroll position to overview pixels:
+        # slider_top = overview_height * editor_scroll / editor_total
+        py_top = int(h * smooth_pos / smooth_max)
+
+        # Clamp slider within the overview
+        py_top = max(0, min(py_top, h - py_height))
 
         # --- Draw the scrollbar slider ---
 
@@ -603,17 +603,19 @@ class PaintboxOverview:
         ct.canvas_proc(c, ct.CANVAS_LINE, x=grab_x1, y=mid_y + 1, x2=grab_x2, y2=mid_y + 1)
         ct.canvas_proc(c, ct.CANVAS_LINE, x=grab_x1, y=mid_y + 3, x2=grab_x2, y2=mid_y + 3)
 
-        # Store slider geometry for click/drag handling
+        # Store slider geometry and scroll info for click/drag handling
         self._slider_top = py_top
         self._slider_height = py_height
         self._overview_height = h
+        self._smooth_max = smooth_max
 
     def _on_click(self, id_dlg, id_ctl, data='', info=''):
         """Called when the image is clicked. Scrolls the editor so the
-        clicked position becomes the center of the visible area.
+        clicked position becomes the center of the slider.
 
-        Uses the browser scrollbar model: maps click Y directly to a
-        line index via simple ratio (no gap/wrap complexity).
+        Pure pixel-based mapping:
+          editor_scroll = smooth_max * click_y / overview_height
+        Then centers by subtracting half the visible page.
         """
         if not info:
             return
@@ -624,34 +626,13 @@ class PaintboxOverview:
         except (ValueError, IndexError):
             return
 
-        w, h = self._get_size()
-        total_lines = max(self.a_line_count, 1)
-
-        # Simple ratio mapping: click_y / h = line / total_lines
-        # Center the viewport on the clicked position
-        scroll_info = self.a_ed.get_prop(ct.PROP_SCROLL_VERT_INFO) if self.a_ed else None
-        page = scroll_info.get('page', 1) if scroll_info else 1
-
-        target_line = int(y * total_lines / h) - page // 2
-        target_line = max(0, min(target_line, total_lines - 1))
-
-        if self.a_ed is not None:
-            try:
-                self.a_ed.action(ct.EDACTION_SHOW_POS, (0, target_line), (0, 0))
-            except Exception:
-                pass
-        if self.b_ed is not None:
-            try:
-                self.b_ed.action(ct.EDACTION_SHOW_POS, (0, target_line), (0, 0))
-            except Exception:
-                pass
+        self._scroll_overview_pixel(y, center=True)
 
     def _on_mouse_down(self, id_dlg, id_ctl, data='', info=''):
-        """Called on mouse down in the image. Supports click-to-scroll
-        and drag-to-scroll (like a real scrollbar).
+        """Called on mouse down. Supports click-to-scroll and drag-to-scroll.
 
-        If the click is inside the slider, start dragging.
-        If the click is outside the slider, jump to that position.
+        If click is inside the slider, start dragging.
+        If click is outside, jump to that position (centered).
         """
         if isinstance(data, dict):
             x = data.get('x', 0)
@@ -666,22 +647,20 @@ class PaintboxOverview:
         else:
             return
 
-        # Check if click is inside the slider (drag mode)
         slider_top = getattr(self, '_slider_top', 0)
         slider_height = getattr(self, '_slider_height', 0)
 
         if slider_top <= y <= slider_top + slider_height:
-            # Click inside slider — start drag mode
+            # Click inside slider — start drag
             self._dragging = True
             self._drag_offset = y - slider_top
         else:
-            # Click outside slider — jump to position
+            # Click outside slider — jump (centered on click)
             self._dragging = False
-            self._scroll_to_y(y, center=True)
+            self._scroll_overview_pixel(y, center=True)
 
     def _on_mouse_move(self, id_dlg, id_ctl, data='', info=''):
-        """Called on mouse move. If dragging, scroll the editor to follow
-        the mouse position."""
+        """Called on mouse move. If dragging, scroll the editor to follow."""
         if not getattr(self, '_dragging', False):
             return
         if isinstance(data, dict):
@@ -693,22 +672,28 @@ class PaintboxOverview:
                 return
         else:
             return
-        # Account for drag offset so the slider top follows the mouse
+        # Drag: the slider top follows the mouse (accounting for offset)
         target_y = y - self._drag_offset
-        self._scroll_to_y(target_y, center=False)
+        self._scroll_overview_pixel(target_y, center=False)
 
     def _on_mouse_up(self, id_dlg, id_ctl, data='', info=''):
         """Called on mouse up. Stops dragging."""
         self._dragging = False
 
-    def _scroll_to_y(self, y, center=True):
-        """Scroll the editors so that the line at overview pixel Y is
-        visible. Uses the browser scrollbar model: simple ratio mapping.
+    def _scroll_overview_pixel(self, overview_y, center=True):
+        """Scroll the editors based on a pixel Y position in the overview.
+
+        Pure pixel-based mapping (no line/gap calculations):
+          editor_target_scroll = smooth_max * overview_y / overview_height
+
+        If center=True, subtract half the visible page so the clicked
+        position becomes the center of the viewport.
+        If center=False (dragging), the clicked position becomes the top.
 
         Args:
-            y: pixel Y position in the overview
+            overview_y: pixel Y position in the overview
             center: if True, center the viewport on Y. If False, Y
-                    becomes the top of the viewport (used for dragging).
+                    becomes the top of the viewport (for dragging).
         """
         h = getattr(self, '_overview_height', 0)
         if h <= 0:
@@ -716,23 +701,36 @@ class PaintboxOverview:
         if h <= 0:
             return
 
-        total_lines = max(self.a_line_count, 1)
-        scroll_info = self.a_ed.get_prop(ct.PROP_SCROLL_VERT_INFO) if self.a_ed else None
-        page = scroll_info.get('page', 1) if scroll_info else 1
+        smooth_max = getattr(self, '_smooth_max', 0)
+        if smooth_max <= 0:
+            # Get it from the editor
+            scroll_info = self.a_ed.get_prop(ct.PROP_SCROLL_VERT_INFO) if self.a_ed else None
+            if scroll_info:
+                smooth_max = scroll_info.get('smooth_max', 0)
+            if smooth_max <= 0:
+                return
+
+        # Map overview pixel to editor scroll pixel:
+        # editor_scroll = smooth_max * overview_y / overview_height
+        target_smooth_pos = int(smooth_max * overview_y / h)
 
         if center:
-            target_line = int(y * total_lines / h) - page // 2
-        else:
-            target_line = int(y * total_lines / h)
-        target_line = max(0, min(target_line, total_lines - 1))
+            # Subtract half the visible page so the click is centered
+            scroll_info = self.a_ed.get_prop(ct.PROP_SCROLL_VERT_INFO) if self.a_ed else None
+            smooth_page = scroll_info.get('smooth_page', 0) if scroll_info else 0
+            target_smooth_pos -= smooth_page // 2
 
+        # Clamp to valid range
+        target_smooth_pos = max(0, target_smooth_pos)
+
+        # Scroll both editors via set_prop(PROP_SCROLL_VERT_INFO, {'smooth_pos': ...})
         if self.a_ed is not None:
             try:
-                self.a_ed.action(ct.EDACTION_SHOW_POS, (0, target_line), (0, 0))
+                self.a_ed.set_prop(ct.PROP_SCROLL_VERT_INFO, {'smooth_pos': target_smooth_pos})
             except Exception:
                 pass
         if self.b_ed is not None:
             try:
-                self.b_ed.action(ct.EDACTION_SHOW_POS, (0, target_line), (0, 0))
+                self.b_ed.set_prop(ct.PROP_SCROLL_VERT_INFO, {'smooth_pos': target_smooth_pos})
             except Exception:
                 pass
