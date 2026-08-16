@@ -229,11 +229,46 @@ OPTS_META = [
               'colored rectangles for deleted (red), added (green), '
               'and changed (yellow) lines, plus gray rectangles for '
               'gaps and white for unchanged lines. Click the overview '
-              'to scroll the corresponding editor. Can be used together '
-              'with the micromap. '
+              'to scroll the corresponding editor, or drag the slider '
+              'to scroll continuously. The slider height is '
+              'proportional to the visible-page vs total-content ratio '
+              '(like real scrollbars in browsers and editors), with a '
+              'minimum height of 30px so it always stays grabbable. '
+              'Can be used together with the micromap. '
               'Default: off.'),
      'def': False,
      'frm': 'bool',
+     'chp': 'config',
+     },
+    {'opt': 'differ.enable_overview_slider_opacity',
+     'cmt': _('Enable transparency for the overview panel slider. '
+              'When enabled, the slider is rendered with simulated '
+              'alpha blending (per-row pre-blend of the underlying '
+              'overview colors with the slider fill color), so the '
+              'colored diff lines remain visible through the slider '
+              'like in WinMerge. When disabled, the slider uses a '
+              'fast opaque solid fill (the old behaviour). '
+              'Note: when enabled AND overview_slider_opacity is below '
+              '8%, the slider falls back to a border-only style '
+              '(BRUSH_CLEAR, fully see-through) for performance. '
+              'Default: on.'),
+     'def': True,
+     'frm': 'bool',
+     'chp': 'config',
+     },
+    {'opt': 'differ.overview_slider_opacity',
+     'cmt': _('Opacity of the overview panel slider, in percent. '
+              '0 = fully transparent (slider border only via '
+              'BRUSH_CLEAR, the static overview shows through '
+              'completely), 100 = fully opaque (solid fill). '
+              'Intermediate values (e.g. 40) simulate true alpha '
+              'blending via per-row pre-blending of the underlying '
+              'overview colors with the slider fill color. Only used '
+              'when enable_overview_slider_opacity is True. Values '
+              'below 8 use the faster BRUSH_CLEAR path instead of '
+              'per-row blending. Range: 0-100. Default: 40.'),
+     'def': 40,
+     'frm': 'int',
      'chp': 'config',
      },
 ]
@@ -1139,6 +1174,14 @@ class Command:
                     self.cfg.get('color_changed'),
                     self.cfg.get('color_gaps'),
                     color_cursor)
+                # Pass slider opacity options. Config stores opacity as
+                # int 0..100 (matches ratio_percents pattern); convert to
+                # float 0..1 for PaintboxOverview.set_slider_options().
+                # See overview.py for the three paint methods dispatched
+                # based on these values (SOLID / CLEAR / BLENDED).
+                overview.set_slider_options(
+                    opacity_enabled=self.cfg.get('enable_overview_slider_opacity', True),
+                    opacity=self.cfg.get('overview_slider_opacity', 40) / 100.0)
                 overview.clear_data()
             elif overview is not None:
                 overview.destroy()
@@ -1687,6 +1730,13 @@ class Command:
                 get_opt('enable_micromap', True),
             'enable_overview':
                 get_opt('enable_overview', False),
+            # Overview slider opacity. Stored as int 0..100 (matches
+            # ratio_percents pattern), passed to PaintboxOverview as a
+            # float 0..1. See overview.set_slider_options().
+            'enable_overview_slider_opacity':
+                get_opt('enable_overview_slider_opacity', True),
+            'overview_slider_opacity':
+                max(0, min(100, get_opt('overview_slider_opacity', 40))),
         }
 
         new_nkind(NKIND_DELETED, config.get('color_deleted'))
