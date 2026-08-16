@@ -26,6 +26,19 @@ Architecture:
     old static bitmap and creates a new one with fresh content. Then
     paint() copies it + draws the dynamic part.
 
+  - TRANSPARENT SLIDER (WinMerge-style):
+    CudaText's canvas_proc API has NO alpha-blend primitive (only
+    BRUSH_SOLID = opaque, BRUSH_CLEAR = no fill). To get a 40%-transparent
+    slider we precompute the blend: a per-row segment index
+    (_row_segments) is built in _paint_static(), recording the final color
+    of every Y row of the static bitmap (background / gap / line-state).
+    On each paint(), _paint_dynamic() walks the 30 slider rows and fills
+    each segment with `blend(orig_color, slider_fill, alpha)` — i.e.
+    per-channel `orig*(1-α) + fill*α`. This produces a pixel-exact
+    simulation of true alpha blending without needing any canvas alpha
+    support, and costs ≤60 CANVAS_RECT_FILL calls per scroll (negligible).
+    The slider border + grabber lines are drawn on top, unchanged.
+
   See: https://github.com/CudaText-addons/cuda_differ/issues/29
 """
 
@@ -86,6 +99,21 @@ class PaintboxOverview:
         self._dragging = False
         self._drag_offset = 0
         self._smooth_max = 0
+
+        # --- Transparent slider (WinMerge-style) ---
+        # CudaText canvas_proc has no alpha primitive. We precompute the
+        # blend per channel: result = orig*(1-α) + fill*α.
+        # Slider opacity: 0.0 = invisible, 1.0 = fully opaque.
+        # 0.6 = 60% opaque / 40% transparent — matches WinMerge's look.
+        # Tune freely; no other code needs to change.
+        self._slider_alpha = 0.6
+        self._slider_fill = 0xEAEAEA  # light grey, same as the old solid fill
+        # Per-row segment index: list of length h, where each row is a
+        # list of (x_start, x_end, color) tuples in paint order (later
+        # entries visually overwrite earlier ones). Rebuilt only in
+        # _paint_static(); consumed by _paint_dynamic(). Empty until the
+        # first static repaint completes.
+        self._row_segments = []
 
     def is_created(self):
         """Return True if the overview dialog has been created."""
@@ -403,6 +431,12 @@ class PaintboxOverview:
         reused on every paint() call without re-executing the expensive
         CANVAS_RECT_FILL loop.
 
+        Also builds _row_segments — the per-row segment index used by
+        _paint_dynamic() to precompute transparent-slider blends. Each
+        row starts as a full-width background segment; _paint_side()
+        appends line/gap segments on top in paint order so the last
+        color wins (matching the on-screen visual).
+
         Args:
             c: canvas handle (static bitmap canvas)
             w: width in pixels
@@ -412,11 +446,65 @@ class PaintboxOverview:
         ct.canvas_proc(c, ct.CANVAS_SET_BRUSH, color=self.color_bg, style=ct.BRUSH_SOLID)
         ct.canvas_proc(c, ct.CANVAS_RECT_FILL, x=0, y=0, x2=w, y2=h)
 
+        # (Re)build the per-row segment index — start with full-width
+        # background for every row. _paint_side() will append layers on
+        # top via _record_segment().
+        self._row_segments = [[(0, w, self.color_bg)] for _ in range(h)]
+        # Also record the background itself for completeness.
+        self._record_segment(0, 0, w, h, self.color_bg)
+
         # Paint both sides
         scale = self._get_scale(h)
         half_w = w // 2
         self._paint_side(c, 'a', 0, half_w, h, scale)
         self._paint_side(c, 'b', half_w, w, h, scale)
+
+    def _record_segment(self, x1, y1, x2, y2, color):
+        """Record a colored rectangle in the per-row segment index.
+
+        Called from _paint_side() for every CANVAS_RECT_FILL it issues.
+        Each affected row gets (x1, x2, color) appended to its segment
+        list — later appends visually overwrite earlier ones (matching
+        the on-screen paint order). Used by _paint_dynamic() to know
+        the exact final color of every Y row, so the transparent
+        slider can be filled with pre-blended colors.
+
+        Args:
+            x1, y1, x2, y2: rectangle in pixels (y1 inclusive, y2 exclusive)
+            color: RGB int color of the rectangle
+        """
+        if not self._row_segments:
+            return
+        h = len(self._row_segments)
+        row_start = max(0, y1)
+        row_end = min(h, y2)
+        for row in range(row_start, row_end):
+            self._row_segments[row].append((x1, x2, color))
+
+    @staticmethod
+    def _blend_color(orig, fill, alpha):
+        """Per-channel alpha blend: result = orig*(1-α) + fill*α.
+
+        Works for any slider color (light or dark). Returns an RGB int.
+        CudaText colors are 0xRRGGBB stored as 0xBBGGRR (little-endian
+        BGR int), so we mask channels accordingly.
+
+        Args:
+            orig: underlying pixel color (BGR int, as used by canvas_proc)
+            fill: slider fill color (BGR int)
+            alpha: slider opacity in [0.0, 1.0]; 0 = invisible, 1 = opaque
+        """
+        inv = 1.0 - alpha
+        r1 = orig & 0xFF
+        g1 = (orig >> 8) & 0xFF
+        b1 = (orig >> 16) & 0xFF
+        r2 = fill & 0xFF
+        g2 = (fill >> 8) & 0xFF
+        b2 = (fill >> 16) & 0xFF
+        r = int(r1 * inv + r2 * alpha)
+        g = int(g1 * inv + g2 * alpha)
+        b = int(b1 * inv + b2 * alpha)
+        return r | (g << 8) | (b << 16)
 
     def _paint_side(self, c, side, x_start, x_end, h, scale):
         """Paint one side of the overview (either a_ed or b_ed half).
@@ -460,6 +548,8 @@ class PaintboxOverview:
                 py = int(vis_y * scale)
                 ct.canvas_proc(c, ct.CANVAS_SET_BRUSH, color=self.color_gap, style=ct.BRUSH_SOLID)
                 ct.canvas_proc(c, ct.CANVAS_RECT_FILL, x=x_start, y=py, x2=x_end, y2=py + gap_h)
+                # Record segment for transparent-slider blending
+                self._record_segment(x_start, py, x_end, py + gap_h, self.color_gap)
                 vis_y += gap_rows
 
             # Paint the line (only if it has a state — changed lines)
@@ -471,6 +561,8 @@ class PaintboxOverview:
                 line_h = max(1, int(line_vr * scale) + 1)
                 ct.canvas_proc(c, ct.CANVAS_SET_BRUSH, color=color, style=ct.BRUSH_SOLID)
                 ct.canvas_proc(c, ct.CANVAS_RECT_FILL, x=x_start, y=py, x2=x_end, y2=py + line_h)
+                # Record segment for transparent-slider blending
+                self._record_segment(x_start, py, x_end, py + line_h, color)
             vis_y += self._line_visual_rows(side, line)
 
         # Paint any remaining gaps after the last line
@@ -480,6 +572,8 @@ class PaintboxOverview:
                 py = int(vis_y * scale)
                 ct.canvas_proc(c, ct.CANVAS_SET_BRUSH, color=self.color_gap, style=ct.BRUSH_SOLID)
                 ct.canvas_proc(c, ct.CANVAS_RECT_FILL, x=x_start, y=py, x2=x_end, y2=py + gap_h)
+                # Record segment for transparent-slider blending
+                self._record_segment(x_start, py, x_end, py + gap_h, self.color_gap)
                 vis_y += gap_rows
 
     def repaint_static(self):
@@ -581,14 +675,44 @@ class PaintboxOverview:
         # Clamp slider within the overview
         py_top = max(0, min(py_top, h - py_height))
 
-        # --- Draw the scrollbar slider ---
+        # --- Draw the scrollbar slider (transparent, WinMerge-style) ---
 
-        # 1. Background and border (filled rectangle)
+        # 1. Fill the slider area with PRE-BLENDED colors, row by row.
+        #    CudaText canvas_proc has no alpha primitive, so we can't say
+        #    "draw this rect at 40% opacity". Instead we walk the per-row
+        #    segment index built in _paint_static() — each segment knows
+        #    its final color on the static bitmap — and fill it with
+        #    `blend(orig, slider_fill, alpha)`. This produces a pixel-exact
+        #    simulation of true alpha blending. Cost: ≤60
+        #    CANVAS_RECT_FILL calls per scroll (negligible vs the static
+        #    repaint's hundreds of fills).
+        alpha = self._slider_alpha
+        fill_color = self._slider_fill
+        if alpha >= 0.999:
+            # Fully opaque — use the original solid fill (fast path)
+            ct.canvas_proc(c, ct.CANVAS_SET_BRUSH, color=fill_color, style=ct.BRUSH_SOLID)
+            ct.canvas_proc(c, ct.CANVAS_RECT_FILL, x=0, y=py_top, x2=w, y2=py_top + py_height)
+        elif alpha > 0.001 and self._row_segments:
+            # Transparent slider — pre-blend per row
+            row_count = len(self._row_segments)
+            for i in range(py_height):
+                row = py_top + i
+                if 0 <= row < row_count:
+                    for x1, x2, col in self._row_segments[row]:
+                        blended = self._blend_color(col, fill_color, alpha)
+                        ct.canvas_proc(c, ct.CANVAS_SET_BRUSH, color=blended, style=ct.BRUSH_SOLID)
+                        ct.canvas_proc(c, ct.CANVAS_RECT_FILL, x=x1, y=row, x2=x2, y2=row + 1)
+        else:
+            # alpha ~ 0 OR no segment index yet — fall back to solid fill
+            # so the slider is always visible even before first compare.
+            ct.canvas_proc(c, ct.CANVAS_SET_BRUSH, color=fill_color, style=ct.BRUSH_SOLID)
+            ct.canvas_proc(c, ct.CANVAS_RECT_FILL, x=0, y=py_top, x2=w, y2=py_top + py_height)
+
+        # 2. Border (pen only — does not overwrite the blended fill)
         ct.canvas_proc(c, ct.CANVAS_SET_PEN, color=0x999999, size=1)
-        ct.canvas_proc(c, ct.CANVAS_SET_BRUSH, color=0xEAEAEA, style=ct.BRUSH_SOLID)
-        ct.canvas_proc(c, ct.CANVAS_RECT, x=0, y=py_top, x2=w - 1, y2=py_top + py_height)
+        ct.canvas_proc(c, ct.CANVAS_RECT_FRAME, x=0, y=py_top, x2=w - 1, y2=py_top + py_height)
 
-        # 2. Draw 3 horizontal grabber lines (dark shadow)
+        # 3. Draw 3 horizontal grabber lines (dark shadow)
         mid_y = py_top + py_height // 2
         ct.canvas_proc(c, ct.CANVAS_SET_PEN, color=0x666666, size=1)
         grab_x1 = max(2, w // 4)
