@@ -16,9 +16,9 @@ Architecture:
       via repaint_static(). This is the expensive part (hundreds of
       CANVAS_RECT_FILL calls).
     * Dynamic: on each paint(), copy the static bitmap to the image's
-      embedded bitmap via CANVAS_BITMAP, then draw the cursor marker and
-      viewport rectangle on top. This is cheap (one bitmap copy + a few
-      CANVAS_LINE / CANVAS_RECT_FRAME calls).
+      embedded bitmap via CANVAS_BITMAP, then draw the slider and
+      grabber on top. This is cheap (one bitmap copy + a few
+      CANVAS_RECT / CANVAS_LINE calls).
   - On scroll (debounced 150ms): paint() is called. It only copies the
     static bitmap and draws the dynamic part — the static bitmap is reused.
     This avoids repainting hundreds of rectangles on every scroll.
@@ -674,8 +674,8 @@ class PaintboxOverview:
         2. Resizes the image's embedded bitmap to match (if needed).
         3. Copies the static bitmap to the image's embedded bitmap via
            CANVAS_BITMAP (fast — one bitmap copy).
-        4. Draws the dynamic part (cursor line + viewport rectangle)
-           on top of the image's bitmap (a few CANVAS_LINE / CANVAS_RECT_FRAME
+        4. Draws the dynamic part (slider + grabber)
+           on top of the image's bitmap (a few CANVAS_RECT / CANVAS_LINE
            calls).
 
         This avoids the expensive CANVAS_RECT_FILL loop on every scroll,
@@ -855,9 +855,18 @@ class PaintboxOverview:
             ct.canvas_proc(c, ct.CANVAS_RECT_FILL,
                            x=0, y=py_top, x2=w, y2=py_top + py_height)
 
-        # Border (pen only — does not overwrite the blended fill)
+        # Border: use CANVAS_RECT + BRUSH_CLEAR (NOT CANVAS_RECT_FRAME).
+        # The SOLID and CLEAR methods both draw the border via CANVAS_RECT
+        # (pen + brush). BLENDED must use the SAME call so the border
+        # renders identically. With BRUSH_CLEAR, the brush does not fill
+        # anything (so the pre-blended fill underneath is preserved), and
+        # the pen draws the border on top — same as the other two methods.
+        # CANVAS_RECT_FRAME was previously used here, but it renders a
+        # thinner frame that becomes nearly invisible against the
+        # pre-blended fill.
         ct.canvas_proc(c, ct.CANVAS_SET_PEN, color=self._slider_border, size=1)
-        ct.canvas_proc(c, ct.CANVAS_RECT_FRAME, x=0, y=py_top, x2=w - 1, y2=py_top + py_height)
+        ct.canvas_proc(c, ct.CANVAS_SET_BRUSH, color=self._slider_fill, style=ct.BRUSH_CLEAR)
+        ct.canvas_proc(c, ct.CANVAS_RECT, x=0, y=py_top, x2=w - 1, y2=py_top + py_height)
 
         self._paint_slider_grabber(c, w, py_top, py_height)
 
