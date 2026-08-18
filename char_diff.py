@@ -5,7 +5,10 @@ WinMerge's algorithm (Src/stringdiffs.cpp):
   1. Break each line into "words" (tokens: identifiers, whitespace,
      punctuation, numbers). Words are more unique than individual
      characters, so the O(NP) Myers preprocessing is effective.
-  2. Run O(NP) Myers on the word arrays to find word-level diffs.
+  2. Run O(NP) Myers on the word arrays to find word-level diffs --
+     but ONLY if both sides have fewer than 20480 words. This is the
+     guard WinMerge uses in BuildWordDiffList() (stringdiffs.cpp
+     line 398) to keep the O(NP) DP from blowing up on huge lines.
   3. For each word-level diff region, run ComputeByteDiff (stringdiffs.cpp
      line 854) which does a simple O(N) common prefix/suffix trim and
      marks the middle as the changed region.
@@ -34,6 +37,35 @@ try:
 except ImportError:
     # Allow direct import (for testing without the package)
     from myers import MyersSequenceMatcher
+
+
+# WinMerge stringdiffs.cpp line 396-404 (BuildWordDiffList):
+#
+#     #ifdef _WIN64
+#         if (m_words1.size() < 20480 && m_words2.size() < 20480)
+#     #else
+#         if (m_words1.size() < 2048 && m_words2.size() < 2048)
+#     #endif
+#         {
+#             succeeded = BuildWordDiffList_DP();
+#         }
+#         if (!succeeded) { /* emit one big wdiff spanning both lines */ }
+#
+# WinMerge uses 20480 words per side on 64-bit builds, 2048 on 32-bit
+# builds. Python has no 32-bit memory constraint, so we always use 20480.
+#
+# When either side meets or exceeds this threshold, the O(NP) Myers DP
+# (BuildWordDiffList_DP -> onp) is skipped and a single coarse wdiff
+# covering the entire line is emitted. ComputeByteDiff (our
+# _compute_byte_diff) then refines that one big wdiff down to character
+# boundaries with a cheap O(N) prefix/suffix trim.
+#
+# This is essential for very long lines (e.g. 90KB per line): such a
+# line tokenizes into tens of thousands of words, and the O(NP) DP
+# becomes O(N*P) where P (the edit distance) can be in the tens of
+# thousands, producing billions of operations. The byte-level fallback
+# is O(N) and finishes in microseconds.
+WORD_DIFF_THRESHOLD = 20480
 
 
 # Word tokenizer: splits into words, whitespace, and punctuation.
@@ -99,14 +131,60 @@ def _compute_byte_diff(a: str, b: str) -> Tuple[int, int, int, int]:
     return (a_begin, a_end, b_begin, b_end)
 
 
+def _char_diff_byte_level(a: str, b: str) -> List[Tuple[str, int, int, int, int]]:
+    """Coarse byte-level diff for very long lines.
+
+    This is the WinMerge fallback path taken in BuildWordDiffList()
+    (stringdiffs.cpp line 405-413) when either side has >= 20480
+    words: emit one big wdiff spanning both entire strings, then let
+    ComputeByteDiff (our _compute_byte_diff) trim the matching prefix
+    and suffix. The result is a single (equal-prefix, replace-or-
+    delete-or-insert, equal-suffix) opcode list.
+
+    This is O(N) and avoids the O(NP) Myers DP that becomes
+    catastrophically slow on 90KB-per-line inputs.
+    """
+    a_begin, a_end, b_begin, b_end = _compute_byte_diff(a, b)
+    if a_begin == -1:
+        # Strings are identical after prefix/suffix trim
+        return [('equal', 0, len(a), 0, len(b))]
+
+    result: List[Tuple[str, int, int, int, int]] = []
+
+    # Equal prefix (if any)
+    if a_begin > 0 or b_begin > 0:
+        result.append(('equal', 0, a_begin, 0, b_begin))
+
+    # The changed middle region
+    if a_begin < a_end and b_begin < b_end:
+        result.append(('replace', a_begin, a_end, b_begin, b_end))
+    elif a_begin < a_end:
+        result.append(('delete', a_begin, a_end, b_begin, b_end))
+    elif b_begin < b_end:
+        result.append(('insert', a_begin, a_end, b_begin, b_end))
+
+    # Equal suffix (if any)
+    if a_end < len(a) or b_end < len(b):
+        result.append(('equal', a_end, len(a), b_end, len(b)))
+
+    return result
+
+
 def char_diff(a: str, b: str) -> List[Tuple[str, int, int, int, int]]:
     """Compute character-level diff between two strings.
 
     Uses WinMerge's two-phase approach:
-      1. Word-level Myers diff (via InlineMyersSequenceMatcher) to find
-         word-level alignment.
+      1. Word-level Myers diff (via MyersSequenceMatcher) to find
+         word-level alignment -- BUT only when both sides have fewer
+         than WORD_DIFF_THRESHOLD (20480) words. This is the gate
+         WinMerge uses (stringdiffs.cpp line 398) to keep the O(NP)
+         DP from blowing up on huge lines.
       2. For each word-level diff region, byte-level prefix/suffix trim
          to find the exact character boundaries.
+      3. Fallback (huge lines): skip step 1, run a single byte-level
+         prefix/suffix trim on the whole strings. This produces a
+         single (equal, replace, equal) result -- less granular than
+         the word-aligned path but O(N) and always fast.
 
     Returns a list of (tag, a_start, a_end, b_start, b_end) opcodes
     where tag is 'equal', 'delete', 'insert', or 'replace'. Same format
@@ -116,6 +194,8 @@ def char_diff(a: str, b: str) -> List[Tuple[str, int, int, int, int]]:
     - Word-level Myers runs on a small array (5-50 tokens)
     - Byte-level refinement is O(N) per diff region
     - Total: O(N) for typical lines, vs O(N*P) for char-level Myers
+    - For huge lines (>= 20480 tokens) the byte-level fallback is O(N)
+      end-to-end and never enters the O(NP) DP
     """
     if a == b:
         return [('equal', 0, len(a), 0, len(b))]
@@ -123,6 +203,18 @@ def char_diff(a: str, b: str) -> List[Tuple[str, int, int, int, int]]:
     # Tokenize both strings into words
     tokens_a = _tokenize(a)
     tokens_b = _tokenize(b)
+
+    # WinMerge's 20480-word threshold gate (stringdiffs.cpp line 398).
+    # When either side has too many tokens, skip the O(NP) Myers DP
+    # and fall back to a single byte-level prefix/suffix trim.
+    # This is the key fix for slow char compare on 90KB-per-line files:
+    # such lines tokenize into tens of thousands of words, which makes
+    # the O(NP) DP O(N*P) with both N and P in the tens of thousands
+    # -- billions of operations. The byte-level fallback is O(N) and
+    # finishes in microseconds.
+    if (len(tokens_a) >= WORD_DIFF_THRESHOLD or
+            len(tokens_b) >= WORD_DIFF_THRESHOLD):
+        return _char_diff_byte_level(a, b)
 
     # Build offset arrays: token_offsets[i] = char offset where token i starts
     offsets_a = []
