@@ -307,6 +307,7 @@ class Differ:
             return result
         else:
             # Native API not available — fall back to Python char_diff.
+            _ct.msg_status(_('Differ: Native API not available — fall back to Python char_diff'))
             Profiler.start('char_diff:python_call')
             try:
                 return char_diff(line_a, line_b)

@@ -1011,12 +1011,15 @@ class Command:
             self._compare_tab_ids.add(tab_id_str)
             # Populate the saved-state cache from disk.
             self._saved_cache[tab_id_str] = entry.get('saved', True)
+            
             # Find an editor for this compare tab and re-apply diff markers.
-            for h in ct.ed_handles():
-                e = ct.Editor(h)
-                if str(e.get_prop(ct.PROP_TAB_ID)) == tab_id_str:
-                    self._refresh_ex(e)
-                    break
+            # if the user have a lot of big diff tabs they will all run at the same time and cudatext will hang for a moment, let stop diffing after restart, if the user is still interested in the compare then a simple click to refresh is not bad experience anyway
+            # for h in ct.ed_handles():
+            #     e = ct.Editor(h)
+            #     if str(e.get_prop(ct.PROP_TAB_ID)) == tab_id_str:
+            #         self._refresh_ex(e)
+            #         break
+                    
             # Re-apply the title color based on the persisted 'saved' flag.
             if entry.get('saved', True):
                 self._apply_color_to_tab(tab_id_str, 0x00A000)  # green
@@ -1064,7 +1067,9 @@ class Command:
         """
         algo = self.cfg.get('diff_algorithm', 'native_histogram')
         if algo in ('native_histogram', 'native_myers') and dfn._HAS_NATIVE_DIFF:
+            ct.msg_status(_("Differ: Using Native Algo {}").format(algo))
             return dfn.Differ()
+        ct.msg_status(_("Differ: Using Python Algo {}").format(algo))
         return dfp.Differ()
 
     def _ensure_correct_differ(self):
