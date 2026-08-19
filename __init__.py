@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import typing as tp
 
@@ -21,10 +22,93 @@ df = dfn
 from cudax_lib import get_translation
 _ = get_translation(__file__)  # I18N
 
+# str.splitlines() breaks on the full Unicode line-boundary set, not just
+# '\n', '\r', '\r\n': it also splits on VT (\x0b), FF (\x0c), NEL (\x85),
+# LS (\u2028), and PS (\u2029), FS (\x1c) GS (\x1d) and RS (\x1e), see 
+# (test_14a_newline_characters.txt). If any of those bytes occur *inside* a
+# line's content (e.g. a NEL byte pasted into a JS string literal, or a
+# stray FF page-break char), splitlines() silently manufactures an extra
+# line the file doesn't actually have. Every diff opcode from that point
+# onward is then off by one row against the other side -- this create a
+# "drift" bug where two on-screen lines get produced from one real line.
+#
+# We only ever want to split on real line endings: \n, \r\n, or bare \r
+# (LF / CRLF / old-Mac CR). Everything else in that Unicode set should
+# stay as ordinary line content.
+#
+# IMPORTANT: this pattern has NO capturing parentheses -- it is used with
+# finditer(), not re.split(), so there is nothing to capture. Each match's
+# m.end() is read directly to slice text[pos:m.end()], which is how the
+# terminator stays attached to its line's content. If this pattern is
+# ever changed to power a re.split() call instead, the group MUST be
+# wrapped in parentheses -- r'(\r\n|\r|\n)' -- or re.split() silently
+# discards the terminators, collapsing the output to [content, content,
+# ...] and merging every pair of consecutive lines together.
+_LINE_SPLIT_RE = re.compile(r'\r\n|\r|\n')
+
+def split_lines_safe(text: str) -> tp.List[str]:
+    """Split text into lines on \\n, \\r\\n, or \\r ONLY.
+
+    Drop-in replacement for text.splitlines(True) that does NOT treat
+    VT, FF, NEL, LS, PS...etc as line boundaries (see comment above _LINE_SPLIT_RE).
+    Keepends behavior is preserved: each returned line includes its
+    original terminator, matching what splitlines(True) callers expect.
+    A trailing terminator-less remainder (if the text doesn't end in a
+    line ending) is included as the final element with no terminator,
+    same as splitlines(True). Empty input returns [].
+ 
+    Details:
+    splitlines splits on the following 11 line boundaries: https://docs.python.org/3/library/stdtypes.html#str.splitlines
+    - \\n Line Feed
+    - \\r Carriage Return
+    - \\r\\n Carriage Return + Line Feed 
+    - \\v or \\x0b Line Tabulation (Vertical Tab (VT))
+    - \\f or \\x0c Form Feed (Page Break)
+    - \\x1c File Separator (FS, \\u001C)
+    - \\x1d Group Separator (GS, \\u001D):
+    - \\x1e Record Separator (RS, \\u001E)
+    - \\x85 Next Line (C1 Control Code, NEL, \\u0085)
+    - \\u2028 Line Separator (LS)
+    - \\u2029 Paragraph Separator (PS)
+       
+    This functions splits *text* into a list of lines, keeping each line's terminator
+    appended (matching str.splitlines(True)'s keepends=True contract),
+    but splitting ONLY on \\r\\n, \\r, \\n -- NOT on NEL/VT/FF/LS/PS...etc.
+    This matches how CudaText stores lines internally: a line containing
+    an embedded NEL/VT/FF/LS/PS...etc is a single logical line, not two.
+    A trailing empty element (after a final terminator) is dropped, so
+    "abc\\n" -> ["abc\\n"] -- same as str.splitlines(True).
+    
+    CudaText's editor only treats CR, LF, and CRLF as line breaks; the other
+    characters stay inside a single logical line and are rendered as
+    in-line control pictures. Using str.splitlines() here would split on
+    those extra characters too, producing more "lines" than the editor
+    actually has, which causes every diff event line index to drift out
+    of sync with the editor (see _refresh_ex).
+
+    Why I use re.finditer and not str.split(): split() can't do this job at all, for one structural reason -- it discards the delimiter. "a\\r\\nb".split('\\r\\n') gives you ['a', 'b'] with the \\r\\n gone. But set_seqs/unidiff call this with keepends=True semantics -- every line needs its original terminator still attached, because the diff engine uses that terminator when reconstructing/rendering output. So whatever splits also has to capture what it split on.
+    Three ways to get delimiter-preserving split, ranked:
+    1. re.split() with a capturing group — re.split(r'(\\r\\n|\\r|\\n)', text) returns alternating content/delimiter pieces you'd then have to re-zip back together in a loop. Works, but it's an extra reconstruction pass for no benefit over option 2.
+    2. finditer (what I used) — one pass, and at each match I already have m.end(), so I slice text[pos:m.end()] directly — content and its trailing terminator in one slice, no reassembly step. This is what I wrote.
+    3. Manual two-pointer scan (no regex) — check each position for \\r, \\n, or \\r\\n by hand, same asymptotic cost, more code, easier to get the "is this \\r followed by \\n" lookahead wrong. Not worth it here.
+    There's a subtlety str.split() would also get wrong even ignoring the discard problem: splitting on \\r and \\n as separate single-char delimiters (e.g. chaining two .split() calls, or re.split(r'[\\r\\n]')) treats \\r\\n as two boundaries, producing a spurious empty string between them. My pattern lists r'\\r\\n|\\r|\\n' with \\r\\n first, so regex alternation matches the two-char sequence before it'd consider the lone \\r — that ordering is why CRLF collapses to one boundary instead of two. If I'd written r'\\r|\\n|\\r\\n' instead, alternation still tries left-to-right per position, so \\r would win before \\r\\n got a chance and you'd get the same double-split bug. It's already correctly ordered in the delivered code, but worth knowing why the ordering matters if you ever touch that pattern.
+    
+    and finditer is faster than re.split() in my tests
+    """
+    if not text:
+        return []
+    lines = []
+    pos = 0
+    for m in _LINE_SPLIT_RE.finditer(text):
+        lines.append(text[pos:m.end()])
+        pos = m.end()
+    if pos < len(text):
+        lines.append(text[pos:])
+    return lines
+
 
 class ScrollSplittedTab:
-    """Manages synchronized scrolling for split compare tabs. Inlined from
-    scroll.py to reduce file count -- small enough to live in __init__.py."""
+    """Manages synchronized scrolling for split compare tabs."""
 
     keep_caret_visible = False
 
@@ -760,8 +844,8 @@ class Command:
         Used by diff_with and diff_with_tab commands."""
         if txt0 and txt0[-1] != '\n': txt0 += '\n'
         if txt1 and txt1[-1] != '\n': txt1 += '\n'
-        a = txt0.splitlines(True)
-        b = txt1.splitlines(True)
+        a = split_lines_safe(txt0)
+        b = split_lines_safe(txt1)
         r = self.diff.unidiff(a, b, fn0, fn1, self.cfg.get('diff_context'))
 
         global DIFF_TAB_COUNT
@@ -1237,10 +1321,10 @@ class Command:
             # algorithm in config since the last compare.
             self._ensure_correct_differ()
 
-            Profiler.start('refresh:splitlines')
-            self.diff.set_seqs(a_text_all.splitlines(True),
-                               b_text_all.splitlines(True))
-            Profiler.stop('refresh:splitlines')
+            Profiler.start('refresh:split_lines_safe')
+            self.diff.set_seqs(split_lines_safe(a_text_all),
+                               split_lines_safe(b_text_all))
+            Profiler.stop('refresh:split_lines_safe')
 
             self.scroll.tab_id.add(tab_id)
             self.scroll.toggle(self.cfg.get('sync_scroll'))
