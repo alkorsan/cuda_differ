@@ -111,15 +111,13 @@ class CudaDiffNativeMatcher:
             text_b,
             self._algo,
             0,                   # flags: DIFF_IGN_NONE (no ignore flags yet)
-            None,                # cancel: none
         )
         Profiler.stop('native:diff_proc_call')
-        # The native API returns None when cancelled; without a cancel
-        # callback this cannot happen, but be defensive.
+        # The native API always returns a valid opcode list.
         if result is None:
-            # Fall back to a single REPLACE covering everything so the
-            # caller's opcode-walking loop still produces sensible output
-            # (everything painted as changed) instead of crashing.
+            # Defensive: should never happen, but fall back to a single
+            # REPLACE covering everything so the caller's opcode-walking
+            # loop still produces sensible output (everything painted as changed) instead of crashing.
             result = [('replace', 0, len(self.a), 0, len(self.b))]
         self.opcodes = result
         return result
@@ -309,14 +307,13 @@ class Differ:
                     line_b,
                     0,                   # algo: unused for DIF_CHARS
                     0,                   # flags: DIFF_IGN_NONE (no ignore flags yet)
-                    None,                # cancel: none
                 )
             finally:
                 _ct.msg_status(_('Differ: Native char_diff used'))
                 Profiler.stop('char_diff:native_call')
             if result is None:
-                # Cancelled (shouldn't happen without a cancel callback)
-                # — fall back to a single REPLACE covering everything.
+                # Defensive: should never happen — fall back to a single
+                # REPLACE covering everything.
                 result = [('replace', 0, len(line_a), 0, len(line_b))]
             return result
         else:

@@ -39,18 +39,7 @@ except ImportError:
     from myers import MyersSequenceMatcher
 
 
-# WinMerge stringdiffs.cpp line 396-404 (BuildWordDiffList):
-#
-#     #ifdef _WIN64
-#         if (m_words1.size() < 20480 && m_words2.size() < 20480)
-#     #else
-#         if (m_words1.size() < 2048 && m_words2.size() < 2048)
-#     #endif
-#         {
-#             succeeded = BuildWordDiffList_DP();
-#         }
-#         if (!succeeded) { /* emit one big wdiff spanning both lines */ }
-#
+# WinMerge stringdiffs.cpp (BuildWordDiffList):
 # WinMerge uses 20480 words per side on 64-bit builds, 2048 on 32-bit
 # builds. Python has no 32-bit memory constraint, so we always use 20480.
 #

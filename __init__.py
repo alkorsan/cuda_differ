@@ -1248,9 +1248,7 @@ class Command:
                     overview.b_ed = b_ed
                 # Get the editor text background color from the UI theme so
                 # the overview matches the editor (works with both light and
-                # dark themes). The font color (EdTextFont) is no longer
-                # used by the overview — color_cursor was removed as dead
-                # code (set but never read in any paint method).
+                # dark themes).
                 try:
                     ui_theme = ct.app_proc(ct.PROC_THEME_UI_DICT_GET, '')
                     color_bg = ui_theme.get('EdTextBg', {}).get('color', 0xFFFFFF)
