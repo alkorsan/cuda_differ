@@ -20,13 +20,15 @@ from difflib import SequenceMatcher as DefaultSequenceMatcher, unified_diff
 from .char_diff import char_diff
 from .profiling import Profiler
 from collections import Counter
+import cudatext as _ct
+from cudax_lib import get_translation
+_ = get_translation(__file__)  # I18N
 
 # Import cudatext and detect whether the native diff_proc API is available.
 # Only _HAS_NATIVE_DIFF is exposed; all other constants (DIF_TEXTS,
 # DIF_CHARS, DIFF_ALGO_MYERS, DIFF_ALGO_HISTOGRAM) are accessed directly
 # via _ct.<NAME> at the call sites.
 try:
-    import cudatext as _ct
     _HAS_NATIVE_DIFF = hasattr(_ct, 'diff_proc')
 except ImportError:
     _HAS_NATIVE_DIFF = False
@@ -287,6 +289,17 @@ class Differ:
         character positions into line_a / line_b. Same format as
         difflib.SequenceMatcher.get_opcodes() operating on characters.
         """
+        # Early bail-out for very long lines: skip the native call
+        # entirely and return a single REPLACE. The Pascal DoDiffChars
+        # would do the same inside diff_proc(DIF_CHARS) (its Tokenize
+        # pre-allocates N tokens where N = byte length, which for
+        # 100KB+ lines causes massive heap allocation that leads to
+        # EAccessViolation when repeated across many line pairs).
+        # Checking here avoids the Python→C→Pascal→C→Python round-trip
+        # and the heap churn entirely.
+        if len(line_a) > 100000 or len(line_b) > 100000:
+            return [('replace', 0, len(line_a), 0, len(line_b))]
+
         if _HAS_NATIVE_DIFF:
             Profiler.start('char_diff:native_call')
             try:
@@ -299,6 +312,7 @@ class Differ:
                     None,                # cancel: none
                 )
             finally:
+                _ct.msg_status(_('Differ: Native char_diff used'))
                 Profiler.stop('char_diff:native_call')
             if result is None:
                 # Cancelled (shouldn't happen without a cancel callback)
