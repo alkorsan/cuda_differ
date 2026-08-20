@@ -18,7 +18,9 @@ from .vscode_diff import VSCodeSequenceMatcher
 from .char_diff import char_diff
 from .profiling import Profiler
 from collections import Counter
-
+import cudatext as _ct
+from cudax_lib import get_translation
+_ = get_translation(__file__)  # I18N
 
 def HybridSequenceMatcher(isjunk=None, a='', b=''):
     """Create a hybrid diff matcher that combines patience + Myers.
@@ -293,10 +295,22 @@ class Differ:
         character positions into line_a / line_b. Same format as
         difflib.SequenceMatcher.get_opcodes() operating on characters.
         """
+        # Early bail-out for very long lines: skip the native call
+        # entirely and return a single REPLACE. The Pascal DoDiffChars
+        # would do the same inside diff_proc(DIF_CHARS) (its Tokenize
+        # pre-allocates N tokens where N = byte length, which for
+        # 100KB+ lines causes massive heap allocation that leads to
+        # EAccessViolation when repeated across many line pairs).
+        # Checking here avoids the Python→C→Pascal→C→Python round-trip
+        # and the heap churn entirely.
+        if len(line_a) > 100000 or len(line_b) > 100000:
+            return [('replace', 0, len(line_a), 0, len(line_b))]
+
         Profiler.start('char_diff:python_call')
         try:
             return char_diff(line_a, line_b)
         finally:
+            _ct.msg_status(_('Differ: Python char_diff used'))
             Profiler.stop('char_diff:python_call')
 
     # Threshold for the "trivial equal block" check in _realign_opcodes.
