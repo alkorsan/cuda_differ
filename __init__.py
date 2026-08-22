@@ -864,7 +864,8 @@ class Command:
         state changes (re-apply gaps with wrap-aware sizes)."""
         if state == ct.APPSTATE_THEME_SYNTAX:
             self.get_config()
-            self._refresh_ex(ct.ed)  # automatic -- no dialog
+            # each time we change setting using the options editor the state even APPSTATE_THEME_UI fires which triger a refresh , if files are big it take time which is frustrating, if the user needs to refresh then he can do it manualy, lets not auto refresh for him
+            # self._refresh_ex(ct.ed)  # automatic -- no dialog
         elif state == ct.EDSTATE_WRAP:
             # Word-wrap mode changed on one of the split halves. The
             # inter-line gaps were sized for the previous wrap state, so
