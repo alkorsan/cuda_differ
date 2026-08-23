@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import time
 import typing as tp
 
 import cudatext as ct
@@ -596,7 +597,8 @@ class Command:
         ct.ini_proc(ct.INI_DELETE_KEY, PLUGINS_INI, PLUGINS_INI_SECTION, MODULE_NAME)
 
     def change_config(self):
-        """Open the options dialog (cuda_options_editor or cuda_prefs) for
+        """Open the options dialog (cuda_options_editor (Options Editor plugin) 
+        or cuda_prefs (Options Editor Lite builtin plugin)) for
         the 'differ.*' settings. After the dialog closes, reload config and
         re-apply sync scroll setting."""
         try:
@@ -1253,6 +1255,14 @@ class Command:
 
         # Wrap the entire compare in try/finally so the profiling report
         # is always printed — even if the compare crashes with an exception.
+        #
+        # _compare_start times the WHOLE refresh (algorithm + event
+        # generation + painting + bookmarks + overview) using a plain
+        # time.perf_counter(). This is INDEPENDENT of the Profiler: it
+        # runs whether profiling is on or off, and is what gets shown on
+        # the status bar after every compare so you always know how long
+        # the last compare took.
+        _compare_start = time.perf_counter()
         try:
             Profiler.start('refresh:total')
 
@@ -1599,6 +1609,24 @@ class Command:
 
             Profiler.stop('refresh:total')
         finally:
+            # Always show the total compare time on the status bar —
+            # INDEPENDENT of profiling. This runs whether profiling is
+            # on or off, so you always know how long the last compare
+            # took (algorithm + event generation + painting + bookmarks
+            # + overview). Format adapts to duration for readability.
+            _compare_elapsed = time.perf_counter() - _compare_start
+            if _compare_elapsed < 1.0:
+                ct.msg_status(_('Differ: compared in {:.0f}ms').format(
+                    _compare_elapsed * 1000.0))
+            elif _compare_elapsed < 60.0:
+                ct.msg_status(_('Differ: compared in {:.1f}s').format(
+                    _compare_elapsed))
+            else:
+                _mins = int(_compare_elapsed // 60)
+                _secs = _compare_elapsed - _mins * 60
+                ct.msg_status(_('Differ: compared in {}m {:.0f}s').format(
+                    _mins, _secs))
+
             # Always print the profiling report — even if the compare
             # crashed with an exception. This ensures you can see WHERE
             # the time was spent (or where it crashed) even on big files.
