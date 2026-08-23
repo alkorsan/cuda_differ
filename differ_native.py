@@ -62,8 +62,8 @@ class CudaDiffNativeMatcher:
     # Algorithm IDs — accessed directly from cudatext (_ct) at the call
     # sites. These class attributes are kept for API compatibility with
     # code that references CudaDiffNativeMatcher._ALGO_MYERS etc.
-    _ALGO_MYERS = 0  # DIFF_ALGO_MYERS (cudatext constant)
-    _ALGO_HISTOGRAM = 1  # DIFF_ALGO_HISTOGRAM (cudatext constant)
+    _ALGO_MYERS = 0  # DIFF_ALGO_MYERS
+    _ALGO_HISTOGRAM = 1  # DIFF_ALGO_HISTOGRAM
 
     def __init__(self, isjunk=None, a='', b='', algo=1):
         """Create a native diff matcher.
@@ -73,8 +73,13 @@ class CudaDiffNativeMatcher:
                 native engine does not support junk heuristics).
             a, b: sequences of lines (list of str, each with its line
                 terminator attached -- i.e. keepends=True).
-            algo: CudaDiffNativeMatcher._ALGO_MYERS (0) or
-                  CudaDiffNativeMatcher._ALGO_HISTOGRAM (1, default).
+            algo: CudaDiffNativeMatcher._ALGO_MYERS (0) — WinMerge's GNU
+                  diffutils Myers with Eggert heuristic. Faster on large /
+                  different files.
+                  CudaDiffNativeMatcher._ALGO_HISTOGRAM (1, default) — JGit
+                  HistogramDiff with MyersDiff as internal fallback for
+                  sub-regions. Patience-style anchoring on unique lines,
+                  more human-readable for normal files.
         """
         self.a = a
         self.b = b
@@ -490,13 +495,16 @@ class Differ:
             'def foo(self):' with 'def bar(self):') so char_diff highlights
             only the differing characters.
     
-            Note: the line-level diff algorithm (cudadiff.pas / Myers) already
-            found ALL exactly-equal lines and emitted them as separate EQUAL
-            opcodes. So this function does NOT re-run Myers — the exact-match
-            search in _find_best_pairs only finds matches that Myers missed
-            (rare, can happen with the TOO_EXPENSIVE heuristic). The main
+            Note: the line-level diff algorithm (cudadiffmyers.pas for
+            DIFF_ALGO_MYERS, cudadiffhistogram.pas for DIFF_ALGO_HISTOGRAM)
+            already found ALL exactly-equal lines and emitted them as
+            separate EQUAL opcodes. So this function does NOT re-run a
+            line-level diff — the exact-match search in _find_best_pairs
+            only finds matches that the engine missed (rare; can happen
+            with the Eggert TOO_EXPENSIVE heuristic under DIFF_ALGO_MYERS,
+            or with HistogramDiff's max_chain_length fallback). The main
             value of _find_best_pairs is the prefix/suffix scoring for
-            similar-but-not-equal lines, which Myers does not do.
+            similar-but-not-equal lines, which neither engine does.
             
         beautify_alignment = False (NEW, WinMerge-faithful, default)
             Render exactly the way WinMerge / GNU diffutils side-by-side
@@ -598,7 +606,8 @@ class Differ:
         the parts before and after. A minimum prefix threshold (>= 3 chars)
         prevents pairing completely unrelated lines.
 
-        The line-level diff (cudadiff.pas) already found all exactly-equal
+        The line-level diff (cudadiffmyers.pas for DIFF_ALGO_MYERS,
+        cudadiffhistogram.pas for DIFF_ALGO_HISTOGRAM) already found all exactly-equal
         lines, so the exact-match search here mainly catches rare cases
         where the TOO_EXPENSIVE heuristic produced a suboptimal REPLACE.
         The main value is the prefix/suffix scoring for similar-but-not-
@@ -778,7 +787,7 @@ class Differ:
 
     def _char_diff_pair(self, ai, bj, ops):
         """Yield character-level diff events for a single line pair,
-        given the char-level opcodes from char_diff().
+        given the char-level opcodes from native engine char_diff().
         Shared by BOTH alignment modes
         Pure glue — no decisions made here.
 

@@ -243,24 +243,31 @@ OPTS_META = [
     {'opt': 'differ.diff_algorithm',
      'cmt': _('Diff algorithm to use. Native Histogram and Native Myers '
               'call the built-in cudatext.diff_proc() API and run in '
-              'compiled Pascal code (ports of JGit\'s HistogramDiff and '
-              'MyersDiff — the same algorithms git uses). They are 10-30x '
-              'faster than the pure-Python implementations on large files; '
-              'Native Histogram is the default. The other algorithms are '
-              'pure-Python: Hybrid combines patience anchoring on unique '
+              'compiled Pascal code. Native Myers is a port of WinMerge\'s '
+              'bundled GNU diffutils Myers with the '
+              'Eggert TOO_EXPENSIVE heuristic — the same algorithm git uses '
+              'for `git diff --myers`; faster on large/different files. '
+              'Native Histogram is a port of JGit\'s HistogramDiff '
+              'with JGit\'s MyersDiff as '
+              'internal fallback for sub-regions — the same algorithm git '
+              'uses for `git diff --histogram`; patience-style anchoring on '
+              'unique lines, more human-readable for normal files. Native algorithms'
+              'are 10-30x faster than the pure-Python implementations on large '
+              'files; Native Histogram is the default. The other algorithms '
+              'are pure-Python: Hybrid combines patience anchoring on unique '
               'lines with Myers for the gaps (best pure-Python quality); '
               'Myers is O(NP) (Wu/Manber/Myers/Miller 1989); VS Code uses '
               'dynamic programming with equality scoring (best for files '
               'with duplicated lines, slowest); Patience anchors on unique '
-              'matching lines; difflib is Python\'s stdlib SequenceMatcher. '
+              'matching lines; difflib is Python\'s stdlib SequenceMatcher (slow). '
               'Default: Native Histogram.'),
      'def': 'native_histogram',
      'frm': 'str2s',
-     'dct': [('native_histogram', _('Native Histogram (JGit, fastest, recommended)')),
-             ('native_myers',     _('Native Myers (JGit, linear-space)')),
-             ('hybrid',           _('Hybrid (Python: Patience + Myers)')),
+     'dct': [('native_histogram', _('Native Histogram (More human-readable, recommended)')),
+             ('native_myers',     _('Native Myers (Fastest on large/different files)')),
+             ('hybrid',           _('Hybrid (Python: Patience + Myers. More human-readable, slow)')),
              ('myers',            _('Myers (Python: O(NP), fastest Python)')),
-             ('vscode',           _('VS Code (Python: DP + Myers)')),
+             ('vscode',           _('VS Code (Python: DP + Myers, very slow with big files)')),
              ('patience',         _('Patience Diff (Python)')),
              ('difflib',          _('Python difflib stdlib'))],
      'chp': 'config',
