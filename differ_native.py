@@ -1,9 +1,8 @@
 """Differ module for native algorithms (native_histogram, native_myers).
 
 This file is self-contained: it contains everything needed to run the
-native diff algorithms (Myers and Histogram, implemented in Free Pascal
-in cudadiff.pas and exposed via cudatext.diff_proc). It does NOT depend
-on differ_python.py.
+native diff engine implemented in Free Pascal and exposed via
+cudatext.diff_proc. It does NOT depend on differ_python.py.
 
 The native engine is 10-30x faster than the pure-Python matchers on
 large files. For Python-only algorithms (hybrid, myers, vscode, patience,
@@ -12,7 +11,15 @@ difflib), use differ_python.py instead.
 Code is intentionally duplicated from differ_python.py to allow
 independent evolution of the native and Python codepaths. As more
 diff logic moves into the Pascal native engine, this file will shrink
-to a thin wrapper around cudatext.diff_proc.
+to a thin wrapper around cudatext.diff_proc if God wills.
+
+Alignment modes (self.beautify_alignment):
+  True  = 'beautified' alignment: similar lines inside a changed block are
+          re-paired by similarity (VS Code-like). Uses _find_best_pairs.
+  False = WinMerge-faithful: the engine's hunks are rendered exactly the
+          way WinMerge / diffutils side-by-side (sdiff) output does —
+          positional top-down pairing, leftovers as plain add/delete.
+          Nothing is re-paired, re-ordered or split. Default.
 """
 
 import time
@@ -25,9 +32,6 @@ from cudax_lib import get_translation
 _ = get_translation(__file__)  # I18N
 
 # Import cudatext and detect whether the native diff_proc API is available.
-# Only _HAS_NATIVE_DIFF is exposed; all other constants (DIF_TEXTS,
-# DIF_CHARS, DIFF_ALGO_MYERS, DIFF_ALGO_HISTOGRAM) are accessed directly
-# via _ct.<NAME> at the call sites.
 try:
     _HAS_NATIVE_DIFF = hasattr(_ct, 'diff_proc')
 except ImportError:
@@ -37,8 +41,7 @@ except ImportError:
 class CudaDiffNativeMatcher:
     """Difflib-compatible wrapper around cudatext.diff_proc().
 
-    Calls the native Free Pascal diff engine (Myers or Histogram, ported
-    from JGit) exposed at cudatext.diff_proc(). The native engine is
+    Calls the native Free Pascal diff engine exposed at cudatext.diff_proc(). The native engine is
     dramatically faster than any of the pure-Python matchers on large
     files (10-30x speedup is typical).
 
@@ -110,7 +113,7 @@ class CudaDiffNativeMatcher:
             text_a,
             text_b,
             self._algo,
-            0,                   # flags: DIFF_IGN_NONE (no ignore flags yet)
+            0,                   # flags: DIFF_IGN_NONE
         )
         Profiler.stop('native:diff_proc_call')
         # The native API always returns a valid opcode list.
@@ -267,6 +270,13 @@ class Differ:
         self.diff_algorithm = 'native_histogram'
         self.autojunk = True
         self.ratio = 0.75  # kept for API compat with __init__.py; unused
+        # alignment mode toggle.
+        #   True  = OLD 'beautified' alignment (_find_best_pairs re-pairs
+        #           similar lines inside unequal-count replace blocks).
+        #   False = WinMerge-faithful positional rendering (default).
+        # __init__.py overrides this from the 'differ.beautify_alignment'
+        # option — see Command._create_differ.
+        self.beautify_alignment = False
         self.set_seqs(a, b)
         self.diffmap = []
 
@@ -278,9 +288,9 @@ class Differ:
     def _char_diff(self, line_a, line_b):
         """Compute char-level diff between two single-line strings.
 
-        Always uses the native cudatext.diff_proc(DIF_CHARS) API — this
-        Differ is native-only. The Python char_diff fallback is in
-        differ_python.Differ._char_diff.
+        Uses the native cudatext.diff_proc(DIF_CHARS) API
+        Falls back to the Python char_diff only if the native
+        API is unavailable.
 
         Returns: list of (tag, a_start, a_end, b_start, b_end) tuples
         where tag is 'equal'/'delete'/'insert'/'replace' and offsets are
@@ -306,7 +316,7 @@ class Differ:
                     line_a,
                     line_b,
                     0,                   # algo: unused for DIF_CHARS
-                    0,                   # flags: DIFF_IGN_NONE (no ignore flags yet)
+                    0,                   # flags: DIFF_IGN_NONE
                 )
             finally:
                 _ct.msg_status(_('Differ: Native char_diff used'))
@@ -328,7 +338,13 @@ class Differ:
     def compare(self):
         """Generator that yields diff events for side-by-side display.
 
-        Runs the native diff algorithm (native_histogram or native_myers),
+        Pure translation of the engine's opcodes into paint events —
+        nothing is added, removed or re-paired here.
+        
+        The alignment mode (beautify_alignment) only affects how
+        unequal-count REPLACE blocks are laid out — see _replace_block.
+        
+        Runs the native diff algorithm,
         then walks the opcodes and yields events (A_LINE_DEL, B_LINE_ADD,
         A_GAP, B_GAP, ALIGN, A_SYMBOL_DEL, etc.) that __init__.py
         consumes to paint the compare view.
@@ -338,7 +354,7 @@ class Differ:
 
         NOTE: _realign_opcodes is NOT called here — native algorithms
         don't produce the INSERT+EQUAL(trivial)+DELETE patterns that
-        _realign_opcodes fixes (that's a Python Myers/difflib issue).
+        _realign_opcodes fixes (that's a Python Myers/difflib issue). TODO: this is not true, correct it
         """
         # Benchmark: when _BENCHMARK is True, measure the total time from
         # when the generator starts executing until it is fully consumed
@@ -403,8 +419,7 @@ class Differ:
         if _bm_start is not None:
             _bm_elapsed = time.perf_counter() - _bm_start
             print('Differ: compare took {:.1f}ms '
-                  '(algo={}, a={}lines, b={}lines, '
-                  'opcodes={}diffs, events_generated)'.format(
+                  '(algo={}, a={}lines, b={}lines, opcodes={}diffs)'.format(
                       _bm_elapsed * 1000,
                       self.diff_algorithm,
                       len(self.a), len(self.b),
@@ -429,34 +444,78 @@ class Differ:
             diff = _unified_diff(a, b, f1, f2, n=n, autojunk=False)
         return ''.join(diff)
 
+    def _positional_pairs(self, a, alo, b, blo, count):
+        """Pair the k-th A line with the k-th B line, top-down, for
+        `count` pairs. For identical lines yield ALIGN only; for
+        different lines run the native char diff and yield its paint
+        events, then ALIGN. No heuristics — this is the sdiff/WinMerge
+        alignment, also used by the OLD beautify mode when line counts
+        are equal (the old code did exactly this in that case).
+        """
+        for k in range(count):
+            ai, bj = alo + k, blo + k
+            if a[ai] == b[bj]:
+                yield (ALIGN, ai, bj)
+            else:
+                Profiler.start('char_diff:per_line')
+                ops = self._char_diff(a[ai], b[bj])
+                Profiler.stop('char_diff:per_line')
+                yield from self._char_diff_pair(ai, bj, ops)
+                yield (ALIGN, ai, bj)
+
     def _replace_block(self, a, alo, ahi, b, blo, bhi):
         """Process a 'replace' opcode: a[alo:ahi] is replaced by b[blo:bhi].
+        
+        Aligns lines within a REPLACE block for visual display.
 
-        Aligns lines within a REPLACE block for visual display. Two paths:
+        Two rendering modes, selected by self.beautify_alignment:
 
-        Fast path (da == db): positional pairing — pair 1st line of A with
-        1st line of B, 2nd with 2nd, etc. For each pair, if lines are
-        identical yield ALIGN; otherwise run char_diff and yield the
-        char-level changes. This is the common case and avoids the O(N*M)
-        prefix/suffix search.
+        beautify_alignment = True (OLD, 'beautified' alignment)
+            Unequal line counts use _find_best_pairs(): anchor on the
+            longest unique exact match or the best prefix/suffix-similar
+            pair, char-diff it, recurse on both sides. Lines with < 3
+            chars of similarity are shown as separate delete+add.
+            VS Code-like; re-arranges the engine's output.
+    
+            Fast path (da == db): positional pairing — pair 1st line of A with
+            1st line of B, 2nd with 2nd, etc. For each pair, if lines are
+            identical yield ALIGN; otherwise run char_diff and yield the
+            char-level changes. This is the common case and avoids the O(N*M)
+            prefix/suffix search.
+    
+            Slow path (da != db): _find_best_pairs — find the best-matching
+            line pair by (1) exact unique match (longest wins), then (2) common
+            prefix/suffix length scoring. Recurse on the parts before and after
+            the best pair. This aligns similar-but-not-equal lines (e.g.
+            'def foo(self):' with 'def bar(self):') so char_diff highlights
+            only the differing characters.
+    
+            Note: the line-level diff algorithm (cudadiff.pas / Myers) already
+            found ALL exactly-equal lines and emitted them as separate EQUAL
+            opcodes. So this function does NOT re-run Myers — the exact-match
+            search in _find_best_pairs only finds matches that Myers missed
+            (rare, can happen with the TOO_EXPENSIVE heuristic). The main
+            value of _find_best_pairs is the prefix/suffix scoring for
+            similar-but-not-equal lines, which Myers does not do.
+            
+        beautify_alignment = False (NEW, WinMerge-faithful, default)
+            Render exactly the way WinMerge / GNU diffutils side-by-side
+            (sdiff) output does: pair the first min(da, db) lines
+            top-down by position (char-diff each pair via the native
+            engine), and show leftover lines on the longer side as plain
+            added/deleted lines against a gap at the bottom of the
+            shorter side. Nothing is re-paired or re-ordered.
 
-        Slow path (da != db): _find_best_pairs — find the best-matching
-        line pair by (1) exact unique match (longest wins), then (2) common
-        prefix/suffix length scoring. Recurse on the parts before and after
-        the best pair. This aligns similar-but-not-equal lines (e.g.
-        'def foo(self):' with 'def bar(self):') so char_diff highlights
-        only the differing characters.
-
-        Note: the line-level diff algorithm (cudadiff.pas / Myers) already
-        found ALL exactly-equal lines and emitted them as separate EQUAL
-        opcodes. So this function does NOT re-run Myers — the exact-match
-        search in _find_best_pairs only finds matches that Myers missed
-        (rare, can happen with the TOO_EXPENSIVE heuristic). The main
-        value of _find_best_pairs is the prefix/suffix scoring for
-        similar-but-not-equal lines, which Myers does not do.
+        Equal line counts (da == db) are positional in BOTH modes, so the modes
+        diverge only in the da != db branch below.
         """
         Profiler.start('replace_block:total')
         da, db = ahi - alo, bhi - blo
+
+        # Defensive only — a 'replace' opcode from the engine always has
+        # both sides non-empty (pure insert/delete arrive as their own
+        # opcodes in compare()). These branches contain no heuristics;
+        # they just render a degenerate opcode faithfully.
         if da == 0 and db == 0:
             Profiler.stop('replace_block:total')
             return
@@ -486,30 +545,45 @@ class Differ:
         # da != db, because that's when positional pairing might misalign
         # similar lines.
         if da == db:
+            # Shared fast path — positional pairing (both modes).
             Profiler.start('replace_block:positional_pair')
-            common = min(da, db)
-            for k in range(common):
-                ai, bj = alo + k, blo + k
-                if a[ai] == b[bj]:
-                    yield (ALIGN, ai, bj)
-                else:
-                    Profiler.start('char_diff:per_line')
-                    ops = self._char_diff(a[ai], b[bj])
-                    Profiler.stop('char_diff:per_line')
-                    yield from self._char_diff_pair(ai, bj, ops)
-                    yield (ALIGN, ai, bj)
+            yield from self._positional_pairs(a, alo, b, blo, da)
             Profiler.stop('replace_block:positional_pair')
             Profiler.stop('replace_block:total')
             return
 
-        # Different line counts (da != db): use _find_best_pairs which
-        # finds the best-matching pair by exact unique match (longest
-        # wins) or prefix/suffix length scoring, then recurses.
-        yield from self._find_best_pairs(a, alo, ahi, b, blo, bhi)
+        # ---- da != db: the two modes diverge here ----
+        if self.beautify_alignment:
+            # OLD: anchor + prefix/suffix scoring + threshold + staggering.
+            # Different line counts (da != db): use _find_best_pairs which
+            # finds the best-matching pair by exact unique match (longest
+            # wins) or prefix/suffix length scoring, then recurses.
+            yield from self._find_best_pairs(a, alo, ahi, b, blo, bhi)
+        else:
+            # NEW (WinMerge): positional top-down pairing; leftovers on
+            # the longer side are plain added/deleted lines against a gap
+            # at the bottom of the shorter side's block (same convention
+            # as _plain_replace_simple).
+            Profiler.start('replace_block:positional_pair')
+            common = min(da, db)
+            yield from self._positional_pairs(a, alo, b, blo, common)
+            if da > common:
+                yield (B_GAP, bhi, alo + common, ahi)
+                for y in range(alo + common, ahi):
+                    yield (A_LINE_DEL, y)
+            elif db > common:
+                yield (A_GAP, ahi, blo + common, bhi)
+                for y in range(blo + common, bhi):
+                    yield (B_LINE_ADD, y)
+            Profiler.stop('replace_block:positional_pair')
+
         Profiler.stop('replace_block:total')
 
     def _find_best_pairs(self, a, alo, ahi, b, blo, bhi):
         """Find the best line alignment within a sub-REPLACE block.
+
+        ONLY USED WHEN self.beautify_alignment is True (the OLD
+        'beautified' alignment mode).
 
         Finds the best-matching line pair using two strategies:
         1. Exact unique match: build a dict of unique lines in a[alo:ahi],
@@ -705,6 +779,8 @@ class Differ:
     def _char_diff_pair(self, ai, bj, ops):
         """Yield character-level diff events for a single line pair,
         given the char-level opcodes from char_diff().
+        Shared by BOTH alignment modes
+        Pure glue — no decisions made here.
 
         The line is marked as A_LINE_CHANGE / B_LINE_CHANGE (yellow/red/
         green decor based on whether char-level deletes or inserts were
@@ -733,7 +809,7 @@ class Differ:
 
     def _plain_replace_simple(self, a, alo, ahi, b, blo, bhi):
         """Non-detailed replace (withdetail=False). Pairs lines by position
-        and marks all as A_LINE_CHANGE/B_LINE_CHANGE with yellow decor
+        and marks all as changed (A_LINE_CHANGE/B_LINE_CHANGE) with yellow decor
         (no char-level highlights)."""
         da, db = ahi - alo, bhi - blo
         common = min(da, db)

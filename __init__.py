@@ -275,6 +275,30 @@ OPTS_META = [
      'frm': 'bool',
      'chp': 'config',
      },
+    {'opt': 'differ.beautify_alignment',
+     'cmt': _('Beautified line alignment inside REPLACE blocks where the '
+              'two sides have DIFFERENT line counts. '
+              'When OFF (default, WinMerge-faithful): lines are paired '
+              'top-down by position for the first min(da, db) lines, and '
+              'leftover lines on the longer side are shown as plain '
+              'added/deleted lines against a gap at the bottom of the '
+              'shorter side. Nothing is re-paired or re-ordered — matches '
+              'WinMerge / GNU diffutils sdiff output. '
+              'When ON (VS Code-like): the engine\'s hunks are re-paired '
+              'by similarity — _find_best_pairs anchors on the longest '
+              'unique exact match or the best prefix/suffix-similar pair, '
+              'char-diffs it, and recurses on both sides. Lines with < 3 '
+              'chars of similarity are shown as separate delete+add. This '
+              're-arranges the engine\'s output for a more "aligned" look '
+              'but is no longer a faithful rendering of the diff. '
+              'Applies to both native and Python algorithms. '
+              'Equal-count REPLACE blocks (da == db) are positional in '
+              'BOTH modes, so this option only affects unequal-count '
+              'REPLACE blocks. Default: off.'),
+     'def': False,
+     'frm': 'bool',
+     'chp': 'config',
+     },
     {'opt': 'differ.enable_profiling',
      'cmt': _('Enable profiling to trace where compare time is consumed. '
               'Outputs a detailed timing report to the console after each '
@@ -1173,11 +1197,13 @@ class Command:
         old_withdetail = getattr(self.diff, 'withdetail', True)
         old_autojunk = getattr(self.diff, 'autojunk', True)
         old_ratio = getattr(self.diff, 'ratio', 0.75)
+        old_beautify_alignment = getattr(self.diff, 'beautify_alignment', False)
         self.diff = dfn.Differ() if want_native else dfp.Differ()
         self.diff.set_seqs(old_a, old_b)
         self.diff.withdetail = old_withdetail
         self.diff.autojunk = old_autojunk
         self.diff.ratio = old_ratio
+        self.diff.beautify_alignment = old_beautify_alignment
         self.diff.diff_algorithm = algo
 
     def _refresh_ex(self, ed, show_dialog=False):
@@ -1332,6 +1358,7 @@ class Command:
             self.diff.ratio = self.cfg.get('ratio')
             self.diff.diff_algorithm = self.cfg.get('diff_algorithm')
             self.diff.autojunk = self.cfg.get('autojunk')
+            self.diff.beautify_alignment = self.cfg.get('beautify_alignment')
 
             # Detect word-wrap on either side. When wrap is on, gaps must be
             # sized by the actual number of visual rows on the opposite side
@@ -1811,6 +1838,8 @@ class Command:
                 get_opt('diff_algorithm', 'native_histogram'),
             'autojunk':
                 get_opt('autojunk', True),
+            'beautify_alignment':
+                get_opt('beautify_alignment', False),
             'enable_profiling':
                 get_opt('enable_profiling', False),
             'enable_micromap':
