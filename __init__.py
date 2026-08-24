@@ -12,7 +12,7 @@ from . import differ_native as dfn
 from . import differ_python as dfp
 from .overview import PaintboxOverview
 from .profiling import Profiler, enable_profiling, profiling_report, reset_profiling
-from .py_algo.unified_diff import unified_diff
+from difflib import unified_diff
 
 # df is used as a namespace for event constants (A_LINE_DEL, B_LINE_ADD, etc.).
 # Both differ_native and differ_python define identical constants, so we alias
@@ -861,14 +861,17 @@ class Command:
         """Create a read-only unified-diff tab from two text strings.
         Used by diff_with and diff_with_tab commands.
 
-        The unified-diff output is always produced with Python's difflib
-        (autojunk=False), never the chosen differ.diff_algorithm -- the
-        algorithm only affects side-by-side line pairing, not the patch
-        format itself, and unified diff is a machine-consumed patch
-        stream (patch / git apply / CI / code-review bots). See
-        py_algo/unified_diff.py for the full rationale and readme.txt
-        ("Diff current document with file..." section) for the user-facing
-        note.
+        The unified-diff output is always produced with Python's stdlib
+        difflib.unified_diff, never the chosen differ.diff_algorithm --
+        the algorithm only affects side-by-side line pairing, not the
+        patch format itself, and unified diff is a machine-consumed patch
+        stream (patch / git apply / CI / code-review bots). difflib's
+        default autojunk=True is left in place here: the autojunk
+        heuristic only triggers on files with >200 occurrences of a
+        single line at >1% of file size (rare in real source files),
+        and even when it triggers the patch is still valid for `patch`/
+        `git apply`. See readme.txt ("Diff current document with
+        file..." section) for the user-facing note.
         """
         if txt0 and txt0[-1] != '\n': txt0 += '\n'
         if txt1 and txt1[-1] != '\n': txt1 += '\n'

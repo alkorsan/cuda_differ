@@ -47,14 +47,15 @@ Diff current document with tab...
     Same as above, but compares with another open tab.
 
     Note: the unified-diff output is always produced using Python's
-    difflib (the standard library SequenceMatcher, with autojunk
-    disabled), not the algorithm chosen via differ.diff_algorithm.
-    Unified diff is a machine-readable patch format normally consumed
-    by tools (patch, git apply, CI, code-review bots, etc.) rather
-    than read end-to-end by humans; the chosen algorithm only affects
-    how lines are paired inside REPLACE blocks for the side-by-side
-    view, and can be slower than difflib on large files. Applying
-    it to the unified-diff path would be wasted work for no user-visible
+    stdlib difflib.unified_diff (the standard library implementation,
+    with its default autojunk=True), not the algorithm chosen via
+    differ.diff_algorithm. Unified diff is a machine-readable patch
+    format normally consumed by tools (patch, git apply, CI,
+    code-review bots, etc.) rather than read end-to-end by humans;
+    the chosen algorithm only affects how lines are paired inside
+    REPLACE blocks for the side-by-side view, and can be
+    slower than difflib on large files. Applying it to the
+    unified-diff path would be wasted work for no user-visible
     benefit. If you want the chosen algorithm's alignment in a
     human-readable form, use the side-by-side compare instead.
 
@@ -221,6 +222,11 @@ Configuration (chapter "config"):
   Note: when the "difflib" algorithm is selected, the plugin always
   passes autojunk=False to difflib's SequenceMatcher (the autojunk
   heuristic is never enabled) -- this is hardcoded, not a user option.
+  This applies only to the side-by-side compare view (the "difflib"
+  choice of differ.diff_algorithm). The separate "Diff current
+  document with file/tab..." commands use stdlib difflib.unified_diff
+  with its default autojunk=True -- see the note under those commands
+  above.
 - Enable profiling (differ.enable_profiling)
   When enabled, prints a detailed timing report to the console after each
   compare, breaking down time spent in the diff algorithm, opcode
