@@ -10,8 +10,7 @@ synced back to the original files automatically.
 - Opens two files (or two untitled tabs) in one split tab and highlights
   added, deleted, and changed lines side-by-side.
 - Lets you edit either side of the compare view. When you save, your edits
-  are written back to the original files on disk -- no need to copy text
-  around manually.
+  are written back to the original files on disk.
 - Keeps the original tabs open while you compare, so you always have both
   the originals and the compare view available.
 - Remembers your compare tabs across CudaText restarts. If you close
@@ -24,8 +23,7 @@ synced back to the original files automatically.
   automatically.
 - Optional gap-aware overview panel docked to the right of the compare
   view, showing a miniature of both editors side-by-side with colored
-  diff highlights and a proportional slider that can be made
-  semi-transparent (WinMerge-style).
+  diff highlights (WinMerge-style).
 
 
 == Commands ==
@@ -46,18 +44,18 @@ Diff current document with file...
 Diff current document with tab...
     Same as above, but compares with another open tab.
 
-    Note: the unified-diff output is always produced using Python's
-    stdlib difflib.unified_diff (the standard library implementation,
-    with its default autojunk=True), not the algorithm chosen via
-    differ.diff_algorithm. Unified diff is a machine-readable patch
-    format normally consumed by tools (patch, git apply, CI,
-    code-review bots, etc.) rather than read end-to-end by humans;
-    the chosen algorithm only affects how lines are paired inside
-    REPLACE blocks for the side-by-side view, and can be
-    slower than difflib on large files. Applying it to the
-    unified-diff path would be wasted work for no user-visible
-    benefit. If you want the chosen algorithm's alignment in a
-    human-readable form, use the side-by-side compare instead.
+Note: the unified-diff output is always produced using Python's
+  stdlib difflib.unified_diff (the standard library implementation,
+  with its default autojunk=True), not the algorithm chosen via
+  differ.diff_algorithm. Unified diff is a machine-readable patch
+  format normally consumed by tools (patch, git apply, CI,
+  code-review bots, etc.) rather than read end-to-end by humans;
+  the chosen algorithm only affects how lines are paired inside
+  REPLACE blocks for the side-by-side view, and can be
+  slower than difflib on large files. Applying it to the
+  unified-diff path would be wasted work for no user-visible
+  benefit. If you want the chosen algorithm's alignment in a
+  human-readable form, use the side-by-side compare instead.
 
 Refresh
     Re-runs the comparison after you edit either side. Useful if
@@ -79,16 +77,16 @@ Jump to previous difference
     Moves the cursor to the previous changed block.
 
 Copy current difference to the right
-    Copies the selected difference from the left file to the right file.
+    Copies the selected difference from the left to the right side.
 
 Copy current difference to the left
-    Copies the selected difference from the right file to the left file.
+    Copies the selected difference from the right to the left side.
 
 Copy current line to the right
-    Copies the line under the cursor from the left file to the right file.
+    Copies the line under the cursor from the left to the right side.
 
 Copy current line to the left
-    Copies the line under the cursor from the right file to the left file.
+    Copies the line under the cursor from the right to the left side.
 
 Config...
     Opens the options dialog.
@@ -128,8 +126,8 @@ When you edit files inside the compare view and press Ctrl+S:
 Compare tabs survive CudaText restarts:
 
 - If you close CudaText with a compare tab open, the compare tab is
-  restored when you start CudaText again, with the same content and
-  comparison.
+  restored when you start CudaText again, with the same content but
+  without compare, run Refresh command to start the compare.
 - The plugin loads automatically on startup only when compare tabs are
   active, so there is no performance impact when you are not comparing.
 - When you close the last compare tab, the plugin stops auto-loading on
@@ -161,129 +159,138 @@ All options are stored in settings/cuda_differ.json. The option names are
 listed below in parentheses.
 
 Colors (chapter "colors"):
-- Color of changed lines (differ.changed_color)
+- differ.changed_color: Color of changed lines
   Background color for lines that were modified (replaced with different
-  content). Leave empty to use the theme default.
-- Color of added lines (differ.added_color)
+  content).
+  Leave empty to use the theme default.
+- differ.added_color: Color of added lines
   Background color for lines that exist only in the right file (added).
   Leave empty to use the theme default.
-- Color of deleted lines (differ.deleted_color)
+- differ.deleted_color: Color of deleted lines
   Background color for lines that exist only in the left file (removed).
   Leave empty to use the theme default.
-- Color of inter-line gap background (differ.gap_color)
+- differ.gap_color: Color of inter-line gap background
   Background color for the blank gap inserted to keep the two sides
-  aligned when one side has fewer lines. Default: LightBG5.
+  aligned when one side has fewer lines.
+  Leave empty to use the theme default.
 
 Configuration (chapter "config"):
-- Synchronized scrolling (differ.sync_scroll)
+- differ.sync_scroll: Synchronized scrolling
   When enabled, scrolling one side of the compare view also scrolls the
-  other side. Default: true.
-- Detailed comparison (differ.compare_with_details)
+  other side.
+  Default: true.
+- differ.compare_with_details: Detailed comparison
   When enabled, changed lines are compared character-by-character and
   the specific changed characters are highlighted within the line.
-  When disabled, changed lines are highlighted as a whole. Default: true.
-- Keep carets visible on sync (differ.enable_sync_caret)
+  When disabled, changed lines are highlighted as a whole.
+  Default: true.
+- differ.enable_sync_caret: Keep carets visible on sync
   When enabled, moving the cursor in one side also moves the cursor in
-  the other side to the corresponding difference block. Default: false.
-- Auto-refresh after changes (differ.enable_auto_refresh)
+  the other side to the corresponding difference block.
+  Default: false.
+- differ.enable_auto_refresh: Auto-refresh after changes
   When enabled, the diff markers are automatically re-calculated after
   you stop editing for 1-2 seconds. When disabled, you must click
-  Refresh manually. Default: false.
-- Context lines in unified diff (differ.diff_context)
+  Refresh manually.
+  Default: false.
+- differ.diff_context: Context lines in unified diff
   Number of unchanged context lines shown around each change in the
   unified diff output (produced by the "Diff current document with..."
-  commands). Default: 3.
-- Diff algorithm (differ.diff_algorithm)
-  Selects the diff algorithm used by the side-by-side compare view and the
-  unified-diff commands. Seven choices are offered in a dropdown:
-    * native_histogram -- Native Histogram diff (port of JGit's
-      HistogramDiff, the algorithm git uses for `git diff --histogram`).
-      Runs in compiled Free Pascal code via cudatext.diff_proc(). Behaves
-      like Patience diff when unique common lines exist, with graceful
-      fallback when they don't. Fast and high-quality. This is the default
-      and recommended option.
-    * native_myers -- Native Myers diff (port of JGit's MyersDiff with
-      linear-space middle-snake optimization, the algorithm git uses for
-      `git diff --myers`). Runs in compiled Free Pascal code via
-      cudatext.diff_proc().
-    * hybrid -- Pure-Python Hybrid (Patience anchoring on unique lines +
-      Myers for the gaps). Best pure-Python quality.
-    * myers -- Pure-Python Myers O(NP) (Wu/Manber/Myers/Miller 1989),
-      ported from Meld.
-    * vscode -- Pure-Python VS Code diff algorithm. Best alignment on
-      files with many duplicated lines, but slowest.
+  commands).
+  Default: 3.
+- differ.diff_algorithm: Diff algorithm
+  Selects the diff algorithm used by the side-by-side compare.
+  Native Histogram and Native Myers run in compiled Pascal code which are
+  10-30x faster than the pure-Python implementations on large files.
+  Seven choices are offered in a dropdown:
+    * native_histogram -- Native Histogram diff (port of JGit's Histogram Diff,
+      with JGit's Myers O(ND) Diff as internal fallback for sub-regions — the same
+      algorithm git uses for `git diff --histogram`).
+      Behaves like Patience diff when unique common lines exist, with graceful
+      fallback when they don't. Fast and high-quality (more human-readable in some cases).
+      This is the default and recommended option for regular files.
+    * native_myers -- Native Myers diff (port of WinMerge's bundled GNU diffutils Myers O(ND),
+      the same algorithm git uses for `git diff --myers`), the fastest on large/very
+      different files. This is faster because it builds on top of Myers with additions
+      from diffutils and WinMerge that JGit lacks, such as Paul Eggert's TOO_EXPENSIVE
+      heuristic, line-purging heuristics like DiscardConfusingLines, and other optimizations.
+  The other algorithms are pure-Python so may be slower with very big files:
+    * hybrid -- Pure-Python Hybrid, combines Patience (anchoring on unique lines) with
+      Myers O(NP) for the gaps. Best pure-Python quality (more human-readable in some cases).
+    * myers -- Pure-Python Myers O(NP) (Wu/Manber/Myers/Miller), ported from Meld.
+    * vscode -- Pure-Python VS Code diff algorithm. This is a port of
+      Microsoft VS Code's diff implementation uses dynamic programming
+      with equality scoring (Best alignment on files with many duplicated
+      lines, more human-readable in some cases, but this is the slowest)
     * patience -- Pure-Python Patience diff (via the embedded
-      patiencediff library).
-    * difflib -- Python's standard difflib SequenceMatcher.
+      patiencediff library), anchors on unique matching lines,
+      more human-readable in some cases. Bad alignment on files
+      with many duplicated lines like log files.
+    * difflib -- Python's standard difflib SequenceMatcher with autojunk=False.
   The native algorithms require a CudaText build that includes the
   diff_proc API. If the API is not available, they silently fall back to
   the closest Python equivalent (native_histogram -> hybrid, native_myers
-  -> myers). Default: native_histogram.
-  Note: when the "difflib" algorithm is selected, the plugin always
-  passes autojunk=False to difflib's SequenceMatcher (the autojunk
-  heuristic is never enabled) -- this is hardcoded, not a user option.
-  This applies only to the side-by-side compare view (the "difflib"
-  choice of differ.diff_algorithm). The separate "Diff current
-  document with file/tab..." commands use stdlib difflib.unified_diff
-  with its default autojunk=True -- see the note under those commands
-  above.
-- Enable profiling (differ.enable_profiling)
+  -> myers).
+  If some parts of a diff isn't making much sense or feels hard to read, try testing a different algorithm: Histogram, Hybrid, Patience, or VSCode tend to generate much cleaner results.
+  If you're comparing massive files and need maximum speed, stick with the Native Myers algorithm instead.
+  Default: native_histogram.
+- differ.beautify_alignment: Improve line alignment
+  Beautify line alignment inside REPLACE blocks where the
+  two sides have DIFFERENT line counts.
+  - When OFF (algo-faithful): lines are paired
+  top-down by position for the first min(da, db) lines, and
+  leftover lines on the longer side are shown as plain
+  added/deleted lines against a gap at the bottom of the
+  shorter side. Nothing is re-paired or re-ordered.
+  This render exactly the way the algorithm dictate
+  for example if native myers is used it will render the way
+  WinMerge / GNU diffutils side-by-side (sdiff) output does.
+  - When ON (VS Code-like): the engine's hunks are re-paired
+  by similarity — find best pairs anchors on the longest
+  unique exact match or the best prefix/suffix-similar pair,
+  char-diffs it, and recurses on both sides. Lines with < 3
+  chars of similarity are shown as separate delete+add. This
+  re-arranges the engine's output for a more "aligned" look
+  but is no longer a faithful rendering of the diff.
+  This results in a more human-readable diff in some cases
+  but the compare becomes slower with very big files.
+  Applies to both native and Python algorithms.
+  Equal-count REPLACE blocks (da == db) are positional in
+  BOTH modes, so this option only affects unequal-count
+  REPLACE blocks.
+  Default: on.
+- differ.enable_profiling: Enable profiling
+  Enable profiling to trace where compare time is consumed.
   When enabled, prints a detailed timing report to the console after each
   compare, breaking down time spent in the diff algorithm, opcode
   realignment, event generation, char-level diffing (native vs Python),
   and UI painting (bookmarks, decor, gaps, attributes). Use for debugging
-  performance issues only -- adds small overhead. Default: false.
-- Enable built-in micromap (differ.enable_micromap)
+  performance issues only -- adds small overhead (~1-2us per timing point).
+  Default: false.
+- differ.enable_micromap: Enable built-in micromap
   When enabled, switches on CudaText's native micromap (mini-map) column
-  in both halves of the compare split. The default micromap columns 0
-  (line states) and 2 (selections) are cleared; column 1 (bookmarks) is
-  kept because it also shows the cursor position. Diff-colored line
-  highlights are painted on column 1. The micromap is fast but does
+  in both halves of the compare split. The micromap is fast but does
   NOT account for the inter-line gaps Differ inserts for visual
   alignment, so it may drift out of sync with the text when gaps are
   present -- for a gap-aware alternative, enable enable_overview
-  instead (or both). Default: false.
-- Enable gap-aware overview panel (differ.enable_overview)
-  When enabled, adds a custom image control docked to the right side of
-  the editor's parent form (PROP_HANDLE_PARENT). The control renders both
-  files side-by-side as colored 1-pixel rectangles (red=deleted, green=added,
-  yellow=changed, gray=gap, background=unchanged) and is fully gap- and
-  wrap-aware so colored blocks always line up with the corresponding
-  editor lines. A slider (the viewport indicator) shows the visible
-  range; its height is proportional to the visible-page vs total-
-  content ratio (like real scrollbars in browsers and editors), with a
-  minimum height of 30px so it always stays grabbable. Click anywhere
-  to scroll the corresponding editor to that line, or drag the slider
-  to scroll continuously. Uses a two-bitmap static/dynamic split so
-  scrolling only redraws the cheap dynamic part (debounced 150 ms).
-  Colors come from the active UI theme (EdTextBg) plus the same color_*
-  config options as the editor highlights. Can be used together with
-  the micromap. Default: true.
-- Enable overview slider transparency (differ.enable_overview_slider_opacity)
+  instead (or both).
+  Default: false.
+- differ.enable_overview: Enable gap-aware overview panel
+  When enabled, adds a micromap alternative docked to the right side of
+  the editor's parent form. It works like micromap but slower, unlike
+  the built-in micromap, the overview accounts for inter-line gaps
+  inserted for visual alignment, so it stays in sync with what you actually see.
+  Default: true.
+- differ.enable_overview_slider_opacity: Enable overview slider transparency
   When enabled, the overview panel's slider is rendered with simulated
   alpha blending so the colored diff lines remain visible through the
-  slider like in WinMerge. CudaText's canvas_proc API has no alpha-blend
-  primitive (only BRUSH_SOLID = opaque and BRUSH_CLEAR = no fill), so
-  transparency is simulated by precomputing the per-channel blend
-  (orig*(1-a) + fill*a) for every row of the slider using a per-row
-  segment index built when the static bitmap is painted. When
-  disabled, the slider uses a fast opaque solid fill (the old
-  behaviour). Three slider-paint methods are dispatched based on this
-  option and overview_slider_opacity: SOLID (option disabled, fastest),
-  CLEAR (option enabled AND opacity below 8%, border-only via
-  BRUSH_CLEAR), and BLENDED (option enabled AND opacity at or above 8%,
-  per-row pre-blend). Only has an effect when enable_overview is on.
+  slider like in WinMerge.
+  Only has an effect when enable_overview is on.
   Default: true.
-- Overview slider opacity in percent (differ.overview_slider_opacity)
-  Opacity of the overview panel slider, in percent. 0 = fully
-  transparent (slider border only via BRUSH_CLEAR, the static overview
-  shows through completely), 100 = fully opaque (solid fill).
-  Intermediate values (e.g. 40) simulate true alpha blending via
-  per-row pre-blending of the underlying overview colors with the
-  slider fill color. Values below 8 use the faster border-only path
-  instead of per-row blending. Only used when
-  enable_overview_slider_opacity is true. Range: 0-100. Default: 40.
-
+- differ.overview_slider_opacity: Overview slider opacity in percent
+  Opacity of the overview panel slider, in percent. Only used when
+  enable_overview_slider_opacity is true.
+  Range: 0-100. Default: 40.
 
 == Overview panel and micromap ==
 
@@ -291,87 +298,8 @@ Differ can show one or both of two mini-map styles next to a compare tab:
 the plugin's own gap-aware overview panel (default: on) and the built-in
 CudaText micromap (default: off). They can be enabled independently and
 used at the same time. The overview is the recommended default because
-it stays gap-aware; the micromap is faster but does not account for
+it stays gap-aware; the micromap is faster and cheap but does not account for
 inter-line gaps.
-
-The overview panel's default width is 40px (was 80px; reduced by 50%
-to take less horizontal space). The panel is docked and resizable --
-drag the left edge to make it wider if you want more detail.
-
-Built-in micromap (enable_micromap, default: off)
-- Switches on CudaText's native micromap column in both halves of the
-  split. The default micromap columns 0 (line states) and 2 (selections)
-  are cleared so only diff-relevant information is shown; column 1
-  (bookmarks) is kept because it also doubles as a cursor-position
-  indicator. Diff-colored line highlights are painted on column 1 via
-  attr(show_on_map=1).
-- On the left editor the micromap is placed on the right side, on the
-  right editor on the left side, so both micromaps sit in the split
-  gutter between the two files.
-- The micromap is fast and cheap, but it does NOT account for the
-  inter-line gaps Differ inserts for visual alignment, so the colored
-  blocks can drift out of sync with the text positions when gaps are
-  present. For a gap-aware alternative, enable the overview panel.
-
-Gap-aware overview panel (enable_overview, default: on)
-- Adds a custom image control docked to the right side of the editor's
-  parent form (PROP_HANDLE_PARENT). The control renders both files
-  side-by-side as colored 1-pixel-tall rectangles: red for deleted lines
-  (left file only), green for added lines (right file only), yellow for
-  changed lines, gray for inter-line gaps, and the theme background color
-  for unchanged lines.
-- Unlike the micromap, the overview is fully gap-aware: it walks both
-  files in lock-step with the same gap bookkeeping the editor uses, so
-  a colored block in the overview always lines up with the
-  corresponding line in the editor. The overview is also wrap-aware:
-  when word-wrap is on, each line's overview height is multiplied by
-  its number of wrapped visual rows, so the overview stays aligned
-  even when matching lines wrap to different heights.
-- A slider (the viewport indicator) shows the range of lines currently
-  visible in each editor. The slider height is proportional to the
-  visible-page vs total-content ratio (smooth_page / smooth_max), like
-  real scrollbars in browsers and editors, with a 30px minimum so it
-  always stays grabbable even on huge files. When the entire file
-  fits in the viewport the slider fills the whole track; when the file
-  is much taller than the viewport the slider shrinks toward 30px.
-  A 1px dark-grey border is always drawn around the slider regardless
-  of which fill strategy is active. Three horizontal grabber lines
-  (2px thick, 6px apart) are drawn in the slider's center for visual
-  grip.
-- Click anywhere in the overview to scroll the corresponding editor
-  to that line. The click is mapped through the same wrap- and
-  gap-aware coordinate transform used for painting, so the line you
-  click on is the line the editor jumps to. You can also drag the
-  slider to scroll continuously.
-- Slider transparency: CudaText's canvas_proc API has no alpha-blend
-  primitive (only BRUSH_SOLID = opaque and BRUSH_CLEAR = no fill), so
-  slider transparency (enable_overview_slider_opacity, default on) is
-  simulated by per-row pre-blending. When the static bitmap is painted,
-  a per-row segment index is built recording the final color of every
-  Y row (background / gap / line-state). On each dynamic paint, the
-  slider's rows are walked and each segment is filled with
-  `blend(orig_color, slider_fill, alpha)` per channel
-  (orig*(1-a) + fill*a). Three slider-paint methods are dispatched
-  based on the option values: SOLID (option disabled, fastest, one
-  CANVAS_RECT call), CLEAR (option enabled AND opacity below 8%,
-  border-only via BRUSH_CLEAR, also fast), and BLENDED (option enabled
-  AND opacity at or above 8%, per-row pre-blend, ~2*slider_height
-  CANVAS_RECT_FILL calls per paint). The 8% threshold is used because
-  at very low opacity the per-row pre-blend is visually
-  indistinguishable from no fill at all, so the faster BRUSH_CLEAR path
-  is used. The slider opacity is configurable via
-  overview_slider_opacity (default 40%).
-- Performance: the panel uses a two-bitmap split. A persistent
-  "static" bitmap stores the hundreds of colored line/gap rectangles
-  and is only rebuilt on compare or resize. On every scroll (debounced
-  150 ms), the static bitmap is blitted to the image control's
-  embedded bitmap and only the cheap dynamic part (slider + grabber)
-  is redrawn on top -- so scrolling does not reissue the expensive
-  CANVAS_RECT_FILL loop.
-- Colors are taken from the active UI theme (EdTextBg for the
-  background) so the panel matches both light and dark themes
-  automatically. The deleted/added/changed/gap colors reuse the same
-  color_* config options as the editor highlights.
 
 
 == Notes ==
@@ -381,7 +309,7 @@ Gap-aware overview panel (enable_overview, default: on)
 - The compare view uses CudaText's built-in split-editor feature -- no
   temporary files are created on disk.
 - If both files become identical after editing, all markers are cleared
-  and a message is shown.
+  and a message is shown when refreshing the compare.
 
 
 == Authors ==

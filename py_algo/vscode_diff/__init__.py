@@ -50,8 +50,6 @@ Performance:
   - Myers is O(N*D) where D is the number of differences. It is used
     for large files (M+N >= 1700) as a faster fallback.
   - The threshold 1700 matches VS Code's own threshold.
-
-License: MIT (same as VS Code source)
 """
 
 import math

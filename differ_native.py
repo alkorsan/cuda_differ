@@ -12,14 +12,6 @@ Code is intentionally duplicated from differ_python.py to allow
 independent evolution of the native and Python codepaths. As more
 diff logic moves into the Pascal native engine, this file will shrink
 to a thin wrapper around cudatext.diff_proc if God wills.
-
-Alignment modes (self.beautify_alignment):
-  True  = 'beautified' alignment: similar lines inside a changed block are
-          re-paired by similarity (VS Code-like). Uses _find_best_pairs.
-  False = WinMerge-faithful: the engine's hunks are rendered exactly the
-          way WinMerge / diffutils side-by-side (sdiff) output does —
-          positional top-down pairing, leftovers as plain add/delete.
-          Nothing is re-paired, re-ordered or split. Default.
 """
 
 import time
@@ -202,15 +194,7 @@ class Differ:
         self.diff_algorithm before calling compare().
         """
         self.withdetail = True
-        # Algorithm key: 'native_histogram' (default) or 'native_myers'.
-        # Only native algorithms are supported by this Differ.
         self.diff_algorithm = 'native_histogram'
-        # alignment mode toggle.
-        #   True  = OLD 'beautified' alignment (_find_best_pairs re-pairs
-        #           similar lines inside unequal-count replace blocks).
-        #   False = WinMerge-faithful positional rendering (default).
-        # __init__.py overrides this from the 'differ.beautify_alignment'
-        # option — see Command._create_differ.
         self.beautify_alignment = False
         self.set_seqs(a, b)
         self.diffmap = []
@@ -389,7 +373,7 @@ class Differ:
 
         Two rendering modes, selected by self.beautify_alignment:
 
-        beautify_alignment = True (OLD, 'beautified' alignment)
+        beautify_alignment = True ('beautified' alignment)
             Unequal line counts use _find_best_pairs(): anchor on the
             longest unique exact match or the best prefix/suffix-similar
             pair, char-diff it, recurse on both sides. Lines with < 3
@@ -420,8 +404,10 @@ class Differ:
             value of _find_best_pairs is the prefix/suffix scoring for
             similar-but-not-equal lines, which neither engine does.
             
-        beautify_alignment = False (NEW, WinMerge-faithful, default)
-            Render exactly the way WinMerge / GNU diffutils side-by-side
+        beautify_alignment = False (algo-faithful, default)
+            Render exactly the way the algorithm dictate
+            for example if native myers is used it will render
+            the way WinMerge / GNU diffutils side-by-side
             (sdiff) output does: pair the first min(da, db) lines
             top-down by position (char-diff each pair via the native
             engine), and show leftover lines on the longer side as plain
@@ -476,13 +462,13 @@ class Differ:
 
         # ---- da != db: the two modes diverge here ----
         if self.beautify_alignment:
-            # OLD: anchor + prefix/suffix scoring + threshold + staggering.
+            # anchor + prefix/suffix scoring + threshold + staggering.
             # Different line counts (da != db): use _find_best_pairs which
             # finds the best-matching pair by exact unique match (longest
             # wins) or prefix/suffix length scoring, then recurses.
             yield from self._find_best_pairs(a, alo, ahi, b, blo, bhi)
         else:
-            # NEW (WinMerge): positional top-down pairing; leftovers on
+            # positional top-down pairing; leftovers on
             # the longer side are plain added/deleted lines against a gap
             # at the bottom of the shorter side's block (same convention
             # as _plain_replace_simple).
@@ -504,7 +490,7 @@ class Differ:
     def _find_best_pairs(self, a, alo, ahi, b, blo, bhi):
         """Find the best line alignment within a sub-REPLACE block.
 
-        ONLY USED WHEN self.beautify_alignment is True (the OLD
+        ONLY USED WHEN self.beautify_alignment is True (the
         'beautified' alignment mode).
 
         Finds the best-matching line pair using two strategies:

@@ -194,33 +194,7 @@ class Differ:
         before calling compare().
         """
         self.withdetail = True
-        # Algorithm key stored in self.diff_algorithm. One of:
-        #
-        #   'hybrid'          (HybridSequenceMatcher — pure-Python patience
-        #                       anchoring on unique lines + Myers for the
-        #                       gaps; best pure-Python quality),
-        #   'myers'           (MyersSequenceMatcher — pure-Python O(NP)
-        #                       Wu/Manber/Myers/Miller 1989 with common
-        #                       prefix/suffix trimming and a
-        #                       non-matching-line discard preprocessing pass),
-        #   'vscode'          (VSCodeSequenceMatcher — pure-Python VS Code-
-        #                       style DP/Myers with equality scoring;
-        #                       slowest, best quality for duplicated-line
-        #                       files),
-        #   'patience'        (PatienceSequenceMatcher — pure-Python
-        #                       patience diff; anchors on unique lines),
-        #   'difflib'         (Python stdlib SequenceMatcher with
-        #                       autojunk=False).
-        #
-        # These are pure-Python implementations. For native algorithms
-        # (10-30x faster), use differ_native.Differ instead.
         self.diff_algorithm = 'hybrid'
-        # alignment mode toggle.
-        #   True  = OLD 'beautified' alignment (_find_best_pairs re-pairs
-        #           similar lines inside unequal-count replace blocks).
-        #   False = WinMerge-faithful positional rendering (default).
-        # __init__.py overrides this from the 'differ.beautify_alignment'
-        # option — see Command._create_differ.
         self.beautify_alignment = False
         self.set_seqs(a, b)
         self.diffmap = []

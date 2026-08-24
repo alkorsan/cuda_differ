@@ -13,6 +13,8 @@ from . import differ_python as dfp
 from .overview import PaintboxOverview
 from .profiling import Profiler, enable_profiling, profiling_report, reset_profiling
 from difflib import unified_diff
+from cudax_lib import get_translation
+_ = get_translation(__file__)  # I18N
 
 # df is used as a namespace for event constants (A_LINE_DEL, B_LINE_ADD, etc.).
 # Both differ_native and differ_python define identical constants, so we alias
@@ -21,8 +23,248 @@ from difflib import unified_diff
 # Command._create_differ below.
 df = dfn
 
-from cudax_lib import get_translation
-_ = get_translation(__file__)  # I18N
+DIFF_TAG = 148
+NKIND_DELETED = 24
+NKIND_ADDED = 25
+NKIND_CHANGED = 26
+GAP_WIDTH = 5000
+DECOR_CHAR = '■'
+DEFAULT_SYNC_SCROLL = '1'
+U_PREFIX = 'untitled:'
+
+PLG_NAME = _('Differ')
+METAJSONFILE = os.path.dirname(__file__) + os.sep + 'differ_opts.json'
+JSONFILE = 'cuda_differ.json'  # To store in settings/cuda_differ.json
+JSONPATH = ct.app_path(ct.APP_DIR_SETTINGS) + os.sep + JSONFILE
+
+OPTS_META = [
+    {'opt': 'differ.changed_color',
+     'cmt': _('Color of changed lines'),
+     'def': '',
+     'frm': '#rgb-e',
+     'chp': 'colors',
+     },
+    {'opt': 'differ.added_color',
+     'cmt': _('Color of added lines/text (right side)'),
+     'def': '',
+     'frm': '#rgb-e',
+     'chp': 'colors',
+     },
+    {'opt': 'differ.deleted_color',
+     'cmt': _('Color of deleted lines/text (left side)'),
+     'def': '',
+     'frm': '#rgb-e',
+     'chp': 'colors',
+     },
+    {'opt': 'differ.gap_color',
+     'cmt': _('Color of inter-line gap background'),
+     'def': '',
+     'frm': '#rgb-e',
+     'chp': 'colors',
+     },
+    {'opt': 'differ.sync_scroll',
+     'cmt': _('Use synchronized scrolling (vertical/horizontal) in two compared files'),
+     'def': True,
+     'frm': 'bool',
+     'chp': 'config',
+     },
+    {'opt': 'differ.compare_with_details',
+     'cmt': _('Perform detailed comparision: Highlight the exact characters that changed within a modified line (when off: highlight the whole line)'),
+     'def': True,
+     'frm': 'bool',
+     'chp': 'config',
+     },
+    {'opt': 'differ.enable_sync_caret',
+     'cmt': _('Keep carets in both editors visible on current screen area'),
+     'def':  False,
+     'frm': 'bool',
+     'chp': 'config',
+     },
+    {'opt': 'differ.enable_auto_refresh',
+     'cmt': _('Auto diff refresh after changes'),
+     'def':  False,
+     'frm': 'bool',
+     'chp': 'config',
+     },
+     {'opt': 'differ.diff_context',
+     'cmt': _('Number of lines of context displayed when diffing with "Compare current document with..." command'),
+     'def':  3,
+     'frm': 'int',
+     'chp': 'config',
+     },
+    # --- diff_algorithm dropdown ------------------------------------------------
+    # Method 2 (used here): value/label pairs via 'str2s' + 'dct'.
+    #   The dropdown shows the second element of each tuple; on save, the keys
+    #   ('difflib'/'patience') are extracted, so the stored value is the raw
+    #   plain string. load_definitions auto-derives 'jdc' from 'dct', so 'jdc'
+    #   does not need to be set by hand. Use this when you want friendlier
+    #   dropdown labels than the raw config value.
+    #
+    # Method 1 (alternative, kept here as a reminder): plain string list via
+    # 'strs' + 'lst'. The combobox is populated straight from 'lst'; on save
+    # the raw string itself is stored. Minimal, no separate labels.
+    #
+    #     {'opt': 'differ.diff_algorithm',
+    #      'cmt': _('Diff algorithm to use. Patience anchors on unique matching '
+    #               'lines and often produces more human-readable diffs when '
+    #               'blocks of code are moved; difflib is Python\'s stdlib '
+    #               'SequenceMatcher. Default: patience.'),
+    #      'def': 'patience',
+    #      'frm': 'strs',
+    #      'lst': ['difflib', 'patience'],
+    #      'chp': 'config',
+    #      },
+    # ----------------------------------------------------------------------------
+    {'opt': 'differ.diff_algorithm',
+     'cmt': _('Diff algorithm to use. Native Histogram and Native Myers run in compiled Pascal code. \n'
+     'Native algorithms are 10-30x faster than the pure-Python implementations on large files.\n'
+              '- Native Myers: is a port of WinMerge\'s bundled GNU diffutils Myers O(ND) — the same algorithm git uses for `git diff --myers`; the fastest on large/very different files.\n'
+              '- Native Histogram: is a port of JGit\'s Histogram Diff with JGit\'s Myers O(ND) Diff as internal fallback for sub-regions — the same algorithm git uses for `git diff --histogram`; patience-style anchoring on unique lines, more human-readable in some cases.\n\n'
+              'The other algorithms are pure-Python so may be slower with very big files:\n'
+              '- Hybrid: combines Patience (anchoring on unique lines) with Myers O(NP) for the gaps (best pure-Python quality (more human-readable in some cases)).\n'
+              '- Myers: is Myers O(NP) (Wu/Manber/Myers/Miller), ported from Meld.\n'
+              '- VS Code: is a port of Microsoft VS Code\'s diff implementation uses dynamic programming with equality scoring (Best alignment on files with many duplicated lines, more human-readable in some cases, but this is the slowest).\n'
+              '- Patience: anchors on unique matching lines, more human-readable in some cases. Bad alignment on files with many duplicated lines like log files.\n'
+              '- Difflib: is Python\'s stdlib with autojunk=False.\n'
+              'Default: Native Histogram.\n\n'
+              'If some parts of a diff isn\'t making much sense or feels hard to read, try testing a different algorithm: Histogram, Hybrid, Patience, or VSCode tend to generate much cleaner results.\n'
+              'If you\'re comparing massive files and need maximum speed, stick with the Native Myers algorithm instead.'),
+     'def': 'native_histogram',
+     'frm': 'str2s',
+     'dct': [('native_histogram', _('Native Histogram (More human-readable, recommended)')),
+             ('native_myers',     _('Native Myers O(ND) (Fastest on large/different files)')),
+             ('hybrid',           _('Hybrid (Python: Patience + Myers O(NP))')),
+             ('myers',            _('Myers O(NP) (Python)')),
+             ('vscode',           _('VSCode (Python: DP + Myers O(ND))')),
+             ('patience',         _('Patience Diff (Python)')),
+             ('difflib',          _('Python difflib stdlib'))],
+     'chp': 'config',
+     },
+    {'opt': 'differ.beautify_alignment',
+     'cmt': _('Beautify line alignment inside REPLACE blocks where the '
+              'two sides have DIFFERENT line counts.\n'
+              '- When OFF (algo-faithful): lines are paired '
+              'top-down by position for the first min(da, db) lines, and '
+              'leftover lines on the longer side are shown as plain '
+              'added/deleted lines against a gap at the bottom of the '
+              'shorter side. Nothing is re-paired or re-ordered.\n'
+              'This render exactly the way the algorithm dictate '
+              'for example if native myers is used it will render the way '
+              'WinMerge / GNU diffutils side-by-side (sdiff) output does.\n'
+              '- When ON (VS Code-like): the engine\'s hunks are re-paired '
+              'by similarity — find best pairs anchors on the longest '
+              'unique exact match or the best prefix/suffix-similar pair, '
+              'char-diffs it, and recurses on both sides. Lines with < 3 '
+              'chars of similarity are shown as separate delete+add. This '
+              're-arranges the engine\'s output for a more "aligned" look '
+              'but is no longer a faithful rendering of the diff.\n'
+              'This results in a more human-readable diff in some cases '
+              'but the compare becomes slower with very big files.\n'
+              'Applies to both native and Python algorithms.\n'
+              'Equal-count REPLACE blocks (da == db) are positional in '
+              'BOTH modes, so this option only affects unequal-count '
+              'REPLACE blocks.\n'
+              'Default: on.'),
+     'def': True,
+     'frm': 'bool',
+     'chp': 'config',
+     },
+    {'opt': 'differ.enable_profiling',
+     'cmt': _('Enable profiling to trace where compare time is consumed. '
+              'Outputs a detailed timing report to the console after each '
+              'compare, breaking down time spent in the diff algorithm, '
+              'opcode realignment, event generation, char-level diffing, '
+              'and UI painting (bookmarks, decor, gaps, attributes).\n'
+              'Use for debugging performance issues only — adds small '
+              'overhead (~1-2us per timing point).\n'
+              'Default: off.'),
+     'def': False,
+     'frm': 'bool',
+     'chp': 'config',
+     },
+    {'opt': 'differ.enable_micromap',
+     'cmt': _('Enable the built-in micromap (mini-map) in compare tabs. '
+              'Clears the default micromap columns 0 (line states) and '
+              '2 (selections), keeps column 1 (bookmarks — also shows '
+              'the cursor position), and paints diff-colored line '
+              'highlights on column 1 via attr(show_on_map=1). '
+              'Note: the micromap does NOT account for inter-line gaps, '
+              'so it may desync from the actual text positions when '
+              'gaps are present. For a gap-aware alternative, enable '
+              'enable_overview instead (or both). '
+              'Default: off.'),
+     'def': False,
+     'frm': 'bool',
+     'chp': 'config',
+     },
+    {'opt': 'differ.enable_overview',
+     'cmt': _('Enable the gap-aware overview panel in compare tabs. '
+              'The overview is a custom paintbox added to the right '
+              'side of the editor. Unlike the built-in micromap, the '
+              'overview accounts for inter-line gaps inserted for '
+              'visual alignment, so it stays in sync with what you '
+              'actually see. Shows both editors side-by-side with '
+              'colored rectangles for deleted (red), added (green), '
+              'and changed (yellow) lines, plus gray rectangles for '
+              'gaps and white for unchanged lines. Click the overview '
+              'to scroll the corresponding editor, or drag the slider '
+              'to scroll continuously. The slider height is '
+              'proportional to the visible-page vs total-content ratio '
+              '(like real scrollbars in browsers and editors), with a '
+              'minimum height of 30px so it always stays grabbable. '
+              'Can be used together with the micromap. '
+              'Default: on.'),
+     'def': True,
+     'frm': 'bool',
+     'chp': 'config',
+     },
+    {'opt': 'differ.enable_overview_slider_opacity',
+     'cmt': _('Enable transparency for the overview panel slider. '
+              'When enabled, the slider is rendered with simulated '
+              'alpha blending (per-row pre-blend of the underlying '
+              'overview colors with the slider fill color), so the '
+              'colored diff lines remain visible through the slider '
+              'like in WinMerge. When disabled, the slider uses a '
+              'fast opaque solid fill (the old behaviour). '
+              'Note: when enabled AND overview_slider_opacity is below '
+              '8%, the slider falls back to a border-only style '
+              '(BRUSH_CLEAR, fully see-through) for performance. '
+              'Default: on.'),
+     'def': True,
+     'frm': 'bool',
+     'chp': 'config',
+     },
+    {'opt': 'differ.overview_slider_opacity',
+     'cmt': _('Opacity of the overview panel slider, in percent. '
+              '0 = fully transparent (slider border only via '
+              'BRUSH_CLEAR, the static overview shows through '
+              'completely), 100 = fully opaque (solid fill). '
+              'Intermediate values (e.g. 40) simulate true alpha '
+              'blending via per-row pre-blending of the underlying '
+              'overview colors with the slider fill color. Only used '
+              'when enable_overview_slider_opacity is True. Values '
+              'below 8 use the faster BRUSH_CLEAR path instead of '
+              'per-row blending. Range: 0-100. Default: 40.'),
+     'def': 40,
+     'frm': 'int',
+     'chp': 'config',
+     },
+]
+
+DIFF_TAB_COUNT = 1
+# Persistent state file: stores compare-tab state grouped by session.
+# session_key is the session file path, relative to the settings folder if
+# the session is inside it (at any depth), or the full path if outside.
+STATE_FILE = os.path.join(ct.app_path(ct.APP_DIR_SETTINGS), 'cuda_differ_state.json')
+# Path to plugins.ini -- used to persistently subscribe to on_start2 so the
+# plugin auto-loads on next CudaText startup when compare tabs are active.
+PLUGINS_INI = os.path.join(ct.app_path(ct.APP_DIR_SETTINGS), 'plugins.ini')
+PLUGINS_INI_SECTION = 'events'
+MODULE_NAME = __name__.split('.')[-1]  # e.g. 'cuda_differ'
+
+
+_homedir = os.path.expanduser('~')
+
 
 # str.splitlines() breaks on the full Unicode line-boundary set, not just
 # '\n', '\r', '\r\n': it also splits on VT (\x0b), FF (\x0c), NEL (\x85),
@@ -143,264 +385,6 @@ class ScrollSplittedTab:
 
         e.cmd(ct_cmd.cmd_RepaintEditor)
 
-
-DIFF_TAG = 148
-NKIND_DELETED = 24
-NKIND_ADDED = 25
-NKIND_CHANGED = 26
-GAP_WIDTH = 5000
-DECOR_CHAR = '■'
-DEFAULT_SYNC_SCROLL = '1'
-U_PREFIX = 'untitled:'
-
-PLG_NAME = _('Differ')
-METAJSONFILE = os.path.dirname(__file__) + os.sep + 'differ_opts.json'
-JSONFILE = 'cuda_differ.json'  # To store in settings/cuda_differ.json
-JSONPATH = ct.app_path(ct.APP_DIR_SETTINGS) + os.sep + JSONFILE
-
-OPTS_META = [
-    {'opt': 'differ.changed_color',
-     'cmt': _('Color of changed lines'),
-     'def': '',
-     'frm': '#rgb-e',
-     'chp': 'colors',
-     },
-    {'opt': 'differ.added_color',
-     'cmt': _('Color of added lines'),
-     'def': '',
-     'frm': '#rgb-e',
-     'chp': 'colors',
-     },
-    {'opt': 'differ.deleted_color',
-     'cmt': _('Color of deleted lines'),
-     'def': '',
-     'frm': '#rgb-e',
-     'chp': 'colors',
-     },
-    {'opt': 'differ.gap_color',
-     'cmt': _('Color of inter-line gap background'),
-     'def': '',
-     'frm': '#rgb-e',
-     'chp': 'colors',
-     },
-    {'opt': 'differ.sync_scroll',
-     'cmt': _('Use synchronized scrolling (vertical/horizontal) in two compared files'),
-     'def': True,
-     'frm': 'bool',
-     'chp': 'config',
-     },
-    {'opt': 'differ.compare_with_details',
-     'cmt': _('Perform detailed comparision'),
-     'def': True,
-     'frm': 'bool',
-     'chp': 'config',
-     },
-    {'opt': 'differ.enable_sync_caret',
-     'cmt': _('Keep carets in both editors visible on current screen area'),
-     'def':  False,
-     'frm': 'bool',
-     'chp': 'config',
-     },
-    {'opt': 'differ.enable_auto_refresh',
-     'cmt': _('Auto diff refresh after changes'),
-     'def':  False,
-     'frm': 'bool',
-     'chp': 'config',
-     },
-     {'opt': 'differ.diff_context',
-     'cmt': _('Number of lines of context displayed when diffing files'),
-     'def':  3,
-     'frm': 'int',
-     'chp': 'config',
-     },
-    # --- diff_algorithm dropdown ------------------------------------------------
-    # Method 2 (used here): value/label pairs via 'str2s' + 'dct'.
-    #   The dropdown shows the second element of each tuple; on save, the keys
-    #   ('difflib'/'patience') are extracted, so the stored value is the raw
-    #   plain string. load_definitions auto-derives 'jdc' from 'dct', so 'jdc'
-    #   does not need to be set by hand. Use this when you want friendlier
-    #   dropdown labels than the raw config value.
-    #
-    # Method 1 (alternative, kept here as a reminder): plain string list via
-    # 'strs' + 'lst'. The combobox is populated straight from 'lst'; on save
-    # the raw string itself is stored. Minimal, no separate labels.
-    #
-    #     {'opt': 'differ.diff_algorithm',
-    #      'cmt': _('Diff algorithm to use. Patience anchors on unique matching '
-    #               'lines and often produces more human-readable diffs when '
-    #               'blocks of code are moved; difflib is Python\'s stdlib '
-    #               'SequenceMatcher. Default: patience.'),
-    #      'def': 'patience',
-    #      'frm': 'strs',
-    #      'lst': ['difflib', 'patience'],
-    #      'chp': 'config',
-    #      },
-    # ----------------------------------------------------------------------------
-    {'opt': 'differ.diff_algorithm',
-     'cmt': _('Diff algorithm to use. Native Histogram and Native Myers '
-              'call the built-in cudatext.diff_proc() API and run in '
-              'compiled Pascal code. Native Myers is a port of WinMerge\'s '
-              'bundled GNU diffutils Myers with the '
-              'Eggert TOO_EXPENSIVE heuristic — the same algorithm git uses '
-              'for `git diff --myers`; faster on large/different files. '
-              'Native Histogram is a port of JGit\'s HistogramDiff '
-              'with JGit\'s MyersDiff as '
-              'internal fallback for sub-regions — the same algorithm git '
-              'uses for `git diff --histogram`; patience-style anchoring on '
-              'unique lines, more human-readable for normal files. Native algorithms'
-              'are 10-30x faster than the pure-Python implementations on large '
-              'files; Native Histogram is the default. The other algorithms '
-              'are pure-Python: Hybrid combines patience anchoring on unique '
-              'lines with Myers for the gaps (best pure-Python quality); '
-              'Myers is O(NP) (Wu/Manber/Myers/Miller 1989); VS Code uses '
-              'dynamic programming with equality scoring (best for files '
-              'with duplicated lines, slowest); Patience anchors on unique '
-              'matching lines; difflib is Python\'s stdlib SequenceMatcher (slow). '
-              'Default: Native Histogram.'),
-     'def': 'native_histogram',
-     'frm': 'str2s',
-     'dct': [('native_histogram', _('Native Histogram (More human-readable, recommended)')),
-             ('native_myers',     _('Native Myers (Fastest on large/different files)')),
-             ('hybrid',           _('Hybrid (Python: Patience + Myers. More human-readable, slow)')),
-             ('myers',            _('Myers (Python: O(NP), fastest Python)')),
-             ('vscode',           _('VS Code (Python: DP + Myers, very slow with big files)')),
-             ('patience',         _('Patience Diff (Python)')),
-             ('difflib',          _('Python difflib stdlib'))],
-     'chp': 'config',
-     },
-    {'opt': 'differ.beautify_alignment',
-     'cmt': _('Beautified line alignment inside REPLACE blocks where the '
-              'two sides have DIFFERENT line counts. '
-              'When OFF (default, WinMerge-faithful): lines are paired '
-              'top-down by position for the first min(da, db) lines, and '
-              'leftover lines on the longer side are shown as plain '
-              'added/deleted lines against a gap at the bottom of the '
-              'shorter side. Nothing is re-paired or re-ordered — matches '
-              'WinMerge / GNU diffutils sdiff output. '
-              'When ON (VS Code-like): the engine\'s hunks are re-paired '
-              'by similarity — _find_best_pairs anchors on the longest '
-              'unique exact match or the best prefix/suffix-similar pair, '
-              'char-diffs it, and recurses on both sides. Lines with < 3 '
-              'chars of similarity are shown as separate delete+add. This '
-              're-arranges the engine\'s output for a more "aligned" look '
-              'but is no longer a faithful rendering of the diff. '
-              'Applies to both native and Python algorithms. '
-              'Equal-count REPLACE blocks (da == db) are positional in '
-              'BOTH modes, so this option only affects unequal-count '
-              'REPLACE blocks. Default: off.'),
-     'def': False,
-     'frm': 'bool',
-     'chp': 'config',
-     },
-    {'opt': 'differ.enable_profiling',
-     'cmt': _('Enable profiling to trace where compare time is consumed. '
-              'Outputs a detailed timing report to the console after each '
-              'compare, breaking down time spent in the diff algorithm, '
-              'opcode realignment, event generation, char-level diffing, '
-              'and UI painting (bookmarks, decor, gaps, attributes). '
-              'Use for debugging performance issues only — adds small '
-              'overhead (~1-2us per timing point). '
-              'Default: off.'),
-     'def': False,
-     'frm': 'bool',
-     'chp': 'config',
-     },
-    {'opt': 'differ.enable_micromap',
-     'cmt': _('Enable the built-in micromap (mini-map) in compare tabs. '
-              'Clears the default micromap columns 0 (line states) and '
-              '2 (selections), keeps column 1 (bookmarks — also shows '
-              'the cursor position), and paints diff-colored line '
-              'highlights on column 1 via attr(show_on_map=1). '
-              'Note: the micromap does NOT account for inter-line gaps, '
-              'so it may desync from the actual text positions when '
-              'gaps are present. For a gap-aware alternative, enable '
-              'enable_overview instead (or both). '
-              'Default: off.'),
-     'def': False,
-     'frm': 'bool',
-     'chp': 'config',
-     },
-    {'opt': 'differ.enable_overview',
-     'cmt': _('Enable the gap-aware overview panel in compare tabs. '
-              'The overview is a custom paintbox added to the right '
-              'side of the editor. Unlike the built-in micromap, the '
-              'overview accounts for inter-line gaps inserted for '
-              'visual alignment, so it stays in sync with what you '
-              'actually see. Shows both editors side-by-side with '
-              'colored rectangles for deleted (red), added (green), '
-              'and changed (yellow) lines, plus gray rectangles for '
-              'gaps and white for unchanged lines. Click the overview '
-              'to scroll the corresponding editor, or drag the slider '
-              'to scroll continuously. The slider height is '
-              'proportional to the visible-page vs total-content ratio '
-              '(like real scrollbars in browsers and editors), with a '
-              'minimum height of 30px so it always stays grabbable. '
-              'Can be used together with the micromap. '
-              'Default: on.'),
-     'def': True,
-     'frm': 'bool',
-     'chp': 'config',
-     },
-    {'opt': 'differ.enable_overview_slider_opacity',
-     'cmt': _('Enable transparency for the overview panel slider. '
-              'When enabled, the slider is rendered with simulated '
-              'alpha blending (per-row pre-blend of the underlying '
-              'overview colors with the slider fill color), so the '
-              'colored diff lines remain visible through the slider '
-              'like in WinMerge. When disabled, the slider uses a '
-              'fast opaque solid fill (the old behaviour). '
-              'Note: when enabled AND overview_slider_opacity is below '
-              '8%, the slider falls back to a border-only style '
-              '(BRUSH_CLEAR, fully see-through) for performance. '
-              'Default: on.'),
-     'def': True,
-     'frm': 'bool',
-     'chp': 'config',
-     },
-    {'opt': 'differ.overview_slider_opacity',
-     'cmt': _('Opacity of the overview panel slider, in percent. '
-              '0 = fully transparent (slider border only via '
-              'BRUSH_CLEAR, the static overview shows through '
-              'completely), 100 = fully opaque (solid fill). '
-              'Intermediate values (e.g. 40) simulate true alpha '
-              'blending via per-row pre-blending of the underlying '
-              'overview colors with the slider fill color. Only used '
-              'when enable_overview_slider_opacity is True. Values '
-              'below 8 use the faster BRUSH_CLEAR path instead of '
-              'per-row blending. Range: 0-100. Default: 40.'),
-     'def': 40,
-     'frm': 'int',
-     'chp': 'config',
-     },
-]
-
-DIFF_TAB_COUNT = 1
-# Persistent state file: stores compare-tab state grouped by session.
-# Structure:
-# {
-#   "sessions": {
-#     "<session_key>": {
-#       "<compare_tab_id>": {
-#         "primary_orig_tab_id": <int>,
-#         "primary_orig_name": "...",
-#         "secondary_orig_tab_id": <int>,
-#         "secondary_orig_name": "...",
-#         "saved": true
-#       }
-#     }
-#   }
-# }
-# session_key is the session file path, relative to the settings folder if
-# the session is inside it (at any depth), or the full path if outside.
-STATE_FILE = os.path.join(ct.app_path(ct.APP_DIR_SETTINGS), 'cuda_differ_state.json')
-# Path to plugins.ini -- used to persistently subscribe to on_start2 so the
-# plugin auto-loads on next CudaText startup when compare tabs are active.
-PLUGINS_INI = os.path.join(ct.app_path(ct.APP_DIR_SETTINGS), 'plugins.ini')
-PLUGINS_INI_SECTION = 'events'
-MODULE_NAME = __name__.split('.')[-1]  # e.g. 'cuda_differ'
-
-
-_homedir = os.path.expanduser('~')
 
 def collapse_filename(fn):
     """Shorten a filename by replacing the home directory with '~'."""
