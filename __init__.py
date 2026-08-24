@@ -12,6 +12,7 @@ from . import differ_native as dfn
 from . import differ_python as dfp
 from .overview import PaintboxOverview
 from .profiling import Profiler, enable_profiling, profiling_report, reset_profiling
+from .py_algo.unified_diff import unified_diff
 
 # df is used as a namespace for event constants (A_LINE_DEL, B_LINE_ADD, etc.).
 # Both differ_native and differ_python define identical constants, so we alias
@@ -858,12 +859,23 @@ class Command:
 
     def create_diff(self, txt0, txt1, fn0, fn1):
         """Create a read-only unified-diff tab from two text strings.
-        Used by diff_with and diff_with_tab commands."""
+        Used by diff_with and diff_with_tab commands.
+
+        The unified-diff output is always produced with Python's difflib
+        (autojunk=False), never the chosen differ.diff_algorithm -- the
+        algorithm only affects side-by-side line pairing, not the patch
+        format itself, and unified diff is a machine-consumed patch
+        stream (patch / git apply / CI / code-review bots). See
+        py_algo/unified_diff.py for the full rationale and readme.txt
+        ("Diff current document with file..." section) for the user-facing
+        note.
+        """
         if txt0 and txt0[-1] != '\n': txt0 += '\n'
         if txt1 and txt1[-1] != '\n': txt1 += '\n'
         a = split_lines_safe(txt0)
         b = split_lines_safe(txt1)
-        r = self.diff.unidiff(a, b, fn0, fn1, self.cfg.get('diff_context'))
+        r = ''.join(unified_diff(a, b, fn0, fn1,
+                                 n=self.cfg.get('diff_context')))
 
         global DIFF_TAB_COUNT
         tab = 'Diff ' + str(DIFF_TAB_COUNT)

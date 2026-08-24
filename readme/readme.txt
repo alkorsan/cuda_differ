@@ -46,6 +46,18 @@ Diff current document with file...
 Diff current document with tab...
     Same as above, but compares with another open tab.
 
+    Note: the unified-diff output is always produced using Python's
+    difflib (the standard library SequenceMatcher, with autojunk
+    disabled), not the algorithm chosen via differ.diff_algorithm.
+    Unified diff is a machine-readable patch format normally consumed
+    by tools (patch, git apply, CI, code-review bots, etc.) rather
+    than read end-to-end by humans; the chosen algorithm only affects
+    how lines are paired inside REPLACE blocks for the side-by-side
+    view, and can be slower than difflib on large files. Applying
+    it to the unified-diff path would be wasted work for no user-visible
+    benefit. If you want the chosen algorithm's alignment in a
+    human-readable form, use the side-by-side compare instead.
+
 Refresh
     Re-runs the comparison after you edit either side. Useful if
     auto-refresh is off.

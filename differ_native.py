@@ -23,7 +23,6 @@ Alignment modes (self.beautify_alignment):
 """
 
 import time
-from difflib import SequenceMatcher as DefaultSequenceMatcher
 from .py_algo.char_diff import char_diff
 from .profiling import Profiler
 from collections import Counter
@@ -161,74 +160,6 @@ B_DECOR_GREEN = '+g'
 ALIGN = '='
 
 
-def _format_range_unified(start, stop):
-    """Convert a (start, stop) line range to unified-diff hunk-header format.
-
-    Verbatim copy of ``difflib._format_range_unified``. It is a private helper
-    in CPython, so we keep our own to stay independent of internal renames.
-    """
-    beginning = start + 1  # lines start numbering with one
-    length = stop - start
-    if length == 1:
-        return '{}'.format(beginning)
-    if not length:
-        beginning -= 1  # empty ranges begin at line just before the range
-    return '{},{}'.format(beginning, length)
-
-
-# Why this function exists instead of calling ``difflib.unified_diff`` directly:
-# ``difflib.unified_diff`` builds its internal ``SequenceMatcher`` with
-# the default ``autojunk=True`` and does not expose any way to change it
-# -- see https://github.com/python/cpython/issues/118150. The plugin
-# always disables the autojunk heuristic (it treats lines that appear
-# more than 1% of the time as 'junk' and skips them, which produces one
-# giant 'replace' block on files with duplicated boilerplate); without
-# this wrapper the unified-diff path (the "Diff with file..." /
-# "Diff with tab..." commands) would silently apply autojunk=True.
-#
-# Implementation is a verbatim copy of ``difflib.unified_diff`` from
-# CPython with two differences:
-#   1. ``SequenceMatcher(None, a, b, autojunk=False)`` instead of
-#      ``SequenceMatcher(None, a, b)`` -- the whole point.
-#   2. ``fromfiledate``/``tofiledate`` of ``None`` fall back to an empty
-#      string instead of the current system timestamp.
-def _unified_diff(a, b, fromfile='', tofile='',
-                  fromfiledate='', tofiledate='',
-                  n=3, lineterm='\n'):
-    """Produce unified diff output, same as difflib.unified_diff but with
-    autojunk always disabled. See the long comment above for why this
-    exists."""
-    if fromfiledate is None:
-        fromfiledate = ''
-    if tofiledate is None:
-        tofiledate = ''
-
-    started = False
-    for group in DefaultSequenceMatcher(
-            None, a, b, autojunk=False).get_grouped_opcodes(n):
-        if not started:
-            started = True
-            fromdate = '\t{}'.format(fromfiledate) if fromfiledate else ''
-            todate = '\t{}'.format(tofiledate) if tofiledate else ''
-            yield '--- {}{}{}'.format(fromfile, fromdate, lineterm)
-            yield '+++ {}{}{}'.format(tofile, todate, lineterm)
-        first, last = group[0], group[-1]
-        file1_range = _format_range_unified(first[1], last[2])
-        file2_range = _format_range_unified(first[3], last[4])
-        yield '@@ -{} +{} @@{}'.format(file1_range, file2_range, lineterm)
-        for tag, i1, i2, j1, j2 in group:
-            if tag == 'equal':
-                for line in a[i1:i2]:
-                    yield ' ' + line
-                continue
-            if tag in {'replace', 'delete'}:
-                for line in a[i1:i2]:
-                    yield '-' + line
-            if tag in {'replace', 'insert'}:
-                for line in b[j1:j2]:
-                    yield '+' + line
-
-
 class Differ:
     """Differ for native algorithms (native_histogram, native_myers).
 
@@ -238,7 +169,7 @@ class Differ:
 
     This class is self-contained: it does not import from differ_python.
     Code that overlaps with differ_python.Differ (event constants,
-    _replace_block, _find_best_pairs, _char_diff_pair, unidiff, etc.) is
+    _replace_block, _find_best_pairs, _char_diff_pair, etc.) is
     duplicated intentionally to allow independent evolution.
 
     compare() function return tuples for paint text:
@@ -426,18 +357,6 @@ class Differ:
                       self.diff_algorithm,
                       len(self.a), len(self.b),
                       len(self.diffmap)))
-
-    def unidiff(self, a, b, f1, f2, n):
-        """Produce a unified diff string from two line sequences.
-
-        Always calls the local _unified_diff wrapper so the autojunk
-        heuristic is disabled (difflib.unified_diff does not expose the
-        autojunk parameter -- see
-        https://github.com/python/cpython/issues/118150 and the comment
-        on _unified_diff for why).
-        """
-        diff = _unified_diff(a, b, f1, f2, n=n)
-        return ''.join(diff)
 
     def _positional_pairs(self, a, alo, b, blo, count):
         """Pair the k-th A line with the k-th B line, top-down, for
