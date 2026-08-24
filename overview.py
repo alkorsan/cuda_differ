@@ -313,11 +313,14 @@ class PaintboxOverview:
         """Configure the overview slider's transparency behaviour.
 
         Two user-facing options:
-          - 'enable overview slider opacity' (bool, default True):
-                False → use the OLD solid-fill slider (fast, no blending).
-                True  → use BRUSH_CLEAR if opacity < 8%, else the pre-blend
-                        method (per-row simulated alpha blend).
-          - 'overview slider opacity' (float 0..1, default 0.4):
+          - differ.micromap.enable_overview_slider_opacity
+                (bool, default True):
+                False -> use the OLD solid-fill slider (fast, no blending).
+                True  -> use BRUSH_CLEAR if opacity < 8%, else the pre-blend
+                         method (per-row simulated alpha blend).
+          - differ.micromap.overview_slider_opacity
+                (int 0..100 in the JSON, passed here as float 0..1,
+                default 0.4):
                 Slider opacity. 0 = invisible (BRUSH_CLEAR), 1 = opaque.
                 Only used when opacity_enabled is True.
 
