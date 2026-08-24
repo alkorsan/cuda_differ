@@ -1,7 +1,7 @@
 """VS Code-style line diffing algorithm.
 
 Ported from Microsoft VS Code's diff implementation at:
-  https://github.com/microsoft/vscode/tree/main/src/vs/editor/common/diff
+  https://github.com/microsoft/vscode/tree/03e0f5ddfb3b387ba074581690838f7b07e272a4/src/vs/editor/common/diff
 
 Files ported:
   - defaultLinesDiffComputer/algorithms/diffAlgorithm.ts

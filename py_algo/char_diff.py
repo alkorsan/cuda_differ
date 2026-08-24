@@ -28,15 +28,7 @@ This module provides:
 """
 import re
 from typing import List, Tuple
-
-# Import at module level to avoid re-importing on every char_diff call
-# (the lazy import inside the function added 11ms per call due to
-# importlib overhead).
-try:
-    from .myers import MyersSequenceMatcher
-except ImportError:
-    # Allow direct import (for testing without the package)
-    from myers import MyersSequenceMatcher
+from .myers_onp_diff import MyersSequenceMatcher
 
 
 # WinMerge stringdiffs.cpp (BuildWordDiffList):

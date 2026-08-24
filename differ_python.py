@@ -20,10 +20,10 @@ Alignment modes (self.beautify_alignment):
 
 import time
 from difflib import SequenceMatcher as DefaultSequenceMatcher, unified_diff
-from .myers import MyersSequenceMatcher, InlineMyersSequenceMatcher
-from .patiencediff import PatienceSequenceMatcher
-from .vscode_diff import VSCodeSequenceMatcher
-from .char_diff import char_diff
+from .py_algo.myers_onp_diff import MyersSequenceMatcher, InlineMyersSequenceMatcher
+from .py_algo.patience_diff.patiencediff import PatienceSequenceMatcher
+from .py_algo.vscode_diff import VSCodeSequenceMatcher
+from .py_algo.char_diff import char_diff
 from .profiling import Profiler
 from collections import Counter
 import cudatext as _ct

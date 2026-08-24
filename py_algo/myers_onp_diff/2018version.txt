@@ -1,0 +1,4 @@
+port of the 2018 version https://github.com/GNOME/meld/blob/3a90da8d433c755f45a2ba095ddd33145f589e21/meld/matchers/myers.py
+
+new additions are useless for this plugin so i used 2018 version, the algo did not change from that time
+the file was adapted for this plugin a litle bit

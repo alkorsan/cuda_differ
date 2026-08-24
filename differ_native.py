@@ -24,7 +24,7 @@ Alignment modes (self.beautify_alignment):
 
 import time
 from difflib import SequenceMatcher as DefaultSequenceMatcher, unified_diff
-from .char_diff import char_diff
+from .py_algo.char_diff import char_diff
 from .profiling import Profiler
 from collections import Counter
 import cudatext as _ct
