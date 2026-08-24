@@ -1264,7 +1264,7 @@ class Command:
         # the last compare took.
         _compare_start = time.perf_counter()
         try:
-            Profiler.start('refresh:total')
+            Profiler.start('refresh')
 
             a_ed = ct.Editor(ed.get_prop(ct.PROP_HANDLE_PRIMARY))
             b_ed = ct.Editor(ed.get_prop(ct.PROP_HANDLE_SECONDARY))
@@ -1337,7 +1337,7 @@ class Command:
                 if show_dialog:
                     t = _('The two sides are identical.')
                     ct.msg_box(t, ct.MB_OK)
-                Profiler.stop('refresh:total')
+                Profiler.stop('refresh')
                 return
 
             # NOTE: Do NOT force word-wrap off here. The user may legitimately
@@ -1607,7 +1607,7 @@ class Command:
                 overview.repaint_static()
                 Profiler.stop('paint:overview')
 
-            Profiler.stop('refresh:total')
+            Profiler.stop('refresh')
         finally:
             # Always show the total compare time on the status bar —
             # INDEPENDENT of profiling. This runs whether profiling is

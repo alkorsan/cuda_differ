@@ -171,14 +171,16 @@ class Profiler:
 
         The % column is based on SELF time as a fraction of the outermost
         section's total — so the sum of all % values approximates 100%
-        (small gap is time spent between sections, not inside any).
+        (the remainder is "Untracked time": wall time spent between
+        sections, outside any Profiler.start/stop pair — NOT related to
+        the paint:gap profiling section).
         """
         if not cls._timings:
             return
 
         # Find the outermost section (the one with the largest total time
-        # — typically 'refresh:total' or 'compare:total'). This is used as
-        # the denominator for percentages so they're more meaningful.
+        # — typically 'refresh' or 'compare'). This is used as the
+        # denominator for percentages so they're more meaningful.
         outermost_name = None
         grand_total = 0.0
         for name, (total, count, max_, self_t) in cls._timings.items():
@@ -188,7 +190,8 @@ class Profiler:
 
         # Sum of self times across all sections. Should be ≤ grand_total.
         # The difference is time spent between sections (overhead, code
-        # outside any Profiler.start/stop pair).
+        # outside any Profiler.start/stop pair) — NOT related to the
+        # paint:gap profiling section, which is a completely separate thing.
         sum_self = sum(t[3] for t in cls._timings.values())
 
         # Sort by SELF time descending — this is the key change. The real
@@ -225,9 +228,15 @@ class Profiler:
             outermost_name if outermost_name else '(none)',
             grand_total * 1000.0))
         _sum_pct = (sum_self / grand_total * 100.0) if grand_total > 0 else 0.0
-        print('  Sum of self times: {:.1f}ms ({:.1f}% of outermost \u2014 '
-              'gap is time between sections)'.format(
-                  sum_self * 1000.0, _sum_pct))
+        _untracked_pct = 100.0 - _sum_pct
+        print('  Sum of self times: {:.1f}ms ({:.1f}% of outermost)'.format(
+            sum_self * 1000.0, _sum_pct))
+        if _untracked_pct > 0.1:
+            print('  Untracked time (between sections): {:.1f}ms ({:.1f}%)'.format(
+                (grand_total - sum_self) * 1000.0, _untracked_pct))
+        else:
+            print('  Untracked time (between sections): {:.1f}ms ({:.1f}%) \u2014 all time accounted for'.format(
+                (grand_total - sum_self) * 1000.0, _untracked_pct))
         print('=' * 100)
         # Print a note about nesting so the user understands the
         # self vs total distinction.
@@ -238,6 +247,14 @@ class Profiler:
         print('      Rows near the bottom with high total but ~0 self are'
               ' pure wrappers \u2014')
         print('      their cost is already counted in their children above.')
+        print('      Naming: a bare name (e.g. char_diff) wraps the whole'
+              ' method; a colon')
+        print('      suffix (e.g. char_diff:native_engine) is a CHILD of'
+              ' that wrapper.')
+        print('      "Untracked time" = wall time NOT inside any profiling'
+              ' section \u2014')
+        print('      unrelated to the paint:gap section, which is a'
+              ' completely separate thing.')
         print('=' * 100 + '\n')
 
     @classmethod

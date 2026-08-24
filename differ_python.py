@@ -321,12 +321,11 @@ class Differ:
         if len(line_a) > 100000 or len(line_b) > 100000:
             return [('replace', 0, len(line_a), 0, len(line_b))]
 
-        Profiler.start('char_diff:python_call')
+        Profiler.start('char_diff:python_engine')
         try:
             return char_diff(line_a, line_b)
         finally:
-            _ct.msg_status(_('Differ: Python char_diff used'))
-            Profiler.stop('char_diff:python_call')
+            Profiler.stop('char_diff:python_engine')
 
     # Threshold for the "trivial equal block" check in _realign_opcodes.
     # If the EQUAL block between an INSERT and a DELETE (or vice versa)
@@ -504,7 +503,7 @@ class Differ:
         # (or closed).
         _bm_start = time.perf_counter() if _BENCHMARK else None
 
-        Profiler.start('compare:total')
+        Profiler.start('compare')
 
         self.diffmap = []
         Profiler.start('compare:algorithm')
@@ -565,7 +564,7 @@ class Differ:
                                                           self.b, j1, j2)
         Profiler.stop('compare:event_generation')
 
-        Profiler.stop('compare:total')
+        Profiler.stop('compare')
 
         if _bm_start is not None:
             _bm_elapsed = time.perf_counter() - _bm_start
@@ -608,9 +607,9 @@ class Differ:
             if a[ai] == b[bj]:
                 yield (ALIGN, ai, bj)
             else:
-                Profiler.start('char_diff:per_line')
+                Profiler.start('char_diff')
                 ops = self._char_diff(a[ai], b[bj])
-                Profiler.stop('char_diff:per_line')
+                Profiler.stop('char_diff')
                 yield from self._char_diff_pair(ai, bj, ops)
                 yield (ALIGN, ai, bj)
 
@@ -660,7 +659,7 @@ class Differ:
         Equal line counts (da == db) are positional in BOTH modes, so the modes
         diverge only in the da != db branch below.
         """
-        Profiler.start('replace_block:total')
+        Profiler.start('replace_block')
         da, db = ahi - alo, bhi - blo
 
         # Defensive only — a 'replace' opcode from the engine always has
@@ -668,7 +667,7 @@ class Differ:
         # opcodes in compare()). These branches contain no heuristics;
         # they just render a degenerate opcode faithfully.
         if da == 0 and db == 0:
-            Profiler.stop('replace_block:total')
+            Profiler.stop('replace_block')
             return
         if da == 0:
             Profiler.start('replace_block:insert_only')
@@ -676,7 +675,7 @@ class Differ:
             for y in range(blo, bhi):
                 yield (B_LINE_ADD, y)
             Profiler.stop('replace_block:insert_only')
-            Profiler.stop('replace_block:total')
+            Profiler.stop('replace_block')
             return
         if db == 0:
             Profiler.start('replace_block:delete_only')
@@ -684,7 +683,7 @@ class Differ:
             for y in range(alo, ahi):
                 yield (A_LINE_DEL, y)
             Profiler.stop('replace_block:delete_only')
-            Profiler.stop('replace_block:total')
+            Profiler.stop('replace_block')
             return
 
         # Fast path: when both sides have the same number of lines, use
@@ -700,7 +699,7 @@ class Differ:
             Profiler.start('replace_block:positional_pair')
             yield from self._positional_pairs(a, alo, b, blo, da)
             Profiler.stop('replace_block:positional_pair')
-            Profiler.stop('replace_block:total')
+            Profiler.stop('replace_block')
             return
 
         # ---- da != db: the two modes diverge here ----
@@ -728,7 +727,7 @@ class Differ:
                     yield (B_LINE_ADD, y)
             Profiler.stop('replace_block:positional_pair')
 
-        Profiler.stop('replace_block:total')
+        Profiler.stop('replace_block')
 
     def _find_best_pairs(self, a, alo, ahi, b, blo, bhi):
         """Find the best line alignment within a sub-REPLACE block.
@@ -917,9 +916,9 @@ class Differ:
         if a_line == b_line:
             yield (ALIGN, best_i, best_j)
         else:
-            Profiler.start('char_diff:per_line')
+            Profiler.start('char_diff')
             ops = self._char_diff(a_line, b_line)
-            Profiler.stop('char_diff:per_line')
+            Profiler.stop('char_diff')
             yield from self._char_diff_pair(best_i, best_j, ops)
             yield (ALIGN, best_i, best_j)
 
