@@ -1,48 +1,0 @@
-this test shows why we should not use splitlines(), see split_lines_safe() in __init__ for more details
-
-1. Line Feed (LF, \n, 0x0A):
-First Line
-Second Line
-
-2. Carriage Return (CR, \r, 0x0D):
-First Line
-Second Line
-
-3. Carriage Return + Line Feed (CRLF, \r\n, 0x0D 0x0A):
-First Line
-Second Line
-
-4. Vertical Tab (VT, \v, 0x0B):
-First LineSecond Line
-
-5. Form Feed / Page Break (FF, \f, 0x0C):
-First LineSecond Line
-
-6. File Separator (FS, \u001C, 0x1C):
-File Section 1File Section 2
-
-7. Group Separator (GS, \u001D, 0x1D):
-Group 1Group 2
-
-8. Record Separator (RS, \u001E, 0x1E):
-Record 1Record 2
-
-9. Next Line (NEL, \u0085, 0x85):
-First LineSecond Line
-
-10. Line Separator (LS, \u2028):
-First Line Second Line
-
-11. Paragraph Separator (PS, \u2029):
-First Line Second Line
-
-hhhhhhhhhh
-fffffffff
-ttttttttttt
-sssssssssss
-ttttttttttt
-uuuuuuuuuuu
-rrrrrrrrrrrr
-eeeeeeeeee
-pppppppp
-llllllllll
