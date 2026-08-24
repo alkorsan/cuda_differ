@@ -19,7 +19,7 @@ Alignment modes (self.beautify_alignment):
 """
 
 import time
-from difflib import SequenceMatcher as DefaultSequenceMatcher, unified_diff
+from difflib import SequenceMatcher as DefaultSequenceMatcher
 from .py_algo.myers_onp_diff import MyersSequenceMatcher, InlineMyersSequenceMatcher
 from .py_algo.patience_diff.patiencediff import PatienceSequenceMatcher
 from .py_algo.vscode_diff import VSCodeSequenceMatcher
@@ -169,25 +169,26 @@ def _format_range_unified(start, stop):
 
 
 # Why this function exists instead of calling ``difflib.unified_diff`` directly:
-# ``difflib.unified_diff`` builds its internal ``SequenceMatcher`` with the
-# default ``autojunk=True`` and does not expose any way to change it -- see
-# https://github.com/python/cpython/issues/118150. The plugin has a
-# user-facing ``autojunk`` config option that already controls the side-by-side
-# compare path; without this wrapper, the unified-diff path (the "Diff with
-# file..." / "Diff with tab..." commands) would silently ignore that option
-# when the user sets ``autojunk=False``.
+# ``difflib.unified_diff`` builds its internal ``SequenceMatcher`` with
+# the default ``autojunk=True`` and does not expose any way to change it
+# -- see https://github.com/python/cpython/issues/118150. The plugin
+# always disables the autojunk heuristic (it treats lines that appear
+# more than 1% of the time as 'junk' and skips them, which produces one
+# giant 'replace' block on files with duplicated boilerplate); without
+# this wrapper the unified-diff path (the "Diff with file..." /
+# "Diff with tab..." commands) would silently apply autojunk=True.
 #
-# Implementation is a verbatim copy of ``difflib.unified_diff`` from CPython
-# with two differences:
-#   1. ``SequenceMatcher(None, a, b, autojunk=autojunk)`` instead of
+# Implementation is a verbatim copy of ``difflib.unified_diff`` from
+# CPython with two differences:
+#   1. ``SequenceMatcher(None, a, b, autojunk=False)`` instead of
 #      ``SequenceMatcher(None, a, b)`` -- the whole point.
 #   2. ``fromfiledate``/``tofiledate`` of ``None`` fall back to an empty
 #      string instead of the current system timestamp.
 def _unified_diff(a, b, fromfile='', tofile='',
                   fromfiledate='', tofiledate='',
-                  n=3, lineterm='\n', autojunk=True):
+                  n=3, lineterm='\n'):
     """Produce unified diff output, same as difflib.unified_diff but with
-    explicit autojunk control. See the long comment above for why this
+    autojunk always disabled. See the long comment above for why this
     exists."""
     if fromfiledate is None:
         fromfiledate = ''
@@ -196,7 +197,7 @@ def _unified_diff(a, b, fromfile='', tofile='',
 
     started = False
     for group in DefaultSequenceMatcher(
-            None, a, b, autojunk=autojunk).get_grouped_opcodes(n):
+            None, a, b, autojunk=False).get_grouped_opcodes(n):
         if not started:
             started = True
             fromdate = '\t{}'.format(fromfiledate) if fromfiledate else ''
@@ -256,9 +257,9 @@ class Differ:
     def __init__(self, a='', b=''):
         """Initialize the Differ with two line sequences.
 
-        Sets default options: hybrid algorithm, autojunk on, detailed
-        compare on. The algorithm can be changed later via
-        self.diff_algorithm before calling compare().
+        Sets default options: hybrid algorithm, detailed compare on.
+        The algorithm can be changed later via self.diff_algorithm
+        before calling compare().
         """
         self.withdetail = True
         # Algorithm key stored in self.diff_algorithm. One of:
@@ -276,13 +277,12 @@ class Differ:
         #                       files),
         #   'patience'        (PatienceSequenceMatcher — pure-Python
         #                       patience diff; anchors on unique lines),
-        #   'difflib'         (Python stdlib SequenceMatcher with autojunk).
+        #   'difflib'         (Python stdlib SequenceMatcher with
+        #                       autojunk=False).
         #
         # These are pure-Python implementations. For native algorithms
         # (10-30x faster), use differ_native.Differ instead.
         self.diff_algorithm = 'hybrid'
-        self.autojunk = True
-        self.ratio = 0.75  # kept for API compat with __init__.py; unused
         # alignment mode toggle.
         #   True  = OLD 'beautified' alignment (_find_best_pairs re-pairs
         #           similar lines inside unequal-count replace blocks).
@@ -516,8 +516,8 @@ class Differ:
         elif self.diff_algorithm == 'patience':
             diff = PatienceSequenceMatcher(None, self.a, self.b)
         else:
-            # Default: difflib stdlib SequenceMatcher
-            diff = DefaultSequenceMatcher(None, self.a, self.b, autojunk=self.autojunk)
+            # Default: difflib stdlib SequenceMatcher with autojunk=False
+            diff = DefaultSequenceMatcher(None, self.a, self.b, autojunk=False)
 
         # get_opcodes() calls diff_proc (the native engine) — this is
         # where the actual algorithm runs.
@@ -578,20 +578,13 @@ class Differ:
     def unidiff(self, a, b, f1, f2, n):
         """Produce a unified diff string from two line sequences.
 
-        Uses difflib.unified_diff when autojunk=True (the default), or
-        _unified_diff when autojunk=False (to forward the flag to
-        SequenceMatcher). See the comment on _unified_diff for why.
+        Always calls the local _unified_diff wrapper so the autojunk
+        heuristic is disabled (difflib.unified_diff does not expose the
+        autojunk parameter -- see
+        https://github.com/python/cpython/issues/118150 and the comment
+        on _unified_diff for why).
         """
-        # autojunk=True matches the stdlib default -> call difflib.unified_diff
-        # directly (no reimplementation on the hot path). Only when the user
-        # opts out (autojunk=False) do we need _unified_diff to forward the
-        # kwarg, since difflib.unified_diff does not expose it -- see
-        # https://github.com/python/cpython/issues/118150 and the comment on
-        # _unified_diff above.
-        if self.autojunk:
-            diff = unified_diff(a, b, f1, f2, n=n)
-        else:
-            diff = _unified_diff(a, b, f1, f2, n=n, autojunk=False)
+        diff = _unified_diff(a, b, f1, f2, n=n)
         return ''.join(diff)
 
     def _positional_pairs(self, a, alo, b, blo, count):

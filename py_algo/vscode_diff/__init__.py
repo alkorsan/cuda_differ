@@ -19,11 +19,13 @@ Files ported:
       (algorithm selection: DP for small files, Myers for large)
 
 Why this exists instead of using difflib or patience:
-  1. difflib with autojunk=True (the stdlib default) treats lines that
-     appear more than 1% of the time as 'junk' and skips them. For files
-     full of duplicated boilerplate this produces one giant 'replace'
-     block covering the whole file, and the side-by-side renderer then
-     pairs lines 1:1 by index — producing a wildly misaligned view.
+  1. difflib's SequenceMatcher uses the Ratcliff/Obershelp algorithm
+     which, without VS Code's equality scoring and consecutive-diagonal
+     bonus, can produce suboptimal alignment on files with many similar
+     or duplicated lines. (Note: the differ plugin always passes
+     autojunk=False to difflib, so the autojunk 'popular line' heuristic
+     is not the issue here -- the issue is the underlying algorithm
+     itself.)
 
   2. Patience diff anchors on UNIQUE matching lines. When a region has
      no unique lines it falls back to pairing lines 1:1 by index, again

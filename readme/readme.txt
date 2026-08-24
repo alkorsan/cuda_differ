@@ -169,13 +169,6 @@ Configuration (chapter "config"):
   When enabled, changed lines are compared character-by-character and
   the specific changed characters are highlighted within the line.
   When disabled, changed lines are highlighted as a whole. Default: true.
-- Similarity threshold in percents (differ.ratio_percents)
-  Controls how aggressive the character-level comparison is when
-  deciding whether two lines should be treated as "changed" (similar
-  but not identical) or as separate "deleted + added" lines. A higher
-  value means lines must be more similar to be considered "changed";
-  a lower value means more lines will be shown as changed (with
-  character-level detail). Range: 1-100. Default: 75.
 - Keep carets visible on sync (differ.enable_sync_caret)
   When enabled, moving the cursor in one side also moves the cursor in
   the other side to the corresponding difference block. Default: false.
@@ -213,17 +206,9 @@ Configuration (chapter "config"):
   diff_proc API. If the API is not available, they silently fall back to
   the closest Python equivalent (native_histogram -> hybrid, native_myers
   -> myers). Default: native_histogram.
-- Autojunk heuristic (differ.autojunk)
-  Controls the autojunk parameter of difflib's SequenceMatcher. When
-  enabled (the Python default), items that appear more than 1% of the
-  time and at least 200 times are automatically treated as "junk" and
-  ignored for matching. This speeds up diffing of large files with many
-  repeated lines but can occasionally cause subtle differences to be
-  missed. Disable it if you suspect the diff is skipping matches due
-  to frequent repeated lines. This option only applies when
-  diff_algorithm is "difflib" -- MyersSequenceMatcher,
-  PatienceSequenceMatcher and VSCodeSequenceMatcher do not support
-  autojunk. Default: true.
+  Note: when the "difflib" algorithm is selected, the plugin always
+  passes autojunk=False to difflib's SequenceMatcher (the autojunk
+  heuristic is never enabled) -- this is hardcoded, not a user option.
 - Enable profiling (differ.enable_profiling)
   When enabled, prints a detailed timing report to the console after each
   compare, breaking down time spent in the diff algorithm, opcode

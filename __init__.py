@@ -194,12 +194,6 @@ OPTS_META = [
      'frm': 'bool',
      'chp': 'config',
      },
-    {'opt': 'differ.ratio_percents',
-     'cmt': _('Measure of the sequences’ similarity, in percents'),
-     'def':  75,
-     'frm': 'int',
-     'chp': 'config',
-     },
     {'opt': 'differ.enable_sync_caret',
      'cmt': _('Keep carets in both editors visible on current screen area'),
      'def':  False,
@@ -271,16 +265,6 @@ OPTS_META = [
              ('vscode',           _('VS Code (Python: DP + Myers, very slow with big files)')),
              ('patience',         _('Patience Diff (Python)')),
              ('difflib',          _('Python difflib stdlib'))],
-     'chp': 'config',
-     },
-    {'opt': 'differ.autojunk',
-     'cmt': _('Enable autojunk heuristic in difflib SequenceMatcher (only '
-              'applies when diff_algorithm is "difflib"; '
-              'HybridSequenceMatcher, MyersSequenceMatcher, '
-              'PatienceSequenceMatcher, VSCodeSequenceMatcher and the '
-              'native algorithms do not support autojunk)'),
-     'def': True,
-     'frm': 'bool',
      'chp': 'config',
      },
     {'opt': 'differ.beautify_alignment',
@@ -1204,14 +1188,10 @@ class Command:
         old_a = getattr(self.diff, 'a', '')
         old_b = getattr(self.diff, 'b', '')
         old_withdetail = getattr(self.diff, 'withdetail', True)
-        old_autojunk = getattr(self.diff, 'autojunk', True)
-        old_ratio = getattr(self.diff, 'ratio', 0.75)
         old_beautify_alignment = getattr(self.diff, 'beautify_alignment', False)
         self.diff = dfn.Differ() if want_native else dfp.Differ()
         self.diff.set_seqs(old_a, old_b)
         self.diff.withdetail = old_withdetail
-        self.diff.autojunk = old_autojunk
-        self.diff.ratio = old_ratio
         self.diff.beautify_alignment = old_beautify_alignment
         self.diff.diff_algorithm = algo
 
@@ -1305,8 +1285,8 @@ class Command:
                     self.cfg.get('color_changed'),
                     self.cfg.get('color_gaps'))
                 # Pass slider opacity options. Config stores opacity as
-                # int 0..100 (matches ratio_percents pattern); convert to
-                # float 0..1 for PaintboxOverview.set_slider_options().
+                # int 0..100; convert to float 0..1 for
+                # PaintboxOverview.set_slider_options().
                 # See overview.py for the three paint methods dispatched
                 # based on these values (SOLID / CLEAR / BLENDED).
                 overview.set_slider_options(
@@ -1372,9 +1352,7 @@ class Command:
             self.scroll.toggle(self.cfg.get('sync_scroll'))
 
             self.diff.withdetail = self.cfg.get('compare_with_details')
-            self.diff.ratio = self.cfg.get('ratio')
             self.diff.diff_algorithm = self.cfg.get('diff_algorithm')
-            self.diff.autojunk = self.cfg.get('autojunk')
             self.diff.beautify_alignment = self.cfg.get('beautify_alignment')
 
             # Detect word-wrap on either side. When wrap is on, gaps must be
@@ -1861,8 +1839,6 @@ class Command:
                 get_opt('sync_scroll', DEFAULT_SYNC_SCROLL == '1'),
             'compare_with_details':
                 get_opt('compare_with_details', True),
-            'ratio':
-                get_opt('ratio_percents',  75)/100,
             'enable_sync_caret':
                 get_opt('enable_sync_caret', False),
             'enable_auto_refresh':
@@ -1871,8 +1847,6 @@ class Command:
                 get_opt('diff_context', 3),
             'diff_algorithm':
                 get_opt('diff_algorithm', 'native_histogram'),
-            'autojunk':
-                get_opt('autojunk', True),
             'beautify_alignment':
                 get_opt('beautify_alignment', False),
             'enable_profiling':
@@ -1881,9 +1855,9 @@ class Command:
                 get_opt('enable_micromap', False),
             'enable_overview':
                 get_opt('enable_overview', True),
-            # Overview slider opacity. Stored as int 0..100 (matches
-            # ratio_percents pattern), passed to PaintboxOverview as a
-            # float 0..1. See overview.set_slider_options().
+            # Overview slider opacity. Stored as int 0..100, passed
+            # to PaintboxOverview as a float 0..1. See
+            # overview.set_slider_options().
             'enable_overview_slider_opacity':
                 get_opt('enable_overview_slider_opacity', True),
             'overview_slider_opacity':
