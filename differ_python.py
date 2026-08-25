@@ -216,14 +216,17 @@ class Differ:
         character positions into line_a / line_b. Same format as
         difflib.SequenceMatcher.get_opcodes() operating on characters.
         """
-        # Early bail-out for very long lines: skip the native call
-        # entirely and return a single REPLACE. The Pascal DoDiffChars
-        # would do the same inside diff_proc(DIF_CHARS) (its Tokenize
-        # pre-allocates N tokens where N = byte length, which for
-        # 100KB+ lines causes massive heap allocation that leads to
-        # EAccessViolation when repeated across many line pairs).
-        # Checking here avoids the Python→C→Pascal→C→Python round-trip
-        # and the heap churn entirely.
+        # Early bail-out for absurdly long lines: return a single REPLACE
+        # covering both lines without running any engine. This mirrors the
+        # same guard in differ_native.Differ._char_diff (where it protects
+        # the native engine's heap from the Pascal Tokenize allocation).
+        # Here the rationale is different: char_diff.py already guards
+        # itself with WORD_DIFF_THRESHOLD (20480 words, WinMerge's limit)
+        # and falls back to an O(N) prefix/suffix trim, but the tokenizer
+        # is still O(N) per line and the word-level Myers can burn real
+        # time on adversarial token counts just below the threshold — and
+        # a 100k-char line painted as a handful of huge blobs is visually
+        # useless anyway. Skipping it costs nothing.
         if len(line_a) > 100000 or len(line_b) > 100000:
             return [('replace', 0, len(line_a), 0, len(line_b))]
 
@@ -425,8 +428,9 @@ class Differ:
             # Default: difflib stdlib SequenceMatcher with autojunk=False
             diff = DefaultSequenceMatcher(None, self.a, self.b, autojunk=False)
 
-        # get_opcodes() calls diff_proc (the native engine) — this is
-        # where the actual algorithm runs.
+        # get_opcodes() runs the selected pure-Python algorithm — this is
+        # where the actual diff is computed (no cudatext.diff_proc call
+        # happens on this path; that is the native differ's job).
         opcodes = diff.get_opcodes()
         Profiler.stop('compare:algorithm')
 

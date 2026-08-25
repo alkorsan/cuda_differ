@@ -491,8 +491,8 @@ def msg(s, level=0):
     """Print a plugin message to the console. level: 0=info, 1=warning, 2=error."""
     if level == 0:
         print(PLG_NAME + ':', s)
-    elif level == 1:
-        print(PLG_NAME + _(' WARNING:'), s)
+    elif level == 1: 
+        print(PLG_NAME + _(' NOTE:'), s) # WARNING
     elif level == 2:
         print(PLG_NAME + _(' ERROR:'), s)
 
@@ -1020,8 +1020,6 @@ class Command:
         `git apply`. See readme.txt ("Diff current document with
         file..." section) for the user-facing note.
         """
-        if txt0 and txt0[-1] != '\n': txt0 += '\n'
-        if txt1 and txt1[-1] != '\n': txt1 += '\n'
         a = split_lines_safe(txt0)
         b = split_lines_safe(txt1)
         r = ''.join(unified_diff(a, b, fn0, fn1,
@@ -1352,6 +1350,15 @@ class Command:
         old_withdetail = getattr(self.diff, 'withdetail', True)
         old_beautify_alignment = getattr(self.diff, 'beautify_alignment', False)
         self.diff = dfn.Differ() if want_native else dfp.Differ()
+        # Line lists transfer as-is (both Differ classes store them).
+        # Raw texts (a_text/b_text) do not transfer — only the native
+        # differ keeps them, and a swap means the old differ was of the
+        # OTHER type. This preserved state is transient: _refresh_ex
+        # always calls set_seqs(...) with fresh raw texts right after
+        # this swap, before any compare() runs. If compare() ever ran
+        # in the transient state, Differ.compare() would rebuild the
+        # raw texts from the line lists via ''.join() (defensive join
+        # at the call site, see differ_native.Differ.compare).
         self.diff.set_seqs(old_a, old_b)
         self.diff.withdetail = old_withdetail
         self.diff.beautify_alignment = old_beautify_alignment
@@ -1465,11 +1472,6 @@ class Command:
             b_text_all = b_ed.get_text_all()
             Profiler.stop('refresh:get_text')
 
-            if not a_text_all.endswith('\n'):
-                a_text_all += '\n'
-            if not b_text_all.endswith('\n'):
-                b_text_all += '\n'
-
             if a_text_all == b_text_all:
                 Profiler.start('refresh:clear')
                 self.clear(a_ed)
@@ -1506,9 +1508,28 @@ class Command:
             self._ensure_correct_differ()
 
             Profiler.start('refresh:split_lines_safe')
-            self.diff.set_seqs(split_lines_safe(a_text_all),
-                               split_lines_safe(b_text_all))
+            lines_a = split_lines_safe(a_text_all)
+            lines_b = split_lines_safe(b_text_all)
             Profiler.stop('refresh:split_lines_safe')
+
+            if isinstance(self.diff, dfn.Differ):
+                # Native differ: pass the RAW texts alongside the line
+                # lists. CudaDiffNativeMatcher forwards them VERBATIM to
+                # cudatext.diff_proc, which splits them into lines inside
+                # the Pascal engine (LoadFile / TRawText.Create, on
+                # CRLF/CR/LF) — so the Python-side split above is used
+                # ONLY for painting (char-level detail, ALIGN pairing),
+                # never for the line-level diff itself. The old code
+                # round-tripped text -> split -> ''.join -> engine splits
+                # again; the join rebuilt a full copy of the text for
+                # nothing (''.join(split_lines_safe(t)) == t exactly).
+                self.diff.set_seqs(lines_a, lines_b,
+                                   a_text=a_text_all, b_text=b_text_all)
+            else:
+                # Python differ: it consumes line lists directly (the
+                # pure-Python matchers take sequences), so the split is
+                # genuinely needed here.
+                self.diff.set_seqs(lines_a, lines_b)
 
             self.scroll.tab_id.add(tab_id)
             self.scroll.toggle(self.cfg.get('sync_scroll'))
@@ -1537,7 +1558,6 @@ class Command:
                 line_h_a = 0
                 line_h_b = 0
             color_gaps = self.cfg.get('color_gaps')
-            overview_on = self.cfg.get('enable_overview', True)
 
             # The for loop below consumes events from diff.compare() (a
             # generator) and paints each event. Profiling the loop as a whole

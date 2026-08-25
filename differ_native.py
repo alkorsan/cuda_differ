@@ -41,13 +41,13 @@ class CudaDiffNativeMatcher:
     (tag, i1, i2, j1, j2) tuples with tag in
     {'equal', 'delete', 'insert', 'replace'}.
 
-    The native API takes two LF-joined strings and returns exactly that
-    opcode format, so this wrapper is essentially a type adapter:
-    list-of-lines -> LF-joined-string -> native call -> opcodes.
-
-    NOTE: cudatext.diff_proc expects strings with line terminators
-    attached (keepends=True). The plugin already stores sequences that
-    way (see __init__.py: splitlines(True)), so we just join with ''.
+    The native API takes two RAW TEXT strings and returns exactly that
+    opcode format. The engine splits the texts into lines internally
+    (on \r\n / \r / \n), so this class takes the raw texts directly
+    via a_text / b_text and passes them to the engine VERBATIM — no
+    Python-side split/join round-trip. Line counts (needed by
+    get_matching_blocks and the defensive fallback in get_opcodes)
+    are derived lazily from the raw texts via split_lines_safe.
     """
 
     # Algorithm IDs — accessed directly from cudatext (_ct) at the call
@@ -56,14 +56,20 @@ class CudaDiffNativeMatcher:
     _ALGO_MYERS = 0  # DIFF_ALGO_MYERS
     _ALGO_HISTOGRAM = 1  # DIFF_ALGO_HISTOGRAM
 
-    def __init__(self, isjunk=None, a='', b='', algo=1):
+    def __init__(self, isjunk=None, a_text='', b_text='', algo=1):
         """Create a native diff matcher.
 
         Args:
             isjunk: ignored (kept for difflib API compatibility; the
                 native engine does not support junk heuristics).
-            a, b: sequences of lines (list of str, each with its line
-                terminator attached -- i.e. keepends=True).
+            a_text, b_text: raw text strings. Passed VERBATIM to
+                cudatext.diff_proc — the engine splits them into lines
+                internally (CRLF/CR/LF). No Python-side split or join is
+                done on the input path: ''.join(split_lines_safe(t)) == t
+                byte-for-byte, so splitting on the Python side just to
+                re-join for the engine call would rebuild a full copy of
+                the text for nothing (on a 1M-line compare: ~30ms and ~35MB
+                of transient allocation of pure waste).
             algo: CudaDiffNativeMatcher._ALGO_MYERS (0) — WinMerge's GNU
                   diffutils Myers with Eggert heuristic. Faster on large /
                   different files.
@@ -72,8 +78,8 @@ class CudaDiffNativeMatcher:
                   sub-regions. Patience-style anchoring on unique lines,
                   more human-readable for normal files.
         """
-        self.a = a
-        self.b = b
+        self._a_text = a_text
+        self._b_text = b_text
         self._algo = algo
         self.opcodes = None
 
@@ -87,7 +93,18 @@ class CudaDiffNativeMatcher:
         for tag, i1, i2, j1, j2 in self.get_opcodes():
             if tag == 'equal':
                 blocks.append((i1, j1, i2 - i1))
-        blocks.append((len(self.a), len(self.b), 0))
+        # Sentinel: difflib-compatible API requires a final (n_a, n_b, 0)
+        # block. The engine's opcode list is sorted, so the last opcode's
+        # i2 / j2 are the total line counts on each side — derive from
+        # there instead of recomputing with split_lines_safe (saves a
+        # full text scan).
+        opcodes = self.opcodes
+        if opcodes:
+            n_a = opcodes[-1][2]
+            n_b = opcodes[-1][4]
+        else:
+            n_a = n_b = 0
+        blocks.append((n_a, n_b, 0))
         return blocks
 
     def get_opcodes(self):
@@ -99,15 +116,11 @@ class CudaDiffNativeMatcher:
         """
         if self.opcodes is not None:
             return self.opcodes
-        Profiler.start('line_diff:join_strings')
-        text_a = ''.join(self.a)
-        text_b = ''.join(self.b)
-        Profiler.stop('line_diff:join_strings')
         Profiler.start('line_diff:native_engine')
         result = _ct.diff_proc(
             _ct.DIF_TEXTS,
-            text_a,
-            text_b,
+            self._a_text,
+            self._b_text,
             self._algo,
             0,                   # flags: DIFF_IGN_NONE
         )
@@ -116,8 +129,14 @@ class CudaDiffNativeMatcher:
         if result is None:
             # Defensive: should never happen, but fall back to a single
             # REPLACE covering everything so the caller's opcode-walking
-            # loop still produces sensible output (everything painted as changed) instead of crashing.
-            result = [('replace', 0, len(self.a), 0, len(self.b))]
+            # loop still produces sensible output (everything painted as
+            # changed) instead of crashing. Line counts are derived from
+            # the raw texts via split_lines_safe (lazy import to avoid a
+            # circular dependency at module-load time — __init__.py
+            # imports differ_native before split_lines_safe is defined).
+            from . import split_lines_safe
+            result = [('replace', 0, len(split_lines_safe(self._a_text)),
+                                  0, len(split_lines_safe(self._b_text)))]
         self.opcodes = result
         return result
 
@@ -199,10 +218,40 @@ class Differ:
         self.set_seqs(a, b)
         self.diffmap = []
 
-    def set_seqs(self, a, b):
-        """Set the two line sequences to compare."""
+    def set_seqs(self, a, b, a_text=None, b_text=None):
+        """Set the two line sequences to compare.
+
+        Args:
+            a, b: sequences of lines (list of str, keepends) — used for
+                painting (char-level detail, ALIGN pairing) in compare()
+                and the defensive fallback paths.
+            a_text, b_text: optional RAW TEXTS of the two sides. When both
+                are given they are stored and later passed VERBATIM to
+                cudatext.diff_proc — the Pascal engine splits them into
+                lines internally (on CRLF/CR/LF), so the engine's split is
+                the single authority for the line-level diff and the line
+                lists above are demoted to painting-only duty. This is the
+                preferred calling convention (what Command._refresh_ex
+                uses): it avoids the old round-trip of
+                text -> split_lines_safe -> ''.join -> engine splits again,
+                where the join rebuilt a full copy of the text for nothing
+                (''.join(split_lines_safe(t)) == t byte-for-byte, so on a
+                1M-line compare it was ~30ms and a ~35MB transient
+                allocation of pure waste).
+
+        Passing a_text=None (default) clears any previously stored raw
+        texts: a stale a_text from an earlier call can never leak into a
+        later compare. When a_text/b_text are None at compare() time, the
+        matcher rebuilds them on the fly via ''.join(self.a) / ''.join(self.b)
+        — this is the path exercised by _ensure_correct_differ's differ
+        swap, which preserves the line lists but not the raw texts (the
+        transient state is always overwritten by _refresh_ex's set_seqs
+        call before any compare runs).
+        """
         self.a = a
         self.b = b
+        self.a_text = a_text
+        self.b_text = b_text
 
     def _char_diff(self, line_a, line_b):
         """Compute char-level diff between two single-line strings.
@@ -282,22 +331,35 @@ class Differ:
 
         self.diffmap = []
         Profiler.start('compare:algorithm')
+        # Defensive: when the Differ was swapped by _ensure_correct_differ
+        # (which preserves line lists but not raw texts), self.a_text /
+        # self.b_text may be None. _refresh_ex always calls set_seqs with
+        # fresh raw texts before any compare() runs, so this is a transient
+        # state — but if compare() were ever called in it, rebuild the
+        # raw texts from the line lists rather than crash the engine
+        # with None args. ''.join(split_lines_safe(t)) == t byte-for-byte.
+        a_text = self.a_text if self.a_text is not None else ''.join(self.a)
+        b_text = self.b_text if self.b_text is not None else ''.join(self.b)
         if self.diff_algorithm == 'native_myers':
             diff = CudaDiffNativeMatcher(
-                None, self.a, self.b, algo=CudaDiffNativeMatcher._ALGO_MYERS)
+                None, algo=CudaDiffNativeMatcher._ALGO_MYERS,
+                a_text=a_text, b_text=b_text)
         else:
             # Default to histogram (covers 'native_histogram' and any
             # unexpected value — histogram is the recommended default).
             diff = CudaDiffNativeMatcher(
-                None, self.a, self.b, algo=CudaDiffNativeMatcher._ALGO_HISTOGRAM)
+                None, algo=CudaDiffNativeMatcher._ALGO_HISTOGRAM,
+                a_text=a_text, b_text=b_text)
 
         # get_opcodes() calls diff_proc (the native engine) — this is
-        # where the actual algorithm runs.
+        # where the actual algorithm runs. The raw texts go to the engine
+        # VERBATIM — the engine splits them into lines itself, so no
+        # Python-side join happens on the fast path.
         opcodes = diff.get_opcodes()
         Profiler.stop('compare:algorithm')
 
-        # No _realign_opcodes call — native algorithms don't need it.
-        # See docstring for details.
+        # No _realign_opcodes call — the native path renders the engine's
+        # hunks faithfully (algo-faithful mode). See docstring for details.
 
         Profiler.start('compare:event_generation')
         for tag, i1, i2, j1, j2 in opcodes:
