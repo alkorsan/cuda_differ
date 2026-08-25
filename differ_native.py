@@ -203,50 +203,28 @@ class Differ:
               lines wrap to a different number of visual rows.
     """
 
-    def __init__(self, a='', b=''):
-        """Initialize the Differ with two raw text strings.
+    def __init__(self):
+        """Initialize the Differ.
 
         Sets default options: native_histogram algorithm, detailed
         compare on. The algorithm can be changed later via
         self.diff_algorithm before calling compare().
 
-        Args:
-            a, b: raw text strings (defaults to empty). Set via
-                set_seqs(a_text=..., b_text=...) from _refresh_ex
-                before compare() runs — the empty defaults are fine
-                because Command's _refresh_ex always populates the
-                Differ with fresh raw texts after construction.
+        The Differ holds NO text between compares — neither raw text
+        nor line lists. a_text / b_text are passed directly to
+        compare() by the caller (Command._refresh_ex), used as locals
+        inside compare() to drive the engine + painting, and dropped
+        when compare() returns. Between compares, the Differ holds
+        only config (withdetail / diff_algorithm / beautify_alignment)
+        and the diffmap (line-index tuples, small). The text itself
+        stays in the editor tabs' Pascal-side buffers (a_ed / b_ed),
+        which are the source of truth; the Python-side copy is built
+        fresh on each compare via a_ed.get_text_all() / b_ed.get_text_all().
         """
         self.withdetail = True
         self.diff_algorithm = 'native_histogram'
         self.beautify_alignment = False
-        self.set_seqs(a, b)
         self.diffmap = []
-
-    def set_seqs(self, a_text=None, b_text=None):
-        """Set the raw texts to compare.
-
-        Args:
-            a_text, b_text: raw text strings for the two sides. Stored
-                verbatim and later passed VERBATIM to cudatext.diff_proc —
-                the Pascal engine splits them into lines internally
-                (CRLF/CR/LF), so the engine's split is the single
-                authority for the line-level diff. The line lists needed
-                for painting (char-level detail, ALIGN pairing) are
-                derived LOCALLY inside compare() via split_lines_safe —
-                they are not kept as persistent attributes, so the diff
-                tab's long-term memory footprint is just the raw texts
-                (not the raw texts + line-list copies of the same data).
-                This is what Command._refresh_ex uses.
-
-        Passing a_text=None (default) clears any previously stored raw
-        texts: a stale a_text from an earlier call can never leak into
-        a later compare. _refresh_ex always calls set_seqs(...) with
-        fresh raw texts before any compare() runs, so None-at-compare
-        time does not happen in the current code flow.
-        """
-        self.a_text = a_text
-        self.b_text = b_text
 
     def _char_diff(self, line_a, line_b):
         """Compute char-level diff between two single-line strings.
@@ -296,22 +274,37 @@ class Differ:
             finally:
                 Profiler.stop('char_diff:python_engine')
 
-    def compare(self):
+    def compare(self, a_text, b_text):
         """Generator that yields diff events for side-by-side display.
 
         Pure translation of the engine's opcodes into paint events —
         nothing is added, removed or re-paired here.
-        
+
         The alignment mode (beautify_alignment) only affects how
         unequal-count REPLACE blocks are laid out — see _replace_block.
-        
-        Runs the native diff algorithm,
-        then walks the opcodes and yields events (A_LINE_DEL, B_LINE_ADD,
-        A_GAP, B_GAP, ALIGN, A_SYMBOL_DEL, etc.) that __init__.py
-        consumes to paint the compare view.
+
+        Runs the native diff algorithm on the two raw texts, then walks
+        the opcodes and yields events (A_LINE_DEL, B_LINE_ADD, A_GAP,
+        B_GAP, ALIGN, A_SYMBOL_DEL, etc.) that __init__.py consumes to
+        paint the compare view.
 
         Also populates self.diffmap with [i1, i2, j1, j2] for each
         non-equal opcode, used by jump()/copy()/select_current().
+
+        Args:
+            a_text, b_text: raw text strings for the two sides. The
+                Differ does NOT store them — they are used as locals
+                inside this generator and dropped when it returns.
+                The caller (Command._refresh_ex) reads them fresh from
+                the editor tabs (a_ed.get_text_all() / b_ed.get_text_all())
+                on every compare, so between compares the Differ holds
+                zero text bytes — only config + diffmap. This is the
+                intended design: the editor tabs are the source of
+                truth for the text; a Python-side copy would be a
+                transient duplicate with no consumer after compare()
+                returns (verified by grep — __init__.py reads only
+                self.diff.diffmap after the compare loop, never
+                self.diff.a_text / self.diff.b_text).
 
         NOTE: _realign_opcodes (the VS Code-style post-pass in
         differ_python.py) is NOT applied to native opcodes. Native engines
@@ -337,13 +330,13 @@ class Differ:
         if self.diff_algorithm == 'native_myers':
             diff = CudaDiffNativeMatcher(
                 None, algo=CudaDiffNativeMatcher._ALGO_MYERS,
-                a_text=self.a_text, b_text=self.b_text)
+                a_text=a_text, b_text=b_text)
         else:
             # Default to histogram (covers 'native_histogram' and any
             # unexpected value — histogram is the recommended default).
             diff = CudaDiffNativeMatcher(
                 None, algo=CudaDiffNativeMatcher._ALGO_HISTOGRAM,
-                a_text=self.a_text, b_text=self.b_text)
+                a_text=a_text, b_text=b_text)
 
         # get_opcodes() calls diff_proc (the native engine) — this is
         # where the actual algorithm runs. The raw texts go to the engine
@@ -357,12 +350,13 @@ class Differ:
 
         # Build the line lists LOCALLY for painting — split_lines_safe is
         # O(N) per call, so we split once here and pass the lists to
-        # _replace_block / _plain_replace_simple. They go out of scope
-        # when compare() returns, so they are garbage-collected after the
-        # compare finishes (the diff tab's persistent memory is just
-        # self.a_text / self.b_text, the smaller raw-text form).
-        a_lines = split_lines_safe(self.a_text)
-        b_lines = split_lines_safe(self.b_text)
+        # _replace_block / _plain_replace_simple. Both a_text/b_text and
+        # a_lines/b_lines are locals inside this generator: they go out
+        # of scope when compare() returns, so they are garbage-collected
+        # after the compare finishes. Between compares, the Differ holds
+        # zero text bytes — only config + diffmap.
+        a_lines = split_lines_safe(a_text)
+        b_lines = split_lines_safe(b_text)
 
         Profiler.start('compare:event_generation')
         for tag, i1, i2, j1, j2 in opcodes:
