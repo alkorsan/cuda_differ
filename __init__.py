@@ -12,6 +12,7 @@ from . import differ_native as dfn
 from . import differ_python as dfp
 from .overview import PaintboxOverview
 from .profiling import Profiler, enable_profiling, profiling_report, reset_profiling
+from .utils import split_lines_safe, ScrollSplittedTab
 from difflib import unified_diff
 from cudax_lib import get_translation
 _ = get_translation(__file__)  # I18N
@@ -355,126 +356,6 @@ MODULE_NAME = __name__.split('.')[-1]  # e.g. 'cuda_differ'
 _homedir = os.path.expanduser('~')
 
 
-# str.splitlines() breaks on the full Unicode line-boundary set, not just
-# '\n', '\r', '\r\n': it also splits on VT (\x0b), FF (\x0c), NEL (\x85),
-# LS (\u2028), and PS (\u2029), FS (\x1c) GS (\x1d) and RS (\x1e), see 
-# (test_14a_newline_characters.txt). If any of those bytes occur *inside* a
-# line's content (e.g. a NEL byte pasted into a JS string literal, or a
-# stray FF page-break char), splitlines() silently manufactures an extra
-# line the file doesn't actually have. Every diff opcode from that point
-# onward is then off by one row against the other side -- this create a
-# "drift" bug where two on-screen lines get produced from one real line.
-#
-# We only ever want to split on real line endings: \n, \r\n, or bare \r
-# (LF / CRLF / old-Mac CR). Everything else in that Unicode set should
-# stay as ordinary line content.
-#
-# IMPORTANT: this pattern has NO capturing parentheses -- it is used with
-# finditer(), not re.split(), so there is nothing to capture. Each match's
-# m.end() is read directly to slice text[pos:m.end()], which is how the
-# terminator stays attached to its line's content. If this pattern is
-# ever changed to power a re.split() call instead, the group MUST be
-# wrapped in parentheses -- r'(\r\n|\r|\n)' -- or re.split() silently
-# discards the terminators, collapsing the output to [content, content,
-# ...] and merging every pair of consecutive lines together.
-_LINE_SPLIT_RE = re.compile(r'\r\n|\r|\n')
-
-def split_lines_safe(text: str) -> tp.List[str]:
-    """Split text into lines on \\n, \\r\\n, or \\r ONLY.
-
-    Drop-in replacement for text.splitlines(True) that does NOT treat
-    VT, FF, NEL, LS, PS...etc as line boundaries (see comment above _LINE_SPLIT_RE).
-    Keepends behavior is preserved: each returned line includes its
-    original terminator, matching what splitlines(True) callers expect.
-    A trailing terminator-less remainder (if the text doesn't end in a
-    line ending) is included as the final element with no terminator,
-    same as splitlines(True). Empty input returns [].
- 
-    Details:
-    splitlines splits on the following 11 line boundaries: https://docs.python.org/3/library/stdtypes.html#str.splitlines
-    - \\n Line Feed
-    - \\r Carriage Return
-    - \\r\\n Carriage Return + Line Feed 
-    - \\v or \\x0b Line Tabulation (Vertical Tab (VT))
-    - \\f or \\x0c Form Feed (Page Break)
-    - \\x1c File Separator (FS, \\u001C)
-    - \\x1d Group Separator (GS, \\u001D):
-    - \\x1e Record Separator (RS, \\u001E)
-    - \\x85 Next Line (C1 Control Code, NEL, \\u0085)
-    - \\u2028 Line Separator (LS)
-    - \\u2029 Paragraph Separator (PS)
-       
-    This functions splits *text* into a list of lines, keeping each line's terminator
-    appended (matching str.splitlines(True)'s keepends=True contract),
-    but splitting ONLY on \\r\\n, \\r, \\n -- NOT on NEL/VT/FF/LS/PS...etc.
-    This matches how CudaText stores lines internally: a line containing
-    an embedded NEL/VT/FF/LS/PS...etc is a single logical line, not two.
-    A trailing empty element (after a final terminator) is dropped, so
-    "abc\\n" -> ["abc\\n"] -- same as str.splitlines(True).
-    
-    CudaText's editor only treats CR, LF, and CRLF as line breaks; the other
-    characters stay inside a single logical line and are rendered as
-    in-line control pictures. Using str.splitlines() here would split on
-    those extra characters too, producing more "lines" than the editor
-    actually has, which causes every diff event line index to drift out
-    of sync with the editor (see _refresh_ex).
-
-    Why I use re.finditer and not str.split(): split() can't do this job at all, for one structural reason -- it discards the delimiter. "a\\r\\nb".split('\\r\\n') gives you ['a', 'b'] with the \\r\\n gone. But set_seqs/unidiff call this with keepends=True semantics -- every line needs its original terminator still attached, because the diff engine uses that terminator when reconstructing/rendering output. So whatever splits also has to capture what it split on.
-    Three ways to get delimiter-preserving split, ranked:
-    1. re.split() with a capturing group — re.split(r'(\\r\\n|\\r|\\n)', text) returns alternating content/delimiter pieces you'd then have to re-zip back together in a loop. Works, but it's an extra reconstruction pass for no benefit over option 2.
-    2. finditer (what I used) — one pass, and at each match I already have m.end(), so I slice text[pos:m.end()] directly — content and its trailing terminator in one slice, no reassembly step. This is what I wrote.
-    3. Manual two-pointer scan (no regex) — check each position for \\r, \\n, or \\r\\n by hand, same asymptotic cost, more code, easier to get the "is this \\r followed by \\n" lookahead wrong. Not worth it here.
-    There's a subtlety str.split() would also get wrong even ignoring the discard problem: splitting on \\r and \\n as separate single-char delimiters (e.g. chaining two .split() calls, or re.split(r'[\\r\\n]')) treats \\r\\n as two boundaries, producing a spurious empty string between them. My pattern lists r'\\r\\n|\\r|\\n' with \\r\\n first, so regex alternation matches the two-char sequence before it'd consider the lone \\r — that ordering is why CRLF collapses to one boundary instead of two. If I'd written r'\\r|\\n|\\r\\n' instead, alternation still tries left-to-right per position, so \\r would win before \\r\\n got a chance and you'd get the same double-split bug. It's already correctly ordered in the delivered code, but worth knowing why the ordering matters if you ever touch that pattern.
-    
-    and finditer is faster than re.split() in my tests
-    """
-    if not text:
-        return []
-    lines = []
-    pos = 0
-    for m in _LINE_SPLIT_RE.finditer(text):
-        lines.append(text[pos:m.end()])
-        pos = m.end()
-    if pos < len(text):
-        lines.append(text[pos:])
-    return lines
-
-
-class ScrollSplittedTab:
-    """Manages synchronized scrolling for split compare tabs."""
-
-    keep_caret_visible = False
-
-    def __init__(self, name):
-        self.name = name
-        self.tab_id = set()
-
-    def toggle(self, on=True):
-        act = ct.PROC_EVENTS_SUB if on and ct.ed.get_prop(ct.PROP_TAB_ID) in self.tab_id else ct.PROC_EVENTS_UNSUB
-        ct.app_proc(act, self.name+';on_scroll;;')
-
-    def on_scroll(self, ed_self):
-        if ed_self.get_prop(ct.PROP_SPLIT)[0] == '-':
-            return
-
-        pos_v = ed_self.get_prop(ct.PROP_SCROLL_VERT_INFO)['smooth_pos']
-        pos_h = ed_self.get_prop(ct.PROP_SCROLL_HORZ_INFO)['smooth_pos']
-
-        hndl_self = ed_self.get_prop(ct.PROP_HANDLE_SELF)
-        hndl_primary = ed_self.get_prop(ct.PROP_HANDLE_PRIMARY)
-        hndl_secondary = ed_self.get_prop(ct.PROP_HANDLE_SECONDARY)
-        if hndl_self == hndl_primary:
-            hndl_opposit = hndl_secondary
-        else:
-            hndl_opposit = hndl_primary
-        e = ct.Editor(hndl_opposit)
-
-        e.set_prop(ct.PROP_SCROLL_VERT_INFO, {'smooth_pos': pos_v})
-        e.set_prop(ct.PROP_SCROLL_HORZ_INFO, {'smooth_pos': pos_h})
-
-        e.cmd(ct_cmd.cmd_RepaintEditor)
-
-
 def collapse_filename(fn):
     """Shorten a filename by replacing the home directory with '~'."""
     if (fn+'/').startswith(_homedir+'/'):
@@ -491,8 +372,8 @@ def msg(s, level=0):
     """Print a plugin message to the console. level: 0=info, 1=warning, 2=error."""
     if level == 0:
         print(PLG_NAME + ':', s)
-    elif level == 1: 
-        print(PLG_NAME + _(' NOTE:'), s) # WARNING
+    elif level == 1:
+        print(PLG_NAME + _(' WARNING:'), s)
     elif level == 2:
         print(PLG_NAME + _(' ERROR:'), s)
 
@@ -1338,28 +1219,27 @@ class Command:
         """Check if self.diff matches the configured algorithm type, and
         swap it if not. Called at the start of _refresh_ex so the Differ
         is always the right type before a compare runs. Preserves the
-        sequences and options from the old Differ."""
+        options (withdetail, beautify_alignment) but NOT the sequences:
+        _refresh_ex always calls set_seqs(...) with fresh data right
+        after this swap, before any compare() runs."""
         algo = self.cfg.get('diff_algorithm', 'native_histogram')
         want_native = algo in ('native_histogram', 'native_myers') and dfn._HAS_NATIVE_DIFF
         is_native = isinstance(self.diff, dfn.Differ)
         if want_native == is_native:
             return  # already the right type
-        # Swap: preserve sequences and options
-        old_a = getattr(self.diff, 'a', '')
-        old_b = getattr(self.diff, 'b', '')
+        # Swap: preserve options only. We do NOT preserve sequences:
+        #   - Native differ's set_seqs takes only raw texts (a_text/b_text),
+        #     not line lists.
+        #   - Python differ's set_seqs takes only line lists (a, b), not
+        #     raw texts.
+        # The two signatures are incompatible, and a swap means the old
+        # differ was of the OTHER type (so its stored form doesn't match
+        # the new differ's expected form anyway). _refresh_ex always
+        # calls set_seqs(...) with fresh state right after this swap,
+        # before any compare() runs, so the empty new Differ is fine.
         old_withdetail = getattr(self.diff, 'withdetail', True)
         old_beautify_alignment = getattr(self.diff, 'beautify_alignment', False)
         self.diff = dfn.Differ() if want_native else dfp.Differ()
-        # Line lists transfer as-is (both Differ classes store them).
-        # Raw texts (a_text/b_text) do not transfer — only the native
-        # differ keeps them, and a swap means the old differ was of the
-        # OTHER type. This preserved state is transient: _refresh_ex
-        # always calls set_seqs(...) with fresh raw texts right after
-        # this swap, before any compare() runs. If compare() ever ran
-        # in the transient state, Differ.compare() would rebuild the
-        # raw texts from the line lists via ''.join() (defensive join
-        # at the call site, see differ_native.Differ.compare).
-        self.diff.set_seqs(old_a, old_b)
         self.diff.withdetail = old_withdetail
         self.diff.beautify_alignment = old_beautify_alignment
         self.diff.diff_algorithm = algo
@@ -1507,28 +1387,30 @@ class Command:
             # algorithm in config since the last compare.
             self._ensure_correct_differ()
 
-            Profiler.start('refresh:split_lines_safe')
-            lines_a = split_lines_safe(a_text_all)
-            lines_b = split_lines_safe(b_text_all)
-            Profiler.stop('refresh:split_lines_safe')
-
             if isinstance(self.diff, dfn.Differ):
-                # Native differ: pass the RAW texts alongside the line
-                # lists. CudaDiffNativeMatcher forwards them VERBATIM to
-                # cudatext.diff_proc, which splits them into lines inside
-                # the Pascal engine (LoadFile / TRawText.Create, on
-                # CRLF/CR/LF) — so the Python-side split above is used
-                # ONLY for painting (char-level detail, ALIGN pairing),
-                # never for the line-level diff itself. The old code
-                # round-tripped text -> split -> ''.join -> engine splits
-                # again; the join rebuilt a full copy of the text for
-                # nothing (''.join(split_lines_safe(t)) == t exactly).
-                self.diff.set_seqs(lines_a, lines_b,
-                                   a_text=a_text_all, b_text=b_text_all)
+                # Native differ: only the RAW TEXTS are passed —
+                # CudaDiffNativeMatcher forwards them VERBATIM to
+                # cudatext.diff_proc, which splits them into lines
+                # inside the Pascal engine (LoadFile / TRawText.Create,
+                # on CRLF/CR/LF). The line lists needed for painting
+                # (char-level detail, ALIGN pairing) are derived LOCALLY
+                # inside Differ.compare() via split_lines_safe — they are
+                # not kept as persistent attributes, so the diff tab's
+                # long-term memory footprint is just the raw texts
+                # (halving the previous footprint, which held both forms).
+                # The Python-side split is not done here for the native
+                # differ (it was wasted work — the engine re-splits
+                # internally, and the painting split happens at compare
+                # time inside Differ.compare).
+                self.diff.set_seqs(a_text=a_text_all, b_text=b_text_all)
             else:
-                # Python differ: it consumes line lists directly (the
-                # pure-Python matchers take sequences), so the split is
-                # genuinely needed here.
+                # Python differ: consumes line lists directly (the
+                # pure-Python matchers take sequences), so the split
+                # is genuinely needed here.
+                Profiler.start('refresh:split_lines_safe')
+                lines_a = split_lines_safe(a_text_all)
+                lines_b = split_lines_safe(b_text_all)
+                Profiler.stop('refresh:split_lines_safe')
                 self.diff.set_seqs(lines_a, lines_b)
 
             self.scroll.tab_id.add(tab_id)
