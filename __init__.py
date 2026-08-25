@@ -1220,26 +1220,24 @@ class Command:
         swap it if not. Called at the start of _refresh_ex so the Differ
         is always the right type before a compare runs. Preserves the
         options (withdetail, beautify_alignment) but NOT the sequences:
-        neither Differ holds sequences between compares anymore — the
-        native Differ's compare() takes a_text/b_text as parameters
-        (no persistent storage), and the Python Differ still uses
-        set_seqs(lines) but that is overwritten on the next refresh.
-        _refresh_ex always re-passes fresh data to compare() (native)
-        or set_seqs() (python) right after this swap, before any
-        compare() runs."""
+        neither Differ holds sequences between compares anymore — both
+        the native Differ (compare(a_text, b_text)) and the Python
+        Differ (compare(lines_a, lines_b)) take their inputs as
+        parameters at compare() time. _refresh_ex always re-passes fresh
+        data to compare() right after this swap, before any compare()
+        runs."""
         algo = self.cfg.get('diff_algorithm', 'native_histogram')
         want_native = algo in ('native_histogram', 'native_myers') and dfn._HAS_NATIVE_DIFF
         is_native = isinstance(self.diff, dfn.Differ)
         if want_native == is_native:
             return  # already the right type
         # Swap: preserve options only. We do NOT preserve sequences:
-        #   - Native differ's compare() takes a_text/b_text as
-        #     parameters — there is nothing to preserve on the instance.
-        #   - Python differ's set_seqs() takes line lists (a, b), and
-        #     is incompatible with the native Differ's parameterized
-        #     compare(). _refresh_ex always calls the right entry point
-        #     with fresh state right after this swap, before any
-        #     compare() runs, so the empty new Differ is fine.
+        #   - Both differs take their inputs as compare() params
+        #     (native: raw texts; Python: line lists). There is nothing
+        #     to preserve on the instance.
+        # _refresh_ex always calls compare(...) with fresh state right
+        # after this swap, before any compare() runs, so the empty new
+        # Differ is fine.
         old_withdetail = getattr(self.diff, 'withdetail', True)
         old_beautify_alignment = getattr(self.diff, 'beautify_alignment', False)
         self.diff = dfn.Differ() if want_native else dfp.Differ()
@@ -1390,14 +1388,15 @@ class Command:
             # algorithm in config since the last compare.
             self._ensure_correct_differ()
 
-            # Branch on the differ type to set up the inputs.
-            # The native Differ no longer has a set_seqs() method — its
-            # compare() takes a_text/b_text directly as parameters, so
-            # the texts are passed at the compare() call site below.
-            # Nothing is stored on the Differ between compares — zero
-            # text bytes persistent. The Python Differ still uses the
-            # set_seqs(line_lists) API because the pure-Python matchers
-            # consume sequences directly.
+            # Branch on the differ type to compute the Python side's
+            # line lists. The native Differ doesn't need a pre-split —
+            # it takes raw texts at the compare() call site below.
+            # Neither Differ holds any sequences between compares:
+            #   - native:  compare(a_text, b_text)
+            #   - python: compare(lines_a, lines_b)
+            # In both cases the inputs enter as locals inside compare()
+            # and are dropped when the generator returns — zero text
+            # bytes persistent between compares.
             if not isinstance(self.diff, dfn.Differ):
                 # Python differ: consumes line lists directly (the
                 # pure-Python matchers take sequences), so the split
@@ -1406,7 +1405,6 @@ class Command:
                 lines_a = split_lines_safe(a_text_all)
                 lines_b = split_lines_safe(b_text_all)
                 Profiler.stop('refresh:split_lines_safe')
-                self.diff.set_seqs(lines_a, lines_b)
 
             self.scroll.tab_id.add(tab_id)
             self.scroll.toggle(self.cfg.get('sync_scroll'))
@@ -1456,15 +1454,15 @@ class Command:
             pending_bkm_a = []  # list of (line, nkind) for a_ed
             pending_bkm_b = []  # list of (line, nkind) for b_ed
             Profiler.start('refresh:compare_and_paint')
-            # Native Differ's compare() takes the raw texts directly as
-            # parameters (no set_seqs() call, no persistent storage on
-            # the Differ between compares — see differ_native.Differ).
-            # Python Differ's compare() takes no args (it uses the line
-            # lists passed to set_seqs() above).
+            # Both differs take their inputs as compare() parameters
+            # (no set_seqs() call, no persistent storage on either
+            # Differ between compares — see differ_native.Differ and
+            # differ_python.Differ). Native takes raw texts; Python
+            # takes line lists (split above).
             if isinstance(self.diff, dfn.Differ):
                 compare_iter = self.diff.compare(a_text_all, b_text_all)
             else:
-                compare_iter = self.diff.compare()
+                compare_iter = self.diff.compare(lines_a, lines_b)
             for d in compare_iter:
                 diff_id, y = d[0], d[1]
                 if diff_id == df.A_LINE_DEL:

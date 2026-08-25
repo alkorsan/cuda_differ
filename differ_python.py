@@ -186,23 +186,29 @@ class Differ:
               lines wrap to a different number of visual rows.
     """
 
-    def __init__(self, a='', b=''):
-        """Initialize the Differ with two line sequences.
+    def __init__(self):
+        """Initialize the Differ.
 
         Sets default options: hybrid algorithm, detailed compare on.
         The algorithm can be changed later via self.diff_algorithm
         before calling compare().
+
+        The Differ holds NO line lists between compares — neither raw
+        text nor line lists. a / b (the line lists) are passed directly
+        to compare() by the caller (Command._refresh_ex), used as
+        locals inside compare() to drive the pure-Python matcher +
+        the painting split, and dropped when compare() returns.
+        Between compares, the Differ holds only config (withdetail /
+        diff_algorithm / beautify_alignment) and the diffmap (line-
+        index tuples, small). The text itself stays in the editor
+        tabs' Pascal-side buffers (a_ed / b_ed), which are the source
+        of truth; the Python-side line-list copy is built fresh on
+        each compare via split_lines_safe(a_ed.get_text_all()).
         """
         self.withdetail = True
         self.diff_algorithm = 'hybrid'
         self.beautify_alignment = False
-        self.set_seqs(a, b)
         self.diffmap = []
-
-    def set_seqs(self, a, b):
-        """Set the two line sequences to compare."""
-        self.a = a
-        self.b = b
 
     def _char_diff(self, line_a, line_b):
         """Compute char-level diff between two single-line strings.
@@ -249,7 +255,7 @@ class Differ:
     # before.seq1Range.length + before.seq2Range.length > 5
     _REALIGN_MIN_LARGE_REPLACE = 6
 
-    def _realign_opcodes(self, opcodes):
+    def _realign_opcodes(self, a, opcodes):
         """Post-process opcodes to match VS Code's alignment quality.
 
         Two transformations (both ported from VS Code's
@@ -289,7 +295,7 @@ class Differ:
                     nxt[0] in ('insert', 'delete') and
                     prev[0] != nxt[0]):
                 _, ei1, ei2, ej1, ej2 = cur
-                equal_text = ''.join(self.a[ei1:ei2])
+                equal_text = ''.join(a[ei1:ei2])
                 non_ws = equal_text.replace(' ', '').replace('\t', '')
                 non_ws = non_ws.replace('\n', '').replace('\r', '')
                 if len(non_ws) <= self._REALIGN_TRIVIAL_THRESHOLD:
@@ -323,7 +329,7 @@ class Differ:
                         prev[0] != 'equal' and
                         nxt[0] != 'equal'):
                     _, ei1, ei2, ej1, ej2 = cur
-                    equal_text = ''.join(self.a[ei1:ei2])
+                    equal_text = ''.join(a[ei1:ei2])
                     non_ws = equal_text.replace(' ', '').replace('\t', '')
                     non_ws = non_ws.replace('\n', '').replace('\r', '')
                     if len(non_ws) <= self._REALIGN_TRIVIAL_THRESHOLD:
@@ -372,7 +378,7 @@ class Differ:
                 if ei2 - ei1 == 0:
                     i += 1
                     continue
-                first_line = self.a[ei1]
+                first_line = a[ei1]
                 first_non_ws = first_line.replace(' ', '').replace('\t', '')
                 first_non_ws = first_non_ws.replace('\n', '').replace('\r', '')
                 if len(first_non_ws) == 0:
@@ -393,19 +399,34 @@ class Differ:
         """
         return result
 
-    def compare(self):
+    def compare(self, a, b):
         """Generator that yields diff events for side-by-side display.
 
-        Runs the selected Python diff algorithm, applies _realign_opcodes
-        to fix LCS tie-breaking issues, then walks the opcodes and yields
-        events (A_LINE_DEL, B_LINE_ADD, A_GAP, B_GAP, ALIGN, A_SYMBOL_DEL,
-        etc.) that __init__.py consumes to paint the compare view.
+        Runs the selected Python diff algorithm on the two line
+        sequences, applies _realign_opcodes to fix LCS tie-breaking
+        issues, then walks the opcodes and yields events (A_LINE_DEL,
+        B_LINE_ADD, A_GAP, B_GAP, ALIGN, A_SYMBOL_DEL, etc.) that
+        __init__.py consumes to paint the compare view.
 
         The alignment mode (beautify_alignment) only affects how
         unequal-count REPLACE blocks are laid out — see _replace_block.
 
         Also populates self.diffmap with [i1, i2, j1, j2] for each
         non-equal opcode, used by jump()/copy()/select_current().
+
+        Args:
+            a, b: the two line sequences (lists of strings). The
+                Differ does NOT store them — they are used as locals
+                inside this generator and dropped when it returns.
+                The caller (Command._refresh_ex) builds them fresh on
+                every compare via split_lines_safe(a_text_all) /
+                split_lines_safe(b_text_all), so between compares the
+                Differ holds zero line-list bytes — only config +
+                diffmap. This mirrors the native Differ's design (which
+                takes raw texts as compare() params for the same reason:
+                the editor tabs are the source of truth, a Python-side
+                persistent copy would be a transient duplicate with no
+                consumer after compare() returns).
         """
         # Benchmark: when _BENCHMARK is True, measure the total time from
         # when the generator starts executing until it is fully consumed
@@ -417,16 +438,16 @@ class Differ:
         self.diffmap = []
         Profiler.start('compare:algorithm')
         if self.diff_algorithm == 'hybrid':
-            diff = HybridSequenceMatcher(None, self.a, self.b)
+            diff = HybridSequenceMatcher(None, a, b)
         elif self.diff_algorithm == 'myers':
-            diff = MyersSequenceMatcher(None, self.a, self.b)
+            diff = MyersSequenceMatcher(None, a, b)
         elif self.diff_algorithm == 'vscode':
-            diff = VSCodeSequenceMatcher(None, self.a, self.b)
+            diff = VSCodeSequenceMatcher(None, a, b)
         elif self.diff_algorithm == 'patience':
-            diff = PatienceSequenceMatcher(None, self.a, self.b)
+            diff = PatienceSequenceMatcher(None, a, b)
         else:
             # Default: difflib stdlib SequenceMatcher with autojunk=False
-            diff = DefaultSequenceMatcher(None, self.a, self.b, autojunk=False)
+            diff = DefaultSequenceMatcher(None, a, b, autojunk=False)
 
         # get_opcodes() runs the selected pure-Python algorithm — this is
         # where the actual diff is computed (no cudatext.diff_proc call
@@ -437,9 +458,11 @@ class Differ:
         # _realign_opcodes fixes LCS tie-breaking issues where Myers
         # matches trivial lines (empty, whitespace) instead of meaningful
         # ones. This is needed for Python Myers/difflib (which produce
-        # INSERT+EQUAL(trivial)+DELETE patterns).
+        # INSERT+EQUAL(trivial)+DELETE patterns). The line list `a` is
+        # passed in so _realign_opcodes can read the EQUAL block's text
+        # without storing it on the instance.
         Profiler.start('compare:realign_opcodes')
-        opcodes = self._realign_opcodes(opcodes)
+        opcodes = self._realign_opcodes(a, opcodes)
         Profiler.stop('compare:realign_opcodes')
 
         Profiler.start('compare:event_generation')
@@ -467,11 +490,11 @@ class Differ:
                     yield (B_LINE_ADD, y)
             elif tag == 'replace':
                 if self.withdetail:
-                    yield from self._replace_block(self.a, i1, i2,
-                                                   self.b, j1, j2)
+                    yield from self._replace_block(a, i1, i2,
+                                                   b, j1, j2)
                 else:
-                    yield from self._plain_replace_simple(self.a, i1, i2,
-                                                          self.b, j1, j2)
+                    yield from self._plain_replace_simple(a, i1, i2,
+                                                          b, j1, j2)
         Profiler.stop('compare:event_generation')
 
         Profiler.stop('compare')
@@ -482,7 +505,7 @@ class Differ:
                   '(algo={}, a={}lines, b={}lines, opcodes={}diffs)'.format(
                       _bm_elapsed * 1000,
                       self.diff_algorithm,
-                      len(self.a), len(self.b),
+                      len(a), len(b),
                       len(self.diffmap)))
 
     def _positional_pairs(self, a, alo, b, blo, count):
