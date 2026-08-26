@@ -489,12 +489,6 @@ _IGNORE_OPTS = (
     ('ignore_numbers',     _('Ignore numbers')),
 )
 
-# Tag put on the 'Differ: Ignore Options' submenu (and its separator) in
-# the editor context menu -- used to find and remove leftovers from a
-# previous plugin instance after a module reload.
-_IGNORE_MENU_TAG = 'differ_ignore_options_menu'
-
-
 def msg(s, level=0):
     """Print a plugin message to the console. level: 0=info, 1=warning, 2=error."""
     if level == 0:
@@ -613,11 +607,6 @@ class Command:
         self.menuid_sep = None
         self.menuid_withfile = None
         self.menuid_withtab = None
-        # 'Differ: Ignore Options' submenu of the editor right-click
-        # context menu ('text' menu): {'sep': id, 'sub': id,
-        # 'items': {config_key: item_id}}. Created while compare tabs are
-        # open (see _ensure_ignore_menu / _remove_ignore_menu).
-        self._ignore_menu = None
 
     def _session_key(self, session_path):
         """Convert a session file path to a state-file key. If the session
@@ -684,9 +673,6 @@ class Command:
         self._save_state(state)
         self._saved_cache[str(compare_tab_id)] = saved
         self._compare_tab_ids.add(str(compare_tab_id))
-        # Compare tabs exist now -- make sure the ignore-options
-        # context-menu submenu is present (no-op when already created).
-        self._ensure_ignore_menu()
 
     def _set_saved_state(self, compare_tab_id, saved):
         """Update the 'saved' flag for a compare tab. Uses an in-memory
@@ -774,139 +760,15 @@ class Command:
             # self.scroll.enable_sync_caret = self.cfg['enable_sync_caret']
 
     # ------------------------------------------------------------------
-    # Ignore options: editor right-click context menu + config settings
+    # Ignore options
     # ------------------------------------------------------------------
     # The five diff_proc DIFF_IGN_* ignore options live in
     # settings/cuda_differ.json under 'differ.ignoreopt.*' (chapter
     # 'ignoreopt' in the config dialog -- see OPTS_META; built into the
-    # flags bitmask by differ_native.build_ignore_flags at compare
-    # time). They are exposed to the user in two places which stay in
-    # sync both ways:
-    #   1. Editor right-click context menu: checkable items in the
-    #      'Differ: Ignore Options' submenu (only while compare tabs are
-    #      open). Toggling writes the setting to the JSON file
-    #      immediately (so the config dialog sees it) and refreshes the
-    #      compare.
-    #   2. Config dialog (Options Editor), chapter 'ignoreopt'. When the
-    #      dialog saves, APPSTATE_THEME_UI fires and config() re-reads
-    #      the file -- both re-sync the context-menu checkmarks.
-
-    def _ensure_ignore_menu(self):
-        """Create the 'Differ: Ignore Options' submenu in the editor
-        right-click context menu ('text' menu), if not created yet, and
-        sync the checkmarks from the current settings file. Idempotent.
-
-        Items carry the tag _IGNORE_MENU_TAG so a leftover submenu from
-        a previous plugin instance (module reload) is removed first
-        instead of stacking duplicates."""
-        if self._ignore_menu is not None:
-            return
-        # Remove items left over by a previous plugin instance (module
-        # reload) so we never stack duplicate submenus.
-        try:
-            for item in (ct.menu_proc('text', ct.MENU_ENUM) or []):
-                if item.get('tag') == _IGNORE_MENU_TAG:
-                    ct.menu_proc(item['id'], ct.MENU_REMOVE)
-        except Exception:
-            pass  # menu API hiccup: just add fresh items below
-        menu_sep = ct.menu_proc('text', ct.MENU_ADD, caption='-',
-                                tag=_IGNORE_MENU_TAG)
-        menu_sub = ct.menu_proc('text', ct.MENU_ADD,
-                                caption=_('Differ: Ignore Options'),
-                                tag=_IGNORE_MENU_TAG)
-        items = {}
-        for key, caption in _IGNORE_OPTS:
-            cmd = 'module={};cmd=menu_{};'.format(MODULE_NAME, key)
-            items[key] = ct.menu_proc(menu_sub, ct.MENU_ADD,
-                                      command=cmd, caption=caption)
-        self._ignore_menu = {'sep': menu_sep, 'sub': menu_sub, 'items': items}
-        self._sync_ignore_menu_checks()
-
-    def _remove_ignore_menu(self):
-        """Remove the 'Differ: Ignore Options' submenu from the editor
-        context menu. Called when the last compare tab closes (the
-        options are only relevant while a compare is open; the config
-        dialog keeps working regardless)."""
-        if self._ignore_menu is None:
-            return
-        try:
-            ct.menu_proc(self._ignore_menu['sub'], ct.MENU_REMOVE)
-            ct.menu_proc(self._ignore_menu['sep'], ct.MENU_REMOVE)
-        except Exception:
-            pass
-        self._ignore_menu = None
-
-    def _sync_ignore_menu_checks(self):
-        """Refresh the checkmarks of the ignore-options context-menu
-        items from the current settings file. No-op when the menu is not
-        created (no compare tabs open). Called on menu creation, after
-        every context-menu toggle, when config() detects the settings
-        file changed, and on APPSTATE_THEME_UI (fires when the Options
-        Editor saves)."""
-        if self._ignore_menu is None:
-            return
-        for key, _caption in _IGNORE_OPTS:
-            item_id = self._ignore_menu['items'].get(key)
-            if item_id is None:
-                continue
-            checked = bool(get_opt('ignoreopt.' + key, False))
-            ct.menu_proc(item_id, ct.MENU_SET_CHECKED, command=checked)
-
-    def _toggle_ignore_opt(self, key):
-        """Flip one 'differ.ignoreopt.*' boolean, persist it to
-        settings/cuda_differ.json via set_opt (so the config dialog and
-        the context menu stay in sync), update the context-menu
-        checkmarks, and schedule a refresh of the active compare tab.
-        Called by the menu_ignore_* context-menu commands."""
-        old = bool(get_opt('ignoreopt.' + key, False))
-        set_opt('ignoreopt.' + key, not old)
-        captions = dict(_IGNORE_OPTS)
-        state = _('enabled') if not old else _('disabled')
-        ct.msg_status('{}: {} -- {}'.format(
-            _('Differ ignore option'), captions.get(key, key), state))
-        # Update the checkmarks right away so the context menu shows the
-        # new state the next time it opens.
-        self._sync_ignore_menu_checks()
-        # Re-run the compare in the active tab so the change is visible
-        # immediately. Runs on a 100ms one-shot timer so the context
-        # menu can close first (same convention as the tabmenu_*
-        # callbacks). _refresh_ex calls config() first, which detects
-        # the settings-file mtime change and reloads self.cfg, so this
-        # very refresh already uses the new flags.
-        if self._is_compare_tab(ct.ed.get_prop(ct.PROP_TAB_ID)):
-            callback = 'module={};cmd=_ignore_refresh_timer;info=_;'.format(
-                MODULE_NAME)
-            ct.timer_proc(ct.TIMER_START_ONE, callback, 100)
-
-    def _ignore_refresh_timer(self, tag='', info=''):
-        """Timer callback: refresh the active compare tab after an
-        ignore option was toggled from the context menu (runs 100ms
-        after the toggle, when the context menu has closed)."""
-        try:
-            if self._is_compare_tab(ct.ed.get_prop(ct.PROP_TAB_ID)):
-                self._refresh_ex(ct.ed)  # automatic -- no dialog
-        except Exception:
-            pass
-
-    def menu_ignore_case(self):
-        """Context-menu command: toggle 'Ignore case'."""
-        self._toggle_ignore_opt('ignore_case')
-
-    def menu_ignore_whitespace(self):
-        """Context-menu command: toggle 'Ignore whitespace'."""
-        self._toggle_ignore_opt('ignore_whitespace')
-
-    def menu_ignore_blank_lines(self):
-        """Context-menu command: toggle 'Ignore blank lines'."""
-        self._toggle_ignore_opt('ignore_blank_lines')
-
-    def menu_ignore_eol(self):
-        """Context-menu command: toggle 'Ignore line endings'."""
-        self._toggle_ignore_opt('ignore_eol')
-
-    def menu_ignore_numbers(self):
-        """Context-menu command: toggle 'Ignore numbers'."""
-        self._toggle_ignore_opt('ignore_numbers')
+    # flags bitmask by differ_native.build_ignore_flags at compare time).
+    # They are ALSO exposed as checkable items in the diff-tab right-click
+    # context menu, right below 'Refresh' -- see tabmenu_init() and
+    # tabmenu_ignore().
 
     def on_cli(self, fn1, fn2):
         """Called when CudaText gets command-line param -p=cuda_differ#file1#file2.
@@ -1189,18 +1051,11 @@ class Command:
 
     def on_state(self, ed_self, state):
         """Handle theme syntax changes (reload config + refresh), word-wrap
-        state changes (re-apply gaps with wrap-aware sizes), and Options
-        Editor saves (re-sync the ignore-options context-menu checkmarks)."""
+        state changes (re-apply gaps with wrap-aware sizes)."""
         if state == ct.APPSTATE_THEME_SYNTAX:
             self.get_config()
             # each time we change setting using the options editor the state even APPSTATE_THEME_UI fires which triger a refresh , if files are big it take time which is frustrating, if the user needs to refresh then he can do it manualy, lets not auto refresh for him
             # self._refresh_ex(ct.ed)  # automatic -- no dialog
-        elif state == ct.APPSTATE_THEME_UI:
-            # Fires when the Options Editor saves settings: re-sync the
-            # ignore-options context-menu checkmarks with the (possibly
-            # changed) settings file. Cheap no-op when the menu is not
-            # created (no compare tabs open).
-            self._sync_ignore_menu_checks()
         elif state == ct.EDSTATE_WRAP:
             # Word-wrap mode changed on one of the split halves. The
             # inter-line gaps were sized for the previous wrap state, so
@@ -1446,11 +1301,6 @@ class Command:
         # Re-subscribe to on_scroll event if sync_scroll is enabled.
         if self.cfg.get('sync_scroll') and self.scroll.tab_id:
             ct.app_proc(ct.PROC_EVENTS_SUB, self.scroll.name+';on_scroll;;')
-
-        # Compare tabs were restored from the session -- make sure the
-        # ignore-options context-menu submenu is present.
-        if self._compare_tab_ids:
-            self._ensure_ignore_menu()
 
     def _apply_color_to_tab(self, tab_id_str, color):
         """Apply a title font color to a compare tab by its PROP_TAB_ID.
@@ -2139,10 +1989,9 @@ class Command:
            self.cfg.get('theme_name') == theme_name:
             return
         self.cfg = self.get_config()
-        # Settings file changed (config dialog, context-menu toggle, or
-        # hand edit) -- keep the ignore-options context-menu checkmarks
-        # in sync with the new values.
-        self._sync_ignore_menu_checks()
+        # (No menu re-sync needed anymore: the diff-tab context menu is
+        # rebuilt from the settings file by tabmenu_init on every
+        # right-click, so it always mirrors the current values.)
 
     def _setup_micromap(self, a_ed, b_ed):
         """Set up the micromap on both split editors when enable_micromap
@@ -2587,8 +2436,26 @@ class Command:
             command='module=cuda_differ;cmd=tabmenu_refresh;',
             caption=_('Refresh')
             )
+        is_compare = self._is_compare_tab(cur_ed.get_prop(ct.PROP_TAB_ID))
         ct.menu_proc(self.menuid_refresh, ct.MENU_SET_ENABLED,
-            command=self._is_compare_tab(cur_ed.get_prop(ct.PROP_TAB_ID)))
+            command=is_compare)
+
+        # Separator + the five ignore options, right below 'Refresh'.
+        # The tab context menu is rebuilt from scratch by this method on
+        # every right-click (on_tab_menu fires each time), so the
+        # checkmarks always mirror the current settings file: changing an
+        # option in the config dialog is reflected here automatically, and
+        # toggling here writes it back via set_opt (tabmenu_ignore) --
+        # two-way sync with zero extra bookkeeping.
+        ct.menu_proc(self.compare_menu, ct.MENU_ADD, caption='-')
+        for key, caption in _IGNORE_OPTS:
+            item = ct.menu_proc(self.compare_menu, ct.MENU_ADD,
+                command='module=cuda_differ;cmd=tabmenu_ignore;info='+key+';',
+                caption=caption
+                )
+            ct.menu_proc(item, ct.MENU_SET_CHECKED,
+                command=bool(get_opt('ignoreopt.' + key, False)))
+            ct.menu_proc(item, ct.MENU_SET_ENABLED, command=is_compare)
 
     def tabmenu_chooser(self):
         """Launch 'Compare with...' via a 100ms timer (needed because menu
@@ -2618,6 +2485,29 @@ class Command:
     def tabmenu_refresh_timer(self, tag='', info=''):
         """Timer callback that actually runs the refresh."""
         self.refresh()
+
+    def tabmenu_ignore(self, info):
+        """Toggle one 'differ.ignoreopt.*' option from the diff-tab context
+        menu (checkable items below 'Refresh'): persist it to
+        settings/cuda_differ.json via set_opt -- so the config dialog sees
+        it too -- then refresh the compare on a 100ms one-shot timer (same
+        convention as the other tabmenu_* callbacks, so the menu can close
+        first). The context menu itself is rebuilt by tabmenu_init on every
+        right-click, so the new checkmark shows up automatically the next
+        time the menu opens."""
+        key = info
+        old = bool(get_opt('ignoreopt.' + key, False))
+        set_opt('ignoreopt.' + key, not old)
+        captions = dict(_IGNORE_OPTS)
+        state = _('enabled') if not old else _('disabled')
+        ct.msg_status('{}: {} -- {}'.format(
+            _('Differ ignore option'), captions.get(key, key), state))
+        # Re-run the compare so the change is visible immediately.
+        # _refresh_ex calls config() first, which detects the settings-file
+        # mtime change and reloads self.cfg, so this very refresh already
+        # uses the new flags.
+        callback = 'module=cuda_differ;cmd=tabmenu_refresh_timer;info=_;'
+        ct.timer_proc(ct.TIMER_START_ONE, callback, 100)
 
     def tabmenu_files(self, info):
         """Launch a compare between two files specified in 'info' (format:
@@ -2685,11 +2575,6 @@ class Command:
 
         # If no more compare tabs are open in the current session,
         # disable autostart so the plugin does not load on next startup.
-        # Drop the ignore-options context-menu submenu only when NO
-        # compare tabs remain at all (checked against the in-memory set,
-        # which covers all sessions).
         state = self._load_state()
         if not state['sessions'].get(self._current_session_key, {}):
             self._disable_autostart()
-            if not self._compare_tab_ids:
-                self._remove_ignore_menu()
