@@ -1402,8 +1402,24 @@ class Command:
                 # pure-Python matchers take sequences), so the split
                 # is genuinely needed here.
                 Profiler.start('refresh:split_lines_safe')
+                # SEQUENTIAL SPLIT — release each raw text the instant
+                # its line list is built. split_lines_safe returns
+                # INDEPENDENT string objects per line (CPython string
+                # slices are COPIES of the char data, not views into
+                # the source str's buffer), so lines_a owns its own
+                # char data and a_text_all is redundant the moment
+                # lines_a exists. Releasing a_text_all BEFORE splitting
+                # b_text_all means the split-phase peak is 3× raw text
+                # (b_text_all + lines_a + lines_b-being-built) instead
+                # of 4× (a_text_all + b_text_all + lines_a +
+                # lines_b-being-built). On a 33k-line / 10MB file
+                # that's a ~3.5MB reduction in the OVERALL peak memory
+                # during _refresh_ex — the peak the user actually sees
+                # when the diff runs.
                 lines_a = split_lines_safe(a_text_all)
+                del a_text_all
                 lines_b = split_lines_safe(b_text_all)
+                del b_text_all
                 Profiler.stop('refresh:split_lines_safe')
 
             self.scroll.tab_id.add(tab_id)
@@ -1461,6 +1477,20 @@ class Command:
             # takes line lists (split above).
             if isinstance(self.diff, dfn.Differ):
                 compare_iter = self.diff.compare(a_text_all, b_text_all)
+                # RELEASE _refresh_ex'S REFS to the raw texts now that
+                # the generator has its own (param) refs. The native
+                # generator splits the texts into line lists inside
+                # compare() and then `del`s its own param refs, so by
+                # the time the first event is yielded, the only refs
+                # to the raw texts are THESE locals. Drop them here,
+                # BEFORE the for loop starts driving the generator, so
+                # that when the generator's `del a_text, b_text`
+                # executes during the first `next()` call, the strings'
+                # refcount actually hits 0 and they're freed instead of
+                # lingering through the whole paint loop. (Python path
+                # already `del`'d its a_text_all/b_text_all above
+                # right after the split_lines_safe call.)
+                del a_text_all, b_text_all
             else:
                 compare_iter = self.diff.compare(lines_a, lines_b)
             for d in compare_iter:

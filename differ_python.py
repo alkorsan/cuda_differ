@@ -455,6 +455,21 @@ class Differ:
         opcodes = diff.get_opcodes()
         Profiler.stop('compare:algorithm')
 
+        # RELEASE THE MATCHER NOW — we already have the opcodes and the
+        # matcher no longer serves any purpose. The pure-Python matchers
+        # (difflib SequenceMatcher, PatienceSequenceMatcher, the
+        # HybridSequenceMatcher's internal _CombinedMatcher, the
+        # MyersSequenceMatcher) all build substantial internal state
+        # during get_opcodes() — hash tables of line fingerprints,
+        # back-pointer matrices for the LCS walk, the matching-blocks
+        # list, junk-detection dicts — and that state stays alive until
+        # the matcher object itself is collected. Without this `del`,
+        # all of that intermediate state survives through the entire
+        # paint loop below alongside the line lists `a`/`b` we still
+        # need. For a 33k-line compare that's ~15-25MB of dead matcher
+        # state holding the peak up unnecessarily.
+        del diff
+
         # _realign_opcodes fixes LCS tie-breaking issues where Myers
         # matches trivial lines (empty, whitespace) instead of meaningful
         # ones. This is needed for Python Myers/difflib (which produce

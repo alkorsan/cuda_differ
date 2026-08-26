@@ -1,0 +1,17 @@
+___IGN_CASE______________________
+case CaSe
+___IGN_WHITESPACE________________
+WHITE SPACE
+WHITESPACE
+    WHITESPACE
+WHITESPACE    
+  WHITE  SPACE    
+___IGN_NUMBERS___________________
+v22.4 12:23:4
+vb
+v
+___IGN_BLANK_LINES_______________
+
+
+
+_________________________________
