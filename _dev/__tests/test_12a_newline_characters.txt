@@ -36,7 +36,7 @@ First Line Second Line
 11. Paragraph Separator (PS, \u2029):
 First Line Second Line
 
-hhhhhhhhhh
+hhhhhhhhhh if only this line is colorised then everything is fine
 fffffffff
 ttttttttttt
 sssssssssss

@@ -227,6 +227,105 @@ OPTS_META = [
      'frm': 'bool',
      'chp': 'algorithm',
      },
+    # --- chapter "ignoreopt": comparison ignore options (the diff_proc
+    # DIFF_IGN_* flags of the native engines; also exposed as checkable
+    # items in the editor right-click context menu) ------------------------
+    {'opt': 'differ.ignoreopt.ignore_case',
+     'cmt': _('Ignore case\n'
+              'Case-insensitive comparison for the native diff algorithms '
+              '(Native Histogram / Native Myers).\n'
+              'Lines that differ only in ASCII letter case (A-Z vs a-z) '
+              'are shown as equal, and case-only changes are not '
+              'highlighted in the char-level details inside modified '
+              'lines. Non-ASCII text is compared as-is (no full Unicode '
+              'case folding).\n'
+              'Can also be toggled from the editor right-click context '
+              'menu ("Differ: Ignore Options") while a compare tab is '
+              'open.\n'
+              'Not supported by the pure-Python algorithms -- they '
+              'compare strictly.\n'
+              'Default: off.'),
+     'def': False,
+     'frm': 'bool',
+     'chp': 'ignoreopt',
+     },
+    {'opt': 'differ.ignoreopt.ignore_whitespace',
+     'cmt': _('Ignore whitespace\n'
+              'All whitespace ignored by the native diff algorithms '
+              '(Native Histogram / Native Myers).\n'
+              'Spaces and tabs are skipped wherever they appear in a '
+              'line -- leading, interior and trailing -- so "abc def" '
+              'compares equal to "abcdef". Also makes whitespace-only '
+              'lines count as blank for the "Ignore blank lines" option.\n'
+              'Can also be toggled from the editor right-click context '
+              'menu ("Differ: Ignore Options") while a compare tab is '
+              'open.\n'
+              'Not supported by the pure-Python algorithms -- they '
+              'compare strictly.\n'
+              'Default: off.'),
+     'def': False,
+     'frm': 'bool',
+     'chp': 'ignoreopt',
+     },
+    {'opt': 'differ.ignoreopt.ignore_blank_lines',
+     'cmt': _('Ignore blank lines\n'
+              'Blank-line-only changes are not shown as differences by '
+              'the native diff algorithms (Native Histogram / Native '
+              'Myers).\n'
+              'A change block is suppressed only when every deleted and '
+              'every inserted line in it is blank; all other changes are '
+              'unaffected. With "Ignore whitespace" also enabled, '
+              'whitespace-only lines count as blank.\n'
+              'Has no effect on the char-level details (blank lines are '
+              'a line-level concept).\n'
+              'Can also be toggled from the editor right-click context '
+              'menu ("Differ: Ignore Options") while a compare tab is '
+              'open.\n'
+              'Not supported by the pure-Python algorithms -- they '
+              'compare strictly.\n'
+              'Default: off.'),
+     'def': False,
+     'frm': 'bool',
+     'chp': 'ignoreopt',
+     },
+    {'opt': 'differ.ignoreopt.ignore_eol',
+     'cmt': _('Ignore line endings\n'
+              'CR/LF line-ending differences are ignored by the native '
+              'diff algorithms (Native Histogram / Native Myers).\n'
+              'CRLF vs LF vs CR line endings compare as equal, so a file '
+              're-saved with different line endings shows no differences. '
+              'End-of-line tokens also compare equal in the char-level '
+              'details inside modified lines.\n'
+              'Can also be toggled from the editor right-click context '
+              'menu ("Differ: Ignore Options") while a compare tab is '
+              'open.\n'
+              'Not supported by the pure-Python algorithms -- they '
+              'compare strictly.\n'
+              'Default: off.'),
+     'def': False,
+     'frm': 'bool',
+     'chp': 'ignoreopt',
+     },
+    {'opt': 'differ.ignoreopt.ignore_numbers',
+     'cmt': _('Ignore numbers\n'
+              'Digit runs are treated as equal by the native diff '
+              'algorithms (Native Histogram / Native Myers) -- useful '
+              'for comparing logs with timestamps, counters or version '
+              'numbers.\n'
+              'Only ASCII digits 0-9 count; non-ASCII digits are not '
+              'affected. "12:34:56.789" matches "12:34:56.790". In the '
+              'char-level details inside modified lines, number-only '
+              'changes are not highlighted.\n'
+              'Can also be toggled from the editor right-click context '
+              'menu ("Differ: Ignore Options") while a compare tab is '
+              'open.\n'
+              'Not supported by the pure-Python algorithms -- they '
+              'compare strictly.\n'
+              'Default: off.'),
+     'def': False,
+     'frm': 'bool',
+     'chp': 'ignoreopt',
+     },
     # --- chapter "advanced": behavior tweaks and debugging tools ----------
     {'opt': 'differ.advanced.sync_scroll',
      'cmt': _('Synchronized scrolling\n'
@@ -368,6 +467,34 @@ def get_opt(key, def_val: tp.Any = ''):
     return ctx.get_opt('differ.' + key, def_val, user_json=JSONFILE)
 
 
+def set_opt(key, val):
+    """Write a 'differ.*' option to the plugin's JSON settings file
+    (settings/cuda_differ.json). Mirrors get_opt above; cudax_lib's
+    set_opt does the comment-preserving line-based update, so hand-made
+    comments in the JSON survive."""
+    return ctx.set_opt('differ.' + key, val, user_json=JSONFILE)
+
+
+# Ignore options exposed in the editor right-click context menu
+# ('Differ: Ignore Options' submenu) and in the config dialog (chapter
+# 'ignoreopt' -- see OPTS_META). Order = context-menu display order.
+# Each entry: (config key suffix under 'ignoreopt.', menu caption).
+# The values feed differ_native.build_ignore_flags() which builds the
+# diff_proc DIFF_IGN_* bitmask for the native algorithms.
+_IGNORE_OPTS = (
+    ('ignore_case',        _('Ignore case')),
+    ('ignore_whitespace',  _('Ignore whitespace')),
+    ('ignore_blank_lines', _('Ignore blank lines')),
+    ('ignore_eol',         _('Ignore line endings')),
+    ('ignore_numbers',     _('Ignore numbers')),
+)
+
+# Tag put on the 'Differ: Ignore Options' submenu (and its separator) in
+# the editor context menu -- used to find and remove leftovers from a
+# previous plugin instance after a module reload.
+_IGNORE_MENU_TAG = 'differ_ignore_options_menu'
+
+
 def msg(s, level=0):
     """Print a plugin message to the console. level: 0=info, 1=warning, 2=error."""
     if level == 0:
@@ -486,6 +613,11 @@ class Command:
         self.menuid_sep = None
         self.menuid_withfile = None
         self.menuid_withtab = None
+        # 'Differ: Ignore Options' submenu of the editor right-click
+        # context menu ('text' menu): {'sep': id, 'sub': id,
+        # 'items': {config_key: item_id}}. Created while compare tabs are
+        # open (see _ensure_ignore_menu / _remove_ignore_menu).
+        self._ignore_menu = None
 
     def _session_key(self, session_path):
         """Convert a session file path to a state-file key. If the session
@@ -552,6 +684,9 @@ class Command:
         self._save_state(state)
         self._saved_cache[str(compare_tab_id)] = saved
         self._compare_tab_ids.add(str(compare_tab_id))
+        # Compare tabs exist now -- make sure the ignore-options
+        # context-menu submenu is present (no-op when already created).
+        self._ensure_ignore_menu()
 
     def _set_saved_state(self, compare_tab_id, saved):
         """Update the 'saved' flag for a compare tab. Uses an in-memory
@@ -637,6 +772,141 @@ class Command:
             self.config()
             self.scroll.toggle(self.cfg['sync_scroll'])
             # self.scroll.enable_sync_caret = self.cfg['enable_sync_caret']
+
+    # ------------------------------------------------------------------
+    # Ignore options: editor right-click context menu + config settings
+    # ------------------------------------------------------------------
+    # The five diff_proc DIFF_IGN_* ignore options live in
+    # settings/cuda_differ.json under 'differ.ignoreopt.*' (chapter
+    # 'ignoreopt' in the config dialog -- see OPTS_META; built into the
+    # flags bitmask by differ_native.build_ignore_flags at compare
+    # time). They are exposed to the user in two places which stay in
+    # sync both ways:
+    #   1. Editor right-click context menu: checkable items in the
+    #      'Differ: Ignore Options' submenu (only while compare tabs are
+    #      open). Toggling writes the setting to the JSON file
+    #      immediately (so the config dialog sees it) and refreshes the
+    #      compare.
+    #   2. Config dialog (Options Editor), chapter 'ignoreopt'. When the
+    #      dialog saves, APPSTATE_THEME_UI fires and config() re-reads
+    #      the file -- both re-sync the context-menu checkmarks.
+
+    def _ensure_ignore_menu(self):
+        """Create the 'Differ: Ignore Options' submenu in the editor
+        right-click context menu ('text' menu), if not created yet, and
+        sync the checkmarks from the current settings file. Idempotent.
+
+        Items carry the tag _IGNORE_MENU_TAG so a leftover submenu from
+        a previous plugin instance (module reload) is removed first
+        instead of stacking duplicates."""
+        if self._ignore_menu is not None:
+            return
+        # Remove items left over by a previous plugin instance (module
+        # reload) so we never stack duplicate submenus.
+        try:
+            for item in (ct.menu_proc('text', ct.MENU_ENUM) or []):
+                if item.get('tag') == _IGNORE_MENU_TAG:
+                    ct.menu_proc(item['id'], ct.MENU_REMOVE)
+        except Exception:
+            pass  # menu API hiccup: just add fresh items below
+        menu_sep = ct.menu_proc('text', ct.MENU_ADD, caption='-',
+                                tag=_IGNORE_MENU_TAG)
+        menu_sub = ct.menu_proc('text', ct.MENU_ADD,
+                                caption=_('Differ: Ignore Options'),
+                                tag=_IGNORE_MENU_TAG)
+        items = {}
+        for key, caption in _IGNORE_OPTS:
+            cmd = 'module={};cmd=menu_{};'.format(MODULE_NAME, key)
+            items[key] = ct.menu_proc(menu_sub, ct.MENU_ADD,
+                                      command=cmd, caption=caption)
+        self._ignore_menu = {'sep': menu_sep, 'sub': menu_sub, 'items': items}
+        self._sync_ignore_menu_checks()
+
+    def _remove_ignore_menu(self):
+        """Remove the 'Differ: Ignore Options' submenu from the editor
+        context menu. Called when the last compare tab closes (the
+        options are only relevant while a compare is open; the config
+        dialog keeps working regardless)."""
+        if self._ignore_menu is None:
+            return
+        try:
+            ct.menu_proc(self._ignore_menu['sub'], ct.MENU_REMOVE)
+            ct.menu_proc(self._ignore_menu['sep'], ct.MENU_REMOVE)
+        except Exception:
+            pass
+        self._ignore_menu = None
+
+    def _sync_ignore_menu_checks(self):
+        """Refresh the checkmarks of the ignore-options context-menu
+        items from the current settings file. No-op when the menu is not
+        created (no compare tabs open). Called on menu creation, after
+        every context-menu toggle, when config() detects the settings
+        file changed, and on APPSTATE_THEME_UI (fires when the Options
+        Editor saves)."""
+        if self._ignore_menu is None:
+            return
+        for key, _caption in _IGNORE_OPTS:
+            item_id = self._ignore_menu['items'].get(key)
+            if item_id is None:
+                continue
+            checked = bool(get_opt('ignoreopt.' + key, False))
+            ct.menu_proc(item_id, ct.MENU_SET_CHECKED, command=checked)
+
+    def _toggle_ignore_opt(self, key):
+        """Flip one 'differ.ignoreopt.*' boolean, persist it to
+        settings/cuda_differ.json via set_opt (so the config dialog and
+        the context menu stay in sync), update the context-menu
+        checkmarks, and schedule a refresh of the active compare tab.
+        Called by the menu_ignore_* context-menu commands."""
+        old = bool(get_opt('ignoreopt.' + key, False))
+        set_opt('ignoreopt.' + key, not old)
+        captions = dict(_IGNORE_OPTS)
+        state = _('enabled') if not old else _('disabled')
+        ct.msg_status('{}: {} -- {}'.format(
+            _('Differ ignore option'), captions.get(key, key), state))
+        # Update the checkmarks right away so the context menu shows the
+        # new state the next time it opens.
+        self._sync_ignore_menu_checks()
+        # Re-run the compare in the active tab so the change is visible
+        # immediately. Runs on a 100ms one-shot timer so the context
+        # menu can close first (same convention as the tabmenu_*
+        # callbacks). _refresh_ex calls config() first, which detects
+        # the settings-file mtime change and reloads self.cfg, so this
+        # very refresh already uses the new flags.
+        if self._is_compare_tab(ct.ed.get_prop(ct.PROP_TAB_ID)):
+            callback = 'module={};cmd=_ignore_refresh_timer;info=_;'.format(
+                MODULE_NAME)
+            ct.timer_proc(ct.TIMER_START_ONE, callback, 100)
+
+    def _ignore_refresh_timer(self, tag='', info=''):
+        """Timer callback: refresh the active compare tab after an
+        ignore option was toggled from the context menu (runs 100ms
+        after the toggle, when the context menu has closed)."""
+        try:
+            if self._is_compare_tab(ct.ed.get_prop(ct.PROP_TAB_ID)):
+                self._refresh_ex(ct.ed)  # automatic -- no dialog
+        except Exception:
+            pass
+
+    def menu_ignore_case(self):
+        """Context-menu command: toggle 'Ignore case'."""
+        self._toggle_ignore_opt('ignore_case')
+
+    def menu_ignore_whitespace(self):
+        """Context-menu command: toggle 'Ignore whitespace'."""
+        self._toggle_ignore_opt('ignore_whitespace')
+
+    def menu_ignore_blank_lines(self):
+        """Context-menu command: toggle 'Ignore blank lines'."""
+        self._toggle_ignore_opt('ignore_blank_lines')
+
+    def menu_ignore_eol(self):
+        """Context-menu command: toggle 'Ignore line endings'."""
+        self._toggle_ignore_opt('ignore_eol')
+
+    def menu_ignore_numbers(self):
+        """Context-menu command: toggle 'Ignore numbers'."""
+        self._toggle_ignore_opt('ignore_numbers')
 
     def on_cli(self, fn1, fn2):
         """Called when CudaText gets command-line param -p=cuda_differ#file1#file2.
@@ -918,12 +1188,19 @@ class Command:
         ct.ed.set_prop(ct.PROP_SAVE_HISTORY, False)
 
     def on_state(self, ed_self, state):
-        """Handle theme syntax changes (reload config + refresh) and word-wrap
-        state changes (re-apply gaps with wrap-aware sizes)."""
+        """Handle theme syntax changes (reload config + refresh), word-wrap
+        state changes (re-apply gaps with wrap-aware sizes), and Options
+        Editor saves (re-sync the ignore-options context-menu checkmarks)."""
         if state == ct.APPSTATE_THEME_SYNTAX:
             self.get_config()
             # each time we change setting using the options editor the state even APPSTATE_THEME_UI fires which triger a refresh , if files are big it take time which is frustrating, if the user needs to refresh then he can do it manualy, lets not auto refresh for him
             # self._refresh_ex(ct.ed)  # automatic -- no dialog
+        elif state == ct.APPSTATE_THEME_UI:
+            # Fires when the Options Editor saves settings: re-sync the
+            # ignore-options context-menu checkmarks with the (possibly
+            # changed) settings file. Cheap no-op when the menu is not
+            # created (no compare tabs open).
+            self._sync_ignore_menu_checks()
         elif state == ct.EDSTATE_WRAP:
             # Word-wrap mode changed on one of the split halves. The
             # inter-line gaps were sized for the previous wrap state, so
@@ -1169,6 +1446,11 @@ class Command:
         # Re-subscribe to on_scroll event if sync_scroll is enabled.
         if self.cfg.get('sync_scroll') and self.scroll.tab_id:
             ct.app_proc(ct.PROC_EVENTS_SUB, self.scroll.name+';on_scroll;;')
+
+        # Compare tabs were restored from the session -- make sure the
+        # ignore-options context-menu submenu is present.
+        if self._compare_tab_ids:
+            self._ensure_ignore_menu()
 
     def _apply_color_to_tab(self, tab_id_str, color):
         """Apply a title font color to a compare tab by its PROP_TAB_ID.
@@ -1428,6 +1710,12 @@ class Command:
             self.diff.withdetail = self.cfg.get('compare_with_details')
             self.diff.diff_algorithm = self.cfg.get('diff_algorithm')
             self.diff.beautify_alignment = self.cfg.get('beautify_alignment')
+            # Ignore options -> diff_proc DIFF_IGN_* bitmask for the
+            # native algorithms (applies to BOTH the line-level diff and
+            # the char-level details). The pure-Python Differ simply
+            # ignores this attribute -- Python algorithms compare
+            # strictly by design.
+            self.diff.ignore_flags = dfn.build_ignore_flags(self.cfg)
 
             # Detect word-wrap on either side. When wrap is on, gaps must be
             # sized by the actual number of visual rows on the opposite side
@@ -1851,6 +2139,10 @@ class Command:
            self.cfg.get('theme_name') == theme_name:
             return
         self.cfg = self.get_config()
+        # Settings file changed (config dialog, context-menu toggle, or
+        # hand edit) -- keep the ignore-options context-menu checkmarks
+        # in sync with the new values.
+        self._sync_ignore_menu_checks()
 
     def _setup_micromap(self, a_ed, b_ed):
         """Set up the micromap on both split editors when enable_micromap
@@ -1939,6 +2231,19 @@ class Command:
                 get_opt('algorithm.compare_with_details', True),
             'beautify_alignment':
                 get_opt('algorithm.beautify_alignment', True),
+            # --- ignore options (diff_proc DIFF_IGN_* flags; collected
+            # into the bitmask for the native algorithms by
+            # differ_native.build_ignore_flags -- see _refresh_ex) ---
+            'ignore_case':
+                get_opt('ignoreopt.ignore_case', False),
+            'ignore_whitespace':
+                get_opt('ignoreopt.ignore_whitespace', False),
+            'ignore_blank_lines':
+                get_opt('ignoreopt.ignore_blank_lines', False),
+            'ignore_eol':
+                get_opt('ignoreopt.ignore_eol', False),
+            'ignore_numbers':
+                get_opt('ignoreopt.ignore_numbers', False),
             # --- advanced ---
             'sync_scroll':
                 get_opt('advanced.sync_scroll', DEFAULT_SYNC_SCROLL == '1'),
@@ -2380,6 +2685,11 @@ class Command:
 
         # If no more compare tabs are open in the current session,
         # disable autostart so the plugin does not load on next startup.
+        # Drop the ignore-options context-menu submenu only when NO
+        # compare tabs remain at all (checked against the in-memory set,
+        # which covers all sessions).
         state = self._load_state()
         if not state['sessions'].get(self._current_session_key, {}):
             self._disable_autostart()
+            if not self._compare_tab_ids:
+                self._remove_ignore_menu()

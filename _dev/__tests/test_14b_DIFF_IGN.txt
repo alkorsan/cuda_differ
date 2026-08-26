@@ -7,9 +7,10 @@ WHITESPACE
 WHITESPACE    
   WHITE  SPACE    
 ___IGN_NUMBERS___________________
-v22.4 12:23:4
-vb
 v
+vb
+v22.43 12:23:43
+v22.4 12:23:4 expected to be different
 ___IGN_BLANK_LINES_______________
 
 

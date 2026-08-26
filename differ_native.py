@@ -8,6 +8,13 @@ The native engine is 10-30x faster than the pure-Python matchers on
 large files. For Python-only algorithms (hybrid, myers, vscode, patience,
 difflib), use differ_python.py instead.
 
+Ignore options: the plugin's 'ignoreopt.*' settings are collected into
+a DIFF_IGN_* bitmask (see build_ignore_flags) and applied to BOTH the
+line-level diff (diff_proc DIF_TEXTS) and the char-level detail diff
+inside modified lines (diff_proc DIF_CHARS). The pure-Python
+algorithms in differ_python.py do NOT support ignore options — they
+always compare strictly.
+
 Code is intentionally duplicated from differ_python.py to allow
 independent evolution of the native and Python codepaths. As more
 diff logic moves into the Pascal native engine, this file will shrink
@@ -28,6 +35,41 @@ try:
     _HAS_NATIVE_DIFF = hasattr(_ct, 'diff_proc')
 except ImportError:
     _HAS_NATIVE_DIFF = False
+
+
+# diff_proc ignore-flag constants, mirrored from the cudatext module
+# (proc_py_const.pas DIFF_IGN_*). getattr() fallbacks keep this module
+# importable on CudaText builds that predate the diff_proc API — the
+# flags only matter for the native engine anyway, which is guarded by
+# _HAS_NATIVE_DIFF.
+DIFF_IGN_NONE        = getattr(_ct, 'DIFF_IGN_NONE', 0)
+DIFF_IGN_CASE        = getattr(_ct, 'DIFF_IGN_CASE', 1)
+DIFF_IGN_WHITESPACE  = getattr(_ct, 'DIFF_IGN_WHITESPACE', 2)
+DIFF_IGN_BLANK_LINES = getattr(_ct, 'DIFF_IGN_BLANK_LINES', 4)
+DIFF_IGN_EOL         = getattr(_ct, 'DIFF_IGN_EOL', 8)
+DIFF_IGN_NUMBERS     = getattr(_ct, 'DIFF_IGN_NUMBERS', 16)
+
+
+def build_ignore_flags(cfg):
+    """Build the diff_proc DIFF_IGN_* bitmask from a Differ config dict.
+
+    Maps the five 'ignoreopt.*' boolean settings read by
+    Command.get_config() (ignore_case, ignore_whitespace,
+    ignore_blank_lines, ignore_eol, ignore_numbers) to the native
+    engine's flag bits. Unknown/missing keys count as False.
+    """
+    flags = DIFF_IGN_NONE
+    if cfg.get('ignore_case'):
+        flags |= DIFF_IGN_CASE
+    if cfg.get('ignore_whitespace'):
+        flags |= DIFF_IGN_WHITESPACE
+    if cfg.get('ignore_blank_lines'):
+        flags |= DIFF_IGN_BLANK_LINES
+    if cfg.get('ignore_eol'):
+        flags |= DIFF_IGN_EOL
+    if cfg.get('ignore_numbers'):
+        flags |= DIFF_IGN_NUMBERS
+    return flags
 
 
 class CudaDiffNativeMatcher:
@@ -57,7 +99,7 @@ class CudaDiffNativeMatcher:
     _ALGO_MYERS = 0  # DIFF_ALGO_MYERS
     _ALGO_HISTOGRAM = 1  # DIFF_ALGO_HISTOGRAM
 
-    def __init__(self, isjunk=None, a_text='', b_text='', algo=1):
+    def __init__(self, isjunk=None, a_text='', b_text='', algo=1, flags=0):
         """Create a native diff matcher.
 
         Args:
@@ -78,10 +120,12 @@ class CudaDiffNativeMatcher:
                   HistogramDiff with MyersDiff as internal fallback for
                   sub-regions. Patience-style anchoring on unique lines,
                   more human-readable for normal files.
+            flags: bitmask of DIFF_IGN_* values (see build_ignore_flags).
         """
         self._a_text = a_text
         self._b_text = b_text
         self._algo = algo
+        self._flags = flags
         self.opcodes = None
 
     def get_matching_blocks(self):
@@ -123,7 +167,7 @@ class CudaDiffNativeMatcher:
             self._a_text,
             self._b_text,
             self._algo,
-            0,                   # flags: DIFF_IGN_NONE
+            self._flags,         # bitmask of DIFF_IGN_* (Differ.ignore_flags)
         )
         Profiler.stop('line_diff:native_engine')
         # The native API always returns a valid opcode list.
@@ -210,28 +254,39 @@ class Differ:
         compare on. The algorithm can be changed later via
         self.diff_algorithm before calling compare().
 
+        self.ignore_flags is the DIFF_IGN_* bitmask built by
+        differ_native.build_ignore_flags() from the plugin's 'ignoreopt.*'
+        config settings. Command._refresh_ex sets it before each
+        compare(); it is applied to BOTH the line-level diff
+        (DIF_TEXTS) and the char-level detail diff (DIF_CHARS).
+
         The Differ holds NO text between compares — neither raw text
         nor line lists. a_text / b_text are passed directly to
         compare() by the caller (Command._refresh_ex), used as locals
         inside compare() to drive the engine + painting, and dropped
         when compare() returns. Between compares, the Differ holds
-        only config (withdetail / diff_algorithm / beautify_alignment)
-        and the diffmap (line-index tuples, small). The text itself
-        stays in the editor tabs' Pascal-side buffers (a_ed / b_ed),
-        which are the source of truth; the Python-side copy is built
-        fresh on each compare via a_ed.get_text_all() / b_ed.get_text_all().
+        only config (withdetail / diff_algorithm / beautify_alignment /
+        ignore_flags) and the diffmap (line-index tuples, small). The
+        text itself stays in the editor tabs' Pascal-side buffers
+        (a_ed / b_ed), which are the source of truth; the Python-side
+        copy is built fresh on each compare via a_ed.get_text_all() /
+        b_ed.get_text_all().
         """
         self.withdetail = True
         self.diff_algorithm = 'native_histogram'
         self.beautify_alignment = False
+        self.ignore_flags = 0  # DIFF_IGN_* bitmask (see build_ignore_flags)
         self.diffmap = []
 
     def _char_diff(self, line_a, line_b):
         """Compute char-level diff between two single-line strings.
 
-        Uses the native cudatext.diff_proc(DIF_CHARS) API
+        Uses the native cudatext.diff_proc(DIF_CHARS) API, passing
+        self.ignore_flags (the DIFF_IGN_* bitmask from the plugin's
+        'ignoreopt.*' settings) so the char-level detail highlights
+        honor the same ignore options as the line-level diff.
         Falls back to the Python char_diff only if the native
-        API is unavailable.
+        API is unavailable (strict comparison, no flags).
 
         Returns: list of (tag, a_start, a_end, b_start, b_end) tuples
         where tag is 'equal'/'delete'/'insert'/'replace' and offsets are
@@ -257,7 +312,7 @@ class Differ:
                     line_a,
                     line_b,
                     0,                   # algo: unused for DIF_CHARS
-                    0,                   # flags: DIFF_IGN_NONE
+                    self.ignore_flags,   # bitmask of DIFF_IGN_* (Differ.ignore_flags)
                 )
             finally:
                 Profiler.stop('char_diff:native_engine')
@@ -330,12 +385,14 @@ class Differ:
         if self.diff_algorithm == 'native_myers':
             diff = CudaDiffNativeMatcher(
                 None, algo=CudaDiffNativeMatcher._ALGO_MYERS,
+                flags=self.ignore_flags,
                 a_text=a_text, b_text=b_text)
         else:
             # Default to histogram (covers 'native_histogram' and any
             # unexpected value — histogram is the recommended default).
             diff = CudaDiffNativeMatcher(
                 None, algo=CudaDiffNativeMatcher._ALGO_HISTOGRAM,
+                flags=self.ignore_flags,
                 a_text=a_text, b_text=b_text)
 
         # get_opcodes() calls diff_proc (the native engine) — this is
