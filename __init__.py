@@ -255,29 +255,7 @@ OPTS_META = [
               '(Native Histogram / Native Myers).\n'
               'Spaces and tabs are skipped wherever they appear in a '
               'line -- leading, interior and trailing -- so "abc def" '
-              'compares equal to "abcdef". Also makes whitespace-only '
-              'lines count as blank for the "Ignore blank lines" option.\n'
-              'Can also be toggled from the editor right-click context '
-              'menu ("Differ: Ignore Options") while a compare tab is '
-              'open.\n'
-              'Not supported by the pure-Python algorithms -- they '
-              'compare strictly.\n'
-              'Default: off.'),
-     'def': False,
-     'frm': 'bool',
-     'chp': 'ignoreopt',
-     },
-    {'opt': 'differ.ignoreopt.ignore_blank_lines',
-     'cmt': _('Ignore blank lines\n'
-              'Blank-line-only changes are not shown as differences by '
-              'the native diff algorithms (Native Histogram / Native '
-              'Myers).\n'
-              'A change block is suppressed only when every deleted and '
-              'every inserted line in it is blank; all other changes are '
-              'unaffected. With "Ignore whitespace" also enabled, '
-              'whitespace-only lines count as blank.\n'
-              'Has no effect on the char-level details (blank lines are '
-              'a line-level concept).\n'
+              'compares equal to "abcdef".\n'
               'Can also be toggled from the editor right-click context '
               'menu ("Differ: Ignore Options") while a compare tab is '
               'open.\n'
@@ -484,7 +462,6 @@ def set_opt(key, val):
 _IGNORE_OPTS = (
     ('ignore_case',        _('Ignore case')),
     ('ignore_whitespace',  _('Ignore whitespace')),
-    ('ignore_blank_lines', _('Ignore blank lines')),
     ('ignore_eol',         _('Ignore line endings')),
     ('ignore_numbers',     _('Ignore numbers')),
 )
@@ -762,7 +739,7 @@ class Command:
     # ------------------------------------------------------------------
     # Ignore options
     # ------------------------------------------------------------------
-    # The five diff_proc DIFF_IGN_* ignore options live in
+    # The diff_proc DIFF_IGN_* ignore options live in
     # settings/cuda_differ.json under 'differ.ignoreopt.*' (chapter
     # 'ignoreopt' in the config dialog -- see OPTS_META; built into the
     # flags bitmask by differ_native.build_ignore_flags at compare time).
@@ -2125,8 +2102,6 @@ class Command:
                 get_opt('ignoreopt.ignore_case', False),
             'ignore_whitespace':
                 get_opt('ignoreopt.ignore_whitespace', False),
-            'ignore_blank_lines':
-                get_opt('ignoreopt.ignore_blank_lines', False),
             'ignore_eol':
                 get_opt('ignoreopt.ignore_eol', False),
             'ignore_numbers':
@@ -2478,7 +2453,8 @@ class Command:
         ct.menu_proc(self.menuid_refresh, ct.MENU_SET_ENABLED,
             command=is_compare)
 
-        # Separator + the five ignore options, right below 'Refresh'.
+        # Separator + the ignore options (see _IGNORE_OPTS), right below
+        # 'Refresh'.
         # The tab context menu is rebuilt from scratch by this method on
         # every right-click (on_tab_menu fires each time), so the
         # checkmarks always mirror the current settings file: changing an

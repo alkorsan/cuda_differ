@@ -6,6 +6,7 @@ WHITESPACE
     WHITESPACE
 WHITESPACE    
   WHITE  SPACE    
+  			Tab   	space	    tab
 ___IGN_NUMBERS___________________
 v
 vb
@@ -14,12 +15,6 @@ aaa 333333 ttttt
 aaa 33333 ttttt
 v22.43 12:23:43
 v22.4 12:23:4
-___IGN_BLANK_LINES_______________
-
-
-
-vvv
-_________________________________
-fff
-
-_________________________________
+___DIFF_IGN_EOL__________________
+CRLF vs LF
+CRLF vs CR_________________________________

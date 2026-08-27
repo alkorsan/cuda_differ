@@ -113,13 +113,13 @@ Right-clicking a tab title shows "Differ" submenu with:
   If the list is too long, the first entry "More tabs..." opens a dialog
   with a scrollbar to pick any open tab.
 - Refresh -- re-run the compare on both sides of the compare tab.
-- Five checkable "ignore" options (below Refresh, after a separator):
-  Ignore case, Ignore whitespace, Ignore blank lines, Ignore line endings,
-  Ignore numbers. See "Ignore options" below for what each option does.
+- Four checkable "ignore" options (below Refresh, after a separator):
+  Ignore case, Ignore whitespace, Ignore line endings, Ignore numbers.
+  See "Ignore options" below for what each option does.
 
 == Ignore options ==
 
-Five options control what kind of differences the compare treats as
+Four options control what kind of differences the compare treats as
 "not a difference". They apply to BOTH the line-level diff and the
 char-level highlighting inside changed lines, and only to the two NATIVE
 algorithms (Native Histogram and Native Myers) -- the pure-Python
@@ -133,10 +133,6 @@ from the diff tab context menu (see above) or from the config dialog
   "a b" equals "ab" and "a   b" equals "a  b". Whitespace means SPACE and
   TAB only -- vertical tab and form feed are not whitespace, and line
   endings are covered by their own option below.
-- Ignore blank lines -- differences that consist only of blank lines are
-  not shown. Blank means an empty line, or (when 'Ignore whitespace' is
-  also on) a line containing only spaces/tabs. Blank lines that sit
-  inside a block of real changes are still shown, exactly like WinMerge.
 - Ignore line endings -- the line terminators (CR, LF, CRLF) are not
   compared: a Unix file and the same file saved with Windows or old-Mac
   line endings compare as equal. Without this option, differing line
@@ -210,11 +206,9 @@ All options are stored in settings/cuda_differ.json. The option names grouped in
 Ignore options section (see the "Ignore options" chapter above for details):
 - differ.ignoreopt.ignore_case: Ignore case (default: off)
 - differ.ignoreopt.ignore_whitespace: Ignore whitespace -- spaces and tabs (default: off)
-- differ.ignoreopt.ignore_blank_lines: Ignore blank lines (default: off)
 - differ.ignoreopt.ignore_eol: Ignore line endings -- CR/LF/CRLF (default: off)
 - differ.ignoreopt.ignore_numbers: Ignore numbers -- digits 0-9 (default: off)
-  These five options build the DIFF_IGN_* bitmask passed to the native
-  diff engines. They only affect the native algorithms (Native Histogram
+  These four options only affect the native algorithms (Native Histogram
   and Native Myers); the pure-Python algorithms always compare strictly.
 
 Theme section:

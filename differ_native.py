@@ -45,17 +45,16 @@ except ImportError:
 DIFF_IGN_NONE        = getattr(_ct, 'DIFF_IGN_NONE', 0)
 DIFF_IGN_CASE        = getattr(_ct, 'DIFF_IGN_CASE', 1)
 DIFF_IGN_WHITESPACE  = getattr(_ct, 'DIFF_IGN_WHITESPACE', 2)
-DIFF_IGN_BLANK_LINES = getattr(_ct, 'DIFF_IGN_BLANK_LINES', 4)
-DIFF_IGN_EOL         = getattr(_ct, 'DIFF_IGN_EOL', 8)
-DIFF_IGN_NUMBERS     = getattr(_ct, 'DIFF_IGN_NUMBERS', 16)
+DIFF_IGN_EOL         = getattr(_ct, 'DIFF_IGN_EOL', 4)
+DIFF_IGN_NUMBERS     = getattr(_ct, 'DIFF_IGN_NUMBERS', 8)
 
 
 def build_ignore_flags(cfg):
     """Build the diff_proc DIFF_IGN_* bitmask from a Differ config dict.
 
-    Maps the five 'ignoreopt.*' boolean settings read by
+    Maps the four 'ignoreopt.*' boolean settings read by
     Command.get_config() (ignore_case, ignore_whitespace,
-    ignore_blank_lines, ignore_eol, ignore_numbers) to the native
+    ignore_eol, ignore_numbers) to the native
     engine's flag bits. Unknown/missing keys count as False.
     """
     flags = DIFF_IGN_NONE
@@ -63,8 +62,6 @@ def build_ignore_flags(cfg):
         flags |= DIFF_IGN_CASE
     if cfg.get('ignore_whitespace'):
         flags |= DIFF_IGN_WHITESPACE
-    if cfg.get('ignore_blank_lines'):
-        flags |= DIFF_IGN_BLANK_LINES
     if cfg.get('ignore_eol'):
         flags |= DIFF_IGN_EOL
     if cfg.get('ignore_numbers'):
