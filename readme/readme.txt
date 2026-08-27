@@ -113,15 +113,23 @@ Right-clicking a tab title shows "Differ" submenu with:
   If the list is too long, the first entry "More tabs..." opens a dialog
   with a scrollbar to pick any open tab.
 - Refresh -- re-run the compare on both sides of the compare tab.
-- Four checkable "ignore" options (below Refresh, after a separator):
-  Ignore case, Ignore whitespace, Ignore line endings, Ignore numbers.
-  See "Ignore options" below for what each option does.
+- Five checkable "ignore" options (below Refresh, after a separator):
+  Ignore case, Ignore whitespace, Ignore blank lines, Ignore line endings,
+  Ignore numbers.
+  Ticking one re-runs the compare immediately with that option applied;
+  the checkmarks always mirror the saved settings, so the config dialog
+  and this menu stay in sync in both directions (toggling here writes the
+  setting to settings/cuda_differ.json, and changing a setting in the
+  config dialog is reflected here the next time the menu opens). See
+  "Ignore options" below for what each option does.
 
 == Ignore options ==
 
-Four options control what kind of differences the compare treats as
+Five options control what kind of differences the compare treats as
 "not a difference". They apply to BOTH the line-level diff and the
-char-level highlighting inside changed lines, and only to the two NATIVE
+char-level highlighting inside changed lines (except "Ignore blank
+lines", which is a line-level concept and does not affect the char-level
+details), and only to the two NATIVE
 algorithms (Native Histogram and Native Myers) -- the pure-Python
 algorithms always compare strictly and ignore these options. Set them
 from the diff tab context menu (see above) or from the config dialog
@@ -133,6 +141,18 @@ from the diff tab context menu (see above) or from the config dialog
   "a b" equals "ab" and "a   b" equals "a  b". Whitespace means SPACE and
   TAB only -- vertical tab and form feed are not whitespace, and line
   endings are covered by their own option below.
+- Ignore blank lines -- changes that only insert or delete blank lines
+  are ignored, like WinMerge's "Ignore blank lines" and GNU diff's -B
+  option. A hunk is ignored when ALL of its lines are blank on both
+  sides; a line is blank when it is empty, or (with "Ignore whitespace"
+  also on) contains only spaces and tabs. Ignored regions stay visible,
+  WinMerge-style: their lines get the "ignored" background color (see
+  "Color of ignored differences" in the options) and a small colored
+  gap fills in for the missing lines so the two sides stay aligned.
+  They are not counted as differences: no bookmarks, skipped by
+  Next/Previous Difference and Copy, and two files differing only in
+  blank lines report "No differences found (with current ignore
+  options)".
 - Ignore line endings -- the line terminators (CR, LF, CRLF) are not
   compared: a Unix file and the same file saved with Windows or old-Mac
   line endings compare as equal. Without this option, differing line
@@ -146,6 +166,14 @@ from the diff tab context menu (see above) or from the config dialog
 
 Notes:
 - The options can be combined freely; they all apply at once.
+- When every difference in the two files is ignored (e.g. the files
+  differ only in line endings and 'Ignore line endings' is on, or only
+  in blank lines and 'Ignore blank lines' is on), Differ
+  tells you: a "No differences found (with current ignore options)"
+  message appears instead of an uncolored compare tab.
+- These options are passed to CudaText's diff_proc API as the
+  DIFF_IGN_* bitmask (see the diff_proc documentation in the CudaText
+  wiki).
 
 
 == Saving and syncing changes ==
@@ -206,9 +234,12 @@ All options are stored in settings/cuda_differ.json. The option names grouped in
 Ignore options section (see the "Ignore options" chapter above for details):
 - differ.ignoreopt.ignore_case: Ignore case (default: off)
 - differ.ignoreopt.ignore_whitespace: Ignore whitespace -- spaces and tabs (default: off)
+- differ.ignoreopt.ignore_blank_lines: Ignore blank lines -- all-blank hunks
+  suppressed, painted as ignored regions with a compensating gap (default: off)
 - differ.ignoreopt.ignore_eol: Ignore line endings -- CR/LF/CRLF (default: off)
 - differ.ignoreopt.ignore_numbers: Ignore numbers -- digits 0-9 (default: off)
-  These four options only affect the native algorithms (Native Histogram
+  These five options build the DIFF_IGN_* bitmask passed to the native
+  diff engines. They only affect the native algorithms (Native Histogram
   and Native Myers); the pure-Python algorithms always compare strictly.
 
 Theme section:
@@ -231,6 +262,13 @@ Theme section:
   Background color for the blank gap inserted to keep the two sides
   aligned when one side has fewer lines. Also colors the gap rectangles
   in the overview panel.
+  Leave empty to use the theme default.
+- differ.theme.ignored_color: Color of ignored differences
+  Background color for lines whose difference is suppressed by the
+  "Ignore blank lines" option, and for the compensating gap inserted
+  next to them so the two sides stay aligned (WinMerge-style ignored
+  differences). Also colors the micromap highlights and the overview
+  panel.
   Leave empty to use the theme default.
 
 Algorithm section:

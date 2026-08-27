@@ -47,14 +47,15 @@ DIFF_IGN_CASE        = getattr(_ct, 'DIFF_IGN_CASE', 1)
 DIFF_IGN_WHITESPACE  = getattr(_ct, 'DIFF_IGN_WHITESPACE', 2)
 DIFF_IGN_EOL         = getattr(_ct, 'DIFF_IGN_EOL', 4)
 DIFF_IGN_NUMBERS     = getattr(_ct, 'DIFF_IGN_NUMBERS', 8)
+DIFF_IGN_BLANK_LINES = getattr(_ct, 'DIFF_IGN_BLANK_LINES', 16)
 
 
 def build_ignore_flags(cfg):
     """Build the diff_proc DIFF_IGN_* bitmask from a Differ config dict.
 
-    Maps the four 'ignoreopt.*' boolean settings read by
+    Maps the five 'ignoreopt.*' boolean settings read by
     Command.get_config() (ignore_case, ignore_whitespace,
-    ignore_eol, ignore_numbers) to the native
+    ignore_blank_lines, ignore_eol, ignore_numbers) to the native
     engine's flag bits. Unknown/missing keys count as False.
     """
     flags = DIFF_IGN_NONE
@@ -62,6 +63,8 @@ def build_ignore_flags(cfg):
         flags |= DIFF_IGN_CASE
     if cfg.get('ignore_whitespace'):
         flags |= DIFF_IGN_WHITESPACE
+    if cfg.get('ignore_blank_lines'):
+        flags |= DIFF_IGN_BLANK_LINES
     if cfg.get('ignore_eol'):
         flags |= DIFF_IGN_EOL
     if cfg.get('ignore_numbers'):
@@ -79,7 +82,9 @@ class CudaDiffNativeMatcher:
     This class exposes the same minimal interface Differ.compare() uses
     from the other matchers: get_opcodes() returning a list of
     (tag, i1, i2, j1, j2) tuples with tag in
-    {'equal', 'delete', 'insert', 'replace'}.
+    {'equal', 'delete', 'insert', 'replace', 'ignore'} ('ignore' is a
+    CudaText extension: an all-blank hunk suppressed by
+    DIFF_IGN_BLANK_LINES — ranges behave like 'replace').
 
     The native API takes two RAW TEXT strings and returns exactly that
     opcode format. The engine splits the texts into lines internally
@@ -154,7 +159,10 @@ class CudaDiffNativeMatcher:
 
         Returns:
             list of (tag, i1, i2, j1, j2) tuples where tag is a lowercase
-            string. Identical in format to difflib.SequenceMatcher.get_opcodes().
+            string. Identical in format to
+            difflib.SequenceMatcher.get_opcodes(), plus the CudaText
+            extension tag 'ignore' (an all-blank hunk suppressed by
+            DIFF_IGN_BLANK_LINES — ranges behave like 'replace').
         """
         if self.opcodes is not None:
             return self.opcodes
@@ -203,6 +211,18 @@ A_DECOR_YELLOW = '-y'
 A_DECOR_RED = '-r'
 B_DECOR_YELLOW = '+y'
 B_DECOR_GREEN = '+g'
+# Ignored (suppressed) difference events — emitted ONLY by the native
+# path for 'ignore' opcodes (DIFF_IGN_BLANK_LINES). WinMerge-style
+# "ignored differences": the lines are painted with the ignored color
+# and a compensating gap keeps the two sides aligned, but they are NOT
+# differences (no bookmarks, no diffmap entry, not counted by
+# n_diff_events). Mirrored in differ_python.py (which never yields
+# them — pure-Python engines compare strictly — but __init__.py's
+# paint loop references the constants off either module).
+A_LINE_IGN = '-i'   # ignored line in file a: (id, y)
+B_LINE_IGN = '+i'   # ignored line in file b: (id, y)
+A_GAP_IGN  = '-^i'  # ignored gap in file a: (id, y, start, end)
+B_GAP_IGN  = '+^i'  # ignored gap in file b: (id, y, start, end)
 # Alignment event: a pair of lines (one in A, one in B) that must be kept
 # at the same visual Y position. Used by __init__.py to add compensating
 # gaps when word-wrap is on and the two lines wrap to a different number
@@ -238,6 +258,20 @@ class Differ:
          -- detail paint deleted symbols in file a
          ++ detail paint added symbols in file b
               return (id, y, x, nlen)
+         -i ignored (suppressed) line in file a
+         +i ignored (suppressed) line in file b
+              return (id, y)
+              Emitted for 'ignore' opcodes (DIFF_IGN_BLANK_LINES):
+              lines of an all-blank hunk the ignore options suppressed.
+              Painted with the ignored color; NOT a difference (no
+              bookmark, no diffmap entry, no char details).
+         -^i / +^i ignored gap in file a / b
+              return (id, y, start, end)
+              Same positioning as -^ / +^ (inserted after line y-1,
+              compensates for the lines [start, end) on the OTHER side)
+              but colored/tagged as ignored — it compensates the length
+              mismatch of a suppressed hunk so lines below stay
+              aligned (WinMerge-style ignored differences).
          = visually-aligned line pair (a_line, b_line)
               return (id, a_line, b_line)
               Consumed by __init__.py to add a compensating gap when the two
@@ -439,7 +473,9 @@ class Differ:
 
         Profiler.start('compare:event_generation')
         for tag, i1, i2, j1, j2 in opcodes:
-            if tag != 'equal':
+            if tag not in ('equal', 'ignore'):
+                # 'ignore' hunks are suppressed differences, not diff
+                # blocks: jump()/copy()/select_current() must skip them.
                 self.diffmap.append([i1, i2, j1, j2])
             if tag == 'equal':
                 # Yield ALIGN for each matched pair so the wrapper can add
@@ -467,6 +503,30 @@ class Differ:
                 else:
                     yield from self._plain_replace_simple(a_lines, i1, i2,
                                                           b_lines, j1, j2)
+            elif tag == 'ignore':
+                # Suppressed all-blank hunk (DIFF_IGN_BLANK_LINES) —
+                # a WinMerge-style "ignored difference". NOT counted as
+                # a difference: no diffmap entry, no bookmarks, no char
+                # details. Paint both sides' lines with the ignored
+                # color and compensate the length mismatch with an
+                # ignored gap so lines below stay aligned.
+                da = i2 - i1
+                db = j2 - j1
+                if da > db:
+                    # Side A has extra blank lines: gap in B before line
+                    # j2 (after B's hunk lines), compensating A's extra
+                    # lines [i1 + db, i2).
+                    yield (B_GAP_IGN, j2, i1 + db, i2)
+                elif db > da:
+                    # Side B has extra blank lines: gap in A before line
+                    # i2, compensating B's extra lines [j1 + da, j2).
+                    yield (A_GAP_IGN, i2, j1 + da, j2)
+                for k in range(min(da, db)):
+                    yield (ALIGN, i1 + k, j1 + k)
+                for y in range(i1, i2):
+                    yield (A_LINE_IGN, y)
+                for y in range(j1, j2):
+                    yield (B_LINE_IGN, y)
         Profiler.stop('compare:event_generation')
 
         Profiler.stop('compare')

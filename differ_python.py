@@ -146,6 +146,16 @@ A_DECOR_YELLOW = '-y'
 A_DECOR_RED = '-r'
 B_DECOR_YELLOW = '+y'
 B_DECOR_GREEN = '+g'
+# Ignored (suppressed) difference events — emitted ONLY by the native
+# path (differ_native) for 'ignore' opcodes under DIFF_IGN_BLANK_LINES.
+# This module NEVER yields them (pure-Python engines compare strictly,
+# so they cannot suppress hunks), but the constants must exist here too:
+# __init__.py's paint loop references them off whichever differ module
+# produced the event stream.
+A_LINE_IGN = '-i'   # ignored line in file a: (id, y)
+B_LINE_IGN = '+i'   # ignored line in file b: (id, y)
+A_GAP_IGN  = '-^i'  # ignored gap in file a: (id, y, start, end)
+B_GAP_IGN  = '+^i'  # ignored gap in file b: (id, y, start, end)
 # Alignment event: a pair of lines (one in A, one in B) that must be kept
 # at the same visual Y position. Used by __init__.py to add compensating
 # gaps when word-wrap is on and the two lines wrap to a different number

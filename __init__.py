@@ -25,6 +25,12 @@ _ = get_translation(__file__)  # I18N
 df = dfn
 
 DIFF_TAG = 148
+# Gap tag for ignored-difference gaps (DIFF_IGN_BLANK_LINES suppressed
+# hunks). Separate from DIFF_TAG so the compensating gaps WinMerge-style
+# "ignored differences" insert are identifiable (and deletable) on
+# their own — they are also painted with the ignored color instead of
+# the regular gap color.
+IGN_GAP_TAG = 149
 NKIND_DELETED = 24
 NKIND_ADDED = 25
 NKIND_CHANGED = 26
@@ -111,6 +117,19 @@ OPTS_META = [
               'Background color for the blank gap inserted to keep the two '
               'sides visually aligned when one side has fewer lines.\n'
               'Also colors the gap rectangles in the overview panel.\n'
+              'Leave empty to use the theme default.'),
+     'def': '',
+     'frm': '#rgb-e',
+     'chp': 'theme',
+     },
+    {'opt': 'differ.theme.ignored_color',
+     'cmt': _('Color of ignored differences\n'
+              'Background color for lines whose difference is suppressed '
+              'by the "Ignore blank lines" option (WinMerge-style '
+              'ignored differences), and for the compensating gap '
+              'inserted next to them so the two sides stay aligned.\n'
+              'Also colors the micromap highlights and the overview '
+              'panel.\n'
               'Leave empty to use the theme default.'),
      'def': '',
      'frm': '#rgb-e',
@@ -229,7 +248,7 @@ OPTS_META = [
      },
     # --- chapter "ignoreopt": comparison ignore options (the diff_proc
     # DIFF_IGN_* flags of the native engines; also exposed as checkable
-    # items in the editor right-click context menu) ------------------------
+    # items in the diff-tab right-click context menu, below 'Refresh') ---
     {'opt': 'differ.ignoreopt.ignore_case',
      'cmt': _('Ignore case\n'
               'Case-insensitive comparison for the native diff algorithms '
@@ -239,9 +258,8 @@ OPTS_META = [
               'highlighted in the char-level details inside modified '
               'lines. Non-ASCII text is compared as-is (no full Unicode '
               'case folding).\n'
-              'Can also be toggled from the editor right-click context '
-              'menu ("Differ: Ignore Options") while a compare tab is '
-              'open.\n'
+              'Can also be toggled from the compare-tab right-click context '
+              'menu (checkable item below "Refresh").\n'
               'Not supported by the pure-Python algorithms -- they '
               'compare strictly.\n'
               'Default: off.'),
@@ -256,9 +274,34 @@ OPTS_META = [
               'Spaces and tabs are skipped wherever they appear in a '
               'line -- leading, interior and trailing -- so "abc def" '
               'compares equal to "abcdef".\n'
-              'Can also be toggled from the editor right-click context '
-              'menu ("Differ: Ignore Options") while a compare tab is '
-              'open.\n'
+              'Can also be toggled from the compare-tab right-click context '
+              'menu (checkable item below "Refresh").\n'
+              'Not supported by the pure-Python algorithms -- they '
+              'compare strictly.\n'
+              'Default: off.'),
+     'def': False,
+     'frm': 'bool',
+     'chp': 'ignoreopt',
+     },
+    {'opt': 'differ.ignoreopt.ignore_blank_lines',
+     'cmt': _('Ignore blank lines\n'
+              'Changes that only insert or delete blank lines are ignored '
+              'by the native diff algorithms (Native Histogram / Native '
+              'Myers) -- like WinMerge\'s "Ignore blank lines" and GNU '
+              'diff\'s -B option.\n'
+              'A hunk is ignored when ALL of its lines are blank on both '
+              'sides. A line is blank when it is empty, or when "Ignore '
+              'whitespace" is also enabled and it contains only spaces '
+              'and tabs.\n'
+              'Ignored regions are still visible, WinMerge-style: their '
+              'lines get the "ignored" background color (see "Color of '
+              'ignored differences"), and a small colored gap compensates '
+              'the missing lines so the two sides stay aligned. They are '
+              'NOT counted as differences: no bookmarks, skipped by '
+              'Next/Previous Difference, and a file differing only in '
+              'blank lines reports "No differences found".\n'
+              'Can also be toggled from the compare-tab right-click context '
+              'menu (checkable item below "Refresh").\n'
               'Not supported by the pure-Python algorithms -- they '
               'compare strictly.\n'
               'Default: off.'),
@@ -274,9 +317,8 @@ OPTS_META = [
               're-saved with different line endings shows no differences. '
               'End-of-line tokens also compare equal in the char-level '
               'details inside modified lines.\n'
-              'Can also be toggled from the editor right-click context '
-              'menu ("Differ: Ignore Options") while a compare tab is '
-              'open.\n'
+              'Can also be toggled from the compare-tab right-click context '
+              'menu (checkable item below "Refresh").\n'
               'Not supported by the pure-Python algorithms -- they '
               'compare strictly.\n'
               'Default: off.'),
@@ -294,9 +336,8 @@ OPTS_META = [
               'affected. "12:34:56.789" matches "12:34:56.790". In the '
               'char-level details inside modified lines, number-only '
               'changes are not highlighted.\n'
-              'Can also be toggled from the editor right-click context '
-              'menu ("Differ: Ignore Options") while a compare tab is '
-              'open.\n'
+              'Can also be toggled from the compare-tab right-click context '
+              'menu (checkable item below "Refresh").\n'
               'Not supported by the pure-Python algorithms -- they '
               'compare strictly.\n'
               'Default: off.'),
@@ -453,15 +494,17 @@ def set_opt(key, val):
     return ctx.set_opt('differ.' + key, val, user_json=JSONFILE)
 
 
-# Ignore options exposed in the editor right-click context menu
-# ('Differ: Ignore Options' submenu) and in the config dialog (chapter
-# 'ignoreopt' -- see OPTS_META). Order = context-menu display order.
+# Ignore options exposed as checkable items in the diff-tab right-click
+# context menu (below 'Refresh' -- see tabmenu_init) and in the config
+# dialog (chapter 'ignoreopt' -- see OPTS_META). Order = context-menu
+# display order.
 # Each entry: (config key suffix under 'ignoreopt.', menu caption).
 # The values feed differ_native.build_ignore_flags() which builds the
 # diff_proc DIFF_IGN_* bitmask for the native algorithms.
 _IGNORE_OPTS = (
     ('ignore_case',        _('Ignore case')),
     ('ignore_whitespace',  _('Ignore whitespace')),
+    ('ignore_blank_lines', _('Ignore blank lines')),
     ('ignore_eol',         _('Ignore line endings')),
     ('ignore_numbers',     _('Ignore numbers')),
 )
@@ -1564,6 +1607,9 @@ class Command:
                 line_h_a = 0
                 line_h_b = 0
             color_gaps = self.cfg.get('color_gaps')
+            # Ignored-difference color (WinMerge-style suppressed blank
+            # lines + their compensating gaps) — see 'ignored_color'.
+            color_ignored = self.cfg.get('color_ignored')
 
             # The for loop below consumes events from diff.compare() (a
             # generator) and paints each event. Profiling the loop as a whole
@@ -1705,6 +1751,81 @@ class Command:
                         Profiler.stop('paint:gap')
                         if overview is not None:
                             overview.add_gap('b', b_line_after, a_end - a_start)
+                elif diff_id == df.A_GAP_IGN:
+                    # Compensating gap for a suppressed all-blank hunk
+                    # (DIFF_IGN_BLANK_LINES): same geometry as A_GAP but
+                    # painted with the ignored color and carrying the
+                    # dedicated IGN_GAP_TAG, so ignored regions look
+                    # distinct from regular alignment gaps. Pure visual
+                    # alignment — not a difference, so no n_diff_events.
+                    a_line_after, b_start, b_end = d[1], d[2], d[3]
+                    if wrap_on:
+                        Profiler.start('paint:wrap_calc')
+                        total_visual = self._sum_visual_rows(
+                            wrap_counts_b, b_start, b_end)
+                        Profiler.stop('paint:wrap_calc')
+                        Profiler.start('paint:gap')
+                        self._add_raw_gap(a_ed, a_line_after - 1,
+                                          total_visual * line_h_a,
+                                          color_ignored, tag=IGN_GAP_TAG)
+                        Profiler.stop('paint:gap')
+                        if overview is not None:
+                            overview.add_gap('a', a_line_after, total_visual)
+                    else:
+                        Profiler.start('paint:gap')
+                        self.set_gap(a_ed, a_line_after, b_end - b_start,
+                                     color=color_ignored, tag=IGN_GAP_TAG)
+                        Profiler.stop('paint:gap')
+                        if overview is not None:
+                            overview.add_gap('a', a_line_after, b_end - b_start)
+                elif diff_id == df.B_GAP_IGN:
+                    b_line_after, a_start, a_end = d[1], d[2], d[3]
+                    if wrap_on:
+                        Profiler.start('paint:wrap_calc')
+                        total_visual = self._sum_visual_rows(
+                            wrap_counts_a, a_start, a_end)
+                        Profiler.stop('paint:wrap_calc')
+                        Profiler.start('paint:gap')
+                        self._add_raw_gap(b_ed, b_line_after - 1,
+                                          total_visual * line_h_b,
+                                          color_ignored, tag=IGN_GAP_TAG)
+                        Profiler.stop('paint:gap')
+                        if overview is not None:
+                            overview.add_gap('b', b_line_after, total_visual)
+                    else:
+                        Profiler.start('paint:gap')
+                        self.set_gap(b_ed, b_line_after, a_end - a_start,
+                                     color=color_ignored, tag=IGN_GAP_TAG)
+                        Profiler.stop('paint:gap')
+                        if overview is not None:
+                            overview.add_gap('b', b_line_after, a_end - a_start)
+                elif diff_id == df.A_LINE_IGN:
+                    # Line of a suppressed all-blank hunk: painted with
+                    # the ignored color, but NOT a difference — no
+                    # bookmark, no diffmap entry, not counted in
+                    # n_diff_events (a file differing only in blank
+                    # lines still reports "No differences found").
+                    Profiler.start('paint:decor')
+                    self.set_decor(a_ed, y, DECOR_CHAR, color_ignored)
+                    Profiler.stop('paint:decor')
+                    if micromap_on:
+                        Profiler.start('paint:micromap')
+                        self.set_attr(a_ed, y=y, bg=color_ignored,
+                                     mptag=1, map_only=1)
+                        Profiler.stop('paint:micromap')
+                    if overview is not None:
+                        overview.add_line_state('a', y, color_ignored)
+                elif diff_id == df.B_LINE_IGN:
+                    Profiler.start('paint:decor')
+                    self.set_decor(b_ed, y, DECOR_CHAR, color_ignored)
+                    Profiler.stop('paint:decor')
+                    if micromap_on:
+                        Profiler.start('paint:micromap')
+                        self.set_attr(b_ed, y=y, bg=color_ignored,
+                                     mptag=1, map_only=1)
+                        Profiler.stop('paint:micromap')
+                    if overview is not None:
+                        overview.add_line_state('b', y, color_ignored)
                 elif diff_id == df.ALIGN:
                     if wrap_on:
                         a_line, b_line = d[1], d[2]
@@ -1889,27 +2010,31 @@ class Command:
                map_only=map_only
                )
 
-    def set_gap(self, e, row, n=1):
+    def set_gap(self, e, row, n=1, color=None, tag=None):
         """Add a gap of n line-heights after 'row' on editor e. Used to
-        compensate for inserted/deleted lines on the opposite side."""
+        compensate for inserted/deleted lines on the opposite side.
+        color/tag override the regular gap look (cfg 'color_gaps' /
+        DIFF_TAG) — ignored-difference gaps pass the ignored color and
+        IGN_GAP_TAG so they are visually distinct (WinMerge-style)."""
         __, h = e.get_prop(ct.PROP_CELL_SIZE)
         h_size = h * n
         e.gap(ct.GAP_ADD, row-1, 0,
-              tag=DIFF_TAG,
+              tag=DIFF_TAG if tag is None else tag,
               size=h_size,
-              color=self.cfg.get('color_gaps')
+              color=self.cfg.get('color_gaps') if color is None else color
               )
 
-    def _add_raw_gap(self, e, line_index, pixel_size, color):
+    def _add_raw_gap(self, e, line_index, pixel_size, color, tag=None):
         """Add a gap at the given line index with an explicit pixel size.
         `line_index` follows the e.gap() convention: the gap is inserted
         between `line_index` and `line_index+1` (i.e. after `line_index`).
         Use -1 for a gap before the first line. Compared to set_gap(), this
         takes an explicit pixel size instead of computing n*line_height,
         which is needed when wrap is on and the gap must match the actual
-        number of wrapped visual rows on the opposite side."""
+        number of wrapped visual rows on the opposite side.
+        tag defaults to DIFF_TAG; ignored-difference gaps pass IGN_GAP_TAG."""
         e.gap(ct.GAP_ADD, line_index, 0,
-              tag=DIFF_TAG,
+              tag=DIFF_TAG if tag is None else tag,
               size=pixel_size,
               color=color
               )
@@ -2071,6 +2196,7 @@ class Command:
             th['color_added'] = data['LightBG3']['color_back']
             th['color_deleted'] = data['LightBG1']['color_back']
             th['color_gaps'] = data['LightBG5']['color_back']
+            th['color_ignored'] = data['LightBG4']['color_back']
             return th
 
         t = get_theme()
@@ -2088,6 +2214,8 @@ class Command:
                 get_color('theme.deleted_color', t.get('color_deleted')),
             'color_gaps':
                 get_color('theme.gap_color', t.get('color_gaps')),
+            'color_ignored':
+                get_color('theme.ignored_color', t.get('color_ignored')),
             # --- algorithm ---
             'diff_algorithm':
                 get_opt('algorithm.diff_algorithm', 'native_histogram'),
@@ -2102,6 +2230,8 @@ class Command:
                 get_opt('ignoreopt.ignore_case', False),
             'ignore_whitespace':
                 get_opt('ignoreopt.ignore_whitespace', False),
+            'ignore_blank_lines':
+                get_opt('ignoreopt.ignore_blank_lines', False),
             'ignore_eol':
                 get_opt('ignoreopt.ignore_eol', False),
             'ignore_numbers':
