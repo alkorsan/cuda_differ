@@ -121,8 +121,8 @@ class PaintboxOverview:
         self._static_h = 0
         # Line states: {('a', line): color, ('b', line): color}
         self.line_states = {}
-        # Gap info: list of (after_line, gap_visual_rows) for each gap
-        self.gaps_a = []  # list of (after_line, gap_visual_rows)
+        # Gap info: list of (after_line, gap_visual_rows, ignored) per gap
+        self.gaps_a = []  # list of (after_line, gap_visual_rows, ignored)
         self.gaps_b = []
         # Per-line visual row counts (for wrap-aware height computation).
         # If None, each line is 1 visual row. Set via set_wrap_counts().
@@ -139,6 +139,7 @@ class PaintboxOverview:
         self.color_added = 0xAAAAAA    # overridden by set_colors()
         self.color_changed = 0xAAAAAA  # overridden by set_colors()
         self.color_gap = 0xEEEEEE      # overridden by set_colors()
+        self.color_ignored_gap = 0xEEEEEE  # overridden by set_colors()
         # Slider state for drag-to-scroll
         self._slider_top = 0
         self._slider_height = 0
@@ -333,7 +334,8 @@ class PaintboxOverview:
         if opacity is not None:
             self.opt_slider_opacity = max(0.0, min(1.0, float(opacity)))
 
-    def set_colors(self, color_bg, color_deleted, color_added, color_changed, color_gap):
+    def set_colors(self, color_bg, color_deleted, color_added, color_changed,
+                   color_gap, color_ignored_gap=None):
         """Set the colors used for painting the overview.
 
         Args:
@@ -342,12 +344,18 @@ class PaintboxOverview:
             color_added: color for added lines (config color_added)
             color_changed: color for changed lines (config color_changed)
             color_gap: color for gap rectangles (config color_gaps)
+            color_ignored_gap: color for the gap rectangles that compensate
+                DIFF_IGN_BLANK_LINES-suppressed ("ignored") differences
+                (config color_ignored_gap). Optional: when omitted, ignored
+                gaps fall back to color_gap (pre-extension behavior).
         """
         self.color_bg = color_bg
         self.color_deleted = color_deleted
         self.color_added = color_added
         self.color_changed = color_changed
         self.color_gap = color_gap
+        if color_ignored_gap is not None:
+            self.color_ignored_gap = color_ignored_gap
 
     def set_line_counts(self, a_count, b_count):
         """Set the total line counts for both editors (without gaps)."""
@@ -386,18 +394,21 @@ class PaintboxOverview:
         """
         self.line_states[(side, line)] = color
 
-    def add_gap(self, side, after_line, gap_visual_rows):
+    def add_gap(self, side, after_line, gap_visual_rows, ignored=False):
         """Record a gap inserted after a line.
 
         Args:
             side: 'a' or 'b'
             after_line: the line index after which the gap was inserted
             gap_visual_rows: number of visual rows the gap occupies
+            ignored: True for gaps that compensate a suppressed all-blank
+                hunk (DIFF_IGN_BLANK_LINES "ignored differences") -- they
+                are painted with color_ignored_gap instead of color_gap.
         """
         if side == 'a':
-            self.gaps_a.append((after_line, gap_visual_rows))
+            self.gaps_a.append((after_line, gap_visual_rows, bool(ignored)))
         else:
-            self.gaps_b.append((after_line, gap_visual_rows))
+            self.gaps_b.append((after_line, gap_visual_rows, bool(ignored)))
 
     def clear_data(self):
         """Clear all collected line states and gaps. Called before a
@@ -426,7 +437,7 @@ class PaintboxOverview:
         for line in range(line_count):
             total += self._line_visual_rows(side, line)
         # Add gap rows
-        for _, gap_rows in gaps:
+        for _, gap_rows, _ign in gaps:
             total += gap_rows
         return max(total, 1)
 
@@ -455,7 +466,7 @@ class PaintboxOverview:
         for i in range(line):
             y += self._line_visual_rows(side, i)
         # Add gap rows for gaps at or before this line
-        for after_line, gap_rows in gaps:
+        for after_line, gap_rows, _ign in gaps:
             if after_line <= line:
                 y += gap_rows
             else:
@@ -481,7 +492,7 @@ class PaintboxOverview:
             line_count = self.b_line_count
         gaps = self._sorted_gaps(side)
         gap_map = {}
-        for after_line, gap_rows in gaps:
+        for after_line, gap_rows, _ign in gaps:
             gap_map[after_line] = gap_map.get(after_line, 0) + gap_rows
 
         remaining = visual_y
@@ -606,11 +617,41 @@ class PaintboxOverview:
         b = int(b1 * inv + b2 * alpha)
         return r | (g << 8) | (b << 16)
 
+    def _paint_gap_rect(self, c, x_start, x_end, py, scale, rows_total,
+                        rows_ignored):
+        """Paint one inter-line gap rectangle.
+
+        Regular rows are painted with color_gap; ignored rows (gaps that
+        compensate a DIFF_IGN_BLANK_LINES-suppressed hunk) are painted
+        with color_ignored_gap on top, stacked inside the same rect.
+        When a regular and an ignored gap share a position their heights
+        add up, and the ignored portion is drawn at the top of the rect.
+        Both segments are recorded for the transparent-slider blending.
+        """
+        gap_h = max(1, int(rows_total * scale))
+        ct.canvas_proc(c, ct.CANVAS_SET_BRUSH, color=self.color_gap,
+                       style=ct.BRUSH_SOLID)
+        ct.canvas_proc(c, ct.CANVAS_RECT_FILL, x=x_start, y=py,
+                       x2=x_end, y2=py + gap_h)
+        self._record_segment(x_start, py, x_end, py + gap_h,
+                             self.color_gap)
+        if rows_ignored > 0:
+            ign_h = min(gap_h, max(1, int(rows_ignored * scale)))
+            ct.canvas_proc(c, ct.CANVAS_SET_BRUSH,
+                           color=self.color_ignored_gap,
+                           style=ct.BRUSH_SOLID)
+            ct.canvas_proc(c, ct.CANVAS_RECT_FILL, x=x_start, y=py,
+                           x2=x_end, y2=py + ign_h)
+            self._record_segment(x_start, py, x_end, py + ign_h,
+                                 self.color_ignored_gap)
+
     def _paint_side(self, c, side, x_start, x_end, h, scale):
         """Paint one side of the overview (either a_ed or b_ed half).
 
         Walks the lines in order, painting each line as a 1-pixel-tall
-        colored rectangle. Gaps are painted as gray rectangles. The visual
+        colored rectangle. Gaps are painted as rectangles in the regular
+        gap color; gaps that compensate ignored (suppressed) differences
+        are painted in the ignored-gap color (see _paint_gap_rect). The visual
         position accounts for gaps so the overview stays in sync with
         the actual editor layout.
 
@@ -629,12 +670,18 @@ class PaintboxOverview:
             line_count = self.b_line_count
             gaps = self._sorted_gaps('b')
 
-        # Build a gap map: after_line -> total gap rows at that position.
-        # A gap with after_line == N means it appears between line N-1
-        # and line N (i.e., BEFORE line N in visual order).
+        # Build a gap map: after_line -> [total gap rows, ignored rows]
+        # at that position. A gap with after_line == N means it appears
+        # between line N-1 and line N (i.e., BEFORE line N in visual
+        # order). Several gaps (regular + ignored) can share a position;
+        # their heights add up and the ignored portion is painted on
+        # top (see _paint_gap_rect).
         gap_map = {}
-        for after_line, gap_rows in gaps:
-            gap_map[after_line] = gap_map.get(after_line, 0) + gap_rows
+        for after_line, gap_rows, gap_ign in gaps:
+            ent = gap_map.setdefault(after_line, [0, 0])
+            ent[0] += gap_rows
+            if gap_ign:
+                ent[1] += gap_rows
 
         vis_y = 0
 
@@ -643,14 +690,11 @@ class PaintboxOverview:
             # Paint gap before this line (if any).
             # Gap with after_line == line means: between line-1 and line.
             if line in gap_map:
-                gap_rows = gap_map[line]
-                gap_h = max(1, int(gap_rows * scale))
+                rows_total, rows_ign = gap_map[line]
                 py = int(vis_y * scale)
-                ct.canvas_proc(c, ct.CANVAS_SET_BRUSH, color=self.color_gap, style=ct.BRUSH_SOLID)
-                ct.canvas_proc(c, ct.CANVAS_RECT_FILL, x=x_start, y=py, x2=x_end, y2=py + gap_h)
-                # Record segment for transparent-slider blending
-                self._record_segment(x_start, py, x_end, py + gap_h, self.color_gap)
-                vis_y += gap_rows
+                self._paint_gap_rect(c, x_start, x_end, py, scale,
+                                     rows_total, rows_ign)
+                vis_y += rows_total
 
             # Paint the line (only if it has a state — changed lines)
             color = self.line_states.get((side, line))
@@ -666,14 +710,11 @@ class PaintboxOverview:
             vis_y += self._line_visual_rows(side, line)
 
         # Paint any remaining gaps after the last line
-        for after_line, gap_rows in gaps:
+        for after_line, gap_rows, gap_ign in gaps:
             if after_line >= line_count:
-                gap_h = max(1, int(gap_rows * scale))
                 py = int(vis_y * scale)
-                ct.canvas_proc(c, ct.CANVAS_SET_BRUSH, color=self.color_gap, style=ct.BRUSH_SOLID)
-                ct.canvas_proc(c, ct.CANVAS_RECT_FILL, x=x_start, y=py, x2=x_end, y2=py + gap_h)
-                # Record segment for transparent-slider blending
-                self._record_segment(x_start, py, x_end, py + gap_h, self.color_gap)
+                self._paint_gap_rect(c, x_start, x_end, py, scale,
+                                     gap_rows, 1 if gap_ign else 0)
                 vis_y += gap_rows
 
     def repaint_static(self):

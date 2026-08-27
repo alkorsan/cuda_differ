@@ -12,7 +12,7 @@ from . import differ_native as dfn
 from . import differ_python as dfp
 from .overview import PaintboxOverview
 from .profiling import Profiler, enable_profiling, profiling_report, reset_profiling
-from .utils import split_lines_safe, ScrollSplittedTab
+from .utils import split_lines_safe, ScrollSplittedTab, apply_text_keep_undo
 from difflib import unified_diff
 from cudax_lib import get_translation
 _ = get_translation(__file__)  # I18N
@@ -126,11 +126,25 @@ OPTS_META = [
      'cmt': _('Color of ignored differences\n'
               'Background color for lines whose difference is suppressed '
               'by the "Ignore blank lines" option (WinMerge-style '
-              'ignored differences), and for the compensating gap '
-              'inserted next to them so the two sides stay aligned.\n'
-              'Also colors the micromap highlights and the overview '
-              'panel.\n'
-              'Leave empty to use the theme default.'),
+              'ignored differences). Also colors the micromap highlights '
+              'and the overview panel.\n'
+              'Leave empty to use the editor text background color '
+              '(the ignored region then looks like normal text).'),
+     'def': '',
+     'frm': '#rgb-e',
+     'chp': 'theme',
+     },
+    {'opt': 'differ.theme.ignored_gap_color',
+     'cmt': _('Color of ignored difference gaps\n'
+              'Background color for the compensating inter-line gap '
+              'inserted next to a suppressed blank-line difference '
+              '("Ignore blank lines" option), so the two sides stay '
+              'aligned. Separate from "Color of ignored differences" '
+              '(the lines) and from "Color of inter-line gap background" '
+              '(regular alignment gaps); also colors the ignored-gap '
+              'rectangles in the overview panel.\n'
+              'Leave empty to use the editor text background color '
+              '(the ignored gap then looks like empty space).'),
      'def': '',
      'frm': '#rgb-e',
      'chp': 'theme',
@@ -293,10 +307,13 @@ OPTS_META = [
               'sides. A line is blank when it is empty, or when "Ignore '
               'whitespace" is also enabled and it contains only spaces '
               'and tabs.\n'
-              'Ignored regions are still visible, WinMerge-style: their '
-              'lines get the "ignored" background color (see "Color of '
-              'ignored differences"), and a small colored gap compensates '
-              'the missing lines so the two sides stay aligned. They are '
+              'Ignored regions keep the two sides aligned, WinMerge-style: '
+              'a small compensating gap fills in for the missing lines. '
+              'By default both the ignored lines and the ignored gap use '
+              'the editor text background color (an ignored region looks '
+              'like normal text) -- see "Color of ignored differences" '
+              '(the lines) and "Color of ignored difference gaps" (the '
+              'gap) to make them visible. They are '
               'NOT counted as differences: no bookmarks, skipped by '
               'Next/Previous Difference, and a file differing only in '
               'blank lines reports "No differences found".\n'
@@ -1230,20 +1247,23 @@ class Command:
         return False
 
     def _apply_text_preserving_undo(self, ed, new_text):
-        """Replace the entire editor text while preserving Undo history.
-        Uses replace_lines() instead of set_text_all() which would destroy
-        Undo information."""
+        """Replace the entire editor text while preserving Undo history
+        AND each line's original line ending.
+
+        Delegates to utils.apply_text_keep_undo: replace_lines() with
+        clean line contents, then Editor.set_line_end() per line to
+        restore the endings replace_lines() cannot express (it joins
+        lines with the document's default EOL; feeding it "\\n"-split
+        lines left the CR of CRLF inside the line content, so a CRLF
+        compare tab synced into a document produced CRCRLF). One
+        EDACTION_LOCK/UNLOCK group keeps it a single Undo step.
+        The target editor's caret is saved and restored around the
+        replace (replace_lines can move it when the line count
+        changes)."""
         caret = ed.get_carets()
-        try:
-            lines = new_text.split('\n')
-            count = ed.get_line_count()
-            if count > 0:
-                ed.replace_lines(0, count - 1, lines)
-            else:
-                ed.insert(0, 0, new_text)
-        except Exception as ex:
-            msg('replace_lines failed, falling back to set_text_all: {}'.format(ex), level=1)
-            ed.set_text_all(new_text)
+        apply_text_keep_undo(ed, new_text, log=lambda ex: msg(
+            'replace_lines failed, falling back to set_text_all: {}'.format(ex),
+            level=1))
         if caret:
             x, y, x2, y2 = caret[0]
             try:
@@ -1485,7 +1505,8 @@ class Command:
                     self.cfg.get('color_deleted'),
                     self.cfg.get('color_added'),
                     self.cfg.get('color_changed'),
-                    self.cfg.get('color_gaps'))
+                    self.cfg.get('color_gaps'),
+                    self.cfg.get('color_ignored_gap'))
                 # Pass slider opacity options. Config stores opacity as
                 # int 0..100; convert to float 0..1 for
                 # PaintboxOverview.set_slider_options().
@@ -1607,9 +1628,11 @@ class Command:
                 line_h_a = 0
                 line_h_b = 0
             color_gaps = self.cfg.get('color_gaps')
-            # Ignored-difference color (WinMerge-style suppressed blank
-            # lines + their compensating gaps) — see 'ignored_color'.
+            # Ignored-difference colors (WinMerge-style suppressed blank
+            # lines + their compensating gaps) -- see 'ignored_color' /
+            # 'ignored_gap_color'.
             color_ignored = self.cfg.get('color_ignored')
+            color_ignored_gap = self.cfg.get('color_ignored_gap')
 
             # The for loop below consumes events from diff.compare() (a
             # generator) and paints each event. Profiling the loop as a whole
@@ -1754,7 +1777,7 @@ class Command:
                 elif diff_id == df.A_GAP_IGN:
                     # Compensating gap for a suppressed all-blank hunk
                     # (DIFF_IGN_BLANK_LINES): same geometry as A_GAP but
-                    # painted with the ignored color and carrying the
+                    # painted with the ignored-gap color and carrying the
                     # dedicated IGN_GAP_TAG, so ignored regions look
                     # distinct from regular alignment gaps. Pure visual
                     # alignment — not a difference, so no n_diff_events.
@@ -1767,17 +1790,19 @@ class Command:
                         Profiler.start('paint:gap')
                         self._add_raw_gap(a_ed, a_line_after - 1,
                                           total_visual * line_h_a,
-                                          color_ignored, tag=IGN_GAP_TAG)
+                                          color_ignored_gap, tag=IGN_GAP_TAG)
                         Profiler.stop('paint:gap')
                         if overview is not None:
-                            overview.add_gap('a', a_line_after, total_visual)
+                            overview.add_gap('a', a_line_after, total_visual,
+                                             ignored=True)
                     else:
                         Profiler.start('paint:gap')
                         self.set_gap(a_ed, a_line_after, b_end - b_start,
-                                     color=color_ignored, tag=IGN_GAP_TAG)
+                                     color=color_ignored_gap, tag=IGN_GAP_TAG)
                         Profiler.stop('paint:gap')
                         if overview is not None:
-                            overview.add_gap('a', a_line_after, b_end - b_start)
+                            overview.add_gap('a', a_line_after, b_end - b_start,
+                                             ignored=True)
                 elif diff_id == df.B_GAP_IGN:
                     b_line_after, a_start, a_end = d[1], d[2], d[3]
                     if wrap_on:
@@ -1788,17 +1813,19 @@ class Command:
                         Profiler.start('paint:gap')
                         self._add_raw_gap(b_ed, b_line_after - 1,
                                           total_visual * line_h_b,
-                                          color_ignored, tag=IGN_GAP_TAG)
+                                          color_ignored_gap, tag=IGN_GAP_TAG)
                         Profiler.stop('paint:gap')
                         if overview is not None:
-                            overview.add_gap('b', b_line_after, total_visual)
+                            overview.add_gap('b', b_line_after, total_visual,
+                                             ignored=True)
                     else:
                         Profiler.start('paint:gap')
                         self.set_gap(b_ed, b_line_after, a_end - a_start,
-                                     color=color_ignored, tag=IGN_GAP_TAG)
+                                     color=color_ignored_gap, tag=IGN_GAP_TAG)
                         Profiler.stop('paint:gap')
                         if overview is not None:
-                            overview.add_gap('b', b_line_after, a_end - a_start)
+                            overview.add_gap('b', b_line_after, a_end - a_start,
+                                             ignored=True)
                 elif diff_id == df.A_LINE_IGN:
                     # Line of a suppressed all-blank hunk: painted with
                     # the ignored color, but NOT a difference — no
@@ -2196,7 +2223,21 @@ class Command:
             th['color_added'] = data['LightBG3']['color_back']
             th['color_deleted'] = data['LightBG1']['color_back']
             th['color_gaps'] = data['LightBG5']['color_back']
-            th['color_ignored'] = data['LightBG4']['color_back']
+            # Ignored-difference colors (suppressed blank-line regions '
+            # and their compensating gaps) default to the editor text
+            # background (UI theme EdTextBg -- the same source the
+            # overview background uses), so by default an ignored
+            # region reads as "not a difference": lines look like
+            # normal text and the gap looks like empty space. Users who
+            # want WinMerge's visible "ignored difference" look can set
+            # explicit colors.
+            try:
+                ui = ct.app_proc(ct.PROC_THEME_UI_DICT_GET, '')
+                ed_bg = ui.get('EdTextBg', {}).get('color', 0xFFFFFF)
+            except Exception:
+                ed_bg = 0xFFFFFF
+            th['color_ignored'] = ed_bg
+            th['color_ignored_gap'] = ed_bg
             return th
 
         t = get_theme()
@@ -2216,6 +2257,8 @@ class Command:
                 get_color('theme.gap_color', t.get('color_gaps')),
             'color_ignored':
                 get_color('theme.ignored_color', t.get('color_ignored')),
+            'color_ignored_gap':
+                get_color('theme.ignored_gap_color', t.get('color_ignored_gap')),
             # --- algorithm ---
             'diff_algorithm':
                 get_opt('algorithm.diff_algorithm', 'native_histogram'),

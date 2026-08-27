@@ -145,14 +145,16 @@ from the diff tab context menu (see above) or from the config dialog
   are ignored, like WinMerge's "Ignore blank lines" and GNU diff's -B
   option. A hunk is ignored when ALL of its lines are blank on both
   sides; a line is blank when it is empty, or (with "Ignore whitespace"
-  also on) contains only spaces and tabs. Ignored regions stay visible,
-  WinMerge-style: their lines get the "ignored" background color (see
-  "Color of ignored differences" in the options) and a small colored
-  gap fills in for the missing lines so the two sides stay aligned.
-  They are not counted as differences: no bookmarks, skipped by
-  Next/Previous Difference and Copy, and two files differing only in
-  blank lines report "No differences found (with current ignore
-  options)".
+  also on) contains only spaces and tabs. Ignored regions keep the two
+  sides aligned, WinMerge-style: a small compensating gap fills in for
+  the missing lines. By default both the ignored lines and the ignored
+  gap are painted with the editor text background color, so an ignored
+  region looks like normal text -- set "Color of ignored differences"
+  (the lines) and/or "Color of ignored difference gaps" (the gap) to
+  make them visible. Ignored regions are not counted as differences:
+  no bookmarks, skipped by Next/Previous Difference and Copy, and two
+  files differing only in blank lines report "No differences found
+  (with current ignore options)".
 - Ignore line endings -- the line terminators (CR, LF, CRLF) are not
   compared: a Unix file and the same file saved with Windows or old-Mac
   line endings compare as equal. Without this option, differing line
@@ -265,11 +267,19 @@ Theme section:
   Leave empty to use the theme default.
 - differ.theme.ignored_color: Color of ignored differences
   Background color for lines whose difference is suppressed by the
-  "Ignore blank lines" option, and for the compensating gap inserted
-  next to them so the two sides stay aligned (WinMerge-style ignored
-  differences). Also colors the micromap highlights and the overview
-  panel.
-  Leave empty to use the theme default.
+  "Ignore blank lines" option (WinMerge-style ignored differences).
+  Also colors the micromap highlights and the overview panel.
+  Leave empty to use the editor text background color (the ignored
+  region then looks like normal text).
+- differ.theme.ignored_gap_color: Color of ignored difference gaps
+  Background color for the compensating inter-line gap inserted next
+  to a suppressed blank-line difference ("Ignore blank lines" option),
+  so the two sides stay aligned. Separate from "Color of ignored
+  differences" (the lines) and from "Color of inter-line gap
+  background" (regular alignment gaps); also colors the ignored-gap
+  rectangles in the overview panel.
+  Leave empty to use the editor text background color (the ignored
+  gap then looks like empty space).
 
 Algorithm section:
 - differ.algorithm.diff_algorithm: Diff algorithm
