@@ -824,13 +824,13 @@ class Command:
         if not fn:
             return
 
-        a = ct.ed.get_text_all()
+        a = ct.ed.get_text_all(ends=True)
         # Read file b by opening it in CudaText (handles all encodings
         # correctly -- CudaText's encoding names like utf16le, koi8u, etc.
         # don't always match Python's codec names).
         h_orig = ct.ed.get_prop(ct.PROP_HANDLE_SELF)
         ct.file_open(fn, options='/nohistory')
-        b = ct.ed.get_text_all()
+        b = ct.ed.get_text_all(ends=True)
         ct.ed.cmd(ct_cmd.cmd_FileClose)
         # Restore focus to the original editor.
         if h_orig:
@@ -858,8 +858,8 @@ class Command:
             return
 
         name = names[res]
-        a = ct.ed.get_text_all()
-        b = ct.Editor(ed[res]).get_text_all()
+        a = ct.ed.get_text_all(ends=True)
+        b = ct.Editor(ed[res]).get_text_all(ends=True)
 
         self.create_diff(a, b, name0, name)
 
@@ -924,7 +924,7 @@ class Command:
                 e = ct.Editor(h)
                 if self.is_match_name(e, name):
                     orig_tab_ids[index] = e.get_prop(ct.PROP_TAB_ID)
-                    orig_texts[index] = e.get_text_all()
+                    orig_texts[index] = e.get_text_all(ends=True)
                     fn = e.get_prop(ct.PROP_FN, '')
                     if fn:
                         orig_names[index] = fn
@@ -1162,10 +1162,10 @@ class Command:
 
         synced_any = False
         if orig_a_id is not None:
-            if self._sync_to_original_by_id(orig_a_id, a_ed.get_text_all()):
+            if self._sync_to_original_by_id(orig_a_id, a_ed.get_text_all(ends=True)):
                 synced_any = True
         if orig_b_id is not None:
-            if self._sync_to_original_by_id(orig_b_id, b_ed.get_text_all()):
+            if self._sync_to_original_by_id(orig_b_id, b_ed.get_text_all(ends=True)):
                 synced_any = True
 
         if synced_any:
@@ -1481,8 +1481,8 @@ class Command:
                 overview = None
 
             Profiler.start('refresh:get_text')
-            a_text_all = a_ed.get_text_all()
-            b_text_all = b_ed.get_text_all()
+            a_text_all = a_ed.get_text_all(ends=True)
+            b_text_all = b_ed.get_text_all(ends=True)
             Profiler.stop('refresh:get_text')
 
             if a_text_all == b_text_all:
@@ -1607,6 +1607,15 @@ class Command:
             # when micromap is enabled.
             pending_bkm_a = []  # list of (line, nkind) for a_ed
             pending_bkm_b = []  # list of (line, nkind) for b_ed
+            # Count of events that actually colorize something (line
+            # marks, char highlights, line decors). Gaps and ALIGN events
+            # are pure visual alignment and don't count. When this stays
+            # 0, the ignore options made every difference invisible --
+            # e.g. two files differing only in line endings with
+            # 'ignore line endings' on, or digits-only differences with
+            # 'ignore numbers' on -- and the user must be told the sides
+            # are equal instead of staring at an uncolored compare tab.
+            n_diff_events = 0
             Profiler.start('refresh:compare_and_paint')
             # Both differs take their inputs as compare() parameters
             # (no set_seqs() call, no persistent storage on either
@@ -1634,6 +1643,7 @@ class Command:
             for d in compare_iter:
                 diff_id, y = d[0], d[1]
                 if diff_id == df.A_LINE_DEL:
+                    n_diff_events += 1
                     pending_bkm_a.append((y, NKIND_DELETED))
                     Profiler.start('paint:decor')
                     self.set_decor(a_ed, y, DECOR_CHAR, self.cfg.get('color_deleted'))
@@ -1646,6 +1656,7 @@ class Command:
                     if overview is not None:
                         overview.add_line_state('a', y, self.cfg.get('color_deleted'))
                 elif diff_id == df.B_LINE_ADD:
+                    n_diff_events += 1
                     pending_bkm_b.append((y, NKIND_ADDED))
                     Profiler.start('paint:decor')
                     self.set_decor(b_ed, y, DECOR_CHAR, self.cfg.get('color_added'))
@@ -1658,6 +1669,7 @@ class Command:
                     if overview is not None:
                         overview.add_line_state('b', y, self.cfg.get('color_added'))
                 elif diff_id == df.A_LINE_CHANGE:
+                    n_diff_events += 1
                     pending_bkm_a.append((y, NKIND_CHANGED))
                     if micromap_on:
                         Profiler.start('paint:micromap')
@@ -1667,6 +1679,7 @@ class Command:
                     if overview is not None:
                         overview.add_line_state('a', y, self.cfg.get('color_changed'))
                 elif diff_id == df.B_LINE_CHANGE:
+                    n_diff_events += 1
                     pending_bkm_b.append((y, NKIND_CHANGED))
                     if micromap_on:
                         Profiler.start('paint:micromap')
@@ -1743,42 +1756,67 @@ class Command:
                                 overview.add_gap('a', a_line + 1, diff_rows)
                         Profiler.stop('paint:gap')
                 elif diff_id == df.A_SYMBOL_DEL:
+                    n_diff_events += 1
                     Profiler.start('paint:attr')
                     self.set_attr(a_ed, d[2], y, d[3], self.cfg.get('color_deleted'))
                     Profiler.stop('paint:attr')
                     if overview is not None:
                         overview.add_line_state('a', y, self.cfg.get('color_deleted'))
                 elif diff_id == df.B_SYMBOL_ADD:
+                    n_diff_events += 1
                     Profiler.start('paint:attr')
                     self.set_attr(b_ed, d[2], y, d[3], self.cfg.get('color_added'))
                     Profiler.stop('paint:attr')
                     if overview is not None:
                         overview.add_line_state('b', y, self.cfg.get('color_added'))
                 elif diff_id == df.A_DECOR_YELLOW:
+                    n_diff_events += 1
                     Profiler.start('paint:decor')
                     self.set_decor(a_ed, y, DECOR_CHAR, self.cfg.get('color_changed'))
                     Profiler.stop('paint:decor')
                     if overview is not None:
                         overview.add_line_state('a', y, self.cfg.get('color_changed'))
                 elif diff_id == df.B_DECOR_YELLOW:
+                    n_diff_events += 1
                     Profiler.start('paint:decor')
                     self.set_decor(b_ed, y, DECOR_CHAR, self.cfg.get('color_changed'))
                     Profiler.stop('paint:decor')
                     if overview is not None:
                         overview.add_line_state('b', y, self.cfg.get('color_changed'))
                 elif diff_id == df.A_DECOR_RED:
+                    n_diff_events += 1
                     Profiler.start('paint:decor')
                     self.set_decor(a_ed, y, DECOR_CHAR, self.cfg.get('color_deleted'))
                     Profiler.stop('paint:decor')
                     if overview is not None:
                         overview.add_line_state('a', y, self.cfg.get('color_deleted'))
                 elif diff_id == df.B_DECOR_GREEN:
+                    n_diff_events += 1
                     Profiler.start('paint:decor')
                     self.set_decor(b_ed, y, DECOR_CHAR, self.cfg.get('color_added'))
                     Profiler.stop('paint:decor')
                     if overview is not None:
                         overview.add_line_state('b', y, self.cfg.get('color_added'))
             Profiler.stop('refresh:compare_and_paint')
+
+            if n_diff_events == 0:
+                # Nothing to colorize: every difference was ignored by
+                # the current ignore options. Mirror the raw-identical
+                # early path above: clear the diffmap, skip bookmarks and
+                # overview (there is nothing to show), and tell the user
+                # -- the compare looks 'empty' otherwise and it is not
+                # obvious whether the plugin even ran.
+                self.diff.diffmap = []
+                if show_dialog:
+                    # Same convention as the raw-identical early path
+                    # above: the dialog only appears for the initial
+                    # compare and manual refresh; automatic refreshes
+                    # (on_change_slow / on_state) stay silent to avoid
+                    # pestering the user.
+                    t = _('No differences found (with current ignore options).')
+                    ct.msg_box(t, ct.MB_OK)
+                Profiler.stop('refresh')
+                return
 
             # Append all collected bookmarks in sorted order using
             # BOOKMARK2_APPEND (much faster than BOOKMARK2_SET — skips

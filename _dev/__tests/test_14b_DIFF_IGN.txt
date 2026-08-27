@@ -9,10 +9,17 @@ WHITESPACE
 ___IGN_NUMBERS___________________
 v
 vb
+aaa 333333 ttttt
+aaa 333333 ttttt
+aaa 33333 ttttt
 v22.43 12:23:43
-v22.4 12:23:4 expected to be different
+v22.4 12:23:4
 ___IGN_BLANK_LINES_______________
 
 
+
+vvv
+_________________________________
+fff
 
 _________________________________

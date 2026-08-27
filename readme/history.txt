@@ -1,3 +1,8 @@
+2026.08.27 (by @badrelmers)
++ add: five "ignore" compare options -- Ignore case, Ignore whitespace, Ignore blank lines, Ignore line endings, Ignore numbers. The options only apply to the two native algorithms; the pure-Python algorithms always compare strictly and ignore the bitmask.
++ add: when every difference between the two sides is suppressed by the ignore options (e.g. files that differ only in line endings compared with 'Ignore line endings' on), the compare now shows a "No differences found (with current ignore options)" message instead of a silently uncolored compare tab.
+- fix: the compare now sees the files' real line endings. All nine get_text_all() calls in the plugin passed ends=False (the API default), so line endings were stripped from the text BEFORE it reached the diff engine.
+
 2026.08.25 (by @badrelmers)
 * change: reorganized all config options into four categories, and every option name now carries its category.
 + add: automatic one-time migration of old option names in settings/cuda_differ.json (_migrate_old_option_names, runs at plugin import). Renames old flat keys like "differ.sync_scroll" to their new categorized names "differ.advanced.sync_scroll" with a line-based regex (the same approach cudax_lib.set_opt uses for simple keys), preserving comments and formatting. An old key is only renamed when the new key is not already present, so the migration is idempotent and never overwrites a value saved under a new name. Existing user settings therefore survive the plugin update.

@@ -112,6 +112,44 @@ Right-clicking a tab title shows "Differ" submenu with:
 - Compare with tab -- submenu listing all open tabs; click one to compare.
   If the list is too long, the first entry "More tabs..." opens a dialog
   with a scrollbar to pick any open tab.
+- Refresh -- re-run the compare on both sides of the compare tab.
+- Five checkable "ignore" options (below Refresh, after a separator):
+  Ignore case, Ignore whitespace, Ignore blank lines, Ignore line endings,
+  Ignore numbers. See "Ignore options" below for what each option does.
+
+== Ignore options ==
+
+Five options control what kind of differences the compare treats as
+"not a difference". They apply to BOTH the line-level diff and the
+char-level highlighting inside changed lines, and only to the two NATIVE
+algorithms (Native Histogram and Native Myers) -- the pure-Python
+algorithms always compare strictly and ignore these options. Set them
+from the diff tab context menu (see above) or from the config dialog
+("differ.ignoreopt.*" options in settings/cuda_differ.json).
+
+- Ignore case -- 'A' and 'a' count as equal. ASCII only; non-ASCII
+  letters are compared byte-for-byte.
+- Ignore whitespace -- spaces and tabs anywhere in a line are skipped:
+  "a b" equals "ab" and "a   b" equals "a  b". Whitespace means SPACE and
+  TAB only -- vertical tab and form feed are not whitespace, and line
+  endings are covered by their own option below.
+- Ignore blank lines -- differences that consist only of blank lines are
+  not shown. Blank means an empty line, or (when 'Ignore whitespace' is
+  also on) a line containing only spaces/tabs. Blank lines that sit
+  inside a block of real changes are still shown, exactly like WinMerge.
+- Ignore line endings -- the line terminators (CR, LF, CRLF) are not
+  compared: a Unix file and the same file saved with Windows or old-Mac
+  line endings compare as equal. Without this option, differing line
+  endings are real differences and the extra CR is highlighted inside
+  the changed lines.
+- Ignore numbers -- digit characters (0-9) are skipped anywhere in a
+  line: "v33" equals "v", "aaa 666666 ttttt" equals "aaa 333333 ttttt",
+  and "v12.45 11:13:45" equals "v22.4 12:23:4". Digits are never
+  highlighted inside changed lines either -- "aaa 666666 tttttdd" vs
+  "aaa 33333 ttttt" highlights only the "dd".
+
+Notes:
+- The options can be combined freely; they all apply at once.
 
 
 == Saving and syncing changes ==
@@ -167,7 +205,17 @@ This launches CudaText with the two given files opened in the Differ plugin.
 Open the options dialog via "Options / Settings-plugins / Differ / Config"
 or "Plugins / Differ / Config...".
 
-All options are stored in settings/cuda_differ.json. The option names grouped into four categories: theme, algorithm, advanced, micromap.
+All options are stored in settings/cuda_differ.json. The option names grouped into five categories: theme, algorithm, ignoreopt, advanced, micromap.
+
+Ignore options section (see the "Ignore options" chapter above for details):
+- differ.ignoreopt.ignore_case: Ignore case (default: off)
+- differ.ignoreopt.ignore_whitespace: Ignore whitespace -- spaces and tabs (default: off)
+- differ.ignoreopt.ignore_blank_lines: Ignore blank lines (default: off)
+- differ.ignoreopt.ignore_eol: Ignore line endings -- CR/LF/CRLF (default: off)
+- differ.ignoreopt.ignore_numbers: Ignore numbers -- digits 0-9 (default: off)
+  These five options build the DIFF_IGN_* bitmask passed to the native
+  diff engines. They only affect the native algorithms (Native Histogram
+  and Native Myers); the pure-Python algorithms always compare strictly.
 
 Theme section:
 - differ.theme.changed_color: Color of changed lines
