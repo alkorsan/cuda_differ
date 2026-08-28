@@ -12,7 +12,7 @@ from . import differ_native as dfn
 from . import differ_python as dfp
 from .overview import PaintboxOverview
 from .profiling import Profiler, enable_profiling, profiling_report, reset_profiling
-from .utils import split_lines_safe, ScrollSplittedTab, apply_text_keep_undo
+from .utils import split_lines_safe, ScrollSplittedTab
 from difflib import unified_diff
 from cudax_lib import get_translation
 _ = get_translation(__file__)  # I18N
@@ -1233,7 +1233,28 @@ class Command:
         for h in ct.ed_handles():
             e = ct.Editor(h)
             if str(e.get_prop(ct.PROP_TAB_ID)) == target:
-                self._apply_text_preserving_undo(e, new_text)
+                # replace_lines() items may carry their line terminator
+                # ('\r\n', '\r', '\n') at the end, so every line keeps
+                # its own ending (the old new_text.split('\n') left the
+                # CR of CRLF inside the line content -> CRCRLF).
+                caret = e.get_carets()
+                try:
+                    lines = split_lines_safe(new_text) or ['']
+                    count = e.get_line_count()
+                    if count > 0:
+                        e.replace_lines(0, count - 1, lines)
+                    else:
+                        e.insert(0, 0, new_text)
+                except Exception as ex:
+                    msg('replace_lines failed, falling back to '
+                        'set_text_all: {}'.format(ex), level=1)
+                    e.set_text_all(new_text)
+                if caret:
+                    x, y, x2, y2 = caret[0]
+                    try:
+                        e.set_caret(x, y, x2, y2)
+                    except Exception:
+                        pass
                 orig_fn = e.get_prop(ct.PROP_FN, '')
                 if orig_fn:
                     # Real file on disk -- save it immediately.
@@ -1245,31 +1266,6 @@ class Command:
                 return True
         ct.msg_status(_('Differ: original tab no longer open'))
         return False
-
-    def _apply_text_preserving_undo(self, ed, new_text):
-        """Replace the entire editor text while preserving Undo history
-        AND each line's original line ending.
-
-        Delegates to utils.apply_text_keep_undo: replace_lines() with
-        clean line contents, then Editor.set_line_end() per line to
-        restore the endings replace_lines() cannot express (it joins
-        lines with the document's default EOL; feeding it "\\n"-split
-        lines left the CR of CRLF inside the line content, so a CRLF
-        compare tab synced into a document produced CRCRLF). One
-        EDACTION_LOCK/UNLOCK group keeps it a single Undo step.
-        The target editor's caret is saved and restored around the
-        replace (replace_lines can move it when the line count
-        changes)."""
-        caret = ed.get_carets()
-        apply_text_keep_undo(ed, new_text, log=lambda ex: msg(
-            'replace_lines failed, falling back to set_text_all: {}'.format(ex),
-            level=1))
-        if caret:
-            x, y, x2, y2 = caret[0]
-            try:
-                ed.set_caret(x, y, x2, y2)
-            except Exception:
-                pass
 
     def on_start2(self, ed_self):
         """Called once on program start, after configs are applied and just
