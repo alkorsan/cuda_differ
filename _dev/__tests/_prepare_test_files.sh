@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 
+__dir="$(cd "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
 # compare this two big files 9mb
 # https://cdnjs.cloudflare.com/ajax/libs/typescript/5.4.5/typescript.js
 # https://cdnjs.cloudflare.com/ajax/libs/typescript/5.9.2/typescript.js
@@ -39,6 +41,8 @@ echo "All downloads completed successfully!"
 
 echo "_________create random big files..."
 python ./_annex/create_big_random_file.py
+# create tests for native histograme optimization 1 opt4 to see the effect of OPT4_ENABLE_MYERS_D_CAP
+python ./_annex/gen_opt4_demo_files.py --out-dir "$__dir"
 
 echo
 read -p "endddd"

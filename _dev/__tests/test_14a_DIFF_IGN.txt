@@ -21,11 +21,15 @@ CRLF vs CR
 ___IGN_BLANK_LINES_______________
 
 vvv
-_________________________________
+___IGN_BLANK_LINES_______________
+this blank lines are expected to not be ignored because they are between diferent blocks
 ddd
 
 
-_________________________________
+
+
+tttt
+___IGN_BLANK_LINES___IGN_WHITESPACE___
              
                        
                                

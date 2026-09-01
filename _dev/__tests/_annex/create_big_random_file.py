@@ -14,6 +14,9 @@ def generate_diff_file(filename, num_lines=100000):  # 5mb
 generate_diff_file("autogen_50mb_a.txt",1000000)
 generate_diff_file("autogen_50mb_b.txt",1000000)
 
+generate_diff_file("autogen_20mb_a.txt",400000)
+generate_diff_file("autogen_20mb_b.txt",400000)
+
 generate_diff_file("autogen_5mb_a.txt",100000)
 generate_diff_file("autogen_5mb_b.txt",100000)
 

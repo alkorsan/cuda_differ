@@ -132,3 +132,36 @@ rewrite the pythonpplugin to do like beyound compare:
 Standard alignment (default) — a proprietary divide-and-conquer scheme that aligns "by comparing successively smaller sections of each file. Parts of the alignment can be shown before the entire comparison is finished" alignment — i.e. it is incremental/streaming, chosen so huge files paint progressively.
 https://sparkles-docs.pages.dev/research/diff-review/beyond-compare.html
 
+_____________________________________________
+
+use
+a_ed.action(ct.EDACTION_LOCK); b_ed.action(ct.EDACTION_LOCK)
+
+a_ed.action(ct.EDACTION_UNLOCK); b_ed.action(ct.EDACTION_UNLOCK)
+
+
+____
+canceled: make overview height same as default scrollbar, canceled: it s not necesary
+canceled: reduce overview slider min-height to 5px, canceled: i prefer 30px so i can move it always 
+
+hide ignore options for python algorithms
+
+
+run all in a thread in pascal and python
+
+make ui paint on viewport only
+
+scroll of very big files like 50mb is very slow 
+
+move block or text or line between editors is broken
+
+split beautifier to blocks/modules
+
+put python algorithm _realign_opcodes inside  beautifier only
+
+vscode algo have a bug with space it does not considere it
+
+add aligne opcode to native algo too like before
+
+rename refresh to recompare
+

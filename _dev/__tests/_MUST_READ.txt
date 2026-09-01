@@ -7,7 +7,7 @@ all this duplicated long line must align with its similar line, patience diff fa
 
 - test_3 files
 lines 10 11 12 13 must align exactly with 10 11 12 13 
-lines 20 21 22 must align exactly with 24 25 26 
+lines 20 21 22 must align exactly with 24 25 26   (python hybrid only)
 
 - test_4 2mb html files
 must not consome more than 30s
@@ -17,7 +17,7 @@ must not consome more than 10s
 
 - test_2 files
 this lines must align exactly like that:
-273 """Register a compare tab       259 """Register a compare tab     like vscode
+273 """Register a compare tab       259 """Register a compare tab     like vscode 
 291 entry = state  now align with   297 entry = session               like vscode
 
 538 def on_change_slow(self, ed_self):   663 def on_change_slow(self, ed_self):
