@@ -7,8 +7,14 @@ synced back to the original files automatically.
 
 == What it does ==
 
-- Opens two files (or two untitled tabs) in one split tab and highlights
+- Compares two files (or two untitled tabs) in one split tab and highlights
   added, deleted, and changed lines side-by-side.
+- Compares run in the background: with the native algorithms, the
+  line-level diff is computed on a background thread inside CudaText, so
+  the editor stays fully responsive while big files are being compared.
+  The diff markers appear when the compare finishes; if you edit the
+  files during the compare, the plugin re-runs it with the updated text
+  automatically. See "Background comparing" below.
 - Lets you edit either side of the compare view. When you save, your edits
   are written back to the original files on disk.
 - Keeps the original tabs open while you compare, so you always have both
@@ -29,13 +35,14 @@ The compare engine implements all the best-known diff algorithms, with a
 lot of improvements on top of each: two native ones running in compiled
 Pascal code inside CudaText (JGit's Histogram Diff and WinMerge/GNU
 diffutils' Myers, 10-30x faster than any pure-Python implementation on
-large files) and five pure-Python ones (Hybrid, Myers O(NP), VS Code,
-Patience and difflib). Combined with character-level highlighting of the
-exact changed characters and smart line alignment, this gives the best
-human-readable compare results -- better than WinMerge, VS Code, Meld and
-Beyond Compare -- while comparing faster than VS Code and Meld. See the
-"Diff algorithms and best practices" section below for how to tune the
-plugin for maximum speed or maximum readability.
+large files, comparing on a background thread so the editor never blocks)
+and five pure-Python ones (Hybrid, Myers O(NP), VS Code, Patience and
+difflib; these compare on the main thread). Combined with character-level
+highlighting of the exact changed characters and smart line alignment,
+this gives the best human-readable compare results -- better than WinMerge,
+VS Code, Meld and Beyond Compare -- while comparing faster than VS Code and
+Meld. See the "Diff algorithms and best practices" section below for how
+to tune the plugin for maximum speed or maximum readability.
 
 
 == Commands ==
@@ -70,8 +77,10 @@ Note: the unified-diff output is always produced using Python's
   human-readable form, use the side-by-side compare instead.
 
 Refresh
-    Re-runs the comparison after you edit either side. Useful if
-    differ.advanced.enable_auto_refresh is off.
+    Re-runs the comparison after you edit either side. With the native
+    algorithms the compare runs on a background thread, so the command
+    returns at once and the markers are re-applied when the compare
+    finishes. Useful if differ.advanced.enable_auto_refresh is off.
 
 Focus the opposite file
     Moves the cursor to the other side of the split.
@@ -176,6 +185,33 @@ Notes:
 - These options are passed to CudaText's diff_proc API as the
   DIFF_IGN_* bitmask (see the diff_proc documentation in the CudaText
   wiki).
+
+
+== Background comparing ==
+
+With the native algorithms (Native Histogram, Native Myers), the
+line-level diff runs on a background thread inside CudaText, started
+through the callback form of the diff_proc API. The editor never blocks
+while two files are being compared: you can keep typing, scrolling,
+switching tabs and using menus during the compare, no matter how big the
+files are.
+
+- The compare markers are applied when the compare finishes. While it
+  runs, the status bar shows "Differ: comparing in background...", and
+  the usual "Differ: compared in Xms" message reports the total time
+  (background compare + painting) when it is done.
+- If you edit either side while a compare is running, the plugin detects
+  it when the compare completes and re-runs the compare with the updated
+  text automatically -- the painted result always matches the current
+  editor content.
+- Only one compare runs per compare tab at a time; refresh requests that
+  arrive while a compare is running are folded into the next run.
+- Comparing two different compare tabs at the same time works: each tab
+  gets its own background compare.
+- The pure-Python algorithms (Hybrid, Myers, VS Code, Patience, difflib)
+  compare on the main thread and occupy the UI for the compare time;
+  Python plugin code cannot move to a background thread. This is one
+  more reason to prefer the native algorithms for big files.
 
 
 == Saving and syncing changes ==
@@ -285,9 +321,11 @@ Algorithm section:
 - differ.algorithm.diff_algorithm: Diff algorithm
   Selects the diff algorithm used by the side-by-side compare.
   Native algorithms run in compiled Pascal code and are 10-30x faster
-  than the pure-Python implementations on large files. They require a
-  CudaText build that includes the diff_proc API; if it is not available,
-  they silently fall back to the closest Python equivalent
+  than the pure-Python implementations on large files. Their line-level
+  diff runs on a background thread (the callback form of the diff_proc
+  API), so CudaText stays responsive while big files are compared. They
+  require a CudaText build that includes the diff_proc API; if it is not
+  available, they silently fall back to the closest Python equivalent
   (native_histogram -> hybrid, native_myers -> myers).
     * native_histogram -- Native Histogram diff (port of JGit's Histogram
       Diff, with JGit's Myers O(ND) Diff as internal fallback for

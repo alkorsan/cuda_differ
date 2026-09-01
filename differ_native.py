@@ -8,6 +8,15 @@ The native engine is 10-30x faster than the pure-Python matchers on
 large files. For Python-only algorithms (hybrid, myers, vscode, patience,
 difflib), use differ_python.py instead.
 
+The line-level compare runs in a background thread: CudaText's
+diff_proc API accepts an optional `callback` argument, and this module
+starts the engine call through it (start_async_line_diff). The engine
+compares on its own OS thread and calls back on the main thread with
+the opcode list; Differ.compare() then walks the precomputed opcodes
+instead of running the engine again. The pure-Python matchers cannot
+do this (plugin Python code runs on the main thread only), so the
+asynchronous mode is native-only.
+
 Ignore options: the plugin's 'ignoreopt.*' settings are collected into
 a DIFF_IGN_* bitmask (see build_ignore_flags) and applied to BOTH the
 line-level diff (diff_proc DIF_TEXTS) and the char-level detail diff
@@ -35,6 +44,26 @@ try:
     _HAS_NATIVE_DIFF = hasattr(_ct, 'diff_proc')
 except ImportError:
     _HAS_NATIVE_DIFF = False
+
+
+def _diff_proc_takes_callback():
+    """Detect the asynchronous form of the native API: diff_proc
+    accepting an optional `callback` argument. With a callback the
+    engine runs the compare in a background OS thread and calls back
+    on the main thread with the opcode list; without it the call
+    blocks until the compare is done. The check is signature-based, so
+    it degrades cleanly on engines that predate the callback form.
+    """
+    if not _HAS_NATIVE_DIFF:
+        return False
+    try:
+        import inspect
+        return 'callback' in inspect.signature(_ct.diff_proc).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+_HAS_ASYNC_DIFF = _diff_proc_takes_callback()
 
 
 # diff_proc ignore-flag constants, mirrored from the cudatext module
@@ -186,6 +215,43 @@ class CudaDiffNativeMatcher:
                                   0, len(split_lines_safe(self._b_text)))]
         self.opcodes = result
         return result
+
+
+def start_async_line_diff(a_text, b_text, algo, flags, callback):
+    """Start a line-level compare in the engine's background thread via
+    the asynchronous form of cudatext.diff_proc (the `callback`
+    argument).
+
+    Returns True when the background compare was started: the engine
+    then invokes `callback(opcodes)` on the main thread when it
+    finishes, with the same opcode list the synchronous form returns
+    (None on engine error). Returns False when the asynchronous form
+    is not available or was rejected -- the caller must then use the
+    synchronous diff_proc form instead.
+
+    'callback' must be a Python callable (the engine also accepts a
+    'module.function' string, but a callable -- e.g. a
+    functools.partial -- carries per-call context, which the plugin
+    needs to know WHICH compare finished).
+    """
+    if not _HAS_ASYNC_DIFF:
+        return False
+    try:
+        return bool(_ct.diff_proc(
+            _ct.DIF_TEXTS, a_text, b_text, algo, flags, callback))
+    except TypeError:
+        # Very defensive: an engine without the 6th parameter.
+        return False
+
+
+def algo_id(algorithm_name):
+    """Map a configured algorithm name to the diff_proc DIFF_ALGO_* id:
+    'native_myers' -> DIFF_ALGO_MYERS, anything else ->
+    DIFF_ALGO_HISTOGRAM (the recommended default, which also covers
+    'native_histogram' and unexpected values)."""
+    if algorithm_name == 'native_myers':
+        return CudaDiffNativeMatcher._ALGO_MYERS
+    return CudaDiffNativeMatcher._ALGO_HISTOGRAM
 
 
 # Internal benchmark toggle. When set to True, Differ.compare() prints the
@@ -360,7 +426,7 @@ class Differ:
             finally:
                 Profiler.stop('char_diff:python_engine')
 
-    def compare(self, a_text, b_text):
+    def compare(self, a_text, b_text, opcodes=None):
         """Generator that yields diff events for side-by-side display.
 
         Pure translation of the engine's opcodes into paint events —
@@ -391,6 +457,14 @@ class Differ:
                 returns (verified by grep — __init__.py reads only
                 self.diff.diffmap after the compare loop, never
                 self.diff.a_text / self.diff.b_text).
+            opcodes: precomputed line-level opcodes for a_text/b_text —
+                the result the engine's background thread delivered to
+                Command._on_native_diff_done (the diff_proc callback
+                form started by start_async_line_diff). When given,
+                this generator does NOT run the engine itself: it walks
+                the given opcodes directly. None (default) runs the
+                engine synchronously here, on the caller's thread,
+                while the generator is being consumed.
 
         NOTE: _realign_opcodes (the VS Code-style post-pass in
         differ_python.py) is NOT applied to native opcodes. Native engines
@@ -412,40 +486,51 @@ class Differ:
         Profiler.start('compare')
 
         self.diffmap = []
-        Profiler.start('compare:algorithm')
-        if self.diff_algorithm == 'native_myers':
-            diff = CudaDiffNativeMatcher(
-                None, algo=CudaDiffNativeMatcher._ALGO_MYERS,
-                flags=self.ignore_flags,
-                a_text=a_text, b_text=b_text)
-        else:
-            # Default to histogram (covers 'native_histogram' and any
-            # unexpected value — histogram is the recommended default).
-            diff = CudaDiffNativeMatcher(
-                None, algo=CudaDiffNativeMatcher._ALGO_HISTOGRAM,
-                flags=self.ignore_flags,
-                a_text=a_text, b_text=b_text)
+        if opcodes is None:
+            # Synchronous mode: the engine runs HERE, on the caller's
+            # thread, while the generator is being consumed.
+            Profiler.start('compare:algorithm')
+            if self.diff_algorithm == 'native_myers':
+                diff = CudaDiffNativeMatcher(
+                    None, algo=CudaDiffNativeMatcher._ALGO_MYERS,
+                    flags=self.ignore_flags,
+                    a_text=a_text, b_text=b_text)
+            else:
+                # Default to histogram (covers 'native_histogram' and any
+                # unexpected value — histogram is the recommended default).
+                diff = CudaDiffNativeMatcher(
+                    None, algo=CudaDiffNativeMatcher._ALGO_HISTOGRAM,
+                    flags=self.ignore_flags,
+                    a_text=a_text, b_text=b_text)
 
-        # get_opcodes() calls diff_proc (the native engine) — this is
-        # where the actual algorithm runs. The raw texts go to the engine
-        # VERBATIM — the engine splits them into lines itself, so no
-        # Python-side join happens.
-        opcodes = diff.get_opcodes()
-        Profiler.stop('compare:algorithm')
+            # get_opcodes() calls diff_proc (the native engine) — this is
+            # where the actual algorithm runs. The raw texts go to the
+            # engine VERBATIM — the engine splits them into lines itself,
+            # so no Python-side join happens.
+            opcodes = diff.get_opcodes()
+            Profiler.stop('compare:algorithm')
+
+            # RELEASE THE MATCHER NOW — we already have the opcodes and
+            # the matcher no longer serves any purpose. Without this
+            # `del`, the matcher keeps holding its self._a_text /
+            # self._b_text refs through the entire paint loop below,
+            # which means we end up keeping THREE copies of each text's
+            # character data alive at once (the local param a_text/
+            # b_text, the matcher's _a_text/_b_text, AND the a_lines/
+            # b_lines we're about to build). For a 33k-line / 10MB file
+            # that's the difference between ~60MB and ~40MB peak memory
+            # during the paint loop.
+            del diff
+        # else: background mode — 'opcodes' is the result the engine's
+        # background thread already computed (delivered to
+        # Command._on_native_diff_done via the diff_proc callback). The
+        # engine does not run here, so there is no matcher to release
+        # and no compare:algorithm section to time: the engine's own
+        # compute time is invisible to the Python-side profiler (it
+        # burns in Pascal code on another thread).
 
         # No _realign_opcodes call — the native path renders the engine's
         # hunks faithfully (algo-faithful mode). See docstring for details.
-
-        # RELEASE THE MATCHER NOW — we already have the opcodes and the
-        # matcher no longer serves any purpose. Without this `del`, the
-        # matcher keeps holding its self._a_text / self._b_text refs
-        # through the entire paint loop below, which means we end up
-        # keeping THREE copies of each text's character data alive at
-        # once (the local param a_text/b_text, the matcher's _a_text/
-        # _b_text, AND the a_lines/b_lines we're about to build). For a
-        # 33k-line / 10MB file that's the difference between ~60MB and
-        # ~40MB peak memory during the paint loop.
-        del diff
 
         # Build the line lists LOCALLY for painting — split_lines_safe is
         # O(N) per call, so we split once here and pass the lists to
