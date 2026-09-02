@@ -14,7 +14,9 @@ synced back to the original files automatically.
   the editor stays fully responsive while big files are being compared.
   The diff markers appear when the compare finishes; if you edit the
   files during the compare, the plugin re-runs it with the updated text
-  automatically. See "Background comparing" below.
+  automatically. Closing the diff tab (or exiting CudaText) cancels a
+  still-running compare so it stops burning CPU for a result nobody
+  will see. See "Background comparing" below.
 - Lets you edit either side of the compare view. When you save, your edits
   are written back to the original files on disk.
 - Keeps the original tabs open while you compare, so you always have both
@@ -35,8 +37,9 @@ The compare engine implements all the best-known diff algorithms, with a
 lot of improvements on top of each: two native ones running in compiled
 Pascal code inside CudaText (JGit's Histogram Diff and WinMerge/GNU
 diffutils' Myers, 10-30x faster than any pure-Python implementation on
-large files, comparing on a background thread so the editor never blocks)
-and five pure-Python ones (Hybrid, Myers O(NP), VS Code, Patience and
+large files, comparing on a background thread so the editor never blocks,
+with cooperative cancellation when a compare is no longer needed) and
+five pure-Python ones (Hybrid, Myers O(NP), VS Code, Patience and
 difflib; these compare on the main thread). Combined with character-level
 highlighting of the exact changed characters and smart line alignment,
 this gives the best human-readable compare results -- better than WinMerge,
@@ -204,6 +207,14 @@ files are.
   it when the compare completes and re-runs the compare with the updated
   text automatically -- the painted result always matches the current
   editor content.
+- Closing the diff tab while a compare is still running CANCELS the
+  engine compare: the plugin tells the engine to stop through the
+  diff_proc(DIF_CANCEL) API, and the engine's diff loops unwind within a
+  couple of seconds instead of grinding to the end for a result nobody
+  will consume. Cancellation is cooperative -- the engine releases
+  everything the compare allocated, nothing leaks -- and the completion
+  callback of a cancelled compare is never invoked. Exiting CudaText
+  (on_exit_pre) cancels every still-running compare the same way.
 - Only one compare runs per compare tab at a time; refresh requests that
   arrive while a compare is running are folded into the next run.
 - Comparing two different compare tabs at the same time works: each tab
@@ -323,9 +334,11 @@ Algorithm section:
   Native algorithms run in compiled Pascal code and are 10-30x faster
   than the pure-Python implementations on large files. Their line-level
   diff runs on a background thread (the callback form of the diff_proc
-  API), so CudaText stays responsive while big files are compared. They
-  require a CudaText build that includes the diff_proc API; if it is not
-  available, they silently fall back to the closest Python equivalent
+  API), so CudaText stays responsive while big files are compared, and a
+  compare that is no longer needed (tab closed, app exiting) is stopped
+  cooperatively through diff_proc(DIF_CANCEL). They require a CudaText
+  build that includes the diff_proc API; if it is not available, they
+  silently fall back to the closest Python equivalent
   (native_histogram -> hybrid, native_myers -> myers).
     * native_histogram -- Native Histogram diff (port of JGit's Histogram
       Diff, with JGit's Myers O(ND) Diff as internal fallback for

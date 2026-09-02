@@ -643,6 +643,7 @@ class _CompareJob:
         'show_dialog',
         'compare_start',            # kick-off perf_counter()
         'profiling_enabled_here',   # profiling enabled by this compare
+        'job_handle',       # engine job handle for the background compare (0 = none)
         'dirty',            # texts changed while the compare was in flight
         'stale',            # job dropped (tab closed / app exiting)
         'in_flight',        # background engine call was started
@@ -671,6 +672,7 @@ class _CompareJob:
         self.show_dialog = False
         self.compare_start = 0.0
         self.profiling_enabled_here = False
+        self.job_handle = 0
         self.dirty = False
         self.stale = False
         self.in_flight = False
@@ -710,7 +712,10 @@ class Command:
         # compare-tab ID string. One compare per tab at a time; a
         # refresh that arrives while a compare is running marks the
         # job dirty -- the completion callback then re-runs the
-        # compare with the current texts.
+        # compare with the current texts. Each job carries the engine
+        # job handle (diff_proc async form) so closing the tab or
+        # exiting the app can cancel the engine compare via
+        # diff_proc(DIF_CANCEL) when its result will never be consumed.
         self._jobs = {}
 
         self.compare_menu = None
@@ -1426,11 +1431,19 @@ class Command:
         on_close (which fires next, once per closing tab) can skip
         temp-file deletion and let compare tabs persist across restarts."""
         self._app_exiting = True
-        # Discard any in-flight background compares: the engine checks
-        # Application.Terminated before delivering callbacks, but mark
-        # the jobs stale too so a late callback does nothing.
+        # Cancel every in-flight background engine compare: the app is
+        # exiting, so no result can ever be consumed. diff_proc(DIF_CANCEL)
+        # stops each engine thread cooperatively (a couple of seconds at
+        # most); the completion callback of a cancelled compare is never
+        # invoked. The stale flags below are belt-and-braces for the
+        # finishing race (a compare that completed right before its
+        # cancellation arrived), and _app_exiting guards the callback
+        # path too.
         for job in self._jobs.values():
             job.stale = True
+            if job.job_handle:
+                dfn.cancel_async_line_diff(job.job_handle)
+                job.job_handle = 0
         self._jobs.clear()
 
     '''
@@ -1508,12 +1521,15 @@ class Command:
         this method does the whole setup -- reads the texts, clears
         the old markers, prepares the overview and the Differ --
         starts the engine call, and returns at once so the UI stays
-        responsive. When the engine finishes, it calls back on the
+        responsive. The engine call returns a job handle, which the
+        job keeps so it can be cancelled (diff_proc DIF_CANCEL) when
+        the result will never be consumed (tab closed / app exiting).
+        When the compare finishes, it calls back on the
         main thread and _on_native_diff_done finishes the compare:
         it paints the events (_paint_compare_events), sets the
         bookmarks, repaints the overview and shows the timing
-        epilogue. Python algorithms (and native engines without the
-        callback form) run the paint phase inline, synchronously."""
+        epilogue. Python algorithms run the paint phase inline,
+        synchronously."""
         if ed is None:
             return
         if ed.get_prop(ct.PROP_EDITORS_LINKED):
@@ -1732,9 +1748,8 @@ class Command:
             # in the engine's background thread (the diff_proc callback
             # form): _refresh_ex returns right after starting it, and
             # _on_native_diff_done finishes the compare on the main
-            # thread when the engine calls back. Python algorithms (and
-            # engines without the callback form) paint inline here,
-            # synchronously.
+            # thread when the engine calls back. Python algorithms
+            # paint inline here, synchronously.
             job = _CompareJob()
             job.ed = ed
             job.tab_id = tab_id
@@ -1763,7 +1778,7 @@ class Command:
                 job.lines_b = lines_b
                 del lines_a, lines_b
 
-            if isinstance(self.diff, dfn.Differ) and dfn._HAS_ASYNC_DIFF:
+            if isinstance(self.diff, dfn.Differ):
                 # One compare at a time per tab: while a background
                 # compare is running for this tab, don't start a second
                 # engine call -- mark the running job dirty; its
@@ -1782,11 +1797,13 @@ class Command:
                 # functools.partial carries the job to the callback, so
                 # the engine's completion knows WHICH compare finished.
                 cb = functools.partial(self._on_native_diff_done, job)
-                if dfn.start_async_line_diff(
-                        job.a_text, job.b_text,
-                        dfn.algo_id(self.diff.diff_algorithm),
-                        self.diff.ignore_flags,
-                        cb):
+                job_handle = dfn.start_async_line_diff(
+                    job.a_text, job.b_text,
+                    dfn.algo_id(self.diff.diff_algorithm),
+                    self.diff.ignore_flags,
+                    cb)
+                if job_handle:
+                    job.job_handle = job_handle
                     job.in_flight = True
                     self._jobs[tab_id_str] = job
                     # The timing/profiling epilogue runs in the
@@ -1794,8 +1811,14 @@ class Command:
                     _epilogue = False
                     ct.msg_status(_('Differ: comparing in background...'))
                     return
-                # Asynchronous form rejected (should not happen): fall
-                # through to the synchronous paint below.
+                # Engine refused to start the background compare: report
+                # and stop (no synchronous fallback -- it would freeze
+                # the UI on exactly the big files the background form
+                # exists for; the next refresh retries in the background).
+                msg('diff_proc failed to start the background compare', level=1)
+                _epilogue = False
+                Profiler.stop('refresh')
+                return
 
             # Synchronous compare: the paint phase runs inline. The
             # Differ's generator runs the engine itself while being
@@ -1816,10 +1839,9 @@ class Command:
         """Consume the Differ's event generator and paint every event.
 
         Shared by both compare modes: the synchronous mode (Python
-        algorithms, and native engines without the asynchronous form)
-        calls it directly from _refresh_ex; the background mode calls it
-        from _on_native_diff_done, passing the opcodes the engine
-        produced on its background thread.
+        algorithms) calls it directly from _refresh_ex; the background
+        mode calls it from _on_native_diff_done, passing the opcodes the
+        engine produced on its background thread.
 
         'job' carries everything the paint phase needs (editor halves,
         colors, wrap state, overview, dialog flag). 'opcodes' is the
@@ -2204,15 +2226,19 @@ class Command:
         same list the synchronous diff_proc form returns -- or None when
         the compare failed. The callback arrives through the
         functools.partial(self._on_native_diff_done, job) created at
-        kick-off, so the job context travels with it.
+        kick-off, so the job context travels with it. A compare cancelled
+        through diff_proc(DIF_CANCEL) never reaches this callback at all
+        (the engine drops the result instead), so normally only completed
+        compares arrive here.
 
         The job is validated against the live editors before painting:
-        when the compare tab was closed, CudaText is exiting, the
-        configured algorithm switched to a Python one, or the editor
-        texts changed while the engine was running, the result is
-        discarded -- and for changed texts the compare is re-run with
-        the current content, so the painted markers always match what
-        the editors actually hold.
+        when the compare tab was closed but the cancellation arrived too
+        late (the compare had already finished and its callback was
+        queued), CudaText is exiting, the configured algorithm switched
+        to a Python one, or the editor texts changed while the engine
+        was running, the result is discarded -- and for changed texts
+        the compare is re-run with the current content, so the painted
+        markers always match what the editors actually hold.
         """
         # This job is finished -- free the per-tab slot first of all.
         if self._jobs.get(job.tab_id_str) is job:
@@ -3039,12 +3065,22 @@ class Command:
         if overview is not None:
             overview.destroy()
 
-        # Drop any in-flight background compare for this tab: the
-        # engine thread keeps running, but its result is discarded
-        # when the callback fires (the job is marked stale).
+        # Drop any in-flight background compare for this tab and CANCEL
+        # the engine compare: closing the tab means the result will
+        # never be consumed, so the engine's background thread is told
+        # to stop cooperatively (diff_proc DIF_CANCEL) instead of
+        # burning CPU until it finishes. Cancellation takes at most a
+        # couple of seconds, and the completion callback of a cancelled
+        # compare is never invoked. The stale flag is belt-and-braces
+        # for the finishing race: a compare that completed right before
+        # the cancellation arrived still delivers its callback, which
+        # the stale check below turns into a no-op.
         job = self._jobs.pop(tab_id_str, None)
         if job is not None:
             job.stale = True
+            if job.job_handle:
+                dfn.cancel_async_line_diff(job.job_handle)
+                job.job_handle = 0
 
         # During app exit, keep the state entry and autostart subscription
         # so compare tabs persist restarts and the plugin auto-loads.

@@ -15,7 +15,11 @@ compares on its own OS thread and calls back on the main thread with
 the opcode list; Differ.compare() then walks the precomputed opcodes
 instead of running the engine again. The pure-Python matchers cannot
 do this (plugin Python code runs on the main thread only), so the
-asynchronous mode is native-only.
+asynchronous mode is native-only. start_async_line_diff returns the
+engine's job handle; when a compare's result will never be consumed
+(diff tab closed, plugin exiting), pass the handle to
+cancel_async_line_diff -- diff_proc(DIF_CANCEL) stops the engine's
+thread cooperatively and its callback is then never invoked.
 
 Ignore options: the plugin's 'ignoreopt.*' settings are collected into
 a DIFF_IGN_* bitmask (see build_ignore_flags) and applied to BOTH the
@@ -39,44 +43,24 @@ import cudatext as _ct
 from cudax_lib import get_translation
 _ = get_translation(__file__)  # I18N
 
-# Import cudatext and detect whether the native diff_proc API is available.
-try:
-    _HAS_NATIVE_DIFF = hasattr(_ct, 'diff_proc')
-except ImportError:
-    _HAS_NATIVE_DIFF = False
-
-
-def _diff_proc_takes_callback():
-    """Detect the asynchronous form of the native API: diff_proc
-    accepting an optional `callback` argument. With a callback the
-    engine runs the compare in a background OS thread and calls back
-    on the main thread with the opcode list; without it the call
-    blocks until the compare is done. The check is signature-based, so
-    it degrades cleanly on engines that predate the callback form.
-    """
-    if not _HAS_NATIVE_DIFF:
-        return False
-    try:
-        import inspect
-        return 'callback' in inspect.signature(_ct.diff_proc).parameters
-    except (TypeError, ValueError):
-        return False
-
-
-_HAS_ASYNC_DIFF = _diff_proc_takes_callback()
+# The native diff engine (cudatext.diff_proc) is part of this build's
+# CudaText API: when the attribute exists the engine is present, when it
+# does not (stock CudaText build) the plugin falls back to the pure-Python
+# algorithms in differ_python.py and never calls into this module's
+# engine paths.
+_HAS_NATIVE_DIFF = hasattr(_ct, 'diff_proc')
 
 
 # diff_proc ignore-flag constants, mirrored from the cudatext module
-# (proc_py_const.pas DIFF_IGN_*). getattr() fallbacks keep this module
-# importable on CudaText builds that predate the diff_proc API — the
-# flags only matter for the native engine anyway, which is guarded by
-# _HAS_NATIVE_DIFF.
-DIFF_IGN_NONE        = getattr(_ct, 'DIFF_IGN_NONE', 0)
-DIFF_IGN_CASE        = getattr(_ct, 'DIFF_IGN_CASE', 1)
-DIFF_IGN_WHITESPACE  = getattr(_ct, 'DIFF_IGN_WHITESPACE', 2)
-DIFF_IGN_EOL         = getattr(_ct, 'DIFF_IGN_EOL', 4)
-DIFF_IGN_NUMBERS     = getattr(_ct, 'DIFF_IGN_NUMBERS', 8)
-DIFF_IGN_BLANK_LINES = getattr(_ct, 'DIFF_IGN_BLANK_LINES', 16)
+# (proc_py_const.pas DIFF_IGN_*). Only meaningful when the native engine
+# is available; the pure-Python algorithms compare strictly and never
+# read them.
+DIFF_IGN_NONE        = _ct.DIFF_IGN_NONE if _HAS_NATIVE_DIFF else 0
+DIFF_IGN_CASE        = _ct.DIFF_IGN_CASE if _HAS_NATIVE_DIFF else 1
+DIFF_IGN_WHITESPACE  = _ct.DIFF_IGN_WHITESPACE if _HAS_NATIVE_DIFF else 2
+DIFF_IGN_EOL         = _ct.DIFF_IGN_EOL if _HAS_NATIVE_DIFF else 4
+DIFF_IGN_NUMBERS     = _ct.DIFF_IGN_NUMBERS if _HAS_NATIVE_DIFF else 8
+DIFF_IGN_BLANK_LINES = _ct.DIFF_IGN_BLANK_LINES if _HAS_NATIVE_DIFF else 16
 
 
 def build_ignore_flags(cfg):
@@ -222,26 +206,51 @@ def start_async_line_diff(a_text, b_text, algo, flags, callback):
     the asynchronous form of cudatext.diff_proc (the `callback`
     argument).
 
-    Returns True when the background compare was started: the engine
-    then invokes `callback(opcodes)` on the main thread when it
-    finishes, with the same opcode list the synchronous form returns
-    (None on engine error). Returns False when the asynchronous form
-    is not available or was rejected -- the caller must then use the
-    synchronous diff_proc form instead.
+    Returns the engine's job handle (a positive int) when the background
+    compare was started: the engine invokes `callback(opcodes)` on the
+    main thread when it finishes, with the same opcode list the
+    synchronous form returns (None on engine error). Returns 0 when the
+    background compare could not be started.
+
+    Keep the job handle and pass it to cancel_async_line_diff() when the
+    compare's result will never be consumed (tab closed, plugin exiting):
+    diff_proc(DIF_CANCEL, handle) stops the engine's thread
+    cooperatively, and the callback of a cancelled compare is never
+    invoked.
 
     'callback' must be a Python callable (the engine also accepts a
     'module.function' string, but a callable -- e.g. a
     functools.partial -- carries per-call context, which the plugin
     needs to know WHICH compare finished).
     """
-    if not _HAS_ASYNC_DIFF:
+    if not _HAS_NATIVE_DIFF:
+        return 0
+    result = _ct.diff_proc(
+        _ct.DIF_TEXTS, a_text, b_text, algo, flags, callback)
+    if isinstance(result, int) and result > 0:
+        return result
+    return 0
+
+
+def cancel_async_line_diff(job):
+    """Cooperatively cancel a background compare started by
+    start_async_line_diff().
+
+    Returns True when the engine found the job and requested
+    cancellation; False when no such job is running (it already
+    finished, was cancelled before, or the handle is invalid) -- a
+    finished job needs no cancelling.
+
+    Cancellation is cooperative: the engine's diff loops poll the job's
+    cancel flag at coarse granularity, so a compare inside a long
+    engine phase unwinds within a couple of seconds (the Pascal stack
+    unwinds through every try/finally block, releasing everything the
+    compare allocated -- nothing leaks). The completion callback of a
+    cancelled compare is never invoked.
+    """
+    if not job:
         return False
-    try:
-        return bool(_ct.diff_proc(
-            _ct.DIF_TEXTS, a_text, b_text, algo, flags, callback))
-    except TypeError:
-        # Very defensive: an engine without the 6th parameter.
-        return False
+    return bool(_ct.diff_proc(_ct.DIF_CANCEL, job))
 
 
 def algo_id(algorithm_name):
