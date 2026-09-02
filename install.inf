@@ -31,6 +31,16 @@ section=commands
 caption=Differ\Refresh
 method=refresh
 
+[item4b]
+section=commands
+caption=Differ\Cancel compare
+method=cancel_compare
+
+[item4c]
+section=commands
+caption=Differ\Cancel all compares
+method=cancel_all_compares
+
 [item5]
 section=commands
 caption=Differ\Focus the opposite file

@@ -1278,10 +1278,7 @@ class Command:
         tab_id_str = str(tab_id)
         job = self._jobs.pop(tab_id_str, None)
         if job is not None:
-            job.stale = True
-            if job.job_handle:
-                dfn.cancel_async_line_diff(job.job_handle)
-                job.job_handle = 0
+            self._cancel_job(job)
 
         # Get both split editors.
         a_ed = ct.Editor(ed_self.get_prop(ct.PROP_HANDLE_PRIMARY))
@@ -1455,10 +1452,7 @@ class Command:
         # cancellation arrived), and _app_exiting guards the callback
         # path too.
         for job in self._jobs.values():
-            job.stale = True
-            if job.job_handle:
-                dfn.cancel_async_line_diff(job.job_handle)
-                job.job_handle = 0
+            self._cancel_job(job)
         self._jobs.clear()
 
     '''
@@ -1478,6 +1472,52 @@ class Command:
         compare runs in a background thread -- the markers are
         re-applied when it finishes."""
         self._refresh_ex(ct.ed, show_dialog=True)
+
+    def _cancel_job(self, job):
+        """Cancel one in-flight background compare job: mark it stale (so
+        a dirty job's completion callback skips its own re-run -- see
+        _CompareJob.dirty/stale in _on_native_diff_done) and tell the
+        engine to stop cooperatively via diff_proc(DIF_CANCEL) if a
+        background call was actually started. No-op for a Python-
+        algorithm job, which never gets a job_handle. Does not touch
+        self._jobs -- callers pop/clear it themselves, since 'cancel
+        one' and 'cancel all' remove from the dict differently."""
+        job.stale = True
+        if job.job_handle:
+            dfn.cancel_async_line_diff(job.job_handle)
+            job.job_handle = 0
+
+    def cancel_compare(self):
+        """Command: cancel the in-flight background compare for the
+        current compare tab, if any is running. Does not close the tab
+        or touch its existing diff markers -- it only stops a compare
+        that is still in progress (e.g. one kicked off by auto-refresh
+        or a prior manual refresh on a large file). Same effect as
+        on_close's cancellation, but callable directly without closing
+        the tab, and without needing on_save_pre's close-then-save
+        path."""
+        tab_id = ct.ed.get_prop(ct.PROP_TAB_ID)
+        if not self._is_compare_tab(tab_id):
+            return ct.msg_status(_('Differ: not a compare tab'))
+        job = self._jobs.pop(str(tab_id), None)
+        if job is None:
+            return ct.msg_status(_('Differ: no compare running'))
+        self._cancel_job(job)
+        ct.msg_status(_('Differ: compare cancelled'))
+
+    def cancel_all_compares(self):
+        """Command: cancel every in-flight background compare across all
+        compare tabs (not just the current one). Same cancellation as
+        on_exit_pre, but triggerable on demand instead of only at app
+        exit -- e.g. after refreshing several large-file compares at
+        once and deciding none of the results are needed."""
+        n = len(self._jobs)
+        if not n:
+            return ct.msg_status(_('Differ: no compares running'))
+        for job in self._jobs.values():
+            self._cancel_job(job)
+        self._jobs.clear()
+        ct.msg_status(_('Differ: cancelled {} compare(s)').format(n))
 
     def _create_differ(self):
         """Create the appropriate Differ instance based on the configured
@@ -3092,10 +3132,7 @@ class Command:
         # the stale check below turns into a no-op.
         job = self._jobs.pop(tab_id_str, None)
         if job is not None:
-            job.stale = True
-            if job.job_handle:
-                dfn.cancel_async_line_diff(job.job_handle)
-                job.job_handle = 0
+            self._cancel_job(job)
 
         # During app exit, keep the state entry and autostart subscription
         # so compare tabs persist restarts and the plugin auto-loads.
