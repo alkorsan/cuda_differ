@@ -1268,6 +1268,21 @@ class Command:
         if not self._is_compare_tab(tab_id):
             return  # not a compare tab -- let CudaText handle normally
 
+        # Cancel any in-flight background compare for this tab before
+        # doing anything else. Save can be reached via the "Save
+        # changes?" prompt right before a tab close, so a compare left
+        # running (or merely marked dirty, which would re-run itself
+        # on completion -- see _CompareJob.dirty) is about to become
+        # useless work; drop it here instead of racing on_close's own
+        # cancellation, which fires after this handler returns.
+        tab_id_str = str(tab_id)
+        job = self._jobs.pop(tab_id_str, None)
+        if job is not None:
+            job.stale = True
+            if job.job_handle:
+                dfn.cancel_async_line_diff(job.job_handle)
+                job.job_handle = 0
+
         # Get both split editors.
         a_ed = ct.Editor(ed_self.get_prop(ct.PROP_HANDLE_PRIMARY))
         b_ed = ct.Editor(ed_self.get_prop(ct.PROP_HANDLE_SECONDARY))
@@ -1296,7 +1311,7 @@ class Command:
             self._suppress_change.pop(str(tab_id), None)
             # Auto-refresh diff markers so the user sees updated
             # highlights without needing to click Refresh manually.
-            self._refresh_ex(ed_self)  # automatic -- no dialog
+            # self._refresh_ex(ed_self)  # automatic -- no dialog
 
         # Block the default save (which would show a Save dialog for the
         # untitled compare tab).
