@@ -40,6 +40,28 @@ DECOR_CHAR = '■'
 DEFAULT_SYNC_SCROLL = '1'
 U_PREFIX = 'untitled:'
 
+# HARD-CODED MODULE CONSTANT — deliberately NOT a config option. Flips
+# the whole-compare editor lock for background (native) compares:
+#
+#   True  (default): from kick-off until the result is fully rendered,
+#          both compare-tab editors are
+#            - EDACTION_LOCKed: the paint lock makes each half repaint
+#              the 'busy' placeholder (hourglass) — the user-visible
+#              "a compare is running" signal, for the whole engine run;
+#            - PROP_RO: typing is blocked — EDACTION_LOCK alone does
+#              NOT block input, the user could still write blind.
+#          The lock/RO pair is released ONLY after the compare finished
+#          AND everything is painted (or the compare was cancelled).
+#
+#   False: pre-lock behavior — the editors stay fully editable while
+#          the engine runs, and only the paint burst is batched under
+#          EDACTION_LOCK (see _paint_compare_events).
+#
+# The synchronous (Python-algorithm) mode never takes this lock: it
+# runs inline on the main thread, so no keystroke can land mid-compare
+# and the UI cannot repaint the busy screen anyway.
+LOCK_EDITORS_WHILE_COMPARING = True
+
 PLG_NAME = _('Differ')
 METAJSONFILE = os.path.dirname(__file__) + os.sep + 'differ_opts.json'
 JSONFILE = 'cuda_differ.json'  # To store in settings/cuda_differ.json
@@ -622,10 +644,18 @@ class _CompareJob:
     algorithms the paint phase runs inline in _refresh_ex and the job
     is just a carrier for the same data.
 
-    The snapshot fields (a_text/b_text, lines_a/lines_b) exist because
-    the background engine compares the texts captured at kick-off; when
-    the callback fires, the live editors are compared against the
-    snapshot to detect edits made while the engine was running.
+    The snapshot fields (a_text/b_text, lines_a/lines_b) are the texts
+    the engine was kicked off with. While a background compare runs,
+    LOCK_EDITORS_WHILE_COMPARING keeps both halves locked + read-only,
+    so the live editors cannot drift from these snapshots; a refresh
+    that arrives anyway is dropped (see _refresh_ex), never queued.
+
+    'editor_lock' carries the whole-compare editor lock state while
+    LOCK_EDITORS_WHILE_COMPARING is on and a background compare is
+    running: None while nothing is held, otherwise a dict
+    {'a': [locked?, original_ro], 'b': [...]} recording per half what
+    was acquired, so _release_compare_editors can restore exactly that
+    (and only once -- the release is idempotent).
     """
 
     __slots__ = (
@@ -644,7 +674,7 @@ class _CompareJob:
         'compare_start',            # kick-off perf_counter()
         'profiling_enabled_here',   # profiling enabled by this compare
         'job_handle',       # engine job handle for the background compare (0 = none)
-        'dirty',            # texts changed while the compare was in flight
+        'editor_lock',      # whole-compare lock/RO state (see class docstring)
         'stale',            # job dropped (tab closed / app exiting)
         'in_flight',        # background engine call was started
     )
@@ -673,7 +703,7 @@ class _CompareJob:
         self.compare_start = 0.0
         self.profiling_enabled_here = False
         self.job_handle = 0
-        self.dirty = False
+        self.editor_lock = None
         self.stale = False
         self.in_flight = False
 
@@ -717,12 +747,16 @@ class Command:
         self._overview_timers = {}
         # In-flight background compares (native algorithms), keyed by
         # compare-tab ID string. One compare per tab at a time; a
-        # refresh that arrives while a compare is running marks the
-        # job dirty -- the completion callback then re-runs the
-        # compare with the current texts. Each job carries the engine
-        # job handle (diff_proc async form) so closing the tab or
+        # refresh that arrives while a compare is running is DROPPED
+        # with a status hint (see _refresh_ex) -- the running compare
+        # paints against its kick-off snapshots, which cannot drift
+        # because LOCK_EDITORS_WHILE_COMPARING keeps the halves
+        # read-only for the whole run. Each job carries the engine
+        # job handle (diff_proc async form) and the whole-compare
+        # editor lock state (job.editor_lock) so closing the tab or
         # exiting the app can cancel the engine compare via
-        # diff_proc(DIF_CANCEL) when its result will never be consumed.
+        # diff_proc(DIF_CANCEL) and release the editors when the
+        # result will never be consumed.
         self._jobs = {}
 
         self.compare_menu = None
@@ -1361,10 +1395,11 @@ class Command:
         # Cancel any in-flight background compare for this tab before
         # doing anything else. Save can be reached via the "Save
         # changes?" prompt right before a tab close, so a compare left
-        # running (or merely marked dirty, which would re-run itself
-        # on completion -- see _CompareJob.dirty) is about to become
-        # useless work; drop it here instead of racing on_close's own
-        # cancellation, which fires after this handler returns.
+        # running is about to become useless work; drop it here instead
+        # of racing on_close's own cancellation, which fires after this
+        # handler returns. _cancel_job also releases the compare-level
+        # editor lock / read-only state, so the halves are editable
+        # again by the time the save finishes.
         tab_id_str = str(tab_id)
         job = self._jobs.pop(tab_id_str, None)
         if job is not None:
@@ -1601,16 +1636,96 @@ class Command:
         re-applied when it finishes."""
         self._refresh_ex(ct.ed, show_dialog=True)
 
+    def _lock_compare_editors(self, job):
+        """Take the whole-compare editor lock for a background compare
+        (only when the hardcoded module constant
+        LOCK_EDITORS_WHILE_COMPARING is on; no-op otherwise).
+
+        For BOTH halves of the compare tab, in this order:
+          - save the current PROP_RO value and set PROP_RO=True — typing
+            is blocked for the engine's whole run (EDACTION_LOCK does
+            NOT block input; without RO the user could still write
+            blind into the locked editor);
+          - EDACTION_LOCK — the paint lock: from the first repaint on,
+            each half shows the 'busy' placeholder (hourglass), which is
+            what tells the user a compare is running.
+
+        Each half is acquired independently and exception-safe: a half
+        whose handle died (or an old CudaText build without
+        EDACTION_LOCK) still gets its RO part — the write-block matters
+        more than the visual. What was actually acquired is recorded in
+        job.editor_lock as {'a': [locked?, original_ro], 'b': [...]} and
+        released EXACTLY once by _release_compare_editors, no matter how
+        the compare ends.
+        """
+        if not LOCK_EDITORS_WHILE_COMPARING:
+            return
+        state = {}
+        for half, e in (('a', job.a_ed), ('b', job.b_ed)):
+            try:
+                orig_ro = bool(e.get_prop(ct.PROP_RO, False))
+                e.set_prop(ct.PROP_RO, True)
+            except Exception:
+                continue  # dead handle: nothing acquired for this half
+            rec = [False, orig_ro]
+            try:
+                e.action(ct.EDACTION_LOCK)
+                rec[0] = True
+            except Exception:
+                pass  # no EDACTION_LOCK: RO alone stays
+            state[half] = rec
+        if state:
+            job.editor_lock = state
+
+    def _release_compare_editors(self, job):
+        """Release what _lock_compare_editors acquired: restore each
+        half's original PROP_RO value and EDACTION_UNLOCK the halves
+        that were locked. Idempotent (guarded by job.editor_lock, which
+        is cleared first), so EVERY abandonment path can call it
+        without double-unlocking the counted paint lock: normal
+        completion, engine error, cancel (user command / tab close /
+        app exit / save-before-close), a stale callback arriving after
+        the cancel, an exception mid-paint.
+
+        Per half, read-only is restored BEFORE the unlock so the
+        repaint that the unlock triggers shows the finished compare
+        with writing already re-enabled. All calls are guarded — the
+        tab may already be gone (dead editor handles must not crash
+        the cancel/close/exit paths that reach here).
+        """
+        state = job.editor_lock
+        if not state:
+            return
+        job.editor_lock = None  # idempotency guard: release exactly once
+        for half, e in (('a', job.a_ed), ('b', job.b_ed)):
+            rec = state.get(half)
+            if rec is None:
+                continue
+            locked, orig_ro = rec
+            try:
+                e.set_prop(ct.PROP_RO, orig_ro)
+            except Exception:
+                pass
+            if locked:
+                try:
+                    e.action(ct.EDACTION_UNLOCK)
+                except Exception:
+                    pass
+
     def _cancel_job(self, job):
         """Cancel one in-flight background compare job: mark it stale (so
-        a dirty job's completion callback skips its own re-run -- see
-        _CompareJob.dirty/stale in _on_native_diff_done) and tell the
-        engine to stop cooperatively via diff_proc(DIF_CANCEL) if a
+        its completion callback, if the engine delivers one after all,
+        turns into a no-op -- see _CompareJob.stale in
+        _on_native_diff_done), release the whole-compare editor lock /
+        read-only state the job's kick-off acquired (the editors must
+        become editable again the moment the compare is gone), and tell
+        the engine to stop cooperatively via diff_proc(DIF_CANCEL) if a
         background call was actually started. No-op for a Python-
         algorithm job, which never gets a job_handle. Does not touch
         self._jobs -- callers pop/clear it themselves, since 'cancel
         one' and 'cancel all' remove from the dict differently."""
         job.stale = True
+        self._release_compare_editors(job)
         if job.job_handle:
             dfn.cancel_async_line_diff(job.job_handle)
             job.job_handle = 0
@@ -1703,16 +1818,19 @@ class Command:
         background thread (the callback form of cudatext.diff_proc):
         this method does the whole setup -- reads the texts, clears
         the old markers, prepares the overview and the Differ --
-        starts the engine call, and returns at once so the UI stays
-        responsive. The engine call returns a job handle, which the
-        job keeps so it can be cancelled (diff_proc DIF_CANCEL) when
-        the result will never be consumed (tab closed / app exiting).
-        When the compare finishes, it calls back on the
-        main thread and _on_native_diff_done finishes the compare:
-        it paints the events (_paint_compare_events), sets the
-        bookmarks, repaints the overview and shows the timing
-        epilogue. Python algorithms run the paint phase inline,
-        synchronously."""
+        starts the engine call, locks both halves (EDACTION_LOCK busy
+        placeholder + PROP_RO read-only) for the whole run when
+        LOCK_EDITORS_WHILE_COMPARING is on, and returns at once so
+        the UI stays responsive. The engine call returns a job
+        handle, which the job keeps so it can be cancelled
+        (diff_proc DIF_CANCEL) when the result will never be consumed
+        (tab closed / app exiting). When the compare finishes, it
+        calls back on the main thread and _on_native_diff_done
+        finishes the compare: it paints the events
+        (_paint_compare_events), sets the bookmarks, repaints the
+        overview, shows the timing epilogue, and only then releases
+        the editor lock / read-only state. Python algorithms run the
+        paint phase inline, synchronously."""
         if ed is None:
             return
         if ed.get_prop(ct.PROP_EDITORS_LINKED):
@@ -1720,6 +1838,20 @@ class Command:
         tab_id = ed.get_prop(ct.PROP_TAB_ID)
         if not self._is_compare_tab(tab_id):
             return  # not a compare tab we manage -- skip
+
+        # One compare at a time per tab. A background compare already
+        # running for this tab? While it runs, LOCK_EDITORS_WHILE_COMPARING
+        # keeps the halves locked + read-only, so their texts cannot drift
+        # under the engine -- there is nothing a queued re-run would fix.
+        # Drop this request (manual Refresh, on_change_slow auto-refresh,
+        # on_state) with a status hint instead of starting a second engine
+        # job or deferring work: the running compare finishes and paints
+        # against its own kick-off snapshots; the NEXT refresh -- the user
+        # can fire it any time after this one, or cancel first -- picks up
+        # whatever the editors hold then.
+        if self._jobs.get(str(tab_id)) is not None:
+            ct.msg_status(_('Differ: compare already running'))
+            return
 
         # Load config FIRST so the profiling check below sees the current
         # value of enable_profiling. Without this, the first compare after
@@ -1962,23 +2094,11 @@ class Command:
                 del lines_a, lines_b
 
             if isinstance(self.diff, dfn.Differ):
-                # One compare at a time per tab: while a background
-                # compare is running for this tab, don't start a second
-                # engine call -- mark the running job dirty; its
-                # completion callback re-runs the refresh with the
-                # current texts, so the painted result always matches
-                # the live editor content.
-                if self._jobs.get(tab_id_str) is not None:
-                    self._jobs[tab_id_str].dirty = True
-                    _epilogue = False
-                    # Balance the Profiler section opened at the top of
-                    # the try: this call paints nothing; the completion
-                    # callback's paint phase stops the section the
-                    # kick-off call opened.
-                    Profiler.stop('refresh')
-                    return
                 # functools.partial carries the job to the callback, so
                 # the engine's completion knows WHICH compare finished.
+                # (The refresh-while-running case was already handled at
+                # the top of _refresh_ex -- by this point no job exists
+                # for this tab.)
                 cb = functools.partial(self._on_native_diff_done, job)
                 job_handle = dfn.start_async_line_diff(
                     job.a_text, job.b_text,
@@ -1989,6 +2109,12 @@ class Command:
                     job.job_handle = job_handle
                     job.in_flight = True
                     self._jobs[tab_id_str] = job
+                    # Editors are locked + read-only for the whole engine
+                    # run (kick-off -> fully-rendered result / cancel):
+                    # the paint lock shows the 'busy' placeholder in both
+                    # halves and PROP_RO blocks typing. Released in
+                    # _on_native_diff_done / _cancel_job.
+                    self._lock_compare_editors(job)
                     # The timing/profiling epilogue runs in the
                     # completion callback, not in the finally below.
                     _epilogue = False
@@ -2019,7 +2145,89 @@ class Command:
                                        _profiling_enabled_here)
 
     def _paint_compare_events(self, job, opcodes=None):
+        """Paint a compare's events into both editor halves, with the
+        whole mutation burst batched under EDACTION_LOCK.
+
+        Thin, exception-safe wrapper around
+        _paint_compare_events_locked (the actual event loop): locks
+        every half that is not ALREADY locked for the whole compare
+        (job.editor_lock -- the background mode's kick-off lock) before
+        any marker/gap/decor/bookmark call and unlocks those halves in a
+        finally block, so the lock can never leak -- not via the 'no
+        differences found' early return, not via an exception
+        mid-loop. EDACTION_LOCK/UNLOCK is a counted paint lock per
+        editor, so every lock here is paired with an unlock on the SAME
+        editor no matter how the paint ends. Halves already under the
+        compare-level lock are NOT re-locked: the burst is batched by
+        that lock, and skipping the inner pair means exactly ONE
+        repaint when the compare-level lock lifts (its EDACTION_UNLOCK
+        is the one that invalidates).
+
+        Why the paint burst is locked at all: EDACTION_LOCK maps to the
+        editor's BeginUpdate -- a PAINT lock only. It does not block
+        typing and does not defer on_change events. The paint phase is
+        the actual burst of editor mutations -- in CudaText every
+        attr(MARKERS_ADD)/gap(GAP_ADD)/decor(DECOR_SET) call ends with
+        Ed.Update -- so this window is where batching pays off: ONE
+        repaint per editor when the lock lifts, instead of one per
+        marker. For the synchronous (Python) mode the lock also covers
+        the algorithm, which runs lazily inside the event loop --
+        harmless: the main thread doesn't pump messages mid-loop, so
+        the placeholder screen never shows. For the background
+        (native) mode the engine ran BEFORE this wrapper is called;
+        with LOCK_EDITORS_WHILE_COMPARING the halves are already locked
+        for the whole run (RO blocks typing), and without it this
+        wrapper covers exactly 'compare finished -> result rendered'.
+
+        The 'No differences found' dialog is shown AFTER the unlock:
+        modal dialogs pump the message loop, and painting a locked
+        editor renders the busy placeholder -- it would flash behind
+        the dialog. _paint_compare_events_locked returns True when
+        that dialog is due. (In the background+locked case the halves
+        stay busy behind the dialog until _on_native_diff_done releases
+        the compare-level lock right after this call returns.)
+
+        Old CudaText builds without EDACTION_LOCK degrade
+        gracefully: the lock call raises, the paint runs unlocked,
+        exactly the previous behavior.
+        """
+        a_ed = job.a_ed
+        b_ed = job.b_ed
+        outer_lock = job.editor_lock or {}
+        locked = []
+        show_nodiffs_dialog = False
+        try:
+            for half, e in (('a', a_ed), ('b', b_ed)):
+                if half in outer_lock:
+                    # Already locked for the whole compare (kick-off):
+                    # that lock batches this burst too.
+                    continue
+                try:
+                    e.action(ct.EDACTION_LOCK)
+                except Exception:
+                    # Missing EDACTION_LOCK (old build) or dead editor
+                    # handle: paint the rest unlocked (previous
+                    # behavior) -- do not lock a partial pair either.
+                    break
+                locked.append(e)
+            show_nodiffs_dialog = self._paint_compare_events_locked(
+                job, opcodes)
+        finally:
+            for e in locked:
+                try:
+                    e.action(ct.EDACTION_UNLOCK)
+                except Exception:
+                    pass
+        if show_nodiffs_dialog:
+            t = _('No differences found (with current ignore options).')
+            ct.msg_box(t, ct.MB_OK)
+
+    def _paint_compare_events_locked(self, job, opcodes=None):
         """Consume the Differ's event generator and paint every event.
+        Runs with both editors paint-locked (see
+        _paint_compare_events). Returns True when the caller should
+        show the 'No differences found (with current ignore options)'
+        dialog after unlocking; False otherwise.
 
         Shared by both compare modes: the synchronous mode (Python
         algorithms) calls it directly from _refresh_ex; the background
@@ -2346,25 +2554,32 @@ class Command:
             # early path above: clear the diffmap, skip bookmarks and
             # overview (there is nothing to show), and tell the user
             # -- the compare looks 'empty' otherwise and it is not
-            # obvious whether the plugin even ran.
+            # obvious whether the plugin even ran. The dialog itself
+            # is deferred to the CALLER (_paint_compare_events) which
+            # shows it after the editors are unlocked: modal dialogs
+            # pump the message loop, and painting a locked editor
+            # renders the 'busy' placeholder screen behind them.
+            # Same convention as the raw-identical early path in
+            # _refresh_ex: the dialog only appears for the initial
+            # compare and manual refresh; automatic refreshes
+            # (on_change_slow / on_state) stay silent to avoid
+            # pestering the user.
             self.diff.diffmap = []
-            if show_dialog:
-                # Same convention as the raw-identical early path
-                # above: the dialog only appears for the initial
-                # compare and manual refresh; automatic refreshes
-                # (on_change_slow / on_state) stay silent to avoid
-                # pestering the user.
-                t = _('No differences found (with current ignore options).')
-                ct.msg_box(t, ct.MB_OK)
             Profiler.stop('refresh')
-            return
+            return show_dialog
 
         # Append all collected bookmarks in sorted order using
         # BOOKMARK2_APPEND (much faster than BOOKMARK2_SET — skips
         # duplicate search, sorting, event firing, and repainting).
         # BOOKMARK2_APPEND requires bookmarks to be added in ascending
-        # line order, so we sort first. After appending, we manually
-        # repaint both editors via EDACTION_UPDATE.
+        # line order, so we sort first. No forced repaint after the
+        # appends: BOOKMARK2_APPEND doesn't repaint by itself, but
+        # this whole paint phase runs with both editors locked (see
+        # _paint_compare_events), and the EDACTION_UNLOCK there
+        # invalidates both editors and repaints everything in one
+        # pass -- a forced EDACTION_UPDATE here would be redundant
+        # and on Windows (synchronous Repaint) would paint the
+        # 'busy' placeholder screen mid-lock.
         Profiler.start('paint:bookmark')
         pending_bkm_a.sort()
         pending_bkm_b.sort()
@@ -2376,9 +2591,6 @@ class Command:
             b_ed.bookmark(ct.BOOKMARK2_APPEND, row,
                           nkind=nk, text='', auto_del=True,
                           show=False, tag=DIFF_TAG)
-        # BOOKMARK2_APPEND doesn't repaint — force it.
-        a_ed.action(ct.EDACTION_UPDATE)
-        b_ed.action(ct.EDACTION_UPDATE)
         Profiler.stop('paint:bookmark')
 
         # Repaint the overview with the collected line states and gaps.
@@ -2399,6 +2611,7 @@ class Command:
             Profiler.stop('paint:overview')
 
         Profiler.stop('refresh')
+        return False
 
     def _on_native_diff_done(self, job, opcodes):
         """diff_proc completion callback for a background line-level
@@ -2414,70 +2627,70 @@ class Command:
         (the engine drops the result instead), so normally only completed
         compares arrive here.
 
-        The job is validated against the live editors before painting:
-        when the compare tab was closed but the cancellation arrived too
-        late (the compare had already finished and its callback was
-        queued), CudaText is exiting, the configured algorithm switched
-        to a Python one, or the editor texts changed while the engine
-        was running, the result is discarded -- and for changed texts
-        the compare is re-run with the current content, so the painted
-        markers always match what the editors actually hold.
+        The job is validated against the live state before painting:
+        when the compare tab was closed, CudaText is exiting, or the
+        configured algorithm switched to a Python one, the result is
+        discarded (the Python case re-runs the refresh with the new
+        algorithm). The engine's own texts cannot have drifted: while
+        the engine ran, LOCK_EDITORS_WHILE_COMPARING kept both halves
+        read-only, and a refresh arriving mid-run was dropped at the top
+        of _refresh_ex -- so what the engine produced is what the
+        editors still hold, and it is painted as-is.
+
+        Whatever the outcome, the kick-off editor lock / read-only state
+        is released in a finally block (idempotent -- _cancel_job already
+        released cancelled jobs): the halves become editable again only
+        here, after the result is fully rendered.
         """
         # This job is finished -- free the per-tab slot first of all.
         if self._jobs.get(job.tab_id_str) is job:
             del self._jobs[job.tab_id_str]
 
-        if job.stale:
-            return
-        if self._app_exiting:
-            return
-        # Compare tab closed while the engine was running?
-        if not self._is_compare_tab(job.tab_id):
-            return
-
         try:
-            if job.dirty:
-                # Texts changed while the engine was running: the
-                # opcodes describe a snapshot that no longer matches
-                # the editors. Re-run the whole refresh -- it reads the
-                # current texts and starts a fresh background compare.
-                self._refresh_ex(job.ed, show_dialog=job.show_dialog)
+            if job.stale:
+                return
+            if self._app_exiting:
+                return
+            # Compare tab closed while the engine was running?
+            if not self._is_compare_tab(job.tab_id):
                 return
 
-            if not isinstance(self.diff, dfn.Differ):
-                # Algorithm switched to a Python one while the engine
-                # was running: the current Differ cannot paint native
-                # opcodes -- re-run the refresh with the new algorithm.
-                self._refresh_ex(job.ed, show_dialog=job.show_dialog)
-                return
-
-            # Belt-and-braces staleness check: texts can change without
-            # on_change_slow having fired yet. get_text_all + compare is
-            # a C-level memcmp -- cheap next to the diff itself. When
-            # the editors moved on, re-run with the current texts.
-            if (job.a_ed.get_text_all(ends=True) != job.a_text or
-                    job.b_ed.get_text_all(ends=True) != job.b_text):
-                self._refresh_ex(job.ed, show_dialog=job.show_dialog)
-                return
-
-            if opcodes is None:
-                # Engine error (CudaText logs it to the console):
-                # mirror the synchronous path's defensive fallback and
-                # paint one big REPLACE covering both texts, so the
-                # compare view still shows something sensible.
-                opcodes = [
-                    ('replace', 0, len(split_lines_safe(job.a_text)),
-                     0, len(split_lines_safe(job.b_text)))]
-
-            # Paint the result. The timing epilogue (status-bar message
-            # + profiling report) covers the WHOLE compare, from
-            # kick-off (job.compare_start) to paint done -- the wall
-            # time the user actually waited.
             try:
-                self._paint_compare_events(job, opcodes)
+                if not isinstance(self.diff, dfn.Differ):
+                    # Algorithm switched to a Python one while the engine
+                    # was running: the current Differ cannot paint native
+                    # opcodes. Release this job's lock BEFORE the re-run
+                    # so the new kick-off's lock does not stack on it,
+                    # then re-run the refresh with the new algorithm.
+                    self._release_compare_editors(job)
+                    self._refresh_ex(job.ed, show_dialog=job.show_dialog)
+                    return
+
+                if opcodes is None:
+                    # Engine error (CudaText logs it to the console):
+                    # mirror the synchronous path's defensive fallback and
+                    # paint one big REPLACE covering both texts, so the
+                    # compare view still shows something sensible.
+                    opcodes = [
+                        ('replace', 0, len(split_lines_safe(job.a_text)),
+                         0, len(split_lines_safe(job.b_text)))]
+
+                # Paint the result. The timing epilogue (status-bar message
+                # + profiling report) covers the WHOLE compare, from
+                # kick-off (job.compare_start) to paint done -- the wall
+                # time the user actually waited.
+                try:
+                    self._paint_compare_events(job, opcodes)
+                finally:
+                    self._compare_epilogue(job.compare_start,
+                                           job.profiling_enabled_here)
             finally:
-                self._compare_epilogue(job.compare_start,
-                                       job.profiling_enabled_here)
+                # Compare finished and everything is rendered: make the
+                # halves editable again / drop the busy placeholder.
+                # Idempotent, so the stale/exiting/closed/re-run paths
+                # above (and _cancel_job for cancelled jobs) are all
+                # covered by this single call.
+                self._release_compare_editors(job)
         except Exception:
             # Never let an exception escape into the engine's callback
             # dispatcher: print the traceback and leave the tab in its
@@ -2907,10 +3120,29 @@ class Command:
         eds[1].set_caret(0, cur_change[2], 0, cur_change[3])
         self.cfg['enable_sync_caret'] = esc
 
+    def _compare_running_here(self, eds):
+        """True while a background compare is in flight for the compare
+        tab the given halves belong to. Text-changing hunk commands
+        (copy / copy_line) are refused then: with
+        LOCK_EDITORS_WHILE_COMPARING the halves are read-only for the
+        whole run, and the running compare paints its kick-off
+        snapshots -- any text edit now would end up misaligned. Also
+        works with the constant off, where editing IS possible but the
+        running compare would still paint stale snapshots."""
+        if not eds:
+            return False
+        try:
+            tab_id = eds[0].get_prop(ct.PROP_TAB_ID)
+        except Exception:
+            return False
+        return str(tab_id) in self._jobs
+
     def copy(self, to_right=True):
         """Copy the current diff hunk's text from left to right (or right to
         left), replacing the opposite side's text. Then refresh diff markers."""
         fc, eds = self.focused
+        if self._compare_running_here(eds):
+            return ct.msg_status(_('Differ: cannot edit while compare is running'))
         current = self.get_current_change
         if not current:
             return
@@ -2943,6 +3175,8 @@ class Command:
         inserting at the current hunk's position. Unlike copy(), this works
         on the current caret line, not the whole hunk."""
         fc, eds = self.focused
+        if self._compare_running_here(eds):
+            return ct.msg_status(_('Differ: cannot edit while compare is running'))
         current = self.get_current_change
 
         def get_lines(ed: ct.Editor):
