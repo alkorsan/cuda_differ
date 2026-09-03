@@ -691,6 +691,13 @@ class Command:
         # Avoids redundant JSON writes when on_change fires repeatedly
         # without the state actually changing.
         self._saved_cache = {}
+        # In-memory cache of PER-HALF dirty state per compare tab ID:
+        # 'a' = primary (left) half, 'b' = secondary (right) half.
+        # on_change marks the edited half; on_save_pre syncs ONLY these
+        # halves back to their originals, so a clean half -- and its
+        # original tab -- is never touched by save. Persisted to disk
+        # together with the legacy 'saved' flag via _update_dirty_state.
+        self._dirty_halves = {}
         # In-memory set of all compare tab IDs in the current session.
         # Used by _is_compare_tab for fast O(1) lookup without disk I/O --
         # critical because on_change fires on every keystroke.
@@ -769,12 +776,23 @@ class Command:
 
     def _register_compare_tab(self, compare_tab_id, primary_orig_id, secondary_orig_id,
                               primary_orig_name='', secondary_orig_name='', session_key='',
-                              saved=True):
+                              saved=True, dirty=None):
         """Register a compare tab under its session key with the PROP_TAB_IDs
-        and display names of its two original tabs. 'saved' tracks whether
-        the compare tab's content has been synced to the originals."""
+        and display names of its two original tabs. 'dirty' tracks which
+        halves ('a' = primary/left, 'b' = secondary/right) carry unsaved
+        edits -- on_save_pre syncs only those halves back to their
+        originals. Callers that pass only the boolean 'saved' (legacy
+        form) get the conservative mapping: unsaved -> both halves dirty."""
         if not session_key:
             session_key = self._current_session_key
+        if dirty is None:
+            dirty = set() if saved else {'a', 'b'}
+        else:
+            dirty = {h for h in dirty if h in ('a', 'b')}
+        # The boolean 'saved' flag (kept for compatibility with state files
+        # of older plugin versions and for the tab title color) simply
+        # means "no half is dirty".
+        saved = not dirty
         state = self._load_state()
         if session_key not in state['sessions']:
             state['sessions'][session_key] = {}
@@ -784,23 +802,65 @@ class Command:
             'secondary_orig_tab_id': secondary_orig_id,
             'secondary_orig_name': secondary_orig_name or '',
             'saved': saved,
+            'dirty': sorted(dirty),
         }
         self._save_state(state)
         self._saved_cache[str(compare_tab_id)] = saved
+        self._dirty_halves[str(compare_tab_id)] = set(dirty)
         self._compare_tab_ids.add(str(compare_tab_id))
 
-    def _set_saved_state(self, compare_tab_id, saved):
-        """Update the 'saved' flag for a compare tab. Uses an in-memory
-        cache to avoid redundant JSON writes."""
+    @staticmethod
+    def _entry_dirty(entry):
+        """Dirty-halves set from a persisted state entry. Entries written
+        by older plugin versions have no 'dirty' key -- derive it from the
+        legacy boolean 'saved' flag: unsaved -> both halves dirty (the old
+        save always synced both sides, so this maps the old behavior 1:1
+        onto the new selective sync)."""
+        if not isinstance(entry, dict):
+            return set()
+        raw = entry.get('dirty')
+        if raw is None:
+            return set() if entry.get('saved', True) else {'a', 'b'}
+        return {h for h in raw if h in ('a', 'b')}
+
+    def _get_dirty_halves(self, compare_tab_id):
+        """Return the set of halves with unsaved edits for a compare tab
+        ('a' = primary/left, 'b' = secondary/right). Serves the in-memory
+        cache; on a cache miss falls back to the persisted state (with
+        legacy migration) and populates the cache."""
         key = str(compare_tab_id)
-        if self._saved_cache.get(key) == saved:
-            return
-        self._saved_cache[key] = saved
+        cached = self._dirty_halves.get(key)
+        if cached is not None:
+            return set(cached)
         state = self._load_state()
         session = state['sessions'].get(self._current_session_key, {})
-        if key in session:
-            session[key]['saved'] = saved
+        dirty = self._entry_dirty(session.get(key))
+        self._dirty_halves[key] = set(dirty)
+        self._saved_cache[key] = not dirty
+        return set(dirty)
+
+    def _update_dirty_state(self, compare_tab_id, dirty_halves):
+        """Single write path for the saved/dirty state of a compare tab.
+        'dirty_halves' is a subset of {'a','b'} naming the halves with
+        unsaved edits; the legacy boolean 'saved' flag is kept in sync
+        (True iff no half is dirty). Cache-guarded so on_change firing on
+        every keystroke doesn't hit the disk -- only an actual state
+        change (clean half gets edited / dirty half gets synced) rewrites
+        the JSON."""
+        key = str(compare_tab_id)
+        dirty_halves = {h for h in dirty_halves if h in ('a', 'b')}
+        if self._dirty_halves.get(key) == dirty_halves:
+            return
+        self._dirty_halves[key] = set(dirty_halves)
+        saved = not dirty_halves
+        state = self._load_state()
+        session = state['sessions'].get(self._current_session_key, {})
+        entry = session.get(key)
+        if isinstance(entry, dict):
+            entry['dirty'] = sorted(dirty_halves)
+            entry['saved'] = saved
             self._save_state(state)
+        self._saved_cache[key] = saved
 
     def _unregister_compare_tab(self, compare_tab_id):
         """Remove a compare tab from the persisted state. Returns the
@@ -815,6 +875,9 @@ class Command:
                 del state['sessions'][self._current_session_key]
             self._save_state(state)
             self._compare_tab_ids.discard(key)
+            # Drop the in-memory state caches for this tab.
+            self._saved_cache.pop(key, None)
+            self._dirty_halves.pop(key, None)
         return entry
 
     def _get_orig_tab_ids(self, compare_tab_id):
@@ -1215,6 +1278,10 @@ class Command:
         """Fires immediately on every keystroke. Used for:
         - Resetting the compare tab title color from green to default (red)
           when the user makes changes (indicating unsaved edits).
+        - Marking the edited HALF dirty ('a' = primary/left, 'b' =
+          secondary/right) so on_save_pre later syncs ONLY that half back
+          to its original tab -- clean halves and their originals are
+          never touched by save.
         - Persisting the 'unsaved' state so it survives restarts.
 
         Uses on_change (not on_change_slow) because on_change_slow has a
@@ -1241,9 +1308,21 @@ class Command:
         else:
             # Real user edit -- reset title color to default (red).
             ed_self.set_prop(ct.PROP_TAB_COLOR_FONT, ct.COLOR_NONE)
+            # Remember WHICH half was edited ('a' = primary/left,
+            # 'b' = secondary/right) so on_save_pre syncs only the dirty
+            # halves instead of always rewriting both originals. The
+            # 'copy hunk left/right' commands also land here: their
+            # insert/delete on the target half fires on_change with that
+            # half as ed_self, so merged hunks are tracked too.
+            h_self = ed_self.get_prop(ct.PROP_HANDLE_SELF)
+            h_primary = ed_self.get_prop(ct.PROP_HANDLE_PRIMARY)
+            half = 'a' if h_self == h_primary else 'b'
+            halves = self._get_dirty_halves(tab_id)
+            halves.add(half)
             # Persist the unsaved state so on_start2 can restore the
-            # correct color after restart.
-            self._set_saved_state(tab_id, False)
+            # correct color after restart. Cache-guarded: only the first
+            # edit of a clean half writes to disk.
+            self._update_dirty_state(tab_id, halves)
 
     def on_change_slow(self, ed_self):
         """Fires after the user edits and a short pause passes. Used only
@@ -1254,16 +1333,27 @@ class Command:
 
     def on_save_pre(self, ed_self):
         """Intercept Ctrl+S in a compare tab. Instead of saving the untitled
-        compare tab to disk (which would show a Save dialog), sync both
-        halves' content back to the original tabs and block the save.
+        compare tab to disk (which would show a Save dialog), sync the DIRTY
+        halves' content back to their original tabs and block the save.
         Returns False to block the default save behavior.
 
+        Only halves with unsaved edits (tracked per half by on_change /
+        _update_dirty_state) are synced -- a clean half is left alone, so
+        its original tab is not rewritten (no pointless replace_lines undo
+        step, no disk write, no clobbering of edits the original may have
+        received outside the compare view). With NO dirty half at all, the
+        save is a complete no-op: nothing is synced, the tab just stays
+        green. If only one half is dirty, only that half's original is
+        synced and saved.
+
         On successful sync, the compare tab's title font is colored green
-        to indicate 'synced'. The color is reset to COLOR_NONE (which
-        CudaText re-colors red) when the user edits again -- see on_change_slow.
-        We do NOT clear PROP_MODIFIED, because that would prevent CudaText's
-        session auto-save/restore from persisting the compare tab's content
-        across restarts."""
+        to indicate 'synced' -- but only once no dirty half remains (if a
+        dirty half failed to sync, e.g. its original tab was closed, the
+        tab correctly stays red). The color is reset to COLOR_NONE (which
+        CudaText re-colors red) when the user edits again -- see
+        on_change. We do NOT clear PROP_MODIFIED, because that would
+        prevent CudaText's session auto-save/restore from persisting the
+        compare tab's content across restarts."""
         tab_id = ed_self.get_prop(ct.PROP_TAB_ID)
         if not self._is_compare_tab(tab_id):
             return  # not a compare tab -- let CudaText handle normally
@@ -1280,6 +1370,23 @@ class Command:
         if job is not None:
             self._cancel_job(job)
 
+        # Which halves carry unsaved edits? Only those get synced.
+        dirty = self._get_dirty_halves(tab_id)
+        if not dirty:
+            # Neither half is dirty: nothing to sync. The old behavior
+            # re-synced and re-saved BOTH files on every Ctrl+S (and on
+            # the "Save changes?" prompt of a closing tab) -- pure waste.
+            # Clear any pending suppress counter so a later real edit is
+            # not swallowed by it, keep the title green, and tell the
+            # user why nothing was saved.
+            self._suppress_change.pop(tab_id_str, None)
+            self._update_dirty_state(tab_id, set())  # repair stale state
+            ed_self.set_prop(ct.PROP_TAB_COLOR_FONT, 0x00A000)  # green
+            ct.msg_status(_('Differ: no unsaved changes'))
+            # Block the default save (which would show a Save dialog for
+            # the untitled compare tab).
+            return False
+
         # Get both split editors.
         a_ed = ct.Editor(ed_self.get_prop(ct.PROP_HANDLE_PRIMARY))
         b_ed = ct.Editor(ed_self.get_prop(ct.PROP_HANDLE_SECONDARY))
@@ -1287,25 +1394,38 @@ class Command:
         # Look up the original tab IDs from the persisted state.
         orig_a_id, orig_b_id = self._get_orig_tab_ids(tab_id)
 
-        synced_any = False
-        if orig_a_id is not None:
-            if self._sync_to_original_by_id(orig_a_id, a_ed.get_text_all(ends=True)):
-                synced_any = True
-        if orig_b_id is not None:
-            if self._sync_to_original_by_id(orig_b_id, b_ed.get_text_all(ends=True)):
-                synced_any = True
+        # Sync ONLY the dirty halves (short-circuit: a clean half's text
+        # is not even extracted, and its original is not searched for).
+        synced_a = ('a' in dirty and orig_a_id is not None and
+                    self._sync_to_original_by_id(
+                        orig_a_id, a_ed.get_text_all(ends=True)))
+        synced_b = ('b' in dirty and orig_b_id is not None and
+                    self._sync_to_original_by_id(
+                        orig_b_id, b_ed.get_text_all(ends=True)))
 
-        if synced_any:
-            # Color the tab title font green to indicate 'synced'.
-            # Do NOT clear PROP_MODIFIED -- that would break session
-            # auto-save/restore for the compare tab.
-            ed_self.set_prop(ct.PROP_TAB_COLOR_FONT, 0x00A000)  # green
-            # Persist the saved state so on_start2 can restore green
-            # color after restart.
-            self._set_saved_state(tab_id, True)
+        if synced_a or synced_b:
             # Clear any pending suppress counter -- save overrides the
             # initial-creation suppress.
-            self._suppress_change.pop(str(tab_id), None)
+            self._suppress_change.pop(tab_id_str, None)
+
+            # Drop the synced halves from the dirty set. A dirty half
+            # whose sync failed (e.g. its original tab is gone) stays
+            # dirty, so the tab title correctly stays red.
+            remaining = set(dirty)
+            if synced_a:
+                remaining.discard('a')
+            if synced_b:
+                remaining.discard('b')
+
+            # Green only when BOTH halves are synced; while any half is
+            # still unsaved the tab must stay red.
+            if remaining:
+                ed_self.set_prop(ct.PROP_TAB_COLOR_FONT, ct.COLOR_NONE)
+            else:
+                ed_self.set_prop(ct.PROP_TAB_COLOR_FONT, 0x00A000)  # green
+            # Persist the state (legacy 'saved' flag + dirty halves) so
+            # on_start2 can restore the correct color after restart.
+            self._update_dirty_state(tab_id, remaining)
             # Auto-refresh diff markers so the user sees updated
             # highlights without needing to click Refresh manually.
             # self._refresh_ex(ed_self)  # automatic -- no dialog
@@ -1410,8 +1530,16 @@ class Command:
             except (ValueError, TypeError):
                 pass
             self._compare_tab_ids.add(tab_id_str)
-            # Populate the saved-state cache from disk.
-            self._saved_cache[tab_id_str] = entry.get('saved', True)
+            # Populate the saved/dirty-state caches from disk. Entries
+            # written by older plugin versions have no 'dirty' key --
+            # _entry_dirty maps the legacy 'saved' flag instead (unsaved
+            # -> both halves dirty, so the first Ctrl+S after upgrade
+            # syncs both sides, exactly like the old always-sync-both
+            # behavior).
+            dirty = self._entry_dirty(entry)
+            self._dirty_halves[tab_id_str] = dirty
+            saved = not dirty
+            self._saved_cache[tab_id_str] = saved
             
             # Find an editor for this compare tab and re-apply diff markers.
             # if the user have a lot of big diff tabs they will all run at the same time and cudatext will hang for a moment, let stop diffing after restart, if the user is still interested in the compare then a simple click to refresh is not bad experience anyway
@@ -1421,8 +1549,8 @@ class Command:
             #         self._refresh_ex(e)
             #         break
                     
-            # Re-apply the title color based on the persisted 'saved' flag.
-            if entry.get('saved', True):
+            # Re-apply the title color: green only when no half is dirty.
+            if saved:
                 self._apply_color_to_tab(tab_id_str, 0x00A000)  # green
         # Re-subscribe to on_scroll event if sync_scroll is enabled.
         if self.cfg.get('sync_scroll') and self.scroll.tab_id:
@@ -3137,7 +3265,9 @@ class Command:
         # During app exit, keep the state entry and autostart subscription
         # so compare tabs persist restarts and the plugin auto-loads.
         # Re-register since we already unregistered above, preserving the
-        # saved state so on_start2 can restore the correct title color.
+        # saved/dirty state (per-half dirty flags + legacy 'saved' flag)
+        # so on_start2 can restore the correct title color and a restart
+        # save still syncs only the halves that were dirty before exit.
         if getattr(self, '_app_exiting', False):
             self._register_compare_tab(
                 tab_id,
@@ -3146,7 +3276,8 @@ class Command:
                 entry.get('primary_orig_name', ''),
                 entry.get('secondary_orig_name', ''),
                 self._current_session_key,
-                entry.get('saved', True)
+                entry.get('saved', True),
+                entry.get('dirty')
             )
             return
 
