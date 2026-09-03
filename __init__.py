@@ -53,9 +53,9 @@ U_PREFIX = 'untitled:'
 #          The lock/RO pair is released ONLY after the compare finished
 #          AND everything is painted (or the compare was cancelled).
 #
-#   False: pre-lock behavior — the editors stay fully editable while
-#          the engine runs, and only the paint burst is batched under
-#          EDACTION_LOCK (see _paint_compare_events).
+#   False: pre-lock behavior — the editors stay fully editable (and
+#          paintable) for the whole compare: no kick-off lock, no
+#          read-only. The paint phase runs unlocked too.
 #
 # The synchronous (Python-algorithm) mode never takes this lock: it
 # runs inline on the main thread, so no keystroke can land mid-compare
@@ -653,9 +653,9 @@ class _CompareJob:
     'editor_lock' carries the whole-compare editor lock state while
     LOCK_EDITORS_WHILE_COMPARING is on and a background compare is
     running: None while nothing is held, otherwise a dict
-    {'a': [locked?, original_ro], 'b': [...]} recording per half what
-    was acquired, so _release_compare_editors can restore exactly that
-    (and only once -- the release is idempotent).
+    {'a': original_ro, 'b': original_ro} recording per half the
+    PROP_RO value the lock replaced, so _release_compare_editors can
+    restore exactly that (and only once -- the release is idempotent).
     """
 
     __slots__ = (
@@ -1650,13 +1650,12 @@ class Command:
             each half shows the 'busy' placeholder (hourglass), which is
             what tells the user a compare is running.
 
-        Each half is acquired independently and exception-safe: a half
-        whose handle died (or an old CudaText build without
-        EDACTION_LOCK) still gets its RO part — the write-block matters
-        more than the visual. What was actually acquired is recorded in
-        job.editor_lock as {'a': [locked?, original_ro], 'b': [...]} and
-        released EXACTLY once by _release_compare_editors, no matter how
-        the compare ends.
+        Each half is acquired independently and dead-handle-safe: the
+        get_prop/set_prop probe raises for a dead handle, and that half
+        is simply skipped (nothing acquired, nothing to release). The
+        original PROP_RO values are recorded in job.editor_lock as
+        {'a': original_ro, 'b': original_ro} and restored EXACTLY once
+        by _release_compare_editors, no matter how the compare ends.
         """
         if not LOCK_EDITORS_WHILE_COMPARING:
             return
@@ -1667,25 +1666,20 @@ class Command:
                 e.set_prop(ct.PROP_RO, True)
             except Exception:
                 continue  # dead handle: nothing acquired for this half
-            rec = [False, orig_ro]
-            try:
-                e.action(ct.EDACTION_LOCK)
-                rec[0] = True
-            except Exception:
-                pass  # no EDACTION_LOCK: RO alone stays
-            state[half] = rec
+            e.action(ct.EDACTION_LOCK)
+            state[half] = orig_ro
         if state:
             job.editor_lock = state
 
     def _release_compare_editors(self, job):
         """Release what _lock_compare_editors acquired: restore each
-        half's original PROP_RO value and EDACTION_UNLOCK the halves
-        that were locked. Idempotent (guarded by job.editor_lock, which
-        is cleared first), so EVERY abandonment path can call it
-        without double-unlocking the counted paint lock: normal
-        completion, engine error, cancel (user command / tab close /
-        app exit / save-before-close), a stale callback arriving after
-        the cancel, an exception mid-paint.
+        half's original PROP_RO value and EDACTION_UNLOCK both halves.
+        Idempotent (guarded by job.editor_lock, which is cleared
+        first), so EVERY abandonment path can call it without
+        double-unlocking the counted paint lock: normal completion,
+        engine error, cancel (user command / tab close / app exit /
+        save-before-close), a stale callback arriving after the cancel,
+        an exception mid-paint.
 
         Per half, read-only is restored BEFORE the unlock so the
         repaint that the unlock triggers shows the finished compare
@@ -1698,19 +1692,16 @@ class Command:
             return
         job.editor_lock = None  # idempotency guard: release exactly once
         for half, e in (('a', job.a_ed), ('b', job.b_ed)):
-            rec = state.get(half)
-            if rec is None:
+            if half not in state:
                 continue
-            locked, orig_ro = rec
             try:
-                e.set_prop(ct.PROP_RO, orig_ro)
+                e.set_prop(ct.PROP_RO, state[half])
             except Exception:
                 pass
-            if locked:
-                try:
-                    e.action(ct.EDACTION_UNLOCK)
-                except Exception:
-                    pass
+            try:
+                e.action(ct.EDACTION_UNLOCK)
+            except Exception:
+                pass  # dead handle: the tab is already gone
 
     def _cancel_job(self, job):
         """Cancel one in-flight background compare job: mark it stale (so
@@ -2145,94 +2136,24 @@ class Command:
                                        _profiling_enabled_here)
 
     def _paint_compare_events(self, job, opcodes=None):
-        """Paint a compare's events into both editor halves, with the
-        whole mutation burst batched under EDACTION_LOCK.
-
-        Thin, exception-safe wrapper around
-        _paint_compare_events_locked (the actual event loop): locks
-        every half that is not ALREADY locked for the whole compare
-        (job.editor_lock -- the background mode's kick-off lock) before
-        any marker/gap/decor/bookmark call and unlocks those halves in a
-        finally block, so the lock can never leak -- not via the 'no
-        differences found' early return, not via an exception
-        mid-loop. EDACTION_LOCK/UNLOCK is a counted paint lock per
-        editor, so every lock here is paired with an unlock on the SAME
-        editor no matter how the paint ends. Halves already under the
-        compare-level lock are NOT re-locked: the burst is batched by
-        that lock, and skipping the inner pair means exactly ONE
-        repaint when the compare-level lock lifts (its EDACTION_UNLOCK
-        is the one that invalidates).
-
-        Why the paint burst is locked at all: EDACTION_LOCK maps to the
-        editor's BeginUpdate -- a PAINT lock only. It does not block
-        typing and does not defer on_change events. The paint phase is
-        the actual burst of editor mutations -- in CudaText every
-        attr(MARKERS_ADD)/gap(GAP_ADD)/decor(DECOR_SET) call ends with
-        Ed.Update -- so this window is where batching pays off: ONE
-        repaint per editor when the lock lifts, instead of one per
-        marker. For the synchronous (Python) mode the lock also covers
-        the algorithm, which runs lazily inside the event loop --
-        harmless: the main thread doesn't pump messages mid-loop, so
-        the placeholder screen never shows. For the background
-        (native) mode the engine ran BEFORE this wrapper is called;
-        with LOCK_EDITORS_WHILE_COMPARING the halves are already locked
-        for the whole run (RO blocks typing), and without it this
-        wrapper covers exactly 'compare finished -> result rendered'.
-
-        The 'No differences found' dialog is shown AFTER the unlock:
-        modal dialogs pump the message loop, and painting a locked
-        editor renders the busy placeholder -- it would flash behind
-        the dialog. _paint_compare_events_locked returns True when
-        that dialog is due. (In the background+locked case the halves
-        stay busy behind the dialog until _on_native_diff_done releases
-        the compare-level lock right after this call returns.)
-
-        Old CudaText builds without EDACTION_LOCK degrade
-        gracefully: the lock call raises, the paint runs unlocked,
-        exactly the previous behavior.
-        """
-        a_ed = job.a_ed
-        b_ed = job.b_ed
-        outer_lock = job.editor_lock or {}
-        locked = []
-        show_nodiffs_dialog = False
-        try:
-            for half, e in (('a', a_ed), ('b', b_ed)):
-                if half in outer_lock:
-                    # Already locked for the whole compare (kick-off):
-                    # that lock batches this burst too.
-                    continue
-                try:
-                    e.action(ct.EDACTION_LOCK)
-                except Exception:
-                    # Missing EDACTION_LOCK (old build) or dead editor
-                    # handle: paint the rest unlocked (previous
-                    # behavior) -- do not lock a partial pair either.
-                    break
-                locked.append(e)
-            show_nodiffs_dialog = self._paint_compare_events_locked(
-                job, opcodes)
-        finally:
-            for e in locked:
-                try:
-                    e.action(ct.EDACTION_UNLOCK)
-                except Exception:
-                    pass
-        if show_nodiffs_dialog:
-            t = _('No differences found (with current ignore options).')
-            ct.msg_box(t, ct.MB_OK)
-
-    def _paint_compare_events_locked(self, job, opcodes=None):
-        """Consume the Differ's event generator and paint every event.
-        Runs with both editors paint-locked (see
-        _paint_compare_events). Returns True when the caller should
-        show the 'No differences found (with current ignore options)'
-        dialog after unlocking; False otherwise.
+        """Consume the Differ's event generator and paint every event
+        into both editor halves.
 
         Shared by both compare modes: the synchronous mode (Python
         algorithms) calls it directly from _refresh_ex; the background
         mode calls it from _on_native_diff_done, passing the opcodes the
         engine produced on its background thread.
+
+        Locking: this method takes NO lock of its own. When the whole-
+        compare lock is held (job.editor_lock -- the background mode's
+        kick-off lock, see _lock_compare_editors), the whole burst runs
+        under it already and the single EDACTION_UNLOCK that releases it
+        repaints everything in one pass. When it is not held (sync mode
+        always; background mode with LOCK_EDITORS_WHILE_COMPARING off),
+        the paint runs unlocked: every attr/gap/decor call repaints by
+        itself, and the bookmark appends -- which do NOT repaint on
+        their own -- are followed by an explicit EDACTION_UPDATE pair
+        (see the end of this method).
 
         'job' carries everything the paint phase needs (editor halves,
         colors, wrap state, overview, dialog flag). 'opcodes' is the
@@ -2554,11 +2475,7 @@ class Command:
             # early path above: clear the diffmap, skip bookmarks and
             # overview (there is nothing to show), and tell the user
             # -- the compare looks 'empty' otherwise and it is not
-            # obvious whether the plugin even ran. The dialog itself
-            # is deferred to the CALLER (_paint_compare_events) which
-            # shows it after the editors are unlocked: modal dialogs
-            # pump the message loop, and painting a locked editor
-            # renders the 'busy' placeholder screen behind them.
+            # obvious whether the plugin even ran.
             # Same convention as the raw-identical early path in
             # _refresh_ex: the dialog only appears for the initial
             # compare and manual refresh; automatic refreshes
@@ -2566,20 +2483,17 @@ class Command:
             # pestering the user.
             self.diff.diffmap = []
             Profiler.stop('refresh')
-            return show_dialog
+            if show_dialog:
+                ct.msg_box(
+                    _('No differences found (with current ignore options).'),
+                    ct.MB_OK)
+            return
 
         # Append all collected bookmarks in sorted order using
         # BOOKMARK2_APPEND (much faster than BOOKMARK2_SET — skips
         # duplicate search, sorting, event firing, and repainting).
         # BOOKMARK2_APPEND requires bookmarks to be added in ascending
-        # line order, so we sort first. No forced repaint after the
-        # appends: BOOKMARK2_APPEND doesn't repaint by itself, but
-        # this whole paint phase runs with both editors locked (see
-        # _paint_compare_events), and the EDACTION_UNLOCK there
-        # invalidates both editors and repaints everything in one
-        # pass -- a forced EDACTION_UPDATE here would be redundant
-        # and on Windows (synchronous Repaint) would paint the
-        # 'busy' placeholder screen mid-lock.
+        # line order, so we sort first.
         Profiler.start('paint:bookmark')
         pending_bkm_a.sort()
         pending_bkm_b.sort()
@@ -2592,6 +2506,23 @@ class Command:
                           nkind=nk, text='', auto_del=True,
                           show=False, tag=DIFF_TAG)
         Profiler.stop('paint:bookmark')
+
+        # BOOKMARK2_APPEND doesn't repaint on its own. When the halves
+        # are NOT already locked for the whole compare (job.editor_lock
+        # -- sync mode always; background mode with
+        # LOCK_EDITORS_WHILE_COMPARING off), force the repaint of both
+        # so the new bookmark icons show up in the gutter. When they
+        # ARE locked, skip it: the EDACTION_UNLOCK that releases the
+        # compare-level lock right after this paint invalidates both
+        # editors and repaints everything in one pass -- a forced
+        # EDACTION_UPDATE under the lock would be redundant, and on
+        # Windows (synchronous Repaint) would paint the 'busy'
+        # placeholder screen mid-lock.
+        outer_lock = job.editor_lock or {}
+        if 'a' not in outer_lock:
+            a_ed.action(ct.EDACTION_UPDATE)
+        if 'b' not in outer_lock:
+            b_ed.action(ct.EDACTION_UPDATE)
 
         # Repaint the overview with the collected line states and gaps.
         # repaint_static() rebuilds the static bitmap, then paint()
@@ -2611,7 +2542,6 @@ class Command:
             Profiler.stop('paint:overview')
 
         Profiler.stop('refresh')
-        return False
 
     def _on_native_diff_done(self, job, opcodes):
         """diff_proc completion callback for a background line-level
@@ -2800,12 +2730,8 @@ class Command:
         # Force CudaText to refresh its internal WrapInfo structure before
         # we query it. After text changes CudaText usually detects the
         # change automatically, but not always -- EDACTION_UPDATE with
-        # param1="1" forces it. Wrapped in try/except in case the constant
-        # or action is unavailable in an older CudaText build.
-        try:
-            ed.action(ct.EDACTION_UPDATE, "1")
-        except Exception:
-            pass
+        # param1="1" forces it.
+        ed.action(ct.EDACTION_UPDATE, "1")
         try:
             info = ed.get_wrapinfo()
         except Exception:
@@ -3382,6 +3308,30 @@ class Command:
                 command=bool(get_opt('ignoreopt.' + key, False)))
             ct.menu_proc(item, ct.MENU_SET_ENABLED, command=is_compare)
 
+        # Separator + the cancel commands at the very bottom, below
+        # everything else. Mirrors the 'Differ\Cancel compare' and
+        # 'Differ\Cancel all compares' plugin commands: they stop an
+        # in-flight background compare (engine told to stop, editors
+        # unlocked + made writable again). 'Cancel compare' acts on
+        # THIS tab, 'Cancel all compares' on every compare tab. Both
+        # are enabled only while a compare is actually running; the
+        # menu is rebuilt on every right-click, so the enabled state
+        # is always fresh.
+        ct.menu_proc(self.compare_menu, ct.MENU_ADD, caption='-')
+        cur_tab_id_str = str(cur_ed.get_prop(ct.PROP_TAB_ID))
+        self.menuid_cancel = ct.menu_proc(self.compare_menu, ct.MENU_ADD,
+            command='module=cuda_differ;cmd=cancel_compare;',
+            caption=_('Cancel compare')
+            )
+        ct.menu_proc(self.menuid_cancel, ct.MENU_SET_ENABLED,
+            command=cur_tab_id_str in self._jobs)
+        self.menuid_cancel_all = ct.menu_proc(self.compare_menu, ct.MENU_ADD,
+            command='module=cuda_differ;cmd=cancel_all_compares;',
+            caption=_('Cancel all compares')
+            )
+        ct.menu_proc(self.menuid_cancel_all, ct.MENU_SET_ENABLED,
+            command=bool(self._jobs))
+
     def tabmenu_chooser(self):
         """Launch 'Compare with...' via a 100ms timer (needed because menu
         callbacks can't call dlg_file directly)."""
@@ -3458,6 +3408,62 @@ class Command:
             id = ct.CARET_SET_ONE if n == 0 else ct.CARET_ADD
             eds[fc].set_caret(0, dif[y1], 0, dif[y2], id=id)
 
+    def on_close_pre(self, ed_self: ct.Editor):
+        """Fires when any tab is about to close, BEFORE CudaText reads
+        the tab's modified state -- i.e. before it would show the
+        'Save changes to ...?' dialog (the event can also cancel the
+        close by returning False; we never do).
+
+        A diff tab is untitled and holds no real file on disk, and its
+        two halves are deliberately kept PROP_MODIFIED=True so
+        CudaText's session keeps the tab (including the SECOND half's
+        text -- the session file only persists a split tab's secondary
+        editor when its modified flag is set). The side effect: closing
+        a diff tab always asked 'Save changes?' even when nothing needs
+        syncing.
+
+        The plugin tracks the REAL unsaved state itself (per-half dirty
+        flags -- see _get_dirty_halves). So here, when NEITHER half is
+        dirty, we clear PROP_MODIFIED on both halves: CudaText's
+        subsequent modified check then reads False and the tab closes
+        silently, no dialog. When a half IS dirty (unsynced edits), the
+        flags are left True and the dialog shows as usual -- the user
+        can still choose to run the Ctrl+S sync path from it.
+
+        Single-tab close fires this once (for the focused half); app
+        exit fires it for EVERY half of every tab, then -- if the tab
+        really closes -- on_close (also per half). on_close's exit
+        branch puts the halves back to PROP_MODIFIED=True before
+        CudaText writes the session, so restart-restore is unaffected
+        by the clearing done here.
+
+        Residual edge case: if ANOTHER plugin cancels the close after
+        we cleared the flags, the tab stays open with Modified=False
+        until the next edit (any edit re-sets it) or the app exit
+        (on_close restores it). No session data can be lost by that
+        alone: only a crash before any of those would save the session
+        without the second half's text.
+        """
+        tab_id = ed_self.get_prop(ct.PROP_TAB_ID)
+        if not self._is_compare_tab(tab_id):
+            return  # not a compare tab -- CudaText handles it normally
+        if self._get_dirty_halves(tab_id):
+            # Dirty half(es): unsynced edits exist -- keep the dialog.
+            return
+        # Clean diff tab: suppress the save dialog. Clear the flag on
+        # BOTH halves -- CudaText treats a split tab as modified when
+        # EITHER half is modified.
+        try:
+            a_ed = ct.Editor(ed_self.get_prop(ct.PROP_HANDLE_PRIMARY))
+            b_ed = ct.Editor(ed_self.get_prop(ct.PROP_HANDLE_SECONDARY))
+        except Exception:
+            return
+        for e in (a_ed, b_ed):
+            try:
+                e.set_prop(ct.PROP_MODIFIED, False)
+            except Exception:
+                pass
+
     def on_close(self, ed_self: ct.Editor):
         """Fires after the close is confirmed. For a compare tab: unregister
         it from the persisted state. If this was the last compare tab,
@@ -3513,6 +3519,22 @@ class Command:
                 entry.get('saved', True),
                 entry.get('dirty')
             )
+            # Put both halves back to PROP_MODIFIED=True. on_close_pre
+            # (which fires for every half before the exit dialogs) may
+            # have cleared the flags on a CLEAN tab to skip the save
+            # dialog -- but the session is written AFTER on_close, and
+            # it only persists a split tab's SECOND half text when that
+            # half is modified. Without this restore, a clean diff tab
+            # would come back after restart with an empty right side.
+            # The tab is closing anyway, so Modified=True here has no
+            # other visible effect.
+            try:
+                for h in (ed_self.get_prop(ct.PROP_HANDLE_PRIMARY),
+                          ed_self.get_prop(ct.PROP_HANDLE_SECONDARY)):
+                    if h:
+                        ct.Editor(h).set_prop(ct.PROP_MODIFIED, True)
+            except Exception:
+                pass
             return
 
         # If no more compare tabs are open in the current session,
