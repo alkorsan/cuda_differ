@@ -673,6 +673,7 @@ class _CompareJob:
         'show_dialog',
         'compare_start',            # kick-off perf_counter()
         'profiling_enabled_here',   # profiling enabled by this compare
+        'profiler_async_token',     # start_async_pair token (engine wait)
         'job_handle',       # engine job handle for the background compare (0 = none)
         'editor_lock',      # whole-compare lock/RO state (see class docstring)
         'stale',            # job dropped (tab closed / app exiting)
@@ -702,6 +703,7 @@ class _CompareJob:
         self.show_dialog = False
         self.compare_start = 0.0
         self.profiling_enabled_here = False
+        self.profiler_async_token = None
         self.job_handle = 0
         self.editor_lock = None
         self.stale = False
@@ -1716,6 +1718,13 @@ class Command:
         self._jobs -- callers pop/clear it themselves, since 'cancel
         one' and 'cancel all' remove from the dict differently."""
         job.stale = True
+        # Close the engine-wait profiling pair: a cancelled compare's
+        # completion callback never fires, so this is the ONLY place the
+        # pair is closed for cancels (tab close / app exit / save /
+        # cancel commands). Token-guarded no-op when the callback (or a
+        # newer kick-off's reset) already handled it.
+        Profiler.stop_async_pair(job.profiler_async_token)
+        job.profiler_async_token = None
         self._release_compare_editors(job)
         if job.job_handle:
             dfn.cancel_async_line_diff(job.job_handle)
@@ -2090,6 +2099,18 @@ class Command:
                 # (The refresh-while-running case was already handled at
                 # the top of _refresh_ex -- by this point no job exists
                 # for this tab.)
+                #
+                # Profile the engine wait BEFORE starting the engine (so
+                # the argument marshalling into the engine job is
+                # included): the pair uses the SAME section names the
+                # synchronous path books its engine time under
+                # (compare:algorithm wrapping line_diff:native_engine),
+                # so the report shows the real bottleneck at the top in
+                # BOTH modes. Closed in _on_native_diff_done / _cancel_job
+                # (every abandonment path); token-guarded, so a late
+                # callback after a cancel cannot double-count.
+                _async_pair = Profiler.start_async_pair(
+                    'compare:algorithm', 'line_diff:native_engine')
                 cb = functools.partial(self._on_native_diff_done, job)
                 job_handle = dfn.start_async_line_diff(
                     job.a_text, job.b_text,
@@ -2099,6 +2120,7 @@ class Command:
                 if job_handle:
                     job.job_handle = job_handle
                     job.in_flight = True
+                    job.profiler_async_token = _async_pair
                     self._jobs[tab_id_str] = job
                     # Editors are locked + read-only for the whole engine
                     # run (kick-off -> fully-rendered result / cancel):
@@ -2115,6 +2137,10 @@ class Command:
                 # and stop (no synchronous fallback -- it would freeze
                 # the UI on exactly the big files the background form
                 # exists for; the next refresh retries in the background).
+                # Close the engine-wait pair now (elapsed covers the
+                # failed start attempt; no report prints on this path, so
+                # the rows are pure bookkeeping hygiene).
+                Profiler.stop_async_pair(_async_pair)
                 msg('diff_proc failed to start the background compare', level=1)
                 _epilogue = False
                 Profiler.stop('refresh')
@@ -2575,6 +2601,18 @@ class Command:
         # This job is finished -- free the per-tab slot first of all.
         if self._jobs.get(job.tab_id_str) is job:
             del self._jobs[job.tab_id_str]
+
+        # Close the engine-wait profiling pair FIRST, before anything
+        # else: its elapsed (kick-off -> now) is booked to
+        # line_diff:native_engine and deducted from 'refresh' BEFORE the
+        # paint sections below open, and it must close on EVERY outcome
+        # (stale / exiting / closed tab / algo-switch re-run / engine
+        # error / normal paint), not just the happy path. Token-guarded:
+        # after a cancel already closed it (or a newer kick-off's reset
+        # wiped the token) this is a no-op, so a late callback cannot
+        # double-count the engine wait.
+        Profiler.stop_async_pair(job.profiler_async_token)
+        job.profiler_async_token = None
 
         try:
             if job.stale:

@@ -533,10 +533,14 @@ class Differ:
         # else: background mode — 'opcodes' is the result the engine's
         # background thread already computed (delivered to
         # Command._on_native_diff_done via the diff_proc callback). The
-        # engine does not run here, so there is no matcher to release
-        # and no compare:algorithm section to time: the engine's own
-        # compute time is invisible to the Python-side profiler (it
-        # burns in Pascal code on another thread).
+        # engine does not run here, so there is no matcher to release.
+        # The engine's compute time IS profiled though: kick-off starts
+        # an async section pair (Profiler.start_async_pair) under the
+        # same names used here in the sync path, closed in the
+        # completion callback / on cancel — so line_diff:native_engine
+        # (and its compare:algorithm wrapper) appear in the report with
+        # the kick-off -> callback wall time instead of the wait being
+        # miscounted as refresh's own work.
 
         # No _realign_opcodes call — the native path renders the engine's
         # hunks faithfully (algo-faithful mode). See docstring for details.

@@ -81,8 +81,14 @@ class Profiler:
     #           section's stop() fires (because the child's elapsed time
     #           is already counted in this section's total — we must not
     #           double-count it as this section's self time).
+    # _async_pending: token -> (outer_name, inner_name, start_time) for
+    #           sections started with start_async_pair() and not yet
+    #           closed — see start_async_pair(). Kept OUT of _stack.
+    # _async_serial: monotonic token source for start_async_pair().
     _stack = []
     _timings = {}
+    _async_pending = {}
+    _async_serial = 0
 
     @classmethod
     def start(cls, name):
@@ -153,12 +159,112 @@ class Profiler:
         finally:
             cls.stop(name)
 
+    # ------------------------------------------------------------------
+    # Async sections (background compare).
+    #
+    # The background line-level compare runs on the engine's own OS
+    # thread between two MAIN-thread moments: kick-off
+    # (start_async_line_diff in Command._refresh_ex) and the completion
+    # callback (Command._on_native_diff_done). A classic start()/stop()
+    # pair cannot span that window: the section would sit open on the
+    # shared _stack across unrelated UI-event sections (nesting them
+    # under it), and any later kick-off's reset() would wipe the stack
+    # out from under it. The async API instead keeps the pending pair
+    # OUT of the shared stack and closes it by TOKEN, so a stale close
+    # (job cancelled / callback arriving after a reset) is a safe no-op
+    # instead of stack corruption.
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def start_async_pair(cls, outer_name, inner_name):
+        """Start a nested (outer wraps inner) section pair that will be
+        closed LATER, from a different call stack — the background
+        compare's engine wait.
+
+        The pair measures wall time from NOW until stop_async_pair()
+        (kick-off -> completion callback): the time the main thread
+        waited for the engine's background thread — engine compute plus
+        thread scheduling and callback-queue latency. Command._refresh_ex
+        calls it with the SAME names the synchronous path uses
+        ('compare:algorithm', 'line_diff:native_engine'), so profiling
+        reports are comparable across compare modes and the real
+        bottleneck shows at the top of the report in both.
+
+        Accounting on close mirrors a nested pair of stop() calls:
+          - inner section: total/count/max/SELF += elapsed (the leaf —
+            the real bottleneck row, e.g. line_diff:native_engine)
+          - outer section: total/count/max += elapsed, self untouched
+            (a pure wrapper — ~0 self, exactly like the sync path)
+          - the innermost section open on the shared stack (the
+            'refresh' the pair was started under) has its SELF
+            decremented by elapsed, so the wait is never miscounted as
+            the wrapper's own work.
+
+        Returns an opaque token for stop_async_pair(); None when
+        profiling is disabled (stop_async_pair(None) is a no-op).
+        """
+        if not cls.enabled:
+            return None
+        cls._async_serial += 1
+        token = cls._async_serial
+        cls._async_pending[token] = (outer_name, inner_name,
+                                     time.perf_counter())
+        for name in (outer_name, inner_name):
+            if name not in cls._timings:
+                cls._timings[name] = [0.0, 0, 0.0, 0.0]
+        return token
+
+    @classmethod
+    def stop_async_pair(cls, token):
+        """Close a pair started by start_async_pair(token).
+
+        Idempotent and safe on every abandonment path: the token is
+        consumed on the first close, so a second call (a cancel that
+        already closed the pair, followed by the completion callback
+        arriving anyway) is a no-op — the engine wait is never
+        double-counted. A token wiped by reset() (a newer compare's
+        kick-off) is likewise a no-op, so a LATE callback cannot corrupt
+        the newer compare's timings. See start_async_pair() for the
+        accounting rules.
+        """
+        if token is None:
+            return
+        rec = cls._async_pending.pop(token, None)
+        if rec is None:
+            return  # already closed, or wiped by reset()
+        if not cls.enabled:
+            return  # disabled mid-run: consume the token, book nothing
+        outer_name, inner_name, start_time = rec
+        elapsed = time.perf_counter() - start_time
+        for name in (outer_name, inner_name):
+            if name not in cls._timings:
+                cls._timings[name] = [0.0, 0, 0.0, 0.0]
+            row = cls._timings[name]
+            row[0] += elapsed       # total
+            row[1] += 1            # count
+            if elapsed > row[2]:
+                row[2] = elapsed   # max
+        # Inner section: the leaf — its elapsed is its own self time.
+        cls._timings[inner_name][3] += elapsed
+        # Deduct from the innermost OPEN section's self — the 'refresh'
+        # the pair was started under — exactly like a nested stop()
+        # would, so the engine wait is not counted as refresh's own work.
+        if cls._stack:
+            parent_name = cls._stack[-1][0]
+            if parent_name not in cls._timings:
+                cls._timings[parent_name] = [0.0, 0, 0.0, 0.0]
+            cls._timings[parent_name][3] -= elapsed
+
     @classmethod
     def reset(cls):
         """Clear all accumulated timings. Call before a new compare to
-        get a clean report."""
+        get a clean report. Also drops any pending async-section tokens:
+        a compare still in flight (its engine wait pair pending) loses
+        its token, so its eventual callback / cancel closes nothing —
+        a late callback cannot corrupt the NEW compare's timings."""
         cls._timings = {}
         cls._stack = []
+        cls._async_pending = {}
 
     @classmethod
     def report(cls):
@@ -251,6 +357,12 @@ class Profiler:
               ' method; a colon')
         print('      suffix (e.g. char_diff:native_engine) is a CHILD of'
               ' that wrapper.')
+        print('      Background mode: line_diff:native_engine measures'
+              ' kick-off ->')
+        print('      callback wall time (engine compute + scheduling),'
+              ' recorded via')
+        print('      start_async_pair/stop_async_pair outside the section'
+              ' stack.')
         print('      "Untracked time" = wall time NOT inside any profiling'
               ' section \u2014')
         print('      unrelated to the paint:gap section, which is a'
