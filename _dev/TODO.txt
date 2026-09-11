@@ -133,12 +133,12 @@ Standard alignment (default) — a proprietary divide-and-conquer scheme that al
 https://sparkles-docs.pages.dev/research/diff-review/beyond-compare.html
 
 _____________________________________________
-
-use
+when a compare is runing use
 a_ed.action(ct.EDACTION_LOCK); b_ed.action(ct.EDACTION_LOCK)
-
+and only when compare finishes and everything is rendered run
 a_ed.action(ct.EDACTION_UNLOCK); b_ed.action(ct.EDACTION_UNLOCK)
 
+is t good idea? do you have a better idea or a better place to do it?
 
 ____
 canceled: make overview height same as default scrollbar, canceled: it s not necesary
@@ -164,4 +164,15 @@ vscode algo have a bug with space it does not considere it
 add aligne opcode to native algo too like before
 
 rename refresh to recompare
+
+__________________________
+
+
+does cudadiffhistogram.pas and cudadiffmyers.pas both split on \r\n and \r and \n or not?
+does cudadiffhistogram.pas and cudadiffmyers.pas implement DIFF_IGN_* flags in a similar way or are they diferent?
+
+
+
+BREAK_CHARS (G6): uses the WinMerge default ",.;:"  what should i add? should i offer setting to user to edit it?
+
 

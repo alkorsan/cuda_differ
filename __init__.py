@@ -1160,75 +1160,82 @@ class Command:
         ct.ed.set_prop(ct.PROP_EDITORS_LINKED, False)
         ct.ed.set_prop(ct.PROP_SPLIT, ('v', 500))
 
-        # Load each original's content into the two split halves.
         a_ed = ct.Editor(ct.ed.get_prop(ct.PROP_HANDLE_PRIMARY))
         b_ed = ct.Editor(ct.ed.get_prop(ct.PROP_HANDLE_SECONDARY))
-        a_ed.set_text_all(orig_texts[0])
-        b_ed.set_text_all(orig_texts[1])
-
-        # Set a readable combined title (just the basenames/titles, no tab IDs).
-        title0 = os.path.basename(orig_names[0]) if orig_names[0] else _('Untitled')
-        title1 = os.path.basename(orig_names[1]) if orig_names[1] else _('Untitled')
-        ct.ed.set_prop(ct.PROP_TAB_TITLE, 'Diff: {} | {}'.format(title0, title1))
-
-        # Copy editor properties (lexer, newline, encoding, tabs, wrap) from
-        # each original to its corresponding compare half.
-        for ed, props in ((a_ed, orig_props[0]), (b_ed, orig_props[1])):
-            if not props:
-                continue
-            for prop, val in props.items():
-                if val is not None:
-                    try:
-                        ed.set_prop(prop, val)
-                    except Exception:
-                        pass  # some props may not be settable on untitled tabs
-
-        # Register the compare tab by its PROP_TAB_ID with the original
-        # tab IDs and names, plus the session key for grouping.
-        compare_tab_id = ct.ed.get_prop(ct.PROP_TAB_ID)
         try:
-            session_path = ct.app_path(ct.APP_FILE_SESSION) or ''
-        except Exception:
-            session_path = ''
-        session_key = self._session_key(session_path)
-        self._current_session_key = session_key
-        self._register_compare_tab(
-            compare_tab_id,
-            orig_tab_ids[0], orig_tab_ids[1],
-            orig_names[0], orig_names[1],
-            session_key,
-            saved=True)  # initial state: content matches originals = saved
+            a_ed.action(ct.EDACTION_LOCK)
+            b_ed.action(ct.EDACTION_LOCK)
 
-        # Color the tab title green to indicate 'synced' (no unsaved
-        # changes yet -- content is identical to the originals).
-        ct.ed.set_prop(ct.PROP_TAB_COLOR_FONT, 0x00A000)  # green
+            # Set a readable combined title (just the basenames/titles, no tab IDs).
+            title0 = os.path.basename(orig_names[0]) if orig_names[0] else _('Untitled')
+            title1 = os.path.basename(orig_names[1]) if orig_names[1] else _('Untitled')
+            ct.ed.set_prop(ct.PROP_TAB_TITLE, 'Diff: {} | {}'.format(title0, title1))
 
-        # Suppress the next 2 on_change events (one per split half)
-        # because set_text_all triggers on_change, which would reset the
-        # green color to red. The counter is decremented in on_change;
-        # real user edits after this will work normally.
-        self._suppress_change[str(compare_tab_id)] = 2
+            # Copy editor properties (lexer, newline, encoding, tabs, wrap) from
+            # each original to its corresponding compare half.
+            for ed, props in ((a_ed, orig_props[0]), (b_ed, orig_props[1])):
+                if not props:
+                    continue
+                for prop, val in props.items():
+                    if val is not None:
+                        try:
+                            ed.set_prop(prop, val)
+                        except Exception:
+                            pass  # some props may not be settable on untitled tabs
+            
+            # Load each original's content into the two split halves.
+            a_ed.set_text_all(orig_texts[0])
+            b_ed.set_text_all(orig_texts[1])
+            
+            # Register the compare tab by its PROP_TAB_ID with the original
+            # tab IDs and names, plus the session key for grouping.
+            compare_tab_id = ct.ed.get_prop(ct.PROP_TAB_ID)
+            try:
+                session_path = ct.app_path(ct.APP_FILE_SESSION) or ''
+            except Exception:
+                session_path = ''
+            session_key = self._session_key(session_path)
+            self._current_session_key = session_key
+            self._register_compare_tab(
+                compare_tab_id,
+                orig_tab_ids[0], orig_tab_ids[1],
+                orig_names[0], orig_names[1],
+                session_key,
+                saved=True)  # initial state: content matches originals = saved
 
-        # Persistently subscribe to on_start2 so the plugin auto-loads on
-        # next startup to restore compare tabs.
-        self._enable_autostart()
+            # Color the tab title green to indicate 'synced' (no unsaved
+            # changes yet -- content is identical to the originals).
+            ct.ed.set_prop(ct.PROP_TAB_COLOR_FONT, 0x00A000)  # green
 
-        # Track this tab for scroll sync.
-        self.scroll.tab_id.add(compare_tab_id)
-        self.scroll.toggle(self.cfg.get('sync_scroll'))
+            # Suppress the next 2 on_change events (one per split half)
+            # because set_text_all triggers on_change, which would reset the
+            # green color to red. The counter is decremented in on_change;
+            # real user edits after this will work normally.
+            self._suppress_change[str(compare_tab_id)] = 2
 
-        # app sets LastLineOnTop automatically on adding 'gaps', but if file
-        # don't have gaps, we must set it manually.
-        a_ed.set_prop(ct.PROP_LAST_LINE_ON_TOP, True)
-        b_ed.set_prop(ct.PROP_LAST_LINE_ON_TOP, True)
+            # Persistently subscribe to on_start2 so the plugin auto-loads on
+            # next startup to restore compare tabs.
+            self._enable_autostart()
 
-        # if file was in group-2, and now group-2 is empty, set "one group" mode
-        if ct.app_proc(ct.PROC_GET_GROUPING, '') in [ct.GROUPS_2VERT, ct.GROUPS_2HORZ]:
-            e = ct.ed_group(1)
-            if not e:
-                ct.app_proc(ct.PROC_SET_GROUPING, ct.GROUPS_ONE)
+            # Track this tab for scroll sync.
+            self.scroll.tab_id.add(compare_tab_id)
+            self.scroll.toggle(self.cfg.get('sync_scroll'))
 
-        self.refresh()
+            # app sets LastLineOnTop automatically on adding 'gaps', but if file
+            # don't have gaps, we must set it manually.
+            a_ed.set_prop(ct.PROP_LAST_LINE_ON_TOP, True)
+            b_ed.set_prop(ct.PROP_LAST_LINE_ON_TOP, True)
+
+            # if file was in group-2, and now group-2 is empty, set "one group" mode
+            if ct.app_proc(ct.PROC_GET_GROUPING, '') in [ct.GROUPS_2VERT, ct.GROUPS_2HORZ]:
+                e = ct.ed_group(1)
+                if not e:
+                    ct.app_proc(ct.PROC_SET_GROUPING, ct.GROUPS_ONE)
+
+            self.refresh()
+        finally:
+            a_ed.action(ct.EDACTION_UNLOCK)
+            b_ed.action(ct.EDACTION_UNLOCK)
 
     def create_diff(self, txt0, txt1, fn0, fn1):
         """Create a read-only unified-diff tab from two text strings.
