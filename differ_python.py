@@ -205,7 +205,7 @@ class Differ:
 
         The Differ holds NO line lists between compares — neither raw
         text nor line lists. a / b (the line lists) are passed directly
-        to compare() by the caller (Command._refresh_ex), used as
+        to compare() by the caller (Command.refresh_compare), used as
         locals inside compare() to drive the pure-Python matcher +
         the painting split, and dropped when compare() returns.
         Between compares, the Differ holds only config (withdetail /
@@ -428,7 +428,7 @@ class Differ:
             a, b: the two line sequences (lists of strings). The
                 Differ does NOT store them — they are used as locals
                 inside this generator and dropped when it returns.
-                The caller (Command._refresh_ex) builds them fresh on
+                The caller (Command.refresh_compare) builds them fresh on
                 every compare via split_lines_safe(a_text_all) /
                 split_lines_safe(b_text_all), so between compares the
                 Differ holds zero line-list bytes — only config +

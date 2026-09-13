@@ -362,13 +362,13 @@ class Differ:
 
         self.ignore_flags is the DIFF_IGN_* bitmask built by
         differ_native.build_ignore_flags() from the plugin's 'ignoreopt.*'
-        config settings. Command._refresh_ex sets it before each
+        config settings. Command.refresh_compare sets it before each
         compare(); it is applied to BOTH the line-level diff
         (DIF_TEXTS) and the char-level detail diff (DIF_CHARS).
 
         The Differ holds NO text between compares — neither raw text
         nor line lists. a_text / b_text are passed directly to
-        compare() by the caller (Command._refresh_ex), used as locals
+        compare() by the caller (Command.refresh_compare), used as locals
         inside compare() to drive the engine + painting, and dropped
         when compare() returns. Between compares, the Differ holds
         only config (withdetail / diff_algorithm / beautify_alignment /
@@ -456,7 +456,7 @@ class Differ:
             a_text, b_text: raw text strings for the two sides. The
                 Differ does NOT store them — they are used as locals
                 inside this generator and dropped when it returns.
-                The caller (Command._refresh_ex) reads them fresh from
+                The caller (Command.refresh_compare) reads them fresh from
                 the editor tabs (a_ed.get_text_all() / b_ed.get_text_all())
                 on every compare, so between compares the Differ holds
                 zero text bytes — only config + diffmap. This is the

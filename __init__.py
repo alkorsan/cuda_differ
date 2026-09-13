@@ -635,20 +635,20 @@ _migrate_old_option_names()
 class _CompareJob:
     """Context for one compare of one compare tab.
 
-    _refresh_ex fills the job while setting the compare up. With the
+    refresh_compare fills the job while setting the compare up. With the
     native algorithms the line-level diff runs in the engine's
-    background thread: _refresh_ex returns after starting it, and the
+    background thread: refresh_compare returns after starting it, and the
     engine's completion callback (_on_native_diff_done, marshalled to
     the main thread) uses the job to finish the compare -- paint the
     events, set the bookmarks, repaint the overview. With the Python
-    algorithms the paint phase runs inline in _refresh_ex and the job
+    algorithms the paint phase runs inline in refresh_compare and the job
     is just a carrier for the same data.
 
     The snapshot fields (a_text/b_text, lines_a/lines_b) are the texts
     the engine was kicked off with. While a background compare runs,
     LOCK_EDITORS_WHILE_COMPARING keeps both halves locked + read-only,
     so the live editors cannot drift from these snapshots; a refresh
-    that arrives anyway is dropped (see _refresh_ex), never queued.
+    that arrives anyway is dropped (see refresh_compare), never queued.
 
     'editor_lock' carries the whole-compare editor lock state while
     LOCK_EDITORS_WHILE_COMPARING is on and a background compare is
@@ -750,7 +750,7 @@ class Command:
         # In-flight background compares (native algorithms), keyed by
         # compare-tab ID string. One compare per tab at a time; a
         # refresh that arrives while a compare is running is DROPPED
-        # with a status hint (see _refresh_ex) -- the running compare
+        # with a status hint (see refresh_compare) -- the running compare
         # paints against its kick-off snapshots, which cannot drift
         # because LOCK_EDITORS_WHILE_COMPARING keeps the halves
         # read-only for the whole run. Each job carries the engine
@@ -1232,7 +1232,7 @@ class Command:
                 if not e:
                     ct.app_proc(ct.PROC_SET_GROUPING, ct.GROUPS_ONE)
 
-            self.refresh()
+            self.refresh_compare()
         finally:
             a_ed.action(ct.EDACTION_UNLOCK)
             b_ed.action(ct.EDACTION_UNLOCK)
@@ -1276,14 +1276,14 @@ class Command:
         if state == ct.APPSTATE_THEME_SYNTAX:
             self.get_config()
             # each time we change setting using the options editor the state even APPSTATE_THEME_UI fires which triger a refresh , if files are big it take time which is frustrating, if the user needs to refresh then he can do it manualy, lets not auto refresh for him
-            # self._refresh_ex(ct.ed)  # automatic -- no dialog
+            # self.refresh_compare(ct.ed, show_dialog=False)  # automatic -- no dialog
         elif state == ct.EDSTATE_WRAP:
             # Word-wrap mode changed on one of the split halves. The
             # inter-line gaps were sized for the previous wrap state, so
             # we must re-apply them with wrap-aware sizes to keep both
             # sides visually aligned.
             if self._is_compare_tab(ed_self.get_prop(ct.PROP_TAB_ID)):
-                self._refresh_ex(ed_self)  # automatic -- no dialog
+                self.refresh_compare(ed_self, show_dialog=False)  # automatic -- no dialog
 
     def on_scroll(self, ed_self):
         """Forward scroll events to ScrollSplittedTab for synchronized
@@ -1372,7 +1372,7 @@ class Command:
         for auto-refreshing the diff markers if that option is enabled.
         Color/saved-state logic is handled in on_change (immediate)."""
         if self.cfg.get('enable_auto_refresh', False):
-            self._refresh_ex(ed_self)  # automatic -- no dialog
+            self.refresh_compare(ed_self, show_dialog=False)  # automatic -- no dialog
 
     def on_save_pre(self, ed_self):
         """Intercept Ctrl+S in a compare tab. Instead of saving the untitled
@@ -1472,7 +1472,7 @@ class Command:
             self._update_dirty_state(tab_id, remaining)
             # Auto-refresh diff markers so the user sees updated
             # highlights without needing to click Refresh manually.
-            # self._refresh_ex(ed_self)  # automatic -- no dialog
+            # self.refresh_compare(ed_self, show_dialog=False)  # automatic -- no dialog
 
         # Block the default save (which would show a Save dialog for the
         # untitled compare tab).
@@ -1590,7 +1590,7 @@ class Command:
             # for h in ct.ed_handles():
             #     e = ct.Editor(h)
             #     if str(e.get_prop(ct.PROP_TAB_ID)) == tab_id_str:
-            #         self._refresh_ex(e)
+            #         self.refresh_compare(e, show_dialog=False)
             #         break
                     
             # Re-apply the title color: green only when no half is dirty.
@@ -1636,14 +1636,6 @@ class Command:
     def on_tab_menu(self, ed_self):
         """Build the right-click tab context menu (Compare with..., Refresh, etc.)."""
         self.tabmenu_init(ed_self)
-
-    def refresh(self):
-        """Manual refresh (from menu command or context menu). Shows the
-        'identical' dialog if both sides are equal. Only applies to compare
-        tabs managed by this plugin. With the native algorithms the
-        compare runs in a background thread -- the markers are
-        re-applied when it finishes."""
-        self._refresh_ex(ct.ed, show_dialog=True)
 
     def _lock_compare_editors(self, job):
         """Take the whole-compare editor lock for a background compare
@@ -1769,40 +1761,85 @@ class Command:
         self._jobs.clear()
         ct.msg_status(_('Differ: cancelled {} compare(s)').format(n))
 
+    # native_histogram / native_myers only work when cudatext.diff_proc
+    # is present. On older CudaText builds the plugin falls back to the
+    # closest pure-Python algorithm (documented in OPTS_META):
+    #   native_histogram -> hybrid
+    #   native_myers     -> myers
+    _NATIVE_TO_PYTHON_FALLBACK = {
+        'native_histogram': 'hybrid',
+        'native_myers': 'myers',
+    }
+
+    def _resolve_algorithm(self):
+        """Return (effective_algo, use_native, fell_back).
+
+        effective_algo is what the Differ instance should run.
+        use_native is True only when a native algo is configured AND
+        cudatext.diff_proc is available.
+        fell_back is True when the user configured a native algo but
+        the native API is missing, so a Python equivalent is used.
+        """
+        algo = self.cfg.get('diff_algorithm', 'native_histogram')
+        if algo in self._NATIVE_TO_PYTHON_FALLBACK:
+            if dfn._HAS_NATIVE_DIFF:
+                return algo, True, False
+            return self._NATIVE_TO_PYTHON_FALLBACK[algo], False, True
+        return algo, False, False
+
     def _create_differ(self):
         """Create the appropriate Differ instance based on the configured
         algorithm. Returns a differ_native.Differ for native algorithms
         (when the native API is available), or a differ_python.Differ for
         all Python algorithms and as a fallback when native is unavailable.
+
+        When a native algorithm is configured on an old CudaText build
+        without diff_proc, the status bar reports the fallback to the
+        equivalent Python algorithm (native_histogram -> hybrid,
+        native_myers -> myers).
         """
-        algo = self.cfg.get('diff_algorithm', 'native_histogram')
-        if algo in ('native_histogram', 'native_myers') and dfn._HAS_NATIVE_DIFF:
+        algo, use_native, fell_back = self._resolve_algorithm()
+        if use_native:
             ct.msg_status(_("Differ: Using Native Algo {}").format(algo))
             return dfn.Differ()
-        ct.msg_status(_("Differ: Using Python Algo {}").format(algo))
+        if fell_back:
+            configured = self.cfg.get('diff_algorithm', 'native_histogram')
+            ct.msg_status(
+                _('Differ: native API not available — falling back to Python algo {} '
+                  '(configured: {})').format(algo, configured))
+        else:
+            ct.msg_status(_("Differ: Using Python Algo {}").format(algo))
         return dfp.Differ()
 
     def _ensure_correct_differ(self):
         """Check if self.diff matches the configured algorithm type, and
-        swap it if not. Called at the start of _refresh_ex so the Differ
+        swap it if not. Called at the start of refresh_compare so the Differ
         is always the right type before a compare runs. Preserves the
         options (withdetail, beautify_alignment) but NOT the sequences:
         neither Differ holds sequences between compares anymore — both
         the native Differ (compare(a_text, b_text)) and the Python
         Differ (compare(lines_a, lines_b)) take their inputs as
-        parameters at compare() time. _refresh_ex always re-passes fresh
+        parameters at compare() time. refresh_compare always re-passes fresh
         data to compare() right after this swap, before any compare()
-        runs."""
-        algo = self.cfg.get('diff_algorithm', 'native_histogram')
-        want_native = algo in ('native_histogram', 'native_myers') and dfn._HAS_NATIVE_DIFF
+        runs.
+
+        Also applies the native→Python algorithm mapping when the native
+        API is missing, so the Python Differ never receives a
+        'native_*' name it cannot run.
+        """
+        algo, want_native, fell_back = self._resolve_algorithm()
         is_native = isinstance(self.diff, dfn.Differ)
         if want_native == is_native:
-            return  # already the right type
+            # Still refresh the effective algorithm name (handles a
+            # config change between two native algos, or the fallback
+            # mapping on a Python Differ that already exists).
+            self.diff.diff_algorithm = algo
+            return
         # Swap: preserve options only. We do NOT preserve sequences:
         #   - Both differs take their inputs as compare() params
         #     (native: raw texts; Python: line lists). There is nothing
         #     to preserve on the instance.
-        # _refresh_ex always calls compare(...) with fresh state right
+        # refresh_compare always calls compare(...) with fresh state right
         # after this swap, before any compare() runs, so the empty new
         # Differ is fine.
         old_withdetail = getattr(self.diff, 'withdetail', True)
@@ -1811,15 +1848,23 @@ class Command:
         self.diff.withdetail = old_withdetail
         self.diff.beautify_alignment = old_beautify_alignment
         self.diff.diff_algorithm = algo
+        # Fallback status is reported once in refresh_compare when the
+        # resolved algorithm is applied — avoid a duplicate message here.
 
-    def _refresh_ex(self, ed, show_dialog=False):
-        """Core refresh logic. 'ed' is any editor belonging to the compare
-        tab. Only applies to compare tabs managed by this plugin.
+    def refresh_compare(self, ed=None, show_dialog=None):
+        """Unified refresh / re-compare entry point.
 
-        'show_dialog' controls whether the 'two sides are identical' dialog
-        is shown. Automatic refreshes (on_start2, on_change_slow, on_state)
-        pass False to avoid pestering the user; manual refresh and the
-        initial compare pass True.
+        Re-reads both sides of a compare tab, runs the configured diff
+        algorithm, and (re)applies markers, gaps, overview and bookmarks.
+
+        'ed' is any editor belonging to the compare tab. When omitted
+        (plugin menu command / context-menu Refresh), uses the focused
+        editor ct.ed.
+
+        'show_dialog' controls whether the 'two sides are identical'
+        dialog is shown. Automatic refreshes (on_start2, on_change_slow,
+        on_state) pass False to avoid pestering the user; the no-arg
+        menu command and other manual entry points default to True.
 
         With the native algorithms, the line-level diff runs in a
         background thread (the callback form of cudatext.diff_proc):
@@ -1839,7 +1884,9 @@ class Command:
         the editor lock / read-only state. Python algorithms run the
         paint phase inline, synchronously."""
         if ed is None:
-            return
+            ed = ct.ed
+        if show_dialog is None:
+            show_dialog = True  # menu / no-arg call is a manual refresh
         if ed.get_prop(ct.PROP_EDITORS_LINKED):
             return
         tab_id = ed.get_prop(ct.PROP_TAB_ID)
@@ -2018,7 +2065,7 @@ class Command:
                 # of 4× (a_text_all + b_text_all + lines_a +
                 # lines_b-being-built). On a 33k-line / 10MB file
                 # that's a ~3.5MB reduction in the OVERALL peak memory
-                # during _refresh_ex — the peak the user actually sees
+                # during refresh_compare — the peak the user actually sees
                 # when the diff runs.
                 lines_a = split_lines_safe(a_text_all)
                 del a_text_all
@@ -2030,7 +2077,16 @@ class Command:
             self.scroll.toggle(self.cfg.get('sync_scroll'))
 
             self.diff.withdetail = self.cfg.get('compare_with_details')
-            self.diff.diff_algorithm = self.cfg.get('diff_algorithm')
+            # Use the resolved algorithm (native→Python mapping when
+            # cudatext.diff_proc is missing). Do not pass a 'native_*'
+            # name into the pure-Python Differ.
+            _algo, _use_native, _fell_back = self._resolve_algorithm()
+            self.diff.diff_algorithm = _algo
+            if _fell_back:
+                ct.msg_status(
+                    _('Differ: native API not available — falling back to Python algo {} '
+                      '(configured: {})').format(
+                        _algo, self.cfg.get('diff_algorithm', 'native_histogram')))
             self.diff.beautify_alignment = self.cfg.get('beautify_alignment')
             # Ignore options -> diff_proc DIFF_IGN_* bitmask for the
             # native algorithms (applies to BOTH the line-level diff and
@@ -2068,7 +2124,7 @@ class Command:
             # Fill the compare job -- the context the event/paint phase
             # needs. For the native algorithms the line-level diff runs
             # in the engine's background thread (the diff_proc callback
-            # form): _refresh_ex returns right after starting it, and
+            # form): refresh_compare returns right after starting it, and
             # _on_native_diff_done finishes the compare on the main
             # thread when the engine calls back. Python algorithms
             # paint inline here, synchronously.
@@ -2104,7 +2160,7 @@ class Command:
                 # functools.partial carries the job to the callback, so
                 # the engine's completion knows WHICH compare finished.
                 # (The refresh-while-running case was already handled at
-                # the top of _refresh_ex -- by this point no job exists
+                # the top of refresh_compare -- by this point no job exists
                 # for this tab.)
                 #
                 # Profile the engine wait BEFORE starting the engine (so
@@ -2173,7 +2229,7 @@ class Command:
         into both editor halves.
 
         Shared by both compare modes: the synchronous mode (Python
-        algorithms) calls it directly from _refresh_ex; the background
+        algorithms) calls it directly from refresh_compare; the background
         mode calls it from _on_native_diff_done, passing the opcodes the
         engine produced on its background thread.
 
@@ -2240,7 +2296,7 @@ class Command:
         # set_seqs() call, no persistent storage on either Differ between
         # compares -- see differ_native.Differ and differ_python.Differ).
         # Native takes raw texts (the job's snapshots); Python takes line
-        # lists (split in _refresh_ex). In the background mode the native
+        # lists (split in refresh_compare). In the background mode the native
         # call receives the engine's opcodes, so the generator skips its
         # own engine call and walks them directly.
         if isinstance(self.diff, dfn.Differ):
@@ -2256,7 +2312,7 @@ class Command:
             # `del a_text, b_text` executes during the first `next()`
             # call, the strings' refcount actually hits 0 and they are
             # freed instead of lingering through the whole paint loop.
-            # (Python path already `del`d its texts in _refresh_ex
+            # (Python path already `del`d its texts in refresh_compare
             # right after the split_lines_safe call.)
             job.a_text = None
             job.b_text = None
@@ -2510,7 +2566,7 @@ class Command:
             # -- the compare looks 'empty' otherwise and it is not
             # obvious whether the plugin even ran.
             # Same convention as the raw-identical early path in
-            # _refresh_ex: the dialog only appears for the initial
+            # refresh_compare: the dialog only appears for the initial
             # compare and manual refresh; automatic refreshes
             # (on_change_slow / on_state) stay silent to avoid
             # pestering the user.
@@ -2597,7 +2653,7 @@ class Command:
         algorithm). The engine's own texts cannot have drifted: while
         the engine ran, LOCK_EDITORS_WHILE_COMPARING kept both halves
         read-only, and a refresh arriving mid-run was dropped at the top
-        of _refresh_ex -- so what the engine produced is what the
+        of refresh_compare -- so what the engine produced is what the
         editors still hold, and it is painted as-is.
 
         Whatever the outcome, the kick-off editor lock / read-only state
@@ -2638,7 +2694,7 @@ class Command:
                     # so the new kick-off's lock does not stack on it,
                     # then re-run the refresh with the new algorithm.
                     self._release_compare_editors(job)
-                    self._refresh_ex(job.ed, show_dialog=job.show_dialog)
+                    self.refresh_compare(job.ed, show_dialog=job.show_dialog)
                     return
 
                 if opcodes is None:
@@ -2677,7 +2733,7 @@ class Command:
     def _compare_epilogue(self, compare_start, profiling_enabled_here):
         """Show the total compare time on the status bar and print the
         profiling report. Runs for the synchronous mode (from
-        _refresh_ex's finally) and for the background mode (from
+        refresh_compare's finally) and for the background mode (from
         _on_native_diff_done). 'compare_start' is the kick-off time, so
         the reported duration covers the whole compare, including the
         background engine phase -- the wall time the user waited."""
@@ -2956,7 +3012,7 @@ class Command:
                 get_opt('algorithm.beautify_alignment', True),
             # --- ignore options (diff_proc DIFF_IGN_* flags; collected
             # into the bitmask for the native algorithms by
-            # differ_native.build_ignore_flags -- see _refresh_ex) ---
+            # differ_native.build_ignore_flags -- see refresh_compare) ---
             'ignore_case':
                 get_opt('ignoreopt.ignore_case', False),
             'ignore_whitespace':
@@ -3016,7 +3072,7 @@ class Command:
         """Jump caret to the next (or previous) diff hunk in the focused editor.
         Wraps around at the end/start of the diffmap."""
         if not self.diff.diffmap:
-            self.refresh()
+            self.refresh_compare()
         cnt = len(self.diff.diffmap)
         if cnt == 0:
             return ct.msg_status(_("No differences were found"))
@@ -3071,7 +3127,7 @@ class Command:
         """Return the diffmap entry [a0, a1, b0, b1] containing the caret
         in the focused editor, or None if the caret is not inside a diff hunk."""
         if not self.diff.diffmap:
-            self.refresh()
+            self.refresh_compare()
         fc, eds = self.focused
         p = fc * 2
         y = eds[fc].get_carets()[0][1]
@@ -3131,7 +3187,7 @@ class Command:
                 eds[0].insert(0, a0, text)
         eds[0].set_caret(0, a0)
         eds[1].set_caret(0, b0)
-        self.refresh()
+        self.refresh_compare()
 
     def copy_right(self):
         """Copy current hunk from left editor to right editor."""
@@ -3177,7 +3233,7 @@ class Command:
             text = get_lines(eds[1])
             if text:
                 eds[0].insert(0, a0, text)
-        self.refresh()
+        self.refresh_compare()
 
     def copy_line_right(self):
         """Copy caret line from left editor to right editor."""
@@ -3404,7 +3460,7 @@ class Command:
 
     def tabmenu_refresh_timer(self, tag='', info=''):
         """Timer callback that actually runs the refresh."""
-        self.refresh()
+        self.refresh_compare()
 
     def tabmenu_ignore(self, info):
         """Toggle one 'differ.ignoreopt.*' option from the diff-tab context
@@ -3423,7 +3479,7 @@ class Command:
         ct.msg_status('{}: {} -- {}'.format(
             _('Differ ignore option'), captions.get(key, key), state))
         # Re-run the compare so the change is visible immediately.
-        # _refresh_ex calls config() first, which detects the settings-file
+        # refresh_compare calls config() first, which detects the settings-file
         # mtime change and reloads self.cfg, so this very refresh already
         # uses the new flags.
         callback = 'module=cuda_differ;cmd=tabmenu_refresh_timer;info=_;'
@@ -3443,7 +3499,7 @@ class Command:
     def select_all_diff(self):
         """Select all diff hunks in the focused editor as multi-caret selections."""
         if not self.diff.diffmap:
-            self.refresh()
+            self.refresh_compare()
         if len(self.diff.diffmap) == 0:
             return ct.msg_status(_("No differences were found"))
         fc, eds = self.focused

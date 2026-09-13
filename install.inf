@@ -29,7 +29,7 @@ method=diff_with_tab
 [item4]
 section=commands
 caption=Differ\Refresh
-method=refresh
+method=refresh_compare
 
 [item4b]
 section=commands

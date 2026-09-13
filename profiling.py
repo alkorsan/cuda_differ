@@ -164,7 +164,7 @@ class Profiler:
     #
     # The background line-level compare runs on the engine's own OS
     # thread between two MAIN-thread moments: kick-off
-    # (start_async_line_diff in Command._refresh_ex) and the completion
+    # (start_async_line_diff in Command.refresh_compare) and the completion
     # callback (Command._on_native_diff_done). A classic start()/stop()
     # pair cannot span that window: the section would sit open on the
     # shared _stack across unrelated UI-event sections (nesting them
@@ -184,7 +184,7 @@ class Profiler:
         The pair measures wall time from NOW until stop_async_pair()
         (kick-off -> completion callback): the time the main thread
         waited for the engine's background thread — engine compute plus
-        thread scheduling and callback-queue latency. Command._refresh_ex
+        thread scheduling and callback-queue latency. Command.refresh_compare
         calls it with the SAME names the synchronous path uses
         ('compare:algorithm', 'line_diff:native_engine'), so profiling
         reports are comparable across compare modes and the real

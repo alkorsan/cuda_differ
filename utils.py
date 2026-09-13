@@ -59,7 +59,7 @@ def split_lines_safe(text: str) -> tp.List[str]:
     in-line control pictures. Using str.splitlines() here would split on
     those extra characters too, producing more "lines" than the editor
     actually has, which causes every diff event line index to drift out
-    of sync with the editor (see _refresh_ex).
+    of sync with the editor (see refresh_compare).
 
     Why I use re.finditer and not str.split(): split() can't do this job at all, for one structural reason -- it discards the delimiter. "a\\r\\nb".split('\\r\\n') gives you ['a', 'b'] with the \\r\\n gone. But set_seqs/unidiff call this with keepends=True semantics -- every line needs its original terminator still attached, because the diff engine uses that terminator when reconstructing/rendering output. So whatever splits also has to capture what it split on.
     Three ways to get delimiter-preserving split, ranked:
