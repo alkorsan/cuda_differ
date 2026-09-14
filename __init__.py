@@ -126,8 +126,188 @@ JSONPATH = ct.app_path(ct.APP_DIR_SETTINGS) + os.sep + JSONFILE
 #      'chp': 'config',
 #      },
 # ----------------------------------------------------------------------------
+# Compare-color themes (option 'differ.theme.color_theme'):
+#   auto   detect the light family of the current UI theme and use its
+#          preset (the default)
+#   white/black/grey   use that family's preset unconditionally
+#   custom   use the six differ.theme.*_color options; empty slots are
+#          filled from the auto-detected preset
+# ----------------------------------------------------------------------------
+# UI-theme name -> light family the preset colors are tuned for ('' is
+# CudaText's built-in default theme). Names are normalized (lowercased)
+# before the lookup -- see _ui_theme_name. 
+_THEME_UI_TYPES = {
+    '': 'grey',
+    'amy': 'black',
+    'cobalt': 'black',
+    'darkwolf': 'black',
+    'ebony': 'black',
+    'green': 'grey',
+    'navy': 'grey',
+    'sub': 'black',
+    'syn': 'white',
+}
+
+# Preset compare colors per family (hex strings; '#'rgb-e' format the
+# color options use). A None entry means "the live editor background"
+# (PROC_THEME_UI_DICT_GET's EdTextBg): ignored differences then keep
+# blending into whatever theme is active -- the same trick empty
+# ignored_*_color options always used. For calibration, the bundled
+# themes' editor backgrounds per family:
+#   white: syn           #FFFFFF
+#   grey:  green, navy   #E0E0E0 (the default theme's grey is close)
+#   black: ebony #202020, amy #200020, cobalt #002240,
+#          darkwolf #293134, sub #272822
+_COLOR_PRESETS = {
+    'white': {
+        'changed': '#f8dfad',
+        'added': '#b3ffb3',
+        'deleted': '#ffc4c4',
+        'gap': '#e3e3e3',
+        'ignored': '#ffffff',
+        'ignored_gap': '#ffffff',
+    },
+    'grey': {
+        # The white family's colors deepened ~25 units, so they hold up
+        # against light-grey (#E0E0E0) editor backgrounds (on #E0E0E0 the
+        # white preset's #e3e3e3 gap would be invisible).
+        'changed': '#ebd493',
+        'added': '#a2e3a2',
+        'deleted': '#f4b6b6',
+        'gap': '#cdcdcd',
+        'ignored': None,
+        'ignored_gap': None,
+    },
+    'black': {
+        # Muted, desaturated blocks that don't glare on dark backgrounds.
+        'changed': '#55482e',
+        'added': '#2d5230',
+        'deleted': '#5c3232',
+        'gap': '#3d3d3d',
+        'ignored': None,
+        'ignored_gap': None,
+    },
+}
+
+# Preset key -> config key (the one difference: 'gap' -> 'color_gaps').
+_PRESET_CFG_KEYS = {
+    'changed': 'color_changed',
+    'added': 'color_added',
+    'deleted': 'color_deleted',
+    'gap': 'color_gaps',
+    'ignored': 'color_ignored',
+    'ignored_gap': 'color_ignored_gap',
+}
+
+# EdTextBg fallback per family, used only when the live lookup fails
+# (missing key / API error) -- basically never in a running CudaText.
+_PRESET_BG_FALLBACK = {
+    'white': 0xFFFFFF,
+    'grey': 0xE0E0E0,
+    'black': 0x202020,
+}
+
+_COLOR_THEME_MODES = ('auto', 'white', 'black', 'grey', 'custom')
+
+
+def _ed_text_bg():
+    """Live editor text background color from the current UI theme, or
+    None when it cannot be read."""
+    try:
+        ui = ct.app_proc(ct.PROC_THEME_UI_DICT_GET, '')
+        return ui.get('EdTextBg', {}).get('color')
+    except Exception:
+        return None
+
+
+def _color_luminance(color_int):
+    """Relative luminance (0..1) of a 0xRRGGBB int, perceptual weights."""
+    r = (color_int >> 16) & 0xFF
+    g = (color_int >> 8) & 0xFF
+    b = color_int & 0xFF
+    return (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255.0
+
+
+def _ui_theme_name():
+    """Current UI-theme name, normalized for the _THEME_UI_TYPES lookup
+    (PROC_THEME_UI_GET returns the bare theme name, e.g. 'syn'; '' is the
+    default theme -- custom themes come back as their plain names too)."""
+    try:
+        name = ct.app_proc(ct.PROC_THEME_UI_GET, '') or ''
+    except Exception:
+        name = ''
+    return name.strip().lower()
+
+
+def _detect_theme_type():
+    """'white' | 'grey' | 'black' -- the light family of the current UI
+    theme, i.e. which preset's colors fit the current editor background.
+
+    Known UI themes carry a fixed family (CudaText's own dark/light
+    split -- see _THEME_UI_TYPES). Unknown/custom themes fall back to
+    the luminance of the live editor background; the thresholds put the
+    bundled themes into the same family the table assigns them
+    (#FFFFFF -> white, #E0E0E0 -> grey, #202020 and darker -> black)."""
+    ttype = _THEME_UI_TYPES.get(_ui_theme_name())
+    if ttype is not None:
+        return ttype
+    bg = _ed_text_bg()
+    if bg is None:
+        return 'grey'  # unreadable background -- middle-of-the-road pick
+    lum = _color_luminance(bg)
+    if lum >= 0.92:
+        return 'white'
+    if lum <= 0.35:
+        return 'black'
+    return 'grey'
+
+
+def _preset_colors(theme_type):
+    """The six compare colors (ints) of a preset family. None entries
+    resolve to the live editor background, so ignored differences always
+    blend into the active theme."""
+    preset = _COLOR_PRESETS[theme_type]
+    ed_bg = None
+    out = {}
+    for key, val in preset.items():
+        if val is None:
+            if ed_bg is None:
+                ed_bg = _ed_text_bg()
+                if ed_bg is None:
+                    ed_bg = _PRESET_BG_FALLBACK[theme_type]
+            out[key] = ed_bg
+        else:
+            out[key] = ctx.html_color_to_int(val)
+    return out
+
+
+# ----------------------------------------------------------------------------
 OPTS_META = [
     # --- chapter "theme": colors used to paint the compare view ----------
+    {'opt': 'differ.theme.color_theme',
+     'cmt': _('Color theme\n'
+              'Which compare colors to use. The six color options below '
+              'only apply in the "Custom" mode.\n'
+              '- Auto-detect -- detect the light family of the current UI '
+              'theme (by theme name, luminance of the editor background as '
+              'fallback) and use its preset. Recommended.\n'
+              '- White / Grey / Black -- use that family\'s preset colors, '
+              'tuned for white / light-grey / dark editor backgrounds.\n'
+              '- Custom -- use the six color options below; each option '
+              'left empty is filled from the auto-detected preset.\n'
+              'Note: in the Grey and Black presets the ignored-difference '
+              'colors always resolve to the live editor background, so '
+              'ignored regions blend into the active theme.\n'
+              'Default: Auto-detect.'),
+     'def': 'auto',
+     'frm': 'str2s',
+     'dct': [('auto',   _('Auto-detect (recommended)')),
+             ('white',  _('White themes preset')),
+             ('grey',   _('Grey themes preset')),
+             ('black',  _('Black themes preset')),
+             ('custom', _('Custom (use the color options below)'))],
+     'chp': 'theme',
+     },
     {'opt': 'differ.theme.changed_color',
      'cmt': _('Color of changed lines\n'
               'Background color for lines that were modified (replaced with '
@@ -135,7 +315,8 @@ OPTS_META = [
               'Also colors the char-level highlights inside modified lines, '
               'the margin markers, the micromap highlights and the overview '
               'panel.\n'
-              'Leave empty to use the theme default.'),
+              'Only used when "Color theme" is Custom; leave empty to fill '
+              'this slot from the auto-detected preset.'),
      'def': '',
      'frm': '#rgb-e',
      'chp': 'theme',
@@ -147,7 +328,8 @@ OPTS_META = [
               'Also colors the char-level highlights inside added lines, the '
               'margin markers, the micromap highlights and the overview '
               'panel.\n'
-              'Leave empty to use the theme default.'),
+              'Only used when "Color theme" is Custom; leave empty to fill '
+              'this slot from the auto-detected preset.'),
      'def': '',
      'frm': '#rgb-e',
      'chp': 'theme',
@@ -159,7 +341,8 @@ OPTS_META = [
               'Also colors the char-level highlights inside deleted lines, '
               'the margin markers, the micromap highlights and the overview '
               'panel.\n'
-              'Leave empty to use the theme default.'),
+              'Only used when "Color theme" is Custom; leave empty to fill '
+              'this slot from the auto-detected preset.'),
      'def': '',
      'frm': '#rgb-e',
      'chp': 'theme',
@@ -169,7 +352,8 @@ OPTS_META = [
               'Background color for the blank gap inserted to keep the two '
               'sides visually aligned when one side has fewer lines.\n'
               'Also colors the gap rectangles in the overview panel.\n'
-              'Leave empty to use the theme default.'),
+              'Only used when "Color theme" is Custom; leave empty to fill '
+              'this slot from the auto-detected preset.'),
      'def': '',
      'frm': '#rgb-e',
      'chp': 'theme',
@@ -180,8 +364,10 @@ OPTS_META = [
               'by the "Ignore blank lines" option (WinMerge-style '
               'ignored differences). Also colors the micromap highlights '
               'and the overview panel.\n'
-              'Leave empty to use the editor text background color '
-              '(the ignored region then looks like normal text).'),
+              'Only used when "Color theme" is Custom; leave empty to fill '
+              'this slot from the auto-detected preset -- which for the '
+              'Grey and Black presets is the editor text background '
+              'color, so the ignored region then looks like normal text.'),
      'def': '',
      'frm': '#rgb-e',
      'chp': 'theme',
@@ -195,8 +381,10 @@ OPTS_META = [
               '(the lines) and from "Color of inter-line gap background" '
               '(regular alignment gaps); also colors the ignored-gap '
               'rectangles in the overview panel.\n'
-              'Leave empty to use the editor text background color '
-              '(the ignored gap then looks like empty space).'),
+              'Only used when "Color theme" is Custom; leave empty to fill '
+              'this slot from the auto-detected preset -- which for the '
+              'Grey and Black presets is the editor text background '
+              'color, so the ignored gap then looks like empty space.'),
      'def': '',
      'frm': '#rgb-e',
      'chp': 'theme',
@@ -672,7 +860,38 @@ def _migrate_old_option_names():
         msg('failed to migrate old option names: {}'.format(ex), level=1)
 
 
+def _migrate_color_theme_choice():
+    """One-time migration for the color_theme option.
+
+    Older versions had no color_theme: the six differ.theme.*_color
+    options ALWAYS overrode the theme-derived defaults. The new default
+    'auto' ignores them (preset colors win), so a user who configured
+    custom compare colors would silently lose them after the update.
+    Detect that case -- any *_color option set to a non-empty value
+    while color_theme is not yet chosen -- and switch that user to
+    'custom' mode, which restores the old colors-take-precedence
+    behavior (empty slots still fill from the detected preset).
+    """
+    if not os.path.exists(JSONPATH):
+        return
+    try:
+        with open(JSONPATH, 'r', encoding='utf8') as f:
+            body = f.read()
+    except OSError:
+        return
+    if re.search(r'(?m)^\s*"differ\.theme\.color_theme"\s*:', body):
+        return  # already chose a mode -- leave the choice alone
+    cre_color = re.compile(
+        r'(?m)^\s*"differ\.theme\.(?:changed|added|deleted|gap|ignored|ignored_gap)_color"'
+        r'\s*:\s*"([^"]*)"')
+    if not any(val for val in cre_color.findall(body)):
+        return  # no configured colors -- the 'auto' default is right
+    set_opt('theme.color_theme', 'custom')
+    msg('color theme set to "custom" to keep your configured compare colors')
+
+
 _migrate_old_option_names()
+_migrate_color_theme_choice()
 
 
 class _CompareJob:
@@ -1358,12 +1577,20 @@ class Command:
         ct.ed.set_prop(ct.PROP_SAVE_HISTORY, False)
 
     def on_state(self, ed_self, state):
-        """Handle theme syntax changes (reload config + refresh), word-wrap
-        state changes (re-apply gaps with wrap-aware sizes)."""
-        if state == ct.APPSTATE_THEME_SYNTAX:
-            self.get_config()
-            # each time we change setting using the options editor the state even APPSTATE_THEME_UI fires which triger a refresh , if files are big it take time which is frustrating, if the user needs to refresh then he can do it manualy, lets not auto refresh for him
-            # self.refresh_compare(ct.ed, show_dialog=False)  # automatic -- no dialog
+        """Handle theme changes (reload config so the new compare colors
+        take effect) and word-wrap state changes (re-apply gaps with
+        wrap-aware sizes)."""
+        if state == ct.APPSTATE_THEME_UI:
+            # UI theme switched: re-resolve the compare colors -- 'auto'
+            # may now detect a different family, and the grey/black
+            # presets' ignored colors (live editor background) moved with
+            # the theme. config() also re-registers the bookmark kinds
+            # with the new colors. No auto-refresh afterwards: the repaint
+            # cost on big compares outweighs the benefit (the next refresh,
+            # manual or automatic, paints with the new colors).
+            self.config()
+        elif state == ct.APPSTATE_THEME_SYNTAX:
+            self.config()
         elif state == ct.EDSTATE_WRAP:
             # Word-wrap mode changed on one of the split halves. The
             # inter-line gaps were sized for the previous wrap state, so
@@ -3120,12 +3347,14 @@ class Command:
         e.bookmark(ct.BOOKMARK2_DELETE_BY_TAG, 0, tag=DIFF_TAG)
 
     def config(self):
-        """Reload config from disk if the JSON file or theme has changed.
+        """Reload config from disk if the JSON file or a theme has changed.
         Caches the result in self.cfg to avoid repeated disk reads."""
         opt_time = os.path.getmtime(JSONPATH) if os.path.exists(JSONPATH) else 0
         theme_name = ct.app_proc(ct.PROC_THEME_SYNTAX_GET, '')
+        ui_theme_name = _ui_theme_name()
         if self.cfg.get('opt_time') == opt_time and \
-           self.cfg.get('theme_name') == theme_name:
+           self.cfg.get('theme_name') == theme_name and \
+           self.cfg.get('ui_theme_name') == ui_theme_name:
             return
         self.cfg = self.get_config()
         # Keep the runtime on_key subscription in step with the (possibly
@@ -3178,13 +3407,6 @@ class Command:
         a config dict. Also registers bookmark kinds (NKIND_*) with their
         colors so CudaText can render them."""
 
-        def get_color(key, default_color):
-            s = get_opt(key, '')
-            if s:
-                return ctx.html_color_to_int(s)
-            else:
-                return default_color
-
         def new_nkind(val, color):
             ct.ed.bookmark(ct.BOOKMARK_SETUP, 0,
                            nkind=val,
@@ -3193,27 +3415,39 @@ class Command:
                            )
 
         def get_theme():
-            data = ct.app_proc(ct.PROC_THEME_SYNTAX_DICT_GET, '')
-            th = {}
-            th['color_changed'] = data['LightBG2']['color_back']
-            th['color_added'] = data['LightBG3']['color_back']
-            th['color_deleted'] = data['LightBG1']['color_back']
-            th['color_gaps'] = data['LightBG5']['color_back']
-            # Ignored-difference colors (suppressed blank-line regions '
-            # and their compensating gaps) default to the editor text
-            # background (UI theme EdTextBg -- the same source the
-            # overview background uses), so by default an ignored
-            # region reads as "not a difference": lines look like
-            # normal text and the gap looks like empty space. Users who
-            # want WinMerge's visible "ignored difference" look can set
-            # explicit colors.
-            try:
-                ui = ct.app_proc(ct.PROC_THEME_UI_DICT_GET, '')
-                ed_bg = ui.get('EdTextBg', {}).get('color', 0xFFFFFF)
-            except Exception:
-                ed_bg = 0xFFFFFF
-            th['color_ignored'] = ed_bg
-            th['color_ignored_gap'] = ed_bg
+            """Resolve the six compare colors from the 'color_theme'
+            option (see the _COLOR_PRESETS / _detect_theme_type block at
+            module level):
+
+            - 'auto' -- preset of the detected theme family;
+            - 'white'/'grey'/'black' -- that family's preset;
+            - 'custom' -- the six differ.theme.*_color options, each
+              option left EMPTY filled from the auto-detected preset
+              (a half-configured custom theme never falls back to
+              nothing).
+
+            The ignored-difference colors of the grey/black presets (and
+            of custom when their options are empty) resolve to the LIVE
+            editor background, so ignored regions keep reading as "not
+            a difference" whatever theme is active."""
+            mode = get_opt('theme.color_theme', 'auto')
+            if mode not in _COLOR_THEME_MODES:
+                mode = 'auto'
+            if mode in ('white', 'black', 'grey'):
+                ttype = mode
+            else:
+                ttype = _detect_theme_type()
+            preset = _preset_colors(ttype)
+            th = {
+                'color_theme': mode,
+                'theme_type': ttype,
+            }
+            for key, cfg_key in _PRESET_CFG_KEYS.items():
+                if mode == 'custom':
+                    s = get_opt('theme.' + key + '_color', '')
+                    th[cfg_key] = ctx.html_color_to_int(s) if s else preset[key]
+                else:
+                    th[cfg_key] = preset[key]
             return th
 
         t = get_theme()
@@ -3222,19 +3456,27 @@ class Command:
                 os.path.getmtime(JSONPATH) if os.path.exists(JSONPATH) else 0,
             'theme_name':
                 ct.app_proc(ct.PROC_THEME_SYNTAX_GET, ''),
+            # Current UI theme name -- part of the config() cache key so a
+            # UI theme switch re-resolves the auto/custom colors.
+            'ui_theme_name':
+                _ui_theme_name(),
             # --- theme ---
+            'color_theme':
+                t['color_theme'],
+            'theme_type':
+                t['theme_type'],
             'color_changed':
-                get_color('theme.changed_color', t.get('color_changed')),
+                t['color_changed'],
             'color_added':
-                get_color('theme.added_color', t.get('color_added')),
+                t['color_added'],
             'color_deleted':
-                get_color('theme.deleted_color', t.get('color_deleted')),
+                t['color_deleted'],
             'color_gaps':
-                get_color('theme.gap_color', t.get('color_gaps')),
+                t['color_gaps'],
             'color_ignored':
-                get_color('theme.ignored_color', t.get('color_ignored')),
+                t['color_ignored'],
             'color_ignored_gap':
-                get_color('theme.ignored_gap_color', t.get('color_ignored_gap')),
+                t['color_ignored_gap'],
             # --- algorithm ---
             'diff_algorithm':
                 get_opt('algorithm.diff_algorithm', 'native_histogram'),

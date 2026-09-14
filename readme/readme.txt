@@ -319,32 +319,58 @@ Ignore options section (see the "Ignore options" chapter above for details):
   and Native Myers); the pure-Python algorithms always compare strictly.
 
 Theme section:
+- differ.theme.color_theme: Color theme (default: auto)
+  Which compare colors to use:
+    * auto -- detect the light family of the current UI theme and use
+      its preset. Known UI themes carry a fixed family (amy, cobalt,
+      darkwolf, ebony, sub -> black; green, navy, the default "" theme ->
+      grey; syn -> white); unknown/custom themes fall back to the
+      luminance of the editor background. Recommended.
+    * white -- preset tuned for white editor backgrounds:
+      changed #f8dfad, added #b3ffb3, deleted #ffc4c4, gap #e3e3e3,
+      ignored and ignored gap #ffffff.
+    * grey -- preset tuned for light-grey editor backgrounds (#E0E0E0,
+      like the green/navy themes): the white family's colors deepened
+      ~25 units, so they keep their contrast against grey.
+    * black -- preset tuned for dark editor backgrounds (muted, so the
+      diff blocks do not glare on dark themes).
+    * custom -- use the six color options below; every option left
+      empty is filled from the auto-detected preset, so a
+      half-configured custom theme never falls back to nothing.
+  In the grey and black presets the ignored-difference colors resolve to
+  the live editor background, so ignored regions blend into the active
+  theme. The six color options below only apply in the "custom" mode.
 - differ.theme.changed_color: Color of changed lines
   Background color for lines that were modified (replaced with different
   content). Also colors the char-level highlights inside modified lines,
   the margin markers, the micromap highlights and the overview panel.
-  Leave empty to use the theme default.
+  Only used when "Color theme" is custom; leave empty to fill this slot
+  from the auto-detected preset.
 - differ.theme.added_color: Color of added lines
   Background color for lines that exist only in the right file (added).
   Also colors the char-level highlights inside added lines, the margin
   markers, the micromap highlights and the overview panel.
-  Leave empty to use the theme default.
+  Only used when "Color theme" is custom; leave empty to fill this slot
+  from the auto-detected preset.
 - differ.theme.deleted_color: Color of deleted lines
   Background color for lines that exist only in the left file (removed).
   Also colors the char-level highlights inside deleted lines, the margin
   markers, the micromap highlights and the overview panel.
-  Leave empty to use the theme default.
+  Only used when "Color theme" is custom; leave empty to fill this slot
+  from the auto-detected preset.
 - differ.theme.gap_color: Color of inter-line gap background
   Background color for the blank gap inserted to keep the two sides
   aligned when one side has fewer lines. Also colors the gap rectangles
   in the overview panel.
-  Leave empty to use the theme default.
+  Only used when "Color theme" is custom; leave empty to fill this slot
+  from the auto-detected preset.
 - differ.theme.ignored_color: Color of ignored differences
   Background color for lines whose difference is suppressed by the
   "Ignore blank lines" option (WinMerge-style ignored differences).
   Also colors the micromap highlights and the overview panel.
-  Leave empty to use the editor text background color (the ignored
-  region then looks like normal text).
+  Only used when "Color theme" is custom; leave empty to fill this slot
+  from the auto-detected preset (the editor text background for the grey
+  and black families, so the ignored region then looks like normal text).
 - differ.theme.ignored_gap_color: Color of ignored difference gaps
   Background color for the compensating inter-line gap inserted next
   to a suppressed blank-line difference ("Ignore blank lines" option),
@@ -352,8 +378,9 @@ Theme section:
   differences" (the lines) and from "Color of inter-line gap
   background" (regular alignment gaps); also colors the ignored-gap
   rectangles in the overview panel.
-  Leave empty to use the editor text background color (the ignored
-  gap then looks like empty space).
+  Only used when "Color theme" is custom; leave empty to fill this slot
+  from the auto-detected preset (the editor text background for the grey
+  and black families, so the ignored gap then looks like empty space).
 
 Algorithm section:
 - differ.algorithm.diff_algorithm: Diff algorithm
@@ -462,9 +489,11 @@ Advanced section:
   When enabled, prints a detailed timing report to the console after
   each compare, breaking down time spent in the diff algorithm, opcode
   realignment, event generation, char-level diffing (native vs Python),
-  and UI painting (bookmarks, decor, gaps, attributes). Use for debugging
-  performance issues only -- adds small overhead (~1-2us per timing
-  point).
+  and UI painting (bookmarks, decor, gaps, attributes). The report
+  header also names what was compared: per side the original file's
+  path, or -- for untitled tabs -- the original tab's title. Use for
+  debugging performance issues only -- adds small overhead (~1-2us per
+  timing point).
   Default: off.
 
 Micromap section:

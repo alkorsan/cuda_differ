@@ -1,4 +1,5 @@
 2026.09.14 (by @badrelmers)
++ add: option differ.theme.color_theme (auto/white/black/grey/custom, default: auto) for the compare colors. auto detects the UI theme family (by name: amy/cobalt/darkwolf/ebony/sub -> black, green/navy/default -> grey, syn -> white; luminance of the editor background as fallback) and uses its preset; custom uses the six color options, filling the empty ones from the detected preset. Existing configured colors migrate to "custom" automatically. The config reloads on UI theme change (no auto-refresh, as before).
 + add: hotkeys in compare tabs: Alt+Left/Right copy the current difference to the left/right, Alt+Down/Up jump to the next/previous difference, F5 refreshes the compare. Exact modifiers only, only inside compare tabs; other keys and other tabs are unaffected. New option differ.advanced.enable_keyboard_capture (default on) enables/disables them -- the plugin (un)subscribes to the on_key event at runtime, so no restart is needed.
 
 2026.09.02 (by @badrelmers)
