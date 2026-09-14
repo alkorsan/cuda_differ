@@ -27,6 +27,8 @@ Usage:
 
     # Report
     Profiler.report()  # prints to console
+    Profiler.report(files=[('Left', '/a.py'), ('Right', '/b.py')])
+        # prints the console report, headed by what was compared
 
 The report shows SELF time, TOTAL time, call count, max, and percentage for
 each named section, sorted by SELF time descending so the real bottleneck
@@ -267,13 +269,21 @@ class Profiler:
         cls._async_pending = {}
 
     @classmethod
-    def report(cls):
+    def report(cls, files=None):
         """Print the timing report to stdout.
 
         Sorted by SELF time descending so the real bottleneck (leaf code
         that actually burns CPU) is at the top. Wrapper sections (high
         total, near-zero self) sink to the bottom and are clearly
         separated from the actual work.
+
+        'files' optionally identifies WHAT was compared: a sequence of
+        (label, name) pairs, e.g. [('Left', '/a.py'), ('Right', 'New 1')].
+        Printed under the report title ('Compared files:' block) so a
+        report can be matched to its input files -- useful when several
+        compares run in one session, or when the console accumulates
+        reports of different compares. Pass None/empty to skip the block
+        (generic Profiler use).
 
         The % column is based on SELF time as a fraction of the outermost
         section's total — so the sum of all % values approximates 100%
@@ -309,6 +319,20 @@ class Profiler:
         print('\n' + '=' * 100)
         print('Differ Profiling Report  (times in ms; sorted by SELF time'
               ' \u2192 real bottleneck at top)')
+        if files:
+            # What this report is about: one line per side, labeled by
+            # the caller ('Left'/'Right' for a compare tab). The name is
+            # the original file's PATH when it is a file on disk,
+            # otherwise the original tab's title (untitled tabs have no
+            # path) -- resolved by Command._compared_names_for_report.
+            print('Compared files:')
+            try:
+                for label, name in files:
+                    print('  {:<5s}: {}'.format(str(label), name))
+            except Exception:
+                # Unexpected 'files' shape (not (label, name) pairs):
+                # print it raw rather than losing the report.
+                print('  ' + str(files))
         print('=' * 100)
         # Column headers. self and total are both shown so you can tell
         # at a glance whether a row is a leaf (self \u2248 total) or a
@@ -426,9 +450,15 @@ def is_profiling_enabled():
     return Profiler.is_enabled()
 
 
-def profiling_report():
-    """Print the current profiling report to stdout."""
-    Profiler.report()
+def profiling_report(files=None):
+    """Print the current profiling report to stdout.
+
+    Args:
+        files: optional sequence of (label, name) pairs identifying what
+            was compared (e.g. [('Left', '/a.py'), ('Right', 'New 1')]);
+            printed in the report header. See Profiler.report.
+    """
+    Profiler.report(files)
 
 
 def reset_profiling():

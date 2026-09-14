@@ -9,6 +9,24 @@ import cudatext as ct
 import cudatext_cmd as ct_cmd
 import cudax_lib as ctx
 
+# Virtual-key codes for the Alt+Arrow hotkeys handled by Command.on_key.
+# The cudatext_keys module ships with CudaText and lists the VK_* codes
+# the on_key 'key' parameter uses. The try/except keeps the whole plugin
+# importable on engine builds without the module (the four arrow codes
+# are stable platform VK values, mirrored here as the fallback) -- a
+# missing module then only disables the hotkeys, not the plugin.
+try:
+    import cudatext_keys as ct_keys
+    _VK_ARROW_LEFT = ct_keys.VK_LEFT    # 37
+    _VK_ARROW_UP = ct_keys.VK_UP        # 38
+    _VK_ARROW_RIGHT = ct_keys.VK_RIGHT  # 39
+    _VK_ARROW_DOWN = ct_keys.VK_DOWN    # 40
+except (ImportError, AttributeError):
+    _VK_ARROW_LEFT = 37
+    _VK_ARROW_UP = 38
+    _VK_ARROW_RIGHT = 39
+    _VK_ARROW_DOWN = 40
+
 from . import differ_native as dfn
 from . import differ_python as dfp
 from .overview import PaintboxOverview
@@ -39,6 +57,24 @@ GAP_WIDTH = 5000
 DECOR_CHAR = '■'
 DEFAULT_SYNC_SCROLL = '1'
 U_PREFIX = 'untitled:'
+
+# Alt+Arrow hotkeys for compare tabs, dispatched by Command.on_key (the
+# plugin subscribes to the lazy on_key~ event). Key code -> Command
+# method name:
+#   Alt+Left  -> copy_left   "Copy current difference to the left"
+#   Alt+Right -> copy_right  "Copy current difference to the right"
+#   Alt+Down  -> jump_next   "Jump to next difference"
+#   Alt+Up    -> jump_prev   "Jump to previous difference"
+# Only PLAIN Alt triggers them (no Shift/Ctrl/Meta -- see on_key), and
+# only when the key lands in one of the two halves of a compare tab this
+# plugin manages; every other editor keeps its normal Alt+Arrow behavior,
+# user bindings included.
+_ARROW_HOTKEYS = {
+    _VK_ARROW_LEFT: 'copy_left',
+    _VK_ARROW_RIGHT: 'copy_right',
+    _VK_ARROW_DOWN: 'jump_next',
+    _VK_ARROW_UP: 'jump_prev',
+}
 
 # HARD-CODED MODULE CONSTANT — deliberately NOT a config option. Flips
 # the whole-compare editor lock for background (native) compares:
@@ -1374,6 +1410,65 @@ class Command:
         if self.cfg.get('enable_auto_refresh', False):
             self.refresh_compare(ed_self, show_dialog=False)  # automatic -- no dialog
 
+    def on_key(self, ed_self, key, state):
+        """Alt+Arrow hotkeys inside compare tabs (the plugin subscribes to
+        the lazy on_key~ event, so this only runs while the plugin is
+        loaded -- i.e. a compare tab exists or existed this session).
+
+        Mapping (the same commands as the menu items, see _ARROW_HOTKEYS):
+            Alt+Left  -> "Copy current difference to the left"
+            Alt+Right -> "Copy current difference to the right"
+            Alt+Down  -> "Jump to next difference"
+            Alt+Up    -> "Jump to previous difference"
+
+        Everything else passes through untouched: non-arrow keys; arrows
+        without EXACTLY the Alt modifier ('a' only -- Alt+Shift/Ctrl/Meta
+        combinations keep their normal behavior, so user bindings like
+        Ctrl+Alt+Down are never shadowed); and arrows pressed outside the
+        two halves of a compare tab this plugin manages -- in any other
+        editor Alt+Arrows keep whatever meaning the user's keybindings
+        give them.
+
+        Returns False when a hotkey was recognized and its command ran,
+        which makes CudaText drop the key instead of also running the
+        editor's own Alt+Arrow action (caret movement etc.) on top of it
+        (returning False also stops the event's propagation to other
+        plugins -- exactly what we want for a consumed hotkey). Returns
+        None otherwise so the key propagates unchanged.
+
+        The dispatched commands carry their own guards: copy_left/right
+        refuse to edit while a background compare is running ("cannot
+        edit while compare is running" status hint), and jump_next/prev
+        report "No differences were found" on a clean compare -- the
+        hotkey then just surfaces that status message, same as the menu
+        command would.
+        """
+        # Early-out for the overwhelmingly common case -- any key that is
+        # not one of the four arrows. on_key fires on EVERY keystroke, so
+        # this must stay a single dict lookup.
+        method = _ARROW_HOTKEYS.get(key)
+        if method is None:
+            return
+        # Exactly the Alt modifier: 'a' present, and none of 'c' (Ctrl),
+        # 's' (Shift), 'm' (Meta). set() comparison is order-insensitive,
+        # so any state-string order CudaText may produce works.
+        mods = set(state) if isinstance(state, str) else set()
+        if mods != {'a'}:
+            return
+        # Only the two halves of a compare tab we manage. Both halves of
+        # the split share one PROP_TAB_ID, so a single lookup covers
+        # whichever side the caret is in.
+        try:
+            tab_id = ed_self.get_prop(ct.PROP_TAB_ID)
+        except Exception:
+            return  # dead/unusual editor handle -- let the key pass
+        if not self._is_compare_tab(tab_id):
+            return
+        getattr(self, method)()
+        # Eat the key so the editor does not ALSO run its default
+        # Alt+Arrow action after our command.
+        return False
+
     def on_save_pre(self, ed_self):
         """Intercept Ctrl+S in a compare tab. Instead of saving the untitled
         compare tab to disk (which would show a Save dialog), sync the DIRTY
@@ -2222,7 +2317,8 @@ class Command:
             # when the paint phase finishes on the main thread.
             if _epilogue:
                 self._compare_epilogue(_compare_start,
-                                       _profiling_enabled_here)
+                                       _profiling_enabled_here,
+                                       tab_id)
 
     def _paint_compare_events(self, job, opcodes=None):
         """Consume the Differ's event generator and paint every event
@@ -2714,7 +2810,8 @@ class Command:
                     self._paint_compare_events(job, opcodes)
                 finally:
                     self._compare_epilogue(job.compare_start,
-                                           job.profiling_enabled_here)
+                                           job.profiling_enabled_here,
+                                           job.tab_id)
             finally:
                 # Compare finished and everything is rendered: make the
                 # halves editable again / drop the busy placeholder.
@@ -2730,13 +2827,19 @@ class Command:
             import traceback
             traceback.print_exc()
 
-    def _compare_epilogue(self, compare_start, profiling_enabled_here):
+    def _compare_epilogue(self, compare_start, profiling_enabled_here, tab_id=None):
         """Show the total compare time on the status bar and print the
         profiling report. Runs for the synchronous mode (from
         refresh_compare's finally) and for the background mode (from
         _on_native_diff_done). 'compare_start' is the kick-off time, so
         the reported duration covers the whole compare, including the
-        background engine phase -- the wall time the user waited."""
+        background engine phase -- the wall time the user waited.
+
+        'tab_id' identifies the compare tab the report is about; the
+        profiling report header names what it compares -- per side the
+        original file's PATH when it is a file on disk, otherwise the
+        original tab's title (untitled tabs have no path). See
+        _compared_names_for_report."""
         _compare_elapsed = time.perf_counter() - compare_start
         if _compare_elapsed < 1.0:
             ct.msg_status(_('Differ: compared in {:.0f}ms').format(
@@ -2752,10 +2855,69 @@ class Command:
 
         # Print the profiling report -- even if the compare crashed with
         # an exception. This shows WHERE the time was spent (or where it
-        # crashed), also on big files.
+        # crashed), also on big files. The header names the compared
+        # files: per side the original's PATH when it is a file on disk,
+        # otherwise the original tab's title.
         if profiling_enabled_here:
-            profiling_report()
+            profiling_report(files=self._compared_names_for_report(tab_id))
             enable_profiling(False)
+
+    def _compared_names_for_report(self, tab_id):
+        """Return [('Left', name), ('Right', name)] describing what the
+        given compare tab compares -- printed in the profiling report
+        header (see _compare_epilogue).
+
+        Per side, first match wins:
+        1. The LIVE original tab (looked up by its PROP_TAB_ID from the
+           persisted state): its file path (PROP_FN) when it is a file
+           on disk -- a real path; otherwise its tab title
+           (PROP_TAB_TITLE) -- untitled tabs have no path. Live lookup
+           keeps the names correct after renames / Save-As done since
+           the compare was created.
+        2. The display name captured at compare time (the persisted
+           state's primary/secondary_orig_name: path for files, title
+           for untitled) -- used when the original tab is already
+           closed.
+        3. '(unknown)' when even that is missing (only reachable for a
+           state file written by an older/edited version -- set_files
+           always registers both names).
+
+        Returns [('Left', '(unknown)'), ('Right', '(unknown)')] for a
+        tab_id that resolves to no state entry at all."""
+        orig_a_id, orig_b_id = (None, None)
+        entry = None
+        if tab_id is not None:
+            orig_a_id, orig_b_id = self._get_orig_tab_ids(tab_id)
+            state = self._load_state()
+            session = state['sessions'].get(self._current_session_key, {})
+            entry = session.get(str(tab_id))
+        if not isinstance(entry, dict):
+            entry = {}
+        names = []
+        for orig_id, fallback, label in (
+                (orig_a_id, entry.get('primary_orig_name', ''), 'Left'),
+                (orig_b_id, entry.get('secondary_orig_name', ''), 'Right')):
+            name = ''
+            if orig_id is not None:
+                # Find the live original tab; prefer its file path,
+                # else its tab title.
+                for h in ct.ed_handles():
+                    e = ct.Editor(h)
+                    if str(e.get_prop(ct.PROP_TAB_ID)) == str(orig_id):
+                        fn = e.get_prop(ct.PROP_FN, '')
+                        if fn:
+                            name = fn
+                        else:
+                            name = e.get_prop(ct.PROP_TAB_TITLE) or ''
+                        break
+            if not name and fallback:
+                # Original tab closed: the name captured at compare time
+                # (path for a real file, title for an untitled tab).
+                name = fallback
+            if not name:
+                name = '(unknown)'
+            names.append((label, name))
+        return names
 
     def set_attr(self, e, x=0, y=0, nlen=0, bg=0, mptag=-1, map_only=0):
         """Add a colored attribute (background highlight) on editor e.

@@ -116,6 +116,26 @@ Config...
     Opens the options dialog.
 
 
+== Keyboard shortcuts ==
+
+These shortcuts are active only while the caret is in one of the two
+halves of a compare tab; in every other tab Alt+Arrows keep their
+normal meaning (your own keybindings included):
+
+    Alt+Down    Jump to next difference
+    Alt+Up      Jump to previous difference
+    Alt+Right   Copy current difference to the right
+    Alt+Left    Copy current difference to the left
+
+They run exactly the same commands as the menu items above (including
+their guards: copying is refused while a background compare is running,
+and jumping reports "No differences were found" on a clean compare).
+Combinations with additional modifiers (Shift/Ctrl/Meta, e.g.
+Ctrl+Alt+Down) are NOT captured and keep their normal behavior. When a
+shortcut fires, the key is consumed, so the editor's own Alt+Arrow
+action (caret movement etc.) does not also run.
+
+
 == Tab context menu ==
 
 Right-clicking a tab title shows "Differ" submenu with:
