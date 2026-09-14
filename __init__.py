@@ -50,7 +50,7 @@ U_PREFIX = 'untitled:'
 #   Alt+Right -> copy_right       "Copy current difference to the right"
 #   Alt+Down  -> jump_next        "Jump to next difference"
 #   Alt+Up    -> jump_prev        "Jump to previous difference"
-#   F5        -> refresh_compare  "Refresh"
+#   F5        -> refresh_compare  "Recompare"
 # Hotkeys fire only with the EXACT modifier state and only inside the
 # two halves of a compare tab this plugin manages; every other editor
 # keeps its normal key behavior, user bindings included. Governed by
@@ -502,7 +502,7 @@ OPTS_META = [
      },
     # --- chapter "ignoreopt": comparison ignore options (the diff_proc
     # DIFF_IGN_* flags of the native engines; also exposed as checkable
-    # items in the diff-tab right-click context menu, below 'Refresh') ---
+    # items in the diff-tab right-click context menu, below 'Recompare') ---
     {'opt': 'differ.ignoreopt.ignore_case',
      'cmt': _('Ignore case\n'
               'Case-insensitive comparison for the native diff algorithms '
@@ -513,9 +513,11 @@ OPTS_META = [
               'lines. Non-ASCII text is compared as-is (no full Unicode '
               'case folding).\n'
               'Can also be toggled from the compare-tab right-click context '
-              'menu (checkable item below "Refresh").\n'
-              'Not supported by the pure-Python algorithms -- they '
-              'compare strictly.\n'
+              'menu (checkable item below "Recompare").\n'
+              'Not supported by the pure-Python algorithms -- '
+              'they compare strictly, so the option is hidden (config '
+              'dialog and compare-tab context menu) while a Python '
+              'algorithm is selected.\n'
               'Default: off.'),
      'def': False,
      'frm': 'bool',
@@ -529,9 +531,11 @@ OPTS_META = [
               'line -- leading, interior and trailing -- so "abc def" '
               'compares equal to "abcdef".\n'
               'Can also be toggled from the compare-tab right-click context '
-              'menu (checkable item below "Refresh").\n'
-              'Not supported by the pure-Python algorithms -- they '
-              'compare strictly.\n'
+              'menu (checkable item below "Recompare").\n'
+              'Not supported by the pure-Python algorithms -- '
+              'they compare strictly, so the option is hidden (config '
+              'dialog and compare-tab context menu) while a Python '
+              'algorithm is selected.\n'
               'Default: off.'),
      'def': False,
      'frm': 'bool',
@@ -558,9 +562,11 @@ OPTS_META = [
               'Next/Previous Difference, and a file differing only in '
               'blank lines reports "No differences found".\n'
               'Can also be toggled from the compare-tab right-click context '
-              'menu (checkable item below "Refresh").\n'
-              'Not supported by the pure-Python algorithms -- they '
-              'compare strictly.\n'
+              'menu (checkable item below "Recompare").\n'
+              'Not supported by the pure-Python algorithms -- '
+              'they compare strictly, so the option is hidden (config '
+              'dialog and compare-tab context menu) while a Python '
+              'algorithm is selected.\n'
               'Default: off.'),
      'def': False,
      'frm': 'bool',
@@ -575,9 +581,11 @@ OPTS_META = [
               'End-of-line tokens also compare equal in the char-level '
               'details inside modified lines.\n'
               'Can also be toggled from the compare-tab right-click context '
-              'menu (checkable item below "Refresh").\n'
-              'Not supported by the pure-Python algorithms -- they '
-              'compare strictly.\n'
+              'menu (checkable item below "Recompare").\n'
+              'Not supported by the pure-Python algorithms -- '
+              'they compare strictly, so the option is hidden (config '
+              'dialog and compare-tab context menu) while a Python '
+              'algorithm is selected.\n'
               'Default: off.'),
      'def': False,
      'frm': 'bool',
@@ -594,9 +602,11 @@ OPTS_META = [
               'char-level details inside modified lines, number-only '
               'changes are not highlighted.\n'
               'Can also be toggled from the compare-tab right-click context '
-              'menu (checkable item below "Refresh").\n'
-              'Not supported by the pure-Python algorithms -- they '
-              'compare strictly.\n'
+              'menu (checkable item below "Recompare").\n'
+              'Not supported by the pure-Python algorithms -- '
+              'they compare strictly, so the option is hidden (config '
+              'dialog and compare-tab context menu) while a Python '
+              'algorithm is selected.\n'
               'Default: off.'),
      'def': False,
      'frm': 'bool',
@@ -627,7 +637,7 @@ OPTS_META = [
      'cmt': _('Auto-refresh after changes\n'
               'When enabled, the diff markers are automatically re-calculated '
               'after you stop editing for 1-2 seconds. When disabled, you '
-              'must use the Refresh command manually.\n'
+              'must use the Recompare command manually.\n'
               'Default: off.'),
      'def': False,
      'frm': 'bool',
@@ -638,7 +648,8 @@ OPTS_META = [
               'When enabled, the plugin captures these keys inside compare '
               'tabs: Alt+Left/Alt+Right copy the current difference to the '
               'other side, Alt+Down/Alt+Up jump to the next/previous '
-              'difference, F5 refreshes the compare. In all other tabs the '
+              'difference, F5 recompares (runs the Recompare command). '
+              'In all other tabs the '
               'keys keep their normal behavior. The plugin subscribes/ '
               'unsubscribes to the key events at runtime, so changing this '
               'option takes effect at once.\n'
@@ -766,7 +777,7 @@ def set_opt(key, val):
 
 
 # Ignore options exposed as checkable items in the diff-tab right-click
-# context menu (below 'Refresh' -- see tabmenu_init) and in the config
+# context menu (below 'Recompare' -- see tabmenu_init) and in the config
 # dialog (chapter 'ignoreopt' -- see OPTS_META). Order = context-menu
 # display order.
 # Each entry: (config key suffix under 'ignoreopt.', menu caption).
@@ -1249,8 +1260,28 @@ class Command:
         else:
             self._unsubscribe_on_key()
 
+    def _visible_opts_meta(self):
+        """OPTS_META filtered for what the current algorithm can use.
+
+        The five 'ignore' options (chapter 'ignoreopt') are implemented by
+        the native diff engines only -- the pure-Python algorithms compare
+        strictly and ignore the flags bitmask. While a Python algorithm is
+        the effective one (configured Python algo, or a native algo that
+        fell back to Python because cudatext.diff_proc is missing), the
+        options do nothing, so they are hidden from the config dialog and
+        the compare-tab context menu instead of sitting there inert.
+
+        The dialog is static (the Options Editor cannot show/hide items
+        while it is open), so switching the algorithm takes effect the
+        next time the dialog / menu is opened -- after OK, config() has
+        already reloaded the new value."""
+        use_native = self._resolve_algorithm()[1]
+        if use_native:
+            return OPTS_META
+        return [m for m in OPTS_META if m.get('chp') != 'ignoreopt']
+
     def change_config(self):
-        """Open the options dialog (cuda_options_editor (Options Editor plugin) 
+        """Open the options dialog (cuda_options_editor (Options Editor plugin)
         or cuda_prefs (Options Editor Lite builtin plugin)) for
         the 'differ.*' settings. After the dialog closes, reload config and
         re-apply sync scroll setting."""
@@ -1262,15 +1293,18 @@ class Command:
         subset = 'differ.'  # Key to isolate settings for op_ed plugin
         how = dict(hide_lex_fil=True,  # If option has not setting for lexer/cur.file
                    stor_json=JSONFILE)
+        # The ignore options are hidden while a Python algorithm is
+        # selected -- see _visible_opts_meta.
+        opts_meta = self._visible_opts_meta()
         try:  # New op_ed allows to skip meta-file
             op_ed_dlg = op_ed.OptEdD(
-                path_keys_info=OPTS_META, subset=subset, how=how)
+                path_keys_info=opts_meta, subset=subset, how=how)
         except:
-            # Old op_ed requires to use meta-file
-            if not os.path.exists(METAJSONFILE) \
-            or os.path.getmtime(METAJSONFILE) < os.path.getmtime(__file__):
-                # Create/update meta-info file
-                open(METAJSONFILE, 'w').write(json.dumps(OPTS_META, indent=4))
+            # Old op_ed requires to use meta-file. Always rewrite it (the
+            # content now depends on the current algorithm, so a stale
+            # file could miss the ignore options after a switch back to a
+            # native algorithm).
+            open(METAJSONFILE, 'w').write(json.dumps(opts_meta, indent=4))
             op_ed_dlg = op_ed.OptEdD(
                 path_keys_info=METAJSONFILE, subset=subset, how=how)
         if op_ed_dlg.show(_('Differ Options')):  # Dialog caption
@@ -1287,7 +1321,7 @@ class Command:
     # 'ignoreopt' in the config dialog -- see OPTS_META; built into the
     # flags bitmask by differ_native.build_ignore_flags at compare time).
     # They are ALSO exposed as checkable items in the diff-tab right-click
-    # context menu, right below 'Refresh' -- see tabmenu_init() and
+    # context menu, right below 'Recompare' -- see tabmenu_init() and
     # tabmenu_ignore().
 
     def on_cli(self, fn1, fn2):
@@ -1578,8 +1612,8 @@ class Command:
 
     def on_state(self, ed_self, state):
         """Handle theme changes (reload config so the new compare colors
-        take effect) and word-wrap state changes (re-apply gaps with
-        wrap-aware sizes)."""
+        take effect) and word-wrap state changes (sync the wrap mode to
+        the other half, then re-apply gaps with wrap-aware sizes)."""
         if state == ct.APPSTATE_THEME_UI:
             # UI theme switched: re-resolve the compare colors -- 'auto'
             # may now detect a different family, and the grey/black
@@ -1592,12 +1626,54 @@ class Command:
         elif state == ct.APPSTATE_THEME_SYNTAX:
             self.config()
         elif state == ct.EDSTATE_WRAP:
-            # Word-wrap mode changed on one of the split halves. The
-            # inter-line gaps were sized for the previous wrap state, so
-            # we must re-apply them with wrap-aware sizes to keep both
-            # sides visually aligned.
+            # Word-wrap mode changed on one of the split halves. Propagate
+            # the new mode to the other half first (see _sync_wrap_state),
+            # then re-apply the inter-line gaps with wrap-aware sizes to
+            # keep both sides visually aligned.
             if self._is_compare_tab(ed_self.get_prop(ct.PROP_TAB_ID)):
-                self.refresh_compare(ed_self, show_dialog=False)  # automatic -- no dialog
+                self._sync_wrap_state(ed_self)  # also refreshes
+
+    def _sync_wrap_state(self, ed_self):
+        """Word-wrap sync: make both halves of ed_self's compare tab use
+        the wrap mode ed_self just got, then refresh the compare.
+
+        The user toggles wrap on ONE half (menu command / hotkey); without
+        this mirror the halves would wrap independently and the side-by-
+        side alignment breaks. We copy ed_self's new PROP_WRAP value to the
+        opposite half BEFORE refreshing, so the gap re-sizing inside
+        refresh_compare reads the wrap counts of two halves that are
+        already in the new wrap mode.
+
+        Echo suppression: setting PROP_WRAP may itself fire EDSTATE_WRAP
+        for the other half (synchronously during our set_prop, or later).
+        By the time such an echo arrives, both halves already carry the
+        same wrap mode, and 'the two halves already match' is exactly the
+        condition under which there is nothing left to propagate or
+        re-size -- so the handler simply returns. A genuine user toggle
+        always fires with the halves still mismatched (the opposite half
+        still holds the old mode), which is the only path that propagates
+        and refreshes. This works the same whether CudaText delivers the
+        echo synchronously or after our handler has returned, and needs
+        no flags or timers."""
+        wrap_mode = ed_self.get_prop(ct.PROP_WRAP)
+        a_ed = ct.Editor(ed_self.get_prop(ct.PROP_HANDLE_PRIMARY))
+        b_ed = ct.Editor(ed_self.get_prop(ct.PROP_HANDLE_SECONDARY))
+        mismatched = False
+        for e in (a_ed, b_ed):
+            try:
+                if e.get_prop(ct.PROP_WRAP) != wrap_mode:
+                    e.set_prop(ct.PROP_WRAP, wrap_mode)
+                    mismatched = True
+            except Exception:
+                pass  # dead handle: tab is being closed, nothing to sync
+        if not mismatched:
+            # Echo of our own propagation (both halves already match) --
+            # the refresh ran when the real toggle was handled.
+            return
+        # Automatic -- no dialog. The refresh re-reads the (now equal)
+        # wrap modes of both halves and re-sizes the inter-line gaps with
+        # wrap-aware visual-row counts.
+        self.refresh_compare(ed_self, show_dialog=False)
 
     def on_scroll(self, ed_self):
         """Forward scroll events to ScrollSplittedTab for synchronized
@@ -1699,7 +1775,7 @@ class Command:
             Alt+Right -> "Copy current difference to the right"
             Alt+Down  -> "Jump to next difference"
             Alt+Up    -> "Jump to previous difference"
-            F5        -> "Refresh"
+            F5        -> "Recompare"
 
         Everything else passes through untouched: keys not in the map;
         hotkey keys without their EXACT modifier state (the Alt+Arrows
@@ -1859,7 +1935,7 @@ class Command:
             # on_start2 can restore the correct color after restart.
             self._update_dirty_state(tab_id, remaining)
             # Auto-refresh diff markers so the user sees updated
-            # highlights without needing to click Refresh manually.
+            # highlights without needing to click Recompare manually.
             # self.refresh_compare(ed_self, show_dialog=False)  # automatic -- no dialog
 
         # Block the default save (which would show a Save dialog for the
@@ -2022,7 +2098,7 @@ class Command:
     '''
 
     def on_tab_menu(self, ed_self):
-        """Build the right-click tab context menu (Compare with..., Refresh, etc.)."""
+        """Build the right-click tab context menu (Compare with..., Recompare, etc.)."""
         self.tabmenu_init(ed_self)
 
     def _lock_compare_editors(self, job):
@@ -2246,7 +2322,7 @@ class Command:
         algorithm, and (re)applies markers, gaps, overview and bookmarks.
 
         'ed' is any editor belonging to the compare tab. When omitted
-        (plugin menu command / context-menu Refresh), uses the focused
+        (plugin menu command / context-menu Recompare), uses the focused
         editor ct.ed.
 
         'show_dialog' controls whether the 'two sides are identical'
@@ -2285,7 +2361,7 @@ class Command:
         # running for this tab? While it runs, LOCK_EDITORS_WHILE_COMPARING
         # keeps the halves locked + read-only, so their texts cannot drift
         # under the engine -- there is nothing a queued re-run would fix.
-        # Drop this request (manual Refresh, on_change_slow auto-refresh,
+        # Drop this request (manual Recompare, on_change_slow auto-refresh,
         # on_state) with a status hint instead of starting a second engine
         # job or deferring work: the running compare finishes and paints
         # against its own kick-off snapshots; the NEXT refresh -- the user
@@ -3790,7 +3866,7 @@ class Command:
     def tabmenu_init(self, cur_ed: ct.Editor):
         """Build the right-click tab context menu: 'Compare with...',
         'Compare with focused tab', 'Compare with tab' (submenu of all
-        open tabs), and 'Refresh'. Only shown for valid compare candidates."""
+        open tabs), and 'Recompare'. Only shown for valid compare candidates."""
         cur_fn = self.get_name(cur_ed)
         path_focused = self.get_name(ct.ed)
 
@@ -3856,34 +3932,48 @@ class Command:
         ct.menu_proc(self.menuid_withfocused, ct.MENU_SET_ENABLED,
             command=cur_ok and not cur_is_focused and not focused_is_diff)
 
-        # Add a separator and "Refresh" entry at the end of the context menu.
-        # Only enabled when the current tab is a compare tab managed by Differ.
+        # Add a separator and "Recompare" entry at the end of the context
+        # menu. Only enabled when the current tab is a compare tab managed
+        # by Differ.
         ct.menu_proc(self.compare_menu, ct.MENU_ADD, caption='-')
         self.menuid_refresh = ct.menu_proc(self.compare_menu, ct.MENU_ADD,
             command='module=cuda_differ;cmd=tabmenu_refresh;',
-            caption=_('Refresh')
+            caption=_('Recompare')
             )
         is_compare = self._is_compare_tab(cur_ed.get_prop(ct.PROP_TAB_ID))
         ct.menu_proc(self.menuid_refresh, ct.MENU_SET_ENABLED,
             command=is_compare)
 
         # Separator + the ignore options (see _IGNORE_OPTS), right below
-        # 'Refresh'.
+        # 'Recompare' -- but ONLY while a native algorithm is the effective
+        # one (_visible_opts_meta explains why): the pure-Python algorithms
+        # compare strictly, the flags do nothing there, so the items are
+        # hidden instead of sitting inert. The menu is rebuilt on every
+        # right-click, so switching the algorithm in the config dialog
+        # shows/hides them on the next right-click.
         # The tab context menu is rebuilt from scratch by this method on
         # every right-click (on_tab_menu fires each time), so the
         # checkmarks always mirror the current settings file: changing an
         # option in the config dialog is reflected here automatically, and
         # toggling here writes it back via set_opt (tabmenu_ignore) --
         # two-way sync with zero extra bookkeeping.
-        ct.menu_proc(self.compare_menu, ct.MENU_ADD, caption='-')
-        for key, caption in _IGNORE_OPTS:
-            item = ct.menu_proc(self.compare_menu, ct.MENU_ADD,
-                command='module=cuda_differ;cmd=tabmenu_ignore;info='+key+';',
-                caption=caption
-                )
-            ct.menu_proc(item, ct.MENU_SET_CHECKED,
-                command=bool(get_opt('ignoreopt.' + key, False)))
-            ct.menu_proc(item, ct.MENU_SET_ENABLED, command=is_compare)
+        # Reload self.cfg from disk when the settings file changed, so the
+        # algorithm check below (like the checkmarks above) always mirrors
+        # the current settings -- hand-edited JSON included.
+        self.config()
+        # (index-unpack: a throwaway named '_' here would shadow the
+        # module-level _() translation function for the whole method)
+        use_native = self._resolve_algorithm()[1]
+        if use_native:
+            ct.menu_proc(self.compare_menu, ct.MENU_ADD, caption='-')
+            for key, caption in _IGNORE_OPTS:
+                item = ct.menu_proc(self.compare_menu, ct.MENU_ADD,
+                    command='module=cuda_differ;cmd=tabmenu_ignore;info='+key+';',
+                    caption=caption
+                    )
+                ct.menu_proc(item, ct.MENU_SET_CHECKED,
+                    command=bool(get_opt('ignoreopt.' + key, False)))
+                ct.menu_proc(item, ct.MENU_SET_ENABLED, command=is_compare)
 
         # Separator + the cancel commands at the very bottom, below
         # everything else. Mirrors the 'Differ\Cancel compare' and
@@ -3930,7 +4020,7 @@ class Command:
         self.compare_with_tab()
 
     def tabmenu_refresh(self):
-        """Refresh the compare tab -- re-applies diff markers."""
+        """Recompare the compare tab -- re-applies diff markers (menu item "Recompare")."""
         callback = 'module=cuda_differ;cmd=tabmenu_refresh_timer;info=_;'
         ct.timer_proc(ct.TIMER_START_ONE, callback, 100)
 
@@ -3940,7 +4030,7 @@ class Command:
 
     def tabmenu_ignore(self, info):
         """Toggle one 'differ.ignoreopt.*' option from the diff-tab context
-        menu (checkable items below 'Refresh'): persist it to
+        menu (checkable items below 'Recompare'): persist it to
         settings/cuda_differ.json via set_opt -- so the config dialog sees
         it too -- then refresh the compare on a 100ms one-shot timer (same
         convention as the other tabmenu_* callbacks, so the menu can close

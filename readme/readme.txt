@@ -27,8 +27,9 @@ synced back to the original files automatically.
   navigate.
 - Supports word-wrap: you can turn wrap on in a compare tab and the two
   sides stay visually aligned even when corresponding lines wrap to
-  different heights. Toggling wrap mode re-applies the alignment
-  automatically.
+  different heights. Toggling wrap mode on one half turns it on in BOTH
+  halves at once (same for turning it off), and the alignment is
+  re-applied automatically.
 - Optional gap-aware overview panel docked to the right of the compare
   view, showing a miniature of both editors side-by-side with colored
   diff highlights (WinMerge-style).
@@ -79,11 +80,12 @@ Note: the unified-diff output is always produced using Python's
   benefit. If you want the chosen algorithm's alignment in a
   human-readable form, use the side-by-side compare instead.
 
-Refresh
-    Re-runs the comparison after you edit either side. With the native
-    algorithms the compare runs on a background thread, so the command
-    returns at once and the markers are re-applied when the compare
-    finishes. Useful if differ.advanced.enable_auto_refresh is off.
+Recompare
+    Re-runs the comparison after you edit either side (formerly called
+    "Refresh"). With the native algorithms the compare runs on a
+    background thread, so the command returns at once and the markers
+    are re-applied when the compare finishes. Useful if
+    differ.advanced.enable_auto_refresh is off.
 
 Focus the opposite file
     Moves the cursor to the other side of the split.
@@ -126,7 +128,7 @@ meaning (your own keybindings included):
     Alt+Up      Jump to previous difference
     Alt+Right   Copy current difference to the right
     Alt+Left    Copy current difference to the left
-    F5          Refresh the compare
+    F5          Recompare (re-run the compare)
 
 They run exactly the same commands as the menu items above (including
 their guards: copying is refused while a background compare is running,
@@ -151,10 +153,13 @@ Right-clicking a tab title shows "Differ" submenu with:
 - Compare with tab -- submenu listing all open tabs; click one to compare.
   If the list is too long, the first entry "More tabs..." opens a dialog
   with a scrollbar to pick any open tab.
-- Refresh -- re-run the compare on both sides of the compare tab.
-- Five checkable "ignore" options (below Refresh, after a separator):
+- Recompare -- re-run the compare on both sides of the compare tab.
+- Five checkable "ignore" options (below Recompare, after a separator):
   Ignore case, Ignore whitespace, Ignore blank lines, Ignore line endings,
-  Ignore numbers.
+  Ignore numbers. Shown only while a native algorithm is the effective
+  one (they do nothing for the pure-Python algorithms, which always
+  compare strictly); the items appear/disappear on the next right-click
+  after the algorithm is changed in the config dialog.
   Ticking one re-runs the compare immediately with that option applied;
   the checkmarks always mirror the saved settings, so the config dialog
   and this menu stay in sync in both directions (toggling here writes the
@@ -170,9 +175,13 @@ char-level highlighting inside changed lines (except "Ignore blank
 lines", which is a line-level concept and does not affect the char-level
 details), and only to the two NATIVE
 algorithms (Native Histogram and Native Myers) -- the pure-Python
-algorithms always compare strictly and ignore these options. Set them
-from the diff tab context menu (see above) or from the config dialog
-("differ.ignoreopt.*" options in settings/cuda_differ.json).
+algorithms always compare strictly and ignore these options. Because of
+that, the options are HIDDEN while a Python algorithm is selected: the
+config dialog does not show them and the diff-tab context menu does not
+add its checkable items (both pick it up the next time they are opened
+after the algorithm is changed). Set them from the diff tab context menu
+(see above) or from the config dialog ("differ.ignoreopt.*" options in
+settings/cuda_differ.json) while a native algorithm is active.
 
 - Ignore case -- 'A' and 'a' count as equal. ASCII only; non-ASCII
   letters are compared byte-for-byte.
@@ -277,7 +286,7 @@ Compare tabs survive CudaText restarts:
 
 - If you close CudaText with a compare tab open, the compare tab is
   restored when you start CudaText again, with the same content but
-  without compare, run Refresh command to start the compare.
+  without compare, run Recompare command to start the compare.
 - The plugin loads automatically on startup only when compare tabs are
   active, so there is no performance impact when you are not comparing.
 - When you close the last compare tab, the plugin stops auto-loading on
@@ -477,7 +486,7 @@ Advanced section:
 - differ.advanced.enable_auto_refresh: Auto-refresh after changes
   When enabled, the diff markers are automatically re-calculated after
   you stop editing for 1-2 seconds. When disabled, you must use the
-  Refresh command manually.
+  Recompare command manually.
   Default: off.
 - differ.advanced.diff_context: Context lines in unified diff
   Number of unchanged context lines shown around each change in the

@@ -83,24 +83,85 @@ def split_lines_safe(text: str) -> tp.List[str]:
 
 
 class ScrollSplittedTab:
-    """Manages synchronized scrolling for split compare tabs."""
+    """Manages synchronized scrolling for split compare tabs.
+
+    How the timing works (and why this code is shaped the way it is):
+
+    CudaText fires the on_scroll event AFTER the scrolled editor has
+    painted (ATSynEdit: Paint -> PaintEx -> DoEventScroll), and program-
+    atic scroll changes fire it too (the SmoothPos-change detection runs
+    at paint time). So a naive "on event, copy the position to the other
+    half" implementation always lags one paint behind AND echoes: the
+    mirrored write makes the other half fire on_scroll back at the plugin,
+    which (without guards) does a redundant set_prop plus an unconditional
+    cmd_RepaintEditor on the already-painted half -- an extra full repaint
+    per scroll step that visibly delays the following sync updates on big
+    compare files.
+
+    This implementation keeps the two halves lock-step by:
+
+    - copying 'smooth_pos' (per-pixel float position) from the scrolled
+      half to the other half inside the event -- the mirrored half's
+      repaint then happens in the same message-loop batch, right after
+      the scrolled half's paint, so both move in the same display frame;
+    - skipping the write entirely when the other half already sits at the
+      same position: no position change means no repaint, no echo event,
+      and the whole cascade dies out instead of ping-ponging;
+    - a re-entrancy guard (like the official cuda_sync_scroll plugin) so
+      a synchronously re-entered event can never recurse;
+    - the end-of-scroll guard from cuda_sync_scroll: when the scrolled
+      half is at its last position, the write is skipped -- workaround
+      for a CudaText bug with scrolling at the end of non-equal-height
+      files (possible here when word-wrap makes the halves differ in
+      visual height).
+
+    keep_caret_visible is unused here (kept for API compatibility with
+    the old implementation); the caret mirror lives in __init__.py
+    (on_caret / sync_caret).
+    """
 
     keep_caret_visible = False
 
     def __init__(self, name):
         self.name = name
         self.tab_id = set()
+        # Re-entrancy guard: True while an on_scroll handler is mirroring
+        # a position, so a nested (synchronous) on_scroll for the opposite
+        # half cannot start a second mirror pass.
+        self._busy = False
 
     def toggle(self, on=True):
-        act = ct.PROC_EVENTS_SUB if on and ct.ed.get_prop(ct.PROP_TAB_ID) in self.tab_id else ct.PROC_EVENTS_UNSUB
+        """(Un)subscribe the on_scroll event for this module.
+
+        Subscribe when sync is on AND at least one compare tab exists --
+        the focused tab does NOT have to be a compare tab: the event is
+        subscribed globally (on_scroll supports no event filter) and
+        filtered per event in __init__.py. The old condition (focused tab
+        must be a compare tab) could UNSUBSCRIBE while compares were open
+        (e.g. change_config ran from a normal tab), silently killing the
+        sync until the next compare was created."""
+        act = ct.PROC_EVENTS_SUB if on and self.tab_id else ct.PROC_EVENTS_UNSUB
         ct.app_proc(act, self.name+';on_scroll;;')
 
     def on_scroll(self, ed_self):
+        """Mirror the scroll position of ed_self to the opposite half of
+        the split tab. Called from __init__.py's on_scroll only for compare
+        tabs (already _is_compare_tab-filtered)."""
         if ed_self.get_prop(ct.PROP_SPLIT)[0] == '-':
             return
+        if self._busy:
+            return
+        self._busy = True
+        try:
+            self._mirror_scroll(ed_self)
+        finally:
+            self._busy = False
 
-        pos_v = ed_self.get_prop(ct.PROP_SCROLL_VERT_INFO)['smooth_pos']
-        pos_h = ed_self.get_prop(ct.PROP_SCROLL_HORZ_INFO)['smooth_pos']
+    def _mirror_scroll(self, ed_self):
+        info_v = ed_self.get_prop(ct.PROP_SCROLL_VERT_INFO)
+        info_h = ed_self.get_prop(ct.PROP_SCROLL_HORZ_INFO)
+        pos_v = info_v['smooth_pos']
+        pos_h = info_h['smooth_pos']
 
         hndl_self = ed_self.get_prop(ct.PROP_HANDLE_SELF)
         hndl_primary = ed_self.get_prop(ct.PROP_HANDLE_PRIMARY)
@@ -111,7 +172,40 @@ class ScrollSplittedTab:
             hndl_opposit = hndl_primary
         e = ct.Editor(hndl_opposit)
 
-        e.set_prop(ct.PROP_SCROLL_VERT_INFO, {'smooth_pos': pos_v})
-        e.set_prop(ct.PROP_SCROLL_HORZ_INFO, {'smooth_pos': pos_h})
+        info2_v = e.get_prop(ct.PROP_SCROLL_VERT_INFO)
+        info2_h = e.get_prop(ct.PROP_SCROLL_HORZ_INFO)
 
-        e.cmd(ct_cmd.cmd_RepaintEditor)
+        # End-of-scroll guard (from the official cuda_sync_scroll plugin):
+        # skip the write when the scrolled half is at its last position --
+        # CudaText misbehaves when scrolling at the end of files whose
+        # halves differ in height (word-wrap can do that here).
+        # Missing 'smooth_pos_last' (older API) just disables the guard.
+        max_v = info_v.get('smooth_pos_last')
+        max2_v = info2_v.get('smooth_pos_last')
+        max_h = info_h.get('smooth_pos_last')
+        max2_h = info2_h.get('smooth_pos_last')
+
+        changed = False
+
+        # Vertical: write only when the position actually differs -- a
+        # redundant write would still cost a Python->C call and a
+        # scrollbars update, and would keep the echo cascade alive.
+        if pos_v != info2_v['smooth_pos']:
+            if (max_v is None or pos_v < max_v) and \
+               (max2_v is None or pos_v < max2_v):
+                e.set_prop(ct.PROP_SCROLL_VERT_INFO, {'smooth_pos': pos_v})
+                changed = True
+
+        # Horizontal: same treatment.
+        if pos_h != info2_h['smooth_pos']:
+            if (max_h is None or pos_h < max_h) and \
+               (max2_h is None or pos_h < max2_h):
+                e.set_prop(ct.PROP_SCROLL_HORZ_INFO, {'smooth_pos': pos_h})
+                changed = True
+
+        # Repaint the mirrored half only when its position really changed.
+        # The scrolled half has already painted (the event is post-paint),
+        # so repainting it again would only burn time; and when nothing
+        # changed there is nothing to show at all.
+        if changed:
+            e.cmd(ct_cmd.cmd_RepaintEditor)

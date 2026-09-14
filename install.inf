@@ -28,7 +28,7 @@ method=diff_with_tab
 
 [item4]
 section=commands
-caption=Differ\Refresh
+caption=Differ\Recompare
 method=refresh_compare
 
 [item4b]
