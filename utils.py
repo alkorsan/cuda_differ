@@ -114,13 +114,7 @@ class ScrollSplittedTab:
       for a CudaText bug with scrolling at the end of non-equal-height
       files (possible here when word-wrap makes the halves differ in
       visual height).
-
-    keep_caret_visible is unused here (kept for API compatibility with
-    the old implementation); the caret mirror lives in __init__.py
-    (on_caret / sync_caret).
     """
-
-    keep_caret_visible = False
 
     def __init__(self, name):
         self.name = name

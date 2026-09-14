@@ -28,9 +28,17 @@ Architecture:
       embedded bitmap via CANVAS_BITMAP, then draw the slider and
       grabber on top. This is cheap (one bitmap copy + a few
       CANVAS_RECT / CANVAS_LINE calls).
-  - On scroll (debounced 150ms): paint() is called. It only copies the
-    static bitmap and draws the dynamic part — the static bitmap is reused.
-    This avoids repainting hundreds of rectangles on every scroll.
+  - On scroll, two repaint paths keep the overview cheap AND responsive:
+    * Immediate: track_paint() (called from the slider drag handlers and
+      from the plugin's on_scroll) repaints at up to ~33 fps, gated by
+      WALL CLOCK -- never by a timer, because a drag floods the message
+      queue and starves WM_TIMER, which would freeze the thumb until
+      the drag stops.
+    * Trailing: a one-shot 150ms timer (armed by the plugin's on_scroll)
+      does the final repaint after scrolling stops.
+    Both only copy the static bitmap and draw the dynamic part (slider +
+    grabber) -- the static bitmap is reused, so the expensive rectangle
+    loop never runs on scroll.
   - On compare/resize: repaint_static() is called first, which frees the
     old static bitmap and creates a new one with fresh content. Then
     paint() copies it + draws the dynamic part.
@@ -84,7 +92,10 @@ Architecture:
   See: https://github.com/CudaText-addons/cuda_differ/issues/29
 """
 
+import time
+
 import cudatext as ct
+import cudatext_cmd as ct_cmd
 from .profiling import Profiler
 
 # Overview dialog width in pixels (docked to the right)
@@ -95,6 +106,17 @@ OVERVIEW_WIDTH = 40
 # resolution to spot colored diff blocks while taking less horizontal
 # space. The panel is docked and resizable, so users can drag it wider
 # if they want more detail.
+
+# Wall-clock interval (seconds) between immediate slider repaints while
+# tracking the mouse (slider drag) or a scroll burst. ~33 fps looks
+# instant to the eye, and paint() is cheap here (one cached-bitmap copy
+# + the slider drawing -- the expensive static rectangles never run),
+# so the CPU cost stays negligible even during fast drags. The gate is
+# WALL-CLOCK, not a timer: during a drag the message queue is flooded
+# with mouse moves and WM_TIMER is only delivered when the queue drains,
+# so a timer-driven repaint would freeze the slider until the drag ends
+# (exactly the "thumb does not move until I stop" bug this fixes).
+OVERVIEW_TRACK_INTERVAL = 0.030
 
 
 class PaintboxOverview:
@@ -147,6 +169,9 @@ class PaintboxOverview:
         self._dragging = False
         self._drag_offset = 0
         self._smooth_max = 0
+        # Wall-clock timestamp of the last track_paint(); gates the
+        # immediate slider repaints to OVERVIEW_TRACK_INTERVAL.
+        self._track_last_paint = 0.0
 
         # --- Slider opacity options (user-configurable) ---
         # opt_slider_opacity_enabled: if False, use the OLD solid-fill
@@ -1029,9 +1054,16 @@ class PaintboxOverview:
             # Click outside slider — jump (centered on click)
             self._dragging = False
             self._scroll_overview_pixel(y, center=True)
+            # Immediate slider update (bypassing the throttle): the
+            # thumb must land on the clicked position right away --
+            # the 150ms debounce timer fires much later, or not at all
+            # if the click turns into a drag.
+            self.track_paint(force=True)
 
     def _on_mouse_move(self, id_dlg, id_ctl, data='', info=''):
-        """Called on mouse move. If dragging, scroll the editor to follow."""
+        """Called on mouse move. If dragging, scroll the editor to follow
+        and repaint the slider so its thumb tracks the mouse like a
+        normal scrollbar (throttled to ~33 fps -- see track_paint)."""
         if not getattr(self, '_dragging', False):
             return
         if isinstance(data, dict):
@@ -1046,10 +1078,50 @@ class PaintboxOverview:
         # Drag: the slider top follows the mouse (accounting for offset)
         target_y = y - self._drag_offset
         self._scroll_overview_pixel(target_y, center=False)
+        # Immediate (throttled) slider repaint so the thumb moves with
+        # the mouse. A timer cannot do this during a drag -- see
+        # track_paint for why (WM_TIMER starvation under the flooded
+        # message queue).
+        self.track_paint()
 
     def _on_mouse_up(self, id_dlg, id_ctl, data='', info=''):
-        """Called on mouse up. Stops dragging."""
+        """Called on mouse up. Stops dragging and does one final slider
+        repaint with the throttle bypassed, so the thumb lands exactly
+        where the drag ended (the throttled repaints during the drag may
+        have skipped the very last position)."""
+        was_dragging = self._dragging
         self._dragging = False
+        if was_dragging:
+            self.track_paint(force=True)
+
+    def track_paint(self, force=False):
+        """Repaint the overview immediately, throttled by WALL CLOCK to
+        OVERVIEW_TRACK_INTERVAL (~33 fps).
+
+        Used while the slider is dragged (mouse-move handler) and on
+        every scroll event (plugin on_scroll) so the slider tracks the
+        live position instead of waiting for the 150ms debounce timer.
+        That timer is useless during a drag: mouse moves flood the
+        message queue and WM_TIMER is only delivered when the queue
+        drains, so a timer-debounced slider appears FROZEN until the
+        drag stops.
+
+        paint() is cheap on this path (one cached-bitmap copy + the
+        slider drawing -- the expensive static rectangles never run),
+        so ~33 repaints per second cost little CPU; the wall-clock gate
+        keeps the rate bounded no matter how fast the mouse moves or
+        how densely scroll events arrive.
+
+        Args:
+            force: bypass the throttle (final repaint on mouse-up and
+                after a click jump, where landing on the exact position
+                matters more than the rate limit).
+        """
+        now = time.monotonic()
+        if not force and now - self._track_last_paint < OVERVIEW_TRACK_INTERVAL:
+            return
+        self._track_last_paint = now
+        self.paint()
 
     def _scroll_overview_pixel(self, overview_y, center=True):
         """Scroll the editors based on a pixel Y position in the overview.
@@ -1103,5 +1175,25 @@ class PaintboxOverview:
         if self.b_ed is not None:
             try:
                 self.b_ed.set_prop(ct.PROP_SCROLL_VERT_INFO, {'smooth_pos': target_smooth_pos})
+            except Exception:
+                pass
+
+        # Force BOTH halves into the SAME repaint batch. set_prop alone
+        # leaves each half's repaint to its own invalidation -- subject
+        # to anti-flicker timers and to the paint-order quirks of two
+        # sibling controls -- which can put the halves into different
+        # display frames: one half visibly scrolls a few milliseconds
+        # before the other catches up. cmd_RepaintEditor maps to
+        # Ed.Update(false, true, false), a FORCED invalidation that
+        # bypasses the anti-flicker delay (CudaText's author added those
+        # parameters exactly for the cuda_sync_scroll plugin); issuing
+        # it for both halves from this one callback makes them repaint
+        # back-to-back in a single message-loop batch, i.e. in the same
+        # display frame.
+        for e in (self.a_ed, self.b_ed):
+            if e is None:
+                continue
+            try:
+                e.cmd(ct_cmd.cmd_RepaintEditor)
             except Exception:
                 pass

@@ -28,8 +28,9 @@ synced back to the original files automatically.
 - Supports word-wrap: you can turn wrap on in a compare tab and the two
   sides stay visually aligned even when corresponding lines wrap to
   different heights. Toggling wrap mode on one half turns it on in BOTH
-  halves at once (same for turning it off), and the alignment is
-  re-applied automatically.
+  halves at once (same for turning it off), and the compare is
+  re-run automatically afterwards so the alignment gaps are re-sized
+  for the new wrap mode.
 - Optional gap-aware overview panel docked to the right of the compare
   view, showing a miniature of both editors side-by-side with colored
   diff highlights (WinMerge-style).
@@ -124,17 +125,20 @@ These shortcuts are active only while the caret is in one of the two
 halves of a compare tab; in every other tab the keys keep their normal
 meaning (your own keybindings included):
 
-    Alt+Down    Jump to next difference
-    Alt+Up      Jump to previous difference
-    Alt+Right   Copy current difference to the right
-    Alt+Left    Copy current difference to the left
-    F5          Recompare (re-run the compare)
+    Alt+Down          Jump to next difference
+    Alt+Up            Jump to previous difference
+    Alt+Right         Copy current difference to the right
+    Alt+Left          Copy current difference to the left
+    Ctrl+Alt+Right    Copy current line to the right
+    Ctrl+Alt+Left     Copy current line to the left
+    F5                Recompare (re-run the compare)
 
 They run exactly the same commands as the menu items above (including
 their guards: copying is refused while a background compare is running,
 and jumping reports "No differences were found" on a clean compare).
-Alt+Arrow combinations with additional modifiers (Shift/Ctrl/Meta, e.g.
-Ctrl+Alt+Down) and modified F5 (Ctrl+F5 etc.) are NOT captured and keep
+Alt+Arrow combinations with additional modifiers (Shift/Meta, e.g.
+Alt+Shift+Left, Ctrl+Alt+Shift+Left, Ctrl+Alt+Meta+Left), Ctrl+Alt+
+Down/Up and modified F5 (Ctrl+F5 etc.) are NOT captured and keep
 their normal behavior. When a shortcut fires, the key is consumed, so
 the editor's own action (Alt+Arrow caret movement etc.) does not also
 run.

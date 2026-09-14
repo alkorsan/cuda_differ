@@ -1,17 +1,16 @@
 
-currently the plugin creates temp files then compare them, cudatext have a new and better way to compare without using temp files using this, open untitled tab , set PROP_EDITORS_LINKED to False then split the tab to two frames like that:
-file_open('')
-ed.set_prop(PROP_EDITORS_LINKED, False)
-ed.set_prop(PROP_SPLIT, ('v', 500))
-
-then we can load the original file content or untitled tab content inside that new splited tab, this allows us to not use any temp file and simplify the code a lot much 
-_______________
-
  
-when i switch to a different session the temporal backup files are deleted and the diff tab become broken, everything must persist until the user explicitly close the diff tab
+remove the colored squares in left bar, it s not needed and may only slow things more
+
+hide ignore options for python algorithms
+
+
+if there a diff tab then i switch session, the session manager ask to save the diff tab if i respond no, the diff tab get deleted from differ json; think in a better fix
+
 
 when user click wrap we must wrap both editors
 
+rename refresh to recompare
 
 remove all events from install inf and subscribe dynamically to the events we need when the plugin is loaded , when we close the last diff tab we must unsubscribe from all events except right click menu
 
@@ -80,7 +79,6 @@ find why there is an orange line near micromap
 add use auto junk option and make default true
 
 
-remove the colored squares in left bar, it s not needed and may only slow things more
 
 bug :on_state do not fire for differ
 
@@ -119,7 +117,6 @@ splitlines(False) change to true and why it have no effect
 
 
 
-if there a diff tab then i switch session, the session manager ask to save the diff tab if i respond no, the diff tab get deleted from differ json; think in a better fix
 
 
 _________________________
@@ -144,7 +141,6 @@ ____
 canceled: make overview height same as default scrollbar, canceled: it s not necesary
 canceled: reduce overview slider min-height to 5px, canceled: i prefer 30px so i can move it always 
 
-hide ignore options for python algorithms
 
 
 run all in a thread in pascal and python
@@ -163,7 +159,7 @@ vscode algo have a bug with space it does not considere it
 
 add aligne opcode to native algo too like before
 
-rename refresh to recompare
+
 
 __________________________
 

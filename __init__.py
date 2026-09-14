@@ -44,23 +44,27 @@ U_PREFIX = 'untitled:'
 # Hotkeys for compare tabs, dispatched by Command.on_key. The plugin
 # subscribes to the lazy on_key~ event AT RUNTIME with a key-code filter
 # (see _sync_on_key_subscription) -- install.inf does NOT list on_key.
-# Key code -> (Command method name, required modifier state:
-# 'a' = exactly Alt, '' = no modifiers at all):
-#   Alt+Left  -> copy_left        "Copy current difference to the left"
-#   Alt+Right -> copy_right       "Copy current difference to the right"
-#   Alt+Down  -> jump_next        "Jump to next difference"
-#   Alt+Up    -> jump_prev        "Jump to previous difference"
-#   F5        -> refresh_compare  "Recompare"
+# Key code -> tuple of (Command method name, required modifier state)
+# entries, tried in order until one matches EXACTLY:
+#   'a'  = Alt and only Alt,  'ca' = Ctrl+Alt and only those two,
+#   ''   = no modifiers at all.
+#   Alt+Left       -> copy_left        "Copy current difference to the left"
+#   Alt+Right      -> copy_right       "Copy current difference to the right"
+#   Ctrl+Alt+Left  -> copy_line_left   "Copy current line to the left"
+#   Ctrl+Alt+Right -> copy_line_right  "Copy current line to the right"
+#   Alt+Down       -> jump_next        "Jump to next difference"
+#   Alt+Up         -> jump_prev        "Jump to previous difference"
+#   F5             -> refresh_compare  "Recompare"
 # Hotkeys fire only with the EXACT modifier state and only inside the
 # two halves of a compare tab this plugin manages; every other editor
 # keeps its normal key behavior, user bindings included. Governed by
 # the 'enable_keyboard_capture' setting (default on).
 _HOTKEYS = {
-    ct_keys.VK_LEFT:   ('copy_left', 'a'),
-    ct_keys.VK_RIGHT:  ('copy_right', 'a'),
-    ct_keys.VK_DOWN:   ('jump_next', 'a'),
-    ct_keys.VK_UP:     ('jump_prev', 'a'),
-    ct_keys.VK_F5:     ('refresh_compare', ''),
+    ct_keys.VK_LEFT:   (('copy_left', 'a'), ('copy_line_left', 'ca')),
+    ct_keys.VK_RIGHT:  (('copy_right', 'a'), ('copy_line_right', 'ca')),
+    ct_keys.VK_DOWN:   (('jump_next', 'a'),),
+    ct_keys.VK_UP:     (('jump_prev', 'a'),),
+    ct_keys.VK_F5:     (('refresh_compare', ''),),
 }
 
 # Key-code filter for the runtime on_key event subscription
@@ -1611,9 +1615,14 @@ class Command:
         ct.ed.set_prop(ct.PROP_SAVE_HISTORY, False)
 
     def on_state(self, ed_self, state):
-        """Handle theme changes (reload config so the new compare colors
-        take effect) and word-wrap state changes (sync the wrap mode to
-        the other half, then re-apply gaps with wrap-aware sizes)."""
+        """App-level state changes: reload the config when a UI or syntax
+        theme switch may have moved the compare colors.
+
+        Note: EDSTATE_* values (word-wrap, read-only, zoom...) never
+        arrive here. Since CudaText 1.94.0 (api 1.0.320) on_state only
+        carries APPSTATE_* constants -- editor states are delivered to
+        on_state_ed (see the next handler). The plugin requires api
+        1.0.483, so relying on that event split is safe."""
         if state == ct.APPSTATE_THEME_UI:
             # UI theme switched: re-resolve the compare colors -- 'auto'
             # may now detect a different family, and the grey/black
@@ -1625,17 +1634,29 @@ class Command:
             self.config()
         elif state == ct.APPSTATE_THEME_SYNTAX:
             self.config()
-        elif state == ct.EDSTATE_WRAP:
-            # Word-wrap mode changed on one of the split halves. Propagate
-            # the new mode to the other half first (see _sync_wrap_state),
-            # then re-apply the inter-line gaps with wrap-aware sizes to
-            # keep both sides visually aligned.
+
+    def on_state_ed(self, ed_self, state):
+        """Editor-level state changes (EDSTATE_* constants -- this event,
+        not on_state, is where CudaText delivers them).
+
+        EDSTATE_WRAP on a half of a compare tab: propagate the new wrap
+        mode to the other half first, then refresh the compare so the
+        inter-line gaps are re-sized with wrap-aware visual-row counts
+        (see _sync_wrap_state, which does both)."""
+        if state == ct.EDSTATE_WRAP:
+            # Word-wrap mode changed on one of the split halves.
             if self._is_compare_tab(ed_self.get_prop(ct.PROP_TAB_ID)):
                 self._sync_wrap_state(ed_self)  # also refreshes
 
     def _sync_wrap_state(self, ed_self):
         """Word-wrap sync: make both halves of ed_self's compare tab use
         the wrap mode ed_self just got, then refresh the compare.
+
+        Entered from on_state_ed(EDSTATE_WRAP) -- the ONLY event that
+        carries wrap changes (on_state stopped supporting EDSTATE_*
+        values in CudaText 1.94.0; before the on_state_ed subscription
+        existed, this whole feature was dead code because the wrap
+        event never arrived).
 
         The user toggles wrap on ONE half (menu command / hotkey); without
         this mirror the halves would wrap independently and the side-by-
@@ -1677,15 +1698,26 @@ class Command:
 
     def on_scroll(self, ed_self):
         """Forward scroll events to ScrollSplittedTab for synchronized
-        scrolling. The overview repaint is debounced via a timer to
-        avoid excessive CPU usage and flickering during continuous
-        scrolling."""
+        scrolling, and keep the overview slider tracking the position.
+
+        The overview update is two-layered:
+        - immediate: overview.track_paint() repaints the slider at up to
+          ~33 fps (wall-clock throttled), so the thumb follows scrolling
+          as it happens. A timer alone cannot do this during a slider
+          drag: mouse moves flood the message queue, and WM_TIMER is
+          only delivered when the queue drains -- a timer-debounced
+          slider stays FROZEN until the drag stops.
+        - trailing: a one-shot 150ms timer does the final full repaint
+          after scrolling stops (catches the settled position, e.g. the
+          end-of-scroll clamping)."""
         tab_id = ed_self.get_prop(ct.PROP_TAB_ID)
         if self._is_compare_tab(tab_id):
             self.scroll.on_scroll(ed_self)
-            # Debounce overview repaint: use a one-shot timer so we
-            # only repaint after scrolling stops for 150ms.
             tab_id_str = str(tab_id)
+            overview = self._overviews.get(tab_id_str)
+            if overview is not None:
+                overview.track_paint()
+            # Trailing repaint 150ms after the last scroll event.
             if tab_id_str not in self._overview_timers:
                 self._overview_timers[tab_id_str] = True
                 callback = 'module=cuda_differ;cmd=_overview_repaint_timer;info={};'.format(tab_id_str)
@@ -1771,20 +1803,25 @@ class Command:
         is loaded, and only for the hotkey key codes).
 
         Mapping (the same commands as the menu items, see _HOTKEYS):
-            Alt+Left  -> "Copy current difference to the left"
-            Alt+Right -> "Copy current difference to the right"
-            Alt+Down  -> "Jump to next difference"
-            Alt+Up    -> "Jump to previous difference"
-            F5        -> "Recompare"
+            Alt+Left       -> "Copy current difference to the left"
+            Alt+Right      -> "Copy current difference to the right"
+            Ctrl+Alt+Left  -> "Copy current line to the left"
+            Ctrl+Alt+Right -> "Copy current line to the right"
+            Alt+Down       -> "Jump to next difference"
+            Alt+Up         -> "Jump to previous difference"
+            F5             -> "Recompare"
 
         Everything else passes through untouched: keys not in the map;
-        hotkey keys without their EXACT modifier state (the Alt+Arrows
-        need Alt and ONLY Alt; F5 needs no modifiers at all --
-        Alt+Shift/Ctrl/Meta combos and modified F5 keep their normal
-        behavior, so user bindings like Ctrl+Alt+Down are never
-        shadowed); and hotkeys pressed outside the two halves of a
-        compare tab this plugin manages -- in any other editor the keys
-        keep whatever meaning the user's keybindings give them.
+        hotkey keys without their EXACT modifier state (the Left/Right
+        arrows carry TWO bindings each -- plain Alt moves the whole
+        difference, Ctrl+Alt moves the caret's single line -- so the
+        arrows need Alt-only or Ctrl+Alt-only, never a mix with Shift/
+        Meta; Down/Up need Alt and ONLY Alt; F5 needs no modifiers at
+        all -- Alt+Shift/Ctrl/Meta combos and modified F5 keep their
+        normal behavior, so user bindings are never shadowed); and
+        hotkeys pressed outside the two halves of a compare tab this
+        plugin manages -- in any other editor the keys keep whatever
+        meaning the user's keybindings give them.
 
         The 'enable_keyboard_capture' setting gates the event
         subscription itself (subscribed when enabled, unsubscribed when
@@ -1799,30 +1836,34 @@ class Command:
         None otherwise so the key propagates unchanged.
 
         The dispatched commands carry their own guards: copy_left/right
-        refuse to edit while a background compare is running ("cannot
-        edit while compare is running" status hint), jump_next/prev
-        report "No differences were found" on a clean compare, and
-        refresh_compare drops with "compare already running" while one
-        is in flight -- the hotkey then just surfaces that status
-        message, same as the menu command would.
+        and copy_line_left/right refuse to edit while a background
+        compare is running ("cannot edit while compare is running"
+        status hint), jump_next/prev report "No differences were found"
+        on a clean compare, and refresh_compare drops with "compare
+        already running" while one is in flight -- the hotkey then just
+        surfaces that status message, same as the menu command would.
         """
         # Early-out for keys not in the hotkey map. With the event's
         # key-code filter this should not even happen, but on_key must
         # stay correct if the filter is ever bypassed.
-        entry = _HOTKEYS.get(key)
-        if entry is None:
+        entries = _HOTKEYS.get(key)
+        if not entries:
             return
         # Safety net: with the setting off the subscription should be
         # gone; honor the setting anyway if an event slips through.
         if not self.cfg.get('enable_keyboard_capture', True):
             return
-        method, need_mods = entry
-        # EXACT modifier match: 'a' = Alt and only Alt for the arrows,
-        # '' = no modifiers at all for F5. set() comparison is
-        # order-insensitive, so any state-string order CudaText may
-        # produce works.
+        # EXACT modifier match per entry: 'a' = Alt and only Alt,
+        # 'ca' = Ctrl+Alt and only those, '' = no modifiers at all.
+        # set() comparison is order-insensitive, so any state-string
+        # order CudaText may produce works.
         mods = set(state) if isinstance(state, str) else set()
-        if mods != set(need_mods):
+        method = None
+        for entry_method, need_mods in entries:
+            if mods == set(need_mods):
+                method = entry_method
+                break
+        if method is None:
             return
         # Only the two halves of a compare tab we manage. Both halves of
         # the split share one PROP_TAB_ID, so a single lookup covers
@@ -2327,8 +2368,9 @@ class Command:
 
         'show_dialog' controls whether the 'two sides are identical'
         dialog is shown. Automatic refreshes (on_start2, on_change_slow,
-        on_state) pass False to avoid pestering the user; the no-arg
-        menu command and other manual entry points default to True.
+        on_state_ed wrap sync) pass False to avoid pestering the user;
+        the no-arg menu command and other manual entry points default
+        to True.
 
         With the native algorithms, the line-level diff runs in a
         background thread (the callback form of cudatext.diff_proc):
@@ -2362,11 +2404,11 @@ class Command:
         # keeps the halves locked + read-only, so their texts cannot drift
         # under the engine -- there is nothing a queued re-run would fix.
         # Drop this request (manual Recompare, on_change_slow auto-refresh,
-        # on_state) with a status hint instead of starting a second engine
-        # job or deferring work: the running compare finishes and paints
-        # against its own kick-off snapshots; the NEXT refresh -- the user
-        # can fire it any time after this one, or cancel first -- picks up
-        # whatever the editors hold then.
+        # on_state_ed wrap sync) with a status hint instead of starting a
+        # second engine job or deferring work: the running compare finishes
+        # and paints against its own kick-off snapshots; the NEXT refresh
+        # -- the user can fire it any time after this one, or cancel first
+        # -- picks up whatever the editors hold then.
         if self._jobs.get(str(tab_id)) is not None:
             ct.msg_status(_('Differ: compare already running'))
             return
@@ -3033,8 +3075,8 @@ class Command:
             # Same convention as the raw-identical early path in
             # refresh_compare: the dialog only appears for the initial
             # compare and manual refresh; automatic refreshes
-            # (on_change_slow / on_state) stay silent to avoid
-            # pestering the user.
+            # (on_change_slow / on_state_ed wrap sync) stay silent to
+            # avoid pestering the user.
             self.diff.diffmap = []
             Profiler.stop('refresh')
             if show_dialog:
