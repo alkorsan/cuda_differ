@@ -7,25 +7,8 @@ import typing as tp
 
 import cudatext as ct
 import cudatext_cmd as ct_cmd
+import cudatext_keys as ct_keys
 import cudax_lib as ctx
-
-# Virtual-key codes for the Alt+Arrow hotkeys handled by Command.on_key.
-# The cudatext_keys module ships with CudaText and lists the VK_* codes
-# the on_key 'key' parameter uses. The try/except keeps the whole plugin
-# importable on engine builds without the module (the four arrow codes
-# are stable platform VK values, mirrored here as the fallback) -- a
-# missing module then only disables the hotkeys, not the plugin.
-try:
-    import cudatext_keys as ct_keys
-    _VK_ARROW_LEFT = ct_keys.VK_LEFT    # 37
-    _VK_ARROW_UP = ct_keys.VK_UP        # 38
-    _VK_ARROW_RIGHT = ct_keys.VK_RIGHT  # 39
-    _VK_ARROW_DOWN = ct_keys.VK_DOWN    # 40
-except (ImportError, AttributeError):
-    _VK_ARROW_LEFT = 37
-    _VK_ARROW_UP = 38
-    _VK_ARROW_RIGHT = 39
-    _VK_ARROW_DOWN = 40
 
 from . import differ_native as dfn
 from . import differ_python as dfp
@@ -58,23 +41,33 @@ DECOR_CHAR = '■'
 DEFAULT_SYNC_SCROLL = '1'
 U_PREFIX = 'untitled:'
 
-# Alt+Arrow hotkeys for compare tabs, dispatched by Command.on_key (the
-# plugin subscribes to the lazy on_key~ event). Key code -> Command
-# method name:
-#   Alt+Left  -> copy_left   "Copy current difference to the left"
-#   Alt+Right -> copy_right  "Copy current difference to the right"
-#   Alt+Down  -> jump_next   "Jump to next difference"
-#   Alt+Up    -> jump_prev   "Jump to previous difference"
-# Only PLAIN Alt triggers them (no Shift/Ctrl/Meta -- see on_key), and
-# only when the key lands in one of the two halves of a compare tab this
-# plugin manages; every other editor keeps its normal Alt+Arrow behavior,
-# user bindings included.
-_ARROW_HOTKEYS = {
-    _VK_ARROW_LEFT: 'copy_left',
-    _VK_ARROW_RIGHT: 'copy_right',
-    _VK_ARROW_DOWN: 'jump_next',
-    _VK_ARROW_UP: 'jump_prev',
+# Hotkeys for compare tabs, dispatched by Command.on_key. The plugin
+# subscribes to the lazy on_key~ event AT RUNTIME with a key-code filter
+# (see _sync_on_key_subscription) -- install.inf does NOT list on_key.
+# Key code -> (Command method name, required modifier state:
+# 'a' = exactly Alt, '' = no modifiers at all):
+#   Alt+Left  -> copy_left        "Copy current difference to the left"
+#   Alt+Right -> copy_right       "Copy current difference to the right"
+#   Alt+Down  -> jump_next        "Jump to next difference"
+#   Alt+Up    -> jump_prev        "Jump to previous difference"
+#   F5        -> refresh_compare  "Refresh"
+# Hotkeys fire only with the EXACT modifier state and only inside the
+# two halves of a compare tab this plugin manages; every other editor
+# keeps its normal key behavior, user bindings included. Governed by
+# the 'enable_keyboard_capture' setting (default on).
+_HOTKEYS = {
+    ct_keys.VK_LEFT:   ('copy_left', 'a'),
+    ct_keys.VK_RIGHT:  ('copy_right', 'a'),
+    ct_keys.VK_DOWN:   ('jump_next', 'a'),
+    ct_keys.VK_UP:     ('jump_prev', 'a'),
+    ct_keys.VK_F5:     ('refresh_compare', ''),
 }
+
+# Key-code filter for the runtime on_key event subscription
+# (PROC_EVENTS_SUB): the event fires only for these key codes, any
+# modifiers -- the exact-modifier check happens in on_key. Derived from
+# the map so a new hotkey can never be left out of the filter.
+_HOTKEY_KEY_FILTER = ','.join(str(k) for k in sorted(_HOTKEYS))
 
 # HARD-CODED MODULE CONSTANT — deliberately NOT a config option. Flips
 # the whole-compare editor lock for background (native) compares:
@@ -452,6 +445,20 @@ OPTS_META = [
      'frm': 'bool',
      'chp': 'advanced',
      },
+    {'opt': 'differ.advanced.enable_keyboard_capture',
+     'cmt': _('Keyboard shortcuts in compare tabs\n'
+              'When enabled, the plugin captures these keys inside compare '
+              'tabs: Alt+Left/Alt+Right copy the current difference to the '
+              'other side, Alt+Down/Alt+Up jump to the next/previous '
+              'difference, F5 refreshes the compare. In all other tabs the '
+              'keys keep their normal behavior. The plugin subscribes/ '
+              'unsubscribes to the key events at runtime, so changing this '
+              'option takes effect at once.\n'
+              'Default: on.'),
+     'def': True,
+     'frm': 'bool',
+     'chp': 'advanced',
+     },
     {'opt': 'differ.advanced.diff_context',
      'cmt': _('Context lines in unified diff\n'
               'Number of unchanged context lines shown around each change in '
@@ -750,6 +757,9 @@ class Command:
     def __init__(self):
         self.scroll = ScrollSplittedTab(__name__)
         self.cfg = self.get_config()
+        # Subscribe to the on_key event when keyboard capture is enabled
+        # (runtime subscription -- install.inf no longer lists on_key).
+        self._sync_on_key_subscription()
         self.diff = self._create_differ()
         # Set to True by on_exit_pre when CudaText is about to exit, so that
         # on_close (which fires next, once per closing tab) can skip
@@ -978,6 +988,47 @@ class Command:
         if not current:
             return
         ct.ini_proc(ct.INI_DELETE_KEY, PLUGINS_INI, PLUGINS_INI_SECTION, MODULE_NAME)
+
+    # ------------------------------------------------------------------
+    # on_key event subscription (runtime, via app_proc -- install.inf
+    # does NOT list on_key). Driven by the 'enable_keyboard_capture'
+    # setting: subscribed while enabled, unsubscribed while disabled.
+    # ------------------------------------------------------------------
+
+    def _subscribe_on_key(self):
+        """Subscribe to the on_key event at runtime (PROC_EVENTS_SUB).
+
+        The lazy 'on_key~' form keeps keystrokes from ever auto-loading
+        the plugin: the event fires only while the plugin is loaded, and
+        a compare tab (the only place the hotkeys do anything) can only
+        exist with the plugin loaded anyway. The key-code filter
+        (_HOTKEY_KEY_FILTER) makes the event fire only for the hotkey
+        key codes instead of every keystroke; the exact-modifier check
+        stays in on_key. PROC_EVENTS_SUB first unsubscribes the listed
+        events (all lexer/filter combinations), so repeated calls never
+        stack duplicate subscriptions."""
+        ct.app_proc(ct.PROC_EVENTS_SUB,
+                    '{};on_key~;;{}'.format(MODULE_NAME, _HOTKEY_KEY_FILTER))
+
+    def _unsubscribe_on_key(self):
+        """Unsubscribe from the on_key event at runtime
+        (PROC_EVENTS_UNSUB): key events stop reaching the plugin until
+        _subscribe_on_key runs again (re-enabling the setting, or the
+        next plugin load with the setting on)."""
+        ct.app_proc(ct.PROC_EVENTS_UNSUB,
+                    '{};on_key'.format(MODULE_NAME))
+
+    def _sync_on_key_subscription(self):
+        """Make the on_key subscription track the current value of the
+        'enable_keyboard_capture' setting: subscribe when enabled,
+        unsubscribe when disabled. Called at plugin load (Command
+        constructor) and on every config reload (config()), so both the
+        Options dialog and hand-edits to cuda_differ.json take effect
+        without a restart."""
+        if self.cfg.get('enable_keyboard_capture', True):
+            self._subscribe_on_key()
+        else:
+            self._unsubscribe_on_key()
 
     def change_config(self):
         """Open the options dialog (cuda_options_editor (Options Editor plugin) 
@@ -1411,49 +1462,64 @@ class Command:
             self.refresh_compare(ed_self, show_dialog=False)  # automatic -- no dialog
 
     def on_key(self, ed_self, key, state):
-        """Alt+Arrow hotkeys inside compare tabs (the plugin subscribes to
-        the lazy on_key~ event, so this only runs while the plugin is
-        loaded -- i.e. a compare tab exists or existed this session).
+        """Hotkeys inside compare tabs (subscribed at RUNTIME to the lazy
+        on_key~ event with a key-code filter -- see
+        _sync_on_key_subscription -- so this only runs while the plugin
+        is loaded, and only for the hotkey key codes).
 
-        Mapping (the same commands as the menu items, see _ARROW_HOTKEYS):
+        Mapping (the same commands as the menu items, see _HOTKEYS):
             Alt+Left  -> "Copy current difference to the left"
             Alt+Right -> "Copy current difference to the right"
             Alt+Down  -> "Jump to next difference"
             Alt+Up    -> "Jump to previous difference"
+            F5        -> "Refresh"
 
-        Everything else passes through untouched: non-arrow keys; arrows
-        without EXACTLY the Alt modifier ('a' only -- Alt+Shift/Ctrl/Meta
-        combinations keep their normal behavior, so user bindings like
-        Ctrl+Alt+Down are never shadowed); and arrows pressed outside the
-        two halves of a compare tab this plugin manages -- in any other
-        editor Alt+Arrows keep whatever meaning the user's keybindings
-        give them.
+        Everything else passes through untouched: keys not in the map;
+        hotkey keys without their EXACT modifier state (the Alt+Arrows
+        need Alt and ONLY Alt; F5 needs no modifiers at all --
+        Alt+Shift/Ctrl/Meta combos and modified F5 keep their normal
+        behavior, so user bindings like Ctrl+Alt+Down are never
+        shadowed); and hotkeys pressed outside the two halves of a
+        compare tab this plugin manages -- in any other editor the keys
+        keep whatever meaning the user's keybindings give them.
+
+        The 'enable_keyboard_capture' setting gates the event
+        subscription itself (subscribed when enabled, unsubscribed when
+        disabled -- see _sync_on_key_subscription); the cfg check below
+        is a cheap safety net for a stale subscription.
 
         Returns False when a hotkey was recognized and its command ran,
         which makes CudaText drop the key instead of also running the
-        editor's own Alt+Arrow action (caret movement etc.) on top of it
+        editor's own action (Alt+Arrow caret movement etc.) on top of it
         (returning False also stops the event's propagation to other
         plugins -- exactly what we want for a consumed hotkey). Returns
         None otherwise so the key propagates unchanged.
 
         The dispatched commands carry their own guards: copy_left/right
         refuse to edit while a background compare is running ("cannot
-        edit while compare is running" status hint), and jump_next/prev
-        report "No differences were found" on a clean compare -- the
-        hotkey then just surfaces that status message, same as the menu
-        command would.
+        edit while compare is running" status hint), jump_next/prev
+        report "No differences were found" on a clean compare, and
+        refresh_compare drops with "compare already running" while one
+        is in flight -- the hotkey then just surfaces that status
+        message, same as the menu command would.
         """
-        # Early-out for the overwhelmingly common case -- any key that is
-        # not one of the four arrows. on_key fires on EVERY keystroke, so
-        # this must stay a single dict lookup.
-        method = _ARROW_HOTKEYS.get(key)
-        if method is None:
+        # Early-out for keys not in the hotkey map. With the event's
+        # key-code filter this should not even happen, but on_key must
+        # stay correct if the filter is ever bypassed.
+        entry = _HOTKEYS.get(key)
+        if entry is None:
             return
-        # Exactly the Alt modifier: 'a' present, and none of 'c' (Ctrl),
-        # 's' (Shift), 'm' (Meta). set() comparison is order-insensitive,
-        # so any state-string order CudaText may produce works.
+        # Safety net: with the setting off the subscription should be
+        # gone; honor the setting anyway if an event slips through.
+        if not self.cfg.get('enable_keyboard_capture', True):
+            return
+        method, need_mods = entry
+        # EXACT modifier match: 'a' = Alt and only Alt for the arrows,
+        # '' = no modifiers at all for F5. set() comparison is
+        # order-insensitive, so any state-string order CudaText may
+        # produce works.
         mods = set(state) if isinstance(state, str) else set()
-        if mods != {'a'}:
+        if mods != set(need_mods):
             return
         # Only the two halves of a compare tab we manage. Both halves of
         # the split share one PROP_TAB_ID, so a single lookup covers
@@ -1466,7 +1532,7 @@ class Command:
             return
         getattr(self, method)()
         # Eat the key so the editor does not ALSO run its default
-        # Alt+Arrow action after our command.
+        # action after our command.
         return False
 
     def on_save_pre(self, ed_self):
@@ -3062,6 +3128,10 @@ class Command:
            self.cfg.get('theme_name') == theme_name:
             return
         self.cfg = self.get_config()
+        # Keep the runtime on_key subscription in step with the (possibly
+        # changed) enable_keyboard_capture setting -- takes effect at
+        # once, without a restart.
+        self._sync_on_key_subscription()
         # (No menu re-sync needed anymore: the diff-tab context menu is
         # rebuilt from the settings file by tabmenu_init on every
         # right-click, so it always mirrors the current values.)
@@ -3192,6 +3262,8 @@ class Command:
                 get_opt('advanced.enable_sync_caret', False),
             'enable_auto_refresh':
                 get_opt('advanced.enable_auto_refresh', False),
+            'enable_keyboard_capture':
+                get_opt('advanced.enable_keyboard_capture', True),
             'diff_context':
                 get_opt('advanced.diff_context', 3),
             'enable_profiling':

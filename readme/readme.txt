@@ -119,21 +119,28 @@ Config...
 == Keyboard shortcuts ==
 
 These shortcuts are active only while the caret is in one of the two
-halves of a compare tab; in every other tab Alt+Arrows keep their
-normal meaning (your own keybindings included):
+halves of a compare tab; in every other tab the keys keep their normal
+meaning (your own keybindings included):
 
     Alt+Down    Jump to next difference
     Alt+Up      Jump to previous difference
     Alt+Right   Copy current difference to the right
     Alt+Left    Copy current difference to the left
+    F5          Refresh the compare
 
 They run exactly the same commands as the menu items above (including
 their guards: copying is refused while a background compare is running,
 and jumping reports "No differences were found" on a clean compare).
-Combinations with additional modifiers (Shift/Ctrl/Meta, e.g.
-Ctrl+Alt+Down) are NOT captured and keep their normal behavior. When a
-shortcut fires, the key is consumed, so the editor's own Alt+Arrow
-action (caret movement etc.) does not also run.
+Alt+Arrow combinations with additional modifiers (Shift/Ctrl/Meta, e.g.
+Ctrl+Alt+Down) and modified F5 (Ctrl+F5 etc.) are NOT captured and keep
+their normal behavior. When a shortcut fires, the key is consumed, so
+the editor's own action (Alt+Arrow caret movement etc.) does not also
+run.
+
+The shortcuts can be turned off with the option
+"differ.advanced.enable_keyboard_capture" (Default: on). The plugin
+subscribes/unsubscribes to the key events at runtime, so toggling the
+option takes effect at once, without a restart.
 
 
 == Tab context menu ==
