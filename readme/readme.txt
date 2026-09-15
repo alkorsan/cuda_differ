@@ -40,6 +40,12 @@ synced back to the original files automatically.
 - Optional gap-aware overview panel docked to the right of the compare
   view, showing a miniature of both editors side-by-side with colored
   diff highlights (WinMerge-style).
+- Jump to next/previous difference always lands the caret (and moves
+  the focus) on the side that HAS text: one-sided differences (added
+  or deleted lines, shown as a gap on the other side) put the caret on
+  the changed lines, never on the empty gap side, so the copy commands
+  keep working right after a jump -- from the changed lines or from
+  the line next to a gap.
 
 The compare engine implements all the best-known diff algorithms, with a
 lot of improvements on top of each: two native ones running in compiled
@@ -127,14 +133,22 @@ Copy current difference to the left
     cursor from the right to the left side.
 
 Copy current line to the right
-    Copies the line under the cursor from the left to the right side.
-    The caret must be on a changed line of the difference (a gap has
-    no line to copy); after jumping to a one-sided difference the
-    caret is already on the changed line.
+    Copies the line under the cursor from the left to the right side,
+    inserting it at the SAME HORIZONTAL LEVEL: inside a difference
+    block the k-th line of one side is aligned with the k-th line of
+    the other side, and lines past the other side's block end are
+    aligned with its gap -- so a line copied from the middle of a
+    block lands at its own level in the other side (right after the
+    block's line it faces, or in the gap below), not at the block
+    start. A whole-line selection copies all its lines at the level
+    of its first line. The caret must be on a changed line of the
+    difference (a gap has no line to copy); after jumping to a
+    one-sided difference the caret is already on the changed line.
 
 Copy current line to the left
     Same in the other direction: copies the line under the cursor
-    from the right to the left side.
+    from the right to the left side, also at the caret line's own
+    horizontal level.
 
 Config...
     Opens the options dialog.
@@ -188,7 +202,11 @@ Because of that:
 - Copy current difference (Alt+Left/Alt+Right) also finds a one-sided
   difference from the line next to its gap.
 - Copy current line (Ctrl+Alt+Left/Ctrl+Alt+Right) needs the caret on
-  a real changed line; a gap has no line to copy.
+  a real changed line; a gap has no line to copy. The line is
+  inserted at its own horizontal level on the other side (the k-th
+  line of a block faces the k-th line of the other block, or the gap
+  past its end), so a copy from the middle of a block never jumps to
+  the block start.
 
 To add a line where a gap is:
 put the caret on the line above or below the gap, press Enter and type

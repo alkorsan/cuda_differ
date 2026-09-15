@@ -50,8 +50,10 @@ U_PREFIX = 'untitled:'
 #   ''   = no modifiers at all.
 #   Alt+Left       -> copy_left        "Copy current difference to the left"
 #   Alt+Right      -> copy_right       "Copy current difference to the right"
-#   Ctrl+Alt+Left  -> copy_line_left   "Copy current line to the left"
-#   Ctrl+Alt+Right -> copy_line_right  "Copy current line to the right"
+#   Ctrl+Alt+Left  -> copy_line_left   "Copy current line to the left (at
+#                                       the caret line's horizontal level)"
+#   Ctrl+Alt+Right -> copy_line_right  "Copy current line to the right (at
+#                                       the caret line's horizontal level)"
 #   Alt+Down       -> jump_next        "Jump to next difference"
 #   Alt+Up         -> jump_prev        "Jump to previous difference"
 #   F5             -> refresh_compare  "Recompare"
@@ -3967,25 +3969,38 @@ class Command:
 
     def copy_line(self, to_right=True):
         """Copy the caret's line(s) from left to right (or right to left),
-        inserting at the current hunk's position. Unlike copy(), this works
-        on the current caret line, not the whole hunk: the caret must be
-        ON a changed line of the hunk (a gap has no line to copy -- jumping
-        to a one-sided difference puts the caret on the changed line)."""
+        inserting at the caret line's SAME HORIZONTAL LEVEL on the other
+        side. Within a hunk the k-th source line is visually aligned with
+        the k-th target-hunk line (positional pairing -- the sdiff/WinMerge
+        alignment), and source lines past the target hunk's end align with
+        its gap, so they insert at the hunk's end. Copying from the FIRST
+        line of a hunk, or into a one-sided hunk's gap, still inserts at
+        the hunk start exactly like before. Unlike copy(), this works on
+        the current caret line, not the whole hunk: the caret must be ON a
+        changed line of the hunk (a gap has no line to copy -- jumping to
+        a one-sided difference puts the caret on the changed line). With
+        beautify_alignment the intra-hunk pairing can be anchored instead
+        of positional; the diffmap-based formula below is then the closest
+        line-index approximation."""
         fc, eds = self.focused
         if self._compare_running_here(eds):
             return ct.msg_status(_('Differ: cannot edit while compare is running'))
         current = self.get_current_change
 
-        def get_lines(ed: ct.Editor):
+        def get_src(ed: ct.Editor):
+            """Return (text, first_line) of the caret's line(s): the single
+            caret line, or the selection's whole-line range. ('', -1) for
+            multi-caret -- no unambiguous line to copy then."""
             carets = ed.get_carets()
             if len(carets) != 1:
-                return []
+                return '', -1
             caret = carets[0]
             __, y1, __, y2 = caret
             if y2 == -1:
-                return ed.get_text_line(y1) + '\n'
+                return ed.get_text_line(y1) + '\n', y1
             else:
-                return ''.join([ed.get_text_line(y)+'\n' for y in range(y1, y2)])
+                return ''.join([ed.get_text_line(y)+'\n'
+                                for y in range(y1, y2)]), y1
 
         if not current:
             return ct.msg_status(_('Differ: caret is not on a changed line'))
@@ -3994,15 +4009,22 @@ class Command:
         if to_right:
             if fc == 1:
                 return ct.msg_status(_('Differ: caret must be in the left editor to copy right'))
-            text = get_lines(eds[0])
+            text, y = get_src(eds[0])
             if text:
-                eds[1].insert(0, b0, text)
+                # Same level: the caret line is the k-th line of the source
+                # hunk, so it inserts before the k-th line of the target
+                # hunk -- or, when k is past the target hunk's end (the
+                # line is aligned with the target's gap), at the hunk's
+                # end: b0 + min(k, b1-b0).
+                ins = b0 + min(max(0, y - a0), b1 - b0)
+                eds[1].insert(0, ins, text)
         else:
             if fc == 0:
                 return ct.msg_status(_('Differ: caret must be in the right editor to copy left'))
-            text = get_lines(eds[1])
+            text, y = get_src(eds[1])
             if text:
-                eds[0].insert(0, a0, text)
+                ins = a0 + min(max(0, y - b0), a1 - a0)
+                eds[0].insert(0, ins, text)
         self.refresh_compare()
 
     def copy_line_right(self):
