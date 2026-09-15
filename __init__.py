@@ -1911,6 +1911,9 @@ class Command:
         on a clean compare, and refresh_compare drops with "compare
         already running" while one is in flight -- the hotkey then just
         surfaces that status message, same as the menu command would.
+        The hunk commands also tell you when the caret is not at any
+        difference ("caret is not on a difference" / "caret is not on a
+        changed line") instead of silently doing nothing.
         """
         # Early-out for keys not in the hotkey map. With the event's
         # key-code filter this should not even happen, but on_key must
@@ -3763,9 +3766,15 @@ class Command:
             return 1, eds
 
     def jump(self, to_next=True):
-        """Jump caret to the next (or previous) diff hunk in the focused
-        editor. Wraps around at the end/start of the FOCUSED tab's own
-        diffmap (the session's Differ -- never another tab's records)."""
+        """Jump caret to the next (or previous) diff hunk. Wraps around at
+        the end/start of the FOCUSED tab's own diffmap (the session's
+        Differ -- never another tab's records).
+
+        One-sided hunks (pure added/deleted lines, shown as a gap on the
+        other side) put the caret AND THE FOCUS on the side that has the
+        text: on the gap side the caret would have to sit on an unchanged
+        line next to the gap, where it is not obvious which difference it
+        belongs to and where the copy commands find no hunk."""
         session = self._focused_session()
         if session is None:
             return ct.msg_status(_('Differ: not a compare tab'))
@@ -3788,7 +3797,14 @@ class Command:
 
         if to_next:
             for n, dif in enumerate(diff.diffmap):
-                df_y = dif[p] if dif[p] <= line_cnt - 1 else line_cnt - 1
+                # An empty range on the focused side (the gap side of a
+                # one-sided hunk) can start AT line_cnt -- a gap after the
+                # last line. With the plain line_cnt-1 clamp such a hunk
+                # is skipped by the scan and the jump needlessly wraps
+                # around (to an earlier hunk, or to this one with a
+                # misleading wrap-around count).
+                limit = line_cnt if dif[p] == dif[p+1] else line_cnt - 1
+                df_y = dif[p] if dif[p] <= limit else limit
                 if y < df_y:
                     i = n
                     break
@@ -3813,6 +3829,14 @@ class Command:
         to2 = to[2] if to[2] <= b_line_cnt - 1 else b_line_cnt - 1
         eds[0].set_caret(0, to0, id=ct.CARET_SET_ONE)
         eds[1].set_caret(0, to2, id=ct.CARET_SET_ONE)
+        # WinMerge-like: when the hunk has no lines on the focused side
+        # (the gap side of a one-sided hunk), the focused half's caret
+        # sits on an unchanged line next to the gap -- move the focus to
+        # the half that has the text, so the next Alt+Left/Right or
+        # Ctrl+Alt+Left/Right acts on this hunk.
+        s = fc * 2
+        if to[s] == to[s+1]:
+            self.set_focus_to_opposite_panel()
 
     def jump_next(self):
         """Jump to the next diff hunk."""
@@ -3822,14 +3846,25 @@ class Command:
         """Jump to the previous diff hunk."""
         self.jump(False)
 
-    @property
-    def get_current_change(self):
-        """Return the FOCUSED tab's own diffmap entry [a0, a1, b0, b1]
-        containing the caret in the focused editor, or None if the caret
-        is not inside a diff hunk (or the focus is not in a compare tab).
-        The diffmap comes from the tab's session -- a second diff tab
-        comparing in between can no longer swap the records under this
-        lookup (that was the original cross-tab bug)."""
+    def _find_hunk_at_caret(self, adjacent=False):
+        """Return the FOCUSED tab's own diffmap entry [a0, a1, b0, b1] at
+        the caret, or None (also None when the focus is not in a compare
+        tab). Shared lookup for the hunk commands; the diffmap comes from
+        the tab's session -- a second diff tab comparing in between can
+        no longer swap the records under this lookup (that was the
+        original cross-tab bug).
+
+        Strict mode (adjacent=False): the caret line must lie INSIDE the
+        hunk's range on the focused side. Used where the caret's own line
+        must be a changed line of the hunk (copy_line, caret sync).
+
+        Adjacent mode (adjacent=True): a one-sided hunk -- pure added or
+        deleted lines, shown as a GAP on the focused side -- is also found
+        when the caret sits on the line just above or just below that gap.
+        Such a hunk has NO line on this side, so "the caret is at this
+        difference" can only mean next to the gap. Used by the whole-hunk
+        commands (copy, select_current), so they keep working right after
+        a jump or with the caret parked next to a gap."""
         session = self._focused_session()
         if session is None:
             return None
@@ -3843,12 +3878,28 @@ class Command:
         for dif in diff.diffmap:
             if dif[p] <= y < dif[p+1]:
                 return dif
+            if adjacent and dif[p] == dif[p+1] and y in (dif[p] - 1, dif[p]):
+                return dif
+        return None
+
+    @property
+    def get_current_change(self):
+        """Return the FOCUSED tab's own diffmap entry [a0, a1, b0, b1]
+        containing the caret in the focused editor, or None if the caret
+        is not inside a diff hunk (or the focus is not in a compare tab).
+        Strict containment on the focused side -- see _find_hunk_at_caret
+        for the gap-adjacent variant used by the whole-hunk copy
+        commands."""
+        return self._find_hunk_at_caret(adjacent=False)
 
     def select_current(self):
-        """Select the lines of the current diff hunk in both editors."""
-        cur_change = self.get_current_change
+        """Select the lines of the current diff hunk in both editors.
+        One-sided hunks (a gap on one side) are found from the line next
+        to their gap too, so the difference the caret is at is always
+        the one selected."""
+        cur_change = self._find_hunk_at_caret(adjacent=True)
         if not cur_change:
-            return
+            return ct.msg_status(_('Differ: caret is not on a difference'))
         esc = self.cfg.get('enable_sync_caret', False)
         fc, eds = self.focused
         self.cfg['enable_sync_caret'] = False
@@ -3877,13 +3928,19 @@ class Command:
 
     def copy(self, to_right=True):
         """Copy the current diff hunk's text from left to right (or right to
-        left), replacing the opposite side's text. Then refresh diff markers."""
+        left), replacing the opposite side's text. Then refresh diff markers.
+
+        The hunk is found gap-aware (see _find_hunk_at_caret): a one-sided
+        hunk is also found from the line next to its gap, so copying works
+        right after a jump. Copying the text side over the gap fills the
+        gap in; copying the gap side's (empty) text over the other side
+        deletes the difference."""
         fc, eds = self.focused
         if self._compare_running_here(eds):
             return ct.msg_status(_('Differ: cannot edit while compare is running'))
-        current = self.get_current_change
+        current = self._find_hunk_at_caret(adjacent=True)
         if not current:
-            return
+            return ct.msg_status(_('Differ: caret is not on a difference'))
         else:
             a0, a1, b0, b1 = current
         if to_right:
@@ -3911,7 +3968,9 @@ class Command:
     def copy_line(self, to_right=True):
         """Copy the caret's line(s) from left to right (or right to left),
         inserting at the current hunk's position. Unlike copy(), this works
-        on the current caret line, not the whole hunk."""
+        on the current caret line, not the whole hunk: the caret must be
+        ON a changed line of the hunk (a gap has no line to copy -- jumping
+        to a one-sided difference puts the caret on the changed line)."""
         fc, eds = self.focused
         if self._compare_running_here(eds):
             return ct.msg_status(_('Differ: cannot edit while compare is running'))
@@ -3929,18 +3988,18 @@ class Command:
                 return ''.join([ed.get_text_line(y)+'\n' for y in range(y1, y2)])
 
         if not current:
-            return
+            return ct.msg_status(_('Differ: caret is not on a changed line'))
         else:
             a0, a1, b0, b1 = current
         if to_right:
             if fc == 1:
-                return
+                return ct.msg_status(_('Differ: caret must be in the left editor to copy right'))
             text = get_lines(eds[0])
             if text:
                 eds[1].insert(0, b0, text)
         else:
             if fc == 0:
-                return
+                return ct.msg_status(_('Differ: caret must be in the right editor to copy left'))
             text = get_lines(eds[1])
             if text:
                 eds[0].insert(0, a0, text)

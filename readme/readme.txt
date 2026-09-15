@@ -104,22 +104,37 @@ Select all differences
     Selects all difference blocks in both files.
 
 Jump to next difference
-    Moves the cursor to the next changed block.
+    Moves the cursor to the next changed block. When the difference is
+    one-sided (lines that exist on one side only, shown as a gap on
+    the other side), the cursor AND the focus go to the side that has
+    the text, so the copy commands always find the difference you
+    jumped to.
 
 Jump to previous difference
-    Moves the cursor to the previous changed block.
+    Same, backwards: moves the cursor to the previous changed block,
+    also landing on (and focusing) the text side of one-sided
+    differences.
 
 Copy current difference to the right
-    Copies the selected difference from the left to the right side.
+    Copies the difference under the cursor from the left to the right
+    side. Works with the caret on either side of the difference,
+    including on the line next to a gap (a one-sided difference has no
+    line on the gap side): copying the text over the gap fills it in;
+    copying from the gap side removes the difference.
 
 Copy current difference to the left
-    Copies the selected difference from the right to the left side.
+    Same in the other direction: copies the difference under the
+    cursor from the right to the left side.
 
 Copy current line to the right
     Copies the line under the cursor from the left to the right side.
+    The caret must be on a changed line of the difference (a gap has
+    no line to copy); after jumping to a one-sided difference the
+    caret is already on the changed line.
 
 Copy current line to the left
-    Copies the line under the cursor from the right to the left side.
+    Same in the other direction: copies the line under the cursor
+    from the right to the left side.
 
 Config...
     Opens the options dialog.
@@ -141,7 +156,9 @@ meaning (your own keybindings included):
 
 They run exactly the same commands as the menu items above (including
 their guards: copying is refused while a background compare is running,
-and jumping reports "No differences were found" on a clean compare).
+jumping reports "No differences were found" on a clean compare, and the
+copy commands report when the caret is not at any difference instead
+of silently doing nothing).
 Alt+Arrow combinations with additional modifiers (Shift/Meta, e.g.
 Alt+Shift+Left, Ctrl+Alt+Shift+Left, Ctrl+Alt+Meta+Left), Ctrl+Alt+
 Down/Up and modified F5 (Ctrl+F5 etc.) are NOT captured and keep
@@ -153,6 +170,31 @@ The shortcuts can be turned off with the option
 "differ.advanced.enable_keyboard_capture" (Default: on). The plugin
 subscribes/unsubscribes to the key events at runtime, so toggling the
 option takes effect at once, without a restart.
+
+
+== Gaps and one-sided differences ==
+
+Lines that exist on one side only (pure additions or deletions) are
+shown as a colored inter-line GAP on the other side. A gap is pure
+visual space painted between two lines -- it is not a line, so nothing
+is ever inserted into your text to keep the sides aligned, and the
+caret cannot be placed inside a gap: CudaText editors do not model
+carets in the space between lines.
+
+Because of that:
+- Jump to next/previous difference lands the caret, and moves the
+  focus, on the side that HAS text -- never on the unchanged line next
+  to a gap -- so the copy commands work right after a jump.
+- Copy current difference (Alt+Left/Alt+Right) also finds a one-sided
+  difference from the line next to its gap.
+- Copy current line (Ctrl+Alt+Left/Ctrl+Alt+Right) needs the caret on
+  a real changed line; a gap has no line to copy.
+
+To add a line where a gap is:
+put the caret on the line above or below the gap, press Enter and type
+-- the new line takes the gap's place as soon as the compare is re-run
+(F5, or automatically with differ.advanced.enable_auto_refresh on),
+and the remaining gap shrinks by one line.
 
 
 == Tab context menu ==
