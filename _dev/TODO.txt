@@ -2,15 +2,12 @@
  
 remove the colored squares in left bar, it s not needed and may only slow things more
 
-hide ignore options for python algorithms
 
 
 if there a diff tab then i switch session, the session manager ask to save the diff tab if i respond no, the diff tab get deleted from differ json; think in a better fix
 
 
-when user click wrap we must wrap both editors
 
-rename refresh to recompare
 
 remove all events from install inf and subscribe dynamically to the events we need when the plugin is loaded , when we close the last diff tab we must unsubscribe from all events except right click menu
 
@@ -171,4 +168,5 @@ does cudadiffhistogram.pas and cudadiffmyers.pas implement DIFF_IGN_* flags in a
 
 BREAK_CHARS (G6): uses the WinMerge default ",.;:"  what should i add? should i offer setting to user to edit it?
 
-
+___________________________
+hide default scrollbars, reduce editor line numbres width,hide folding

@@ -10,7 +10,6 @@ import re
 import typing as tp
 
 import cudatext as ct
-import cudatext_cmd as ct_cmd
 
 
 # Pattern that matches a single line terminator (CRLF, lone CR, or lone LF).
@@ -114,6 +113,26 @@ class ScrollSplittedTab:
       for a CudaText bug with scrolling at the end of non-equal-height
       files (possible here when word-wrap makes the halves differ in
       visual height).
+
+    WHY THE MIRRORED HALF USES EDACTION_UPDATE (synchronous Repaint)
+    AND NOT cmd_RepaintEditor (forced Invalidate):
+
+    Users could see the initiating half scroll first and the mirrored
+    half catch up a few milliseconds later whenever the RIGHT half (or
+    the overview) initiated. cmd_RepaintEditor maps to Ed.Update(false,
+    true, false), which is only a FORCED INVALIDATE -- the paint is
+    still delivered asynchronously through the message queue, where it
+    competes with pending input messages (a scrollbar / overview drag
+    floods the queue with mouse moves, and Windows delivers WM_PAINT
+    only when the queue is otherwise empty) and can land in the NEXT
+    display frame. ed.action(EDACTION_UPDATE) maps to Ed.Repaint --
+    Invalidate + LCL Update, i.e. the mirrored half paints
+    SYNCHRONOUSLY, right here inside the event callback, so both halves
+    are on screen in the same frame no matter which half initiated or
+    how busy the message queue is. The synchronous paint of the
+    mirrored half fires its own on_scroll echo; the _busy guard below
+    drops it, and by then the positions are equal anyway (no write, no
+    cascade).
     """
 
     def __init__(self, name):
@@ -121,7 +140,8 @@ class ScrollSplittedTab:
         self.tab_id = set()
         # Re-entrancy guard: True while an on_scroll handler is mirroring
         # a position, so a nested (synchronous) on_scroll for the opposite
-        # half cannot start a second mirror pass.
+        # half cannot start a second mirror pass. EDACTION_UPDATE's
+        # synchronous repaint makes this nesting actually happen now.
         self._busy = False
 
     def toggle(self, on=True):
@@ -197,9 +217,13 @@ class ScrollSplittedTab:
                 e.set_prop(ct.PROP_SCROLL_HORZ_INFO, {'smooth_pos': pos_h})
                 changed = True
 
-        # Repaint the mirrored half only when its position really changed.
+        # Paint the mirrored half ONLY when its position really changed,
+        # and paint it SYNCHRONOUSLY (EDACTION_UPDATE = Ed.Repaint =
+        # Invalidate + Update; see the class docstring for why the async
+        # forced invalidate of cmd_RepaintEditor left a visible
+        # few-millisecond drift when the right half / overview initiated).
         # The scrolled half has already painted (the event is post-paint),
         # so repainting it again would only burn time; and when nothing
         # changed there is nothing to show at all.
         if changed:
-            e.cmd(ct_cmd.cmd_RepaintEditor)
+            e.action(ct.EDACTION_UPDATE)

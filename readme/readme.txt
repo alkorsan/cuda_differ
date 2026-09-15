@@ -23,6 +23,12 @@ synced back to the original files automatically.
   the originals and the compare view available.
 - Remembers your compare tabs across CudaText restarts. If you close
   CudaText with a compare tab open, it is restored when you start again.
+- Every diff tab is a fully standalone session: its diff records, overview
+  panel, running compare and unsaved-change tracking live in their own
+  per-tab world and are never shared with another diff tab. Open as many
+  diff tabs as you like -- comparing in one never disturbs what another
+  tab shows, and the hunk/jump/keyboard commands always act on the
+  focused tab's own records.
 - Provides synchronized scrolling so both sides stay aligned as you
   navigate.
 - Supports word-wrap: you can turn wrap on in a compare tab and the two
@@ -295,6 +301,21 @@ Compare tabs survive CudaText restarts:
   active, so there is no performance impact when you are not comparing.
 - When you close the last compare tab, the plugin stops auto-loading on
   the next startup.
+- Each diff tab is its own standalone session. Its diff records,
+  overview panel, in-flight compare, change-suppression counter and
+  saved/dirty tracking live in a per-tab session object, so nothing
+  leaks between diff tabs: comparing in tab B does not change what the
+  hunk/copy/jump commands do in tab A, and closing tab B destroys only
+  tab B's world. The session also remembers which CudaText session
+  file the tab was registered under, so dirty/saved state keeps going
+  to the right persisted group even after you switch CudaText sessions.
+- Each tab's session also isolates the compare engine: two diff tabs
+  can run background compares at the same time, and a running compare
+  only blocks refreshes of its OWN tab ("compare already running" is
+  per tab). One known limitation: the optional profiling report is a
+  global diagnostic -- if you enable profiling and compare two tabs
+  concurrently, the printed timings interleave (profiling is off by
+  default).
 
 When you close a compare tab manually (not via app exit):
 - If you have unsaved changes, CudaText asks whether to save or discard.

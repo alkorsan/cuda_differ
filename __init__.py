@@ -937,6 +937,7 @@ class _CompareJob:
 
     __slots__ = (
         'ed',               # editor that triggered the refresh
+        'session',          # the compare tab's _TabSession (owner)
         'tab_id',           # PROP_TAB_ID of the compare tab
         'tab_id_str',       # str(tab_id) -- dict key
         'a_ed', 'b_ed',     # the two split halves
@@ -959,6 +960,7 @@ class _CompareJob:
 
     def __init__(self):
         self.ed = None
+        self.session = None
         self.tab_id = None
         self.tab_id_str = ''
         self.a_ed = None
@@ -987,6 +989,65 @@ class _CompareJob:
         self.in_flight = False
 
 
+class _TabSession:
+    """Standalone per-tab session: EVERY piece of runtime state that
+    belongs to one compare tab lives here, and nothing is shared between
+    diff tabs.
+
+    Before the session refactor the plugin kept ONE global Differ (with
+    its .diffmap of line-index tuples) on the Command object, so the
+    diff records of whichever tab compared LAST were served to ALL
+    tabs -- in tab A, Ctrl+Alt+Left picked hunks from tab B's compare
+    (line numbers pointed at the wrong lines), and when the caret
+    matched none of the foreign hunks the hunk/copy/jump commands
+    silently did nothing ("shortcuts stop working after switching
+    tabs"). The diffmap, the Differ, the overview panel, the in-flight
+    compare job, the on_change suppression counter and the
+    saved/dirty caches are per-tab by definition; they now live on this
+    object, keyed by str(PROP_TAB_ID) in Command._sessions.
+
+    Fields:
+      tab_id           int PROP_TAB_ID of the compare tab
+      tab_id_str       str(tab_id) -- the _sessions dict key
+      state_key        key of the PERSISTED session group (session file)
+                       this tab was registered under -- carried per tab
+                       so a diff tab keeps writing to its own persisted
+                       group even after the CudaText session switches
+      diff             this tab's Differ (diffmap lives on it); None
+                       until the first compare needs it (restored-after-
+                       restart tabs defer creation -- no status spam at
+                       startup), created by _session_diff()
+      overview         PaintboxOverview docked to this tab, or None
+      job              in-flight background _CompareJob, or None
+      overview_timer   True while the trailing 150ms overview repaint
+                       timer is armed for this tab
+      suppress_change  remaining on_change events to swallow (the two
+                       spurious events set_text_all fires when a compare
+                       tab is created)
+      saved            cached 'no half dirty' flag (persisted 'saved')
+      dirty            cached set of halves with unsaved edits
+    """
+
+    __slots__ = (
+        'tab_id', 'tab_id_str', 'state_key',
+        'diff', 'overview', 'job',
+        'overview_timer', 'suppress_change',
+        'saved', 'dirty',
+    )
+
+    def __init__(self, tab_id, state_key=''):
+        self.tab_id = tab_id
+        self.tab_id_str = str(tab_id)
+        self.state_key = state_key
+        self.diff = None
+        self.overview = None
+        self.job = None
+        self.overview_timer = False
+        self.suppress_change = 0
+        self.saved = True
+        self.dirty = set()
+
+
 class Command:
     def __init__(self):
         self.scroll = ScrollSplittedTab(__name__)
@@ -994,52 +1055,20 @@ class Command:
         # Subscribe to the on_key event when keyboard capture is enabled
         # (runtime subscription -- install.inf no longer lists on_key).
         self._sync_on_key_subscription()
-        self.diff = self._create_differ()
         # Set to True by on_exit_pre when CudaText is about to exit, so that
         # on_close (which fires next, once per closing tab) can skip
         # temp-file deletion and let compare tabs persist across restarts.
         self._app_exiting = False
-        # In-memory cache of saved/unsaved state per compare tab ID.
-        # Avoids redundant JSON writes when on_change fires repeatedly
-        # without the state actually changing.
-        self._saved_cache = {}
-        # In-memory cache of PER-HALF dirty state per compare tab ID:
-        # 'a' = primary (left) half, 'b' = secondary (right) half.
-        # on_change marks the edited half; on_save_pre syncs ONLY these
-        # halves back to their originals, so a clean half -- and its
-        # original tab -- is never touched by save. Persisted to disk
-        # together with the legacy 'saved' flag via _update_dirty_state.
-        self._dirty_halves = {}
-        # In-memory set of all compare tab IDs in the current session.
-        # Used by _is_compare_tab for fast O(1) lookup without disk I/O --
-        # critical because on_change fires on every keystroke.
-        self._compare_tab_ids = set()
+        # THE session registry: one _TabSession per compare tab, keyed by
+        # str(PROP_TAB_ID). Each diff tab is a standalone world -- its
+        # Differ/diffmap, overview panel, in-flight job, timers and
+        # saved/dirty caches all live on the session object, never on the
+        # Command. _is_compare_tab is now exactly "has a session".
+        self._sessions = {}
         # Cached key for the current session (relative path if inside
-        # settings folder, full path otherwise). Set in on_start2 and set_files.
+        # settings folder, full path otherwise). Set in on_start2 and
+        # set_files; individual sessions remember their OWN key.
         self._current_session_key = ''
-        # Counter of on_change events to suppress per compare tab ID.
-        # Set to 2 when a compare is created (one per split half) because
-        # set_text_all triggers on_change for each half. Prevents the
-        # initial green color from being reset to red.
-        self._suppress_change = {}
-        # Overview panels per compare tab ID. Each value is a
-        # PaintboxOverview instance docked to the right of the editor.
-        self._overviews = {}
-        # Active overview repaint timers per tab ID (for debouncing).
-        self._overview_timers = {}
-        # In-flight background compares (native algorithms), keyed by
-        # compare-tab ID string. One compare per tab at a time; a
-        # refresh that arrives while a compare is running is DROPPED
-        # with a status hint (see refresh_compare) -- the running compare
-        # paints against its kick-off snapshots, which cannot drift
-        # because LOCK_EDITORS_WHILE_COMPARING keeps the halves
-        # read-only for the whole run. Each job carries the engine
-        # job handle (diff_proc async form) and the whole-compare
-        # editor lock state (job.editor_lock) so closing the tab or
-        # exiting the app can cancel the engine compare via
-        # diff_proc(DIF_CANCEL) and release the editors when the
-        # result will never be consumed.
-        self._jobs = {}
 
         self.compare_menu = None
         self.menuid_sep = None
@@ -1085,22 +1114,67 @@ class Command:
         except OSError as ex:
             msg('failed to save state file: {}'.format(ex), level=2)
 
+    def _new_session(self, tab_id, state_key=''):
+        """Create and register the standalone session for a compare tab
+        (or return the existing one). All per-tab runtime state hangs off
+        the returned _TabSession; the Command object stays stateless with
+        respect to individual compares."""
+        key = str(tab_id)
+        session = self._sessions.get(key)
+        if session is not None:
+            return session
+        session = _TabSession(tab_id, state_key or self._current_session_key)
+        self._sessions[key] = session
+        return session
+
+    def _session_for(self, tab_id):
+        """The _TabSession of a compare tab (tab_id int or str), or None
+        when the tab is not a compare tab this plugin manages. This is
+        the single routing lookup every event handler and command uses
+        to reach the right tab's world."""
+        if tab_id is None:
+            return None
+        return self._sessions.get(str(tab_id))
+
+    def _session_diff(self, session):
+        """The session's Differ, created on demand. Restored-after-restart
+        tabs carry diff=None until their first compare (no 'Using ... Algo'
+        status spam at startup); the first refresh / hunk command that
+        needs the diffmap creates the Differ here."""
+        if session.diff is None:
+            session.diff = self._create_differ()
+        return session.diff
+
+    def _focused_session(self):
+        """The _TabSession of the currently focused tab, or None when the
+        focus is not inside a compare tab. The hunk/copy/jump commands
+        route through this so they can never act on another tab's diff
+        records."""
+        try:
+            tab_id = ct.ed.get_prop(ct.PROP_TAB_ID)
+        except Exception:
+            return None
+        return self._session_for(tab_id)
+
     def _is_compare_tab(self, tab_id):
         """Check if the given PROP_TAB_ID belongs to a compare tab.
-        Uses an in-memory set for O(1) lookup -- no disk I/O."""
-        return str(tab_id) in self._compare_tab_ids
+        A tab is a compare tab exactly when it has a session -- the
+        registry and the runtime state are one and the same now, so
+        they can never drift apart. O(1) dict lookup, no disk I/O."""
+        return str(tab_id) in self._sessions
 
-    def _register_compare_tab(self, compare_tab_id, primary_orig_id, secondary_orig_id,
-                              primary_orig_name='', secondary_orig_name='', session_key='',
+    def _register_compare_tab(self, session, primary_orig_id, secondary_orig_id,
+                              primary_orig_name='', secondary_orig_name='',
                               saved=True, dirty=None):
-        """Register a compare tab under its session key with the PROP_TAB_IDs
-        and display names of its two original tabs. 'dirty' tracks which
-        halves ('a' = primary/left, 'b' = secondary/right) carry unsaved
-        edits -- on_save_pre syncs only those halves back to their
-        originals. Callers that pass only the boolean 'saved' (legacy
-        form) get the conservative mapping: unsaved -> both halves dirty."""
-        if not session_key:
-            session_key = self._current_session_key
+        """Persist a compare tab's registration under ITS OWN session key
+        (session.state_key -- the CudaText session file group the tab was
+        created in, not whatever session is current now), with the
+        PROP_TAB_IDs and display names of its two original tabs. 'dirty'
+        tracks which halves ('a' = primary/left, 'b' = secondary/right)
+        carry unsaved edits -- on_save_pre syncs only those halves back
+        to their originals. Callers that pass only the boolean 'saved'
+        (legacy form) get the conservative mapping: unsaved -> both
+        halves dirty. Also fills the session's saved/dirty caches."""
         if dirty is None:
             dirty = set() if saved else {'a', 'b'}
         else:
@@ -1110,9 +1184,9 @@ class Command:
         # means "no half is dirty".
         saved = not dirty
         state = self._load_state()
-        if session_key not in state['sessions']:
-            state['sessions'][session_key] = {}
-        state['sessions'][session_key][str(compare_tab_id)] = {
+        if session.state_key not in state['sessions']:
+            state['sessions'][session.state_key] = {}
+        state['sessions'][session.state_key][session.tab_id_str] = {
             'primary_orig_tab_id': primary_orig_id,
             'primary_orig_name': primary_orig_name or '',
             'secondary_orig_tab_id': secondary_orig_id,
@@ -1121,9 +1195,8 @@ class Command:
             'dirty': sorted(dirty),
         }
         self._save_state(state)
-        self._saved_cache[str(compare_tab_id)] = saved
-        self._dirty_halves[str(compare_tab_id)] = set(dirty)
-        self._compare_tab_ids.add(str(compare_tab_id))
+        session.saved = saved
+        session.dirty = set(dirty)
 
     @staticmethod
     def _entry_dirty(entry):
@@ -1139,23 +1212,16 @@ class Command:
             return set() if entry.get('saved', True) else {'a', 'b'}
         return {h for h in raw if h in ('a', 'b')}
 
-    def _get_dirty_halves(self, compare_tab_id):
-        """Return the set of halves with unsaved edits for a compare tab
-        ('a' = primary/left, 'b' = secondary/right). Serves the in-memory
-        cache; on a cache miss falls back to the persisted state (with
-        legacy migration) and populates the cache."""
-        key = str(compare_tab_id)
-        cached = self._dirty_halves.get(key)
-        if cached is not None:
-            return set(cached)
-        state = self._load_state()
-        session = state['sessions'].get(self._current_session_key, {})
-        dirty = self._entry_dirty(session.get(key))
-        self._dirty_halves[key] = set(dirty)
-        self._saved_cache[key] = not dirty
-        return set(dirty)
+    def _get_dirty_halves(self, session):
+        """Return the set of halves with unsaved edits for a compare
+        tab's session ('a' = primary/left, 'b' = secondary/right).
+        The session's cache is the live value -- it is initialized at
+        registration / on_start2 restore (from the persisted state,
+        with legacy migration via _entry_dirty) and maintained by
+        _update_dirty_state, so no disk access is needed here."""
+        return set(session.dirty)
 
-    def _update_dirty_state(self, compare_tab_id, dirty_halves):
+    def _update_dirty_state(self, session, dirty_halves):
         """Single write path for the saved/dirty state of a compare tab.
         'dirty_halves' is a subset of {'a','b'} naming the halves with
         unsaved edits; the legacy boolean 'saved' flag is kept in sync
@@ -1163,45 +1229,45 @@ class Command:
         every keystroke doesn't hit the disk -- only an actual state
         change (clean half gets edited / dirty half gets synced) rewrites
         the JSON."""
-        key = str(compare_tab_id)
         dirty_halves = {h for h in dirty_halves if h in ('a', 'b')}
-        if self._dirty_halves.get(key) == dirty_halves:
+        if session.dirty == dirty_halves:
             return
-        self._dirty_halves[key] = set(dirty_halves)
+        session.dirty = set(dirty_halves)
         saved = not dirty_halves
         state = self._load_state()
-        session = state['sessions'].get(self._current_session_key, {})
-        entry = session.get(key)
+        group = state['sessions'].get(session.state_key, {})
+        entry = group.get(session.tab_id_str)
         if isinstance(entry, dict):
             entry['dirty'] = sorted(dirty_halves)
             entry['saved'] = saved
             self._save_state(state)
-        self._saved_cache[key] = saved
+        session.saved = saved
 
-    def _unregister_compare_tab(self, compare_tab_id):
-        """Remove a compare tab from the persisted state. Returns the
-        removed entry dict or None if not found."""
+    def _unregister_compare_tab(self, session):
+        """Remove a compare tab from the persisted state (under the
+        tab's OWN state_key, so closing a tab created in another
+        CudaText session never touches that session's group). Returns
+        the removed entry dict or None if not found."""
         state = self._load_state()
-        key = str(compare_tab_id)
-        session = state['sessions'].get(self._current_session_key, {})
-        entry = session.pop(key, None)
+        group = state['sessions'].get(session.state_key, {})
+        entry = group.pop(session.tab_id_str, None)
         if entry is not None:
-            # Clean up empty session.
-            if not session:
-                del state['sessions'][self._current_session_key]
+            # Clean up empty session group.
+            if not group:
+                del state['sessions'][session.state_key]
             self._save_state(state)
-            self._compare_tab_ids.discard(key)
-            # Drop the in-memory state caches for this tab.
-            self._saved_cache.pop(key, None)
-            self._dirty_halves.pop(key, None)
         return entry
 
-    def _get_orig_tab_ids(self, compare_tab_id):
+    def _get_orig_tab_ids(self, tab_id):
         """Return (primary_orig_id, secondary_orig_id) for a compare tab,
-        or (None, None) if not found."""
+        or (None, None) if not found. Reads the tab's OWN persisted
+        session group."""
+        session = self._session_for(tab_id)
+        state_key = session.state_key if session is not None else self._current_session_key
         state = self._load_state()
-        session = state['sessions'].get(self._current_session_key, {})
-        entry = session.get(str(compare_tab_id))
+        group = state['sessions'].get(state_key, {})
+        key = str(tab_id)
+        entry = group.get(key)
         if not isinstance(entry, dict):
             return (None, None)
         return (entry.get('primary_orig_tab_id'), entry.get('secondary_orig_tab_id'))
@@ -1532,7 +1598,8 @@ class Command:
             b_ed.set_text_all(orig_texts[1])
             
             # Register the compare tab by its PROP_TAB_ID with the original
-            # tab IDs and names, plus the session key for grouping.
+            # tab IDs and names, plus the session key for grouping. The
+            # _TabSession is the tab's standalone world from here on.
             compare_tab_id = ct.ed.get_prop(ct.PROP_TAB_ID)
             try:
                 session_path = ct.app_path(ct.APP_FILE_SESSION) or ''
@@ -1540,11 +1607,11 @@ class Command:
                 session_path = ''
             session_key = self._session_key(session_path)
             self._current_session_key = session_key
+            session = self._new_session(compare_tab_id, session_key)
             self._register_compare_tab(
-                compare_tab_id,
+                session,
                 orig_tab_ids[0], orig_tab_ids[1],
                 orig_names[0], orig_names[1],
-                session_key,
                 saved=True)  # initial state: content matches originals = saved
 
             # Color the tab title green to indicate 'synced' (no unsaved
@@ -1555,7 +1622,7 @@ class Command:
             # because set_text_all triggers on_change, which would reset the
             # green color to red. The counter is decremented in on_change;
             # real user edits after this will work normally.
-            self._suppress_change[str(compare_tab_id)] = 2
+            session.suppress_change = 2
 
             # Persistently subscribe to on_start2 so the plugin auto-loads on
             # next startup to restore compare tabs.
@@ -1699,6 +1766,8 @@ class Command:
     def on_scroll(self, ed_self):
         """Forward scroll events to ScrollSplittedTab for synchronized
         scrolling, and keep the overview slider tracking the position.
+        Routed to the scrolled tab's OWN session -- one tab's scroll never
+        touches another tab's overview or timers.
 
         The overview update is two-layered:
         - immediate: overview.track_paint() repaints the slider at up to
@@ -1711,16 +1780,15 @@ class Command:
           after scrolling stops (catches the settled position, e.g. the
           end-of-scroll clamping)."""
         tab_id = ed_self.get_prop(ct.PROP_TAB_ID)
-        if self._is_compare_tab(tab_id):
+        session = self._session_for(tab_id)
+        if session is not None:
             self.scroll.on_scroll(ed_self)
-            tab_id_str = str(tab_id)
-            overview = self._overviews.get(tab_id_str)
-            if overview is not None:
-                overview.track_paint()
+            if session.overview is not None:
+                session.overview.track_paint()
             # Trailing repaint 150ms after the last scroll event.
-            if tab_id_str not in self._overview_timers:
-                self._overview_timers[tab_id_str] = True
-                callback = 'module=cuda_differ;cmd=_overview_repaint_timer;info={};'.format(tab_id_str)
+            if not session.overview_timer:
+                session.overview_timer = True
+                callback = 'module=cuda_differ;cmd=_overview_repaint_timer;info={};'.format(session.tab_id_str)
                 ct.timer_proc(ct.TIMER_START_ONE, callback, 150)
 
     def _overview_repaint_timer(self, tag='', info=''):
@@ -1729,10 +1797,12 @@ class Command:
         repaints during continuous scrolling."""
         if not info:
             return
-        self._overview_timers.pop(info, None)
-        overview = self._overviews.get(info)
-        if overview is not None:
-            overview.paint()
+        session = self._sessions.get(info)
+        if session is None:
+            return  # tab closed with the timer still in flight
+        session.overview_timer = False
+        if session.overview is not None:
+            session.overview.paint()
 
     def on_caret(self, ed_self):
         """Mirror caret to opposite editor when sync_caret is enabled."""
@@ -1755,20 +1825,19 @@ class Command:
         on_save_pre and reset the green color back to red.
 
         The first 2 calls after a compare is created are suppressed (see
-        _suppress_change) because set_text_all triggers spurious on_change
-        events that would reset the initial green color.
+        the session's suppress_change counter) because set_text_all
+        triggers spurious on_change events that would reset the initial
+        green color.
 
-        Performance: _is_compare_tab uses an in-memory set (no disk I/O),
+        Performance: the session lookup is one dict get (no disk I/O),
         so non-compare tabs return in O(1). The handler is lightweight
         enough for on_change."""
         tab_id = ed_self.get_prop(ct.PROP_TAB_ID)
-        if not self._is_compare_tab(tab_id):
+        session = self._session_for(tab_id)
+        if session is None:
             return
-        key = str(tab_id)
-        if key in self._suppress_change:
-            self._suppress_change[key] -= 1
-            if self._suppress_change[key] <= 0:
-                del self._suppress_change[key]
+        if session.suppress_change > 0:
+            session.suppress_change -= 1
             # Skip color change and state write for this spurious event.
         else:
             # Real user edit -- reset title color to default (red).
@@ -1782,12 +1851,12 @@ class Command:
             h_self = ed_self.get_prop(ct.PROP_HANDLE_SELF)
             h_primary = ed_self.get_prop(ct.PROP_HANDLE_PRIMARY)
             half = 'a' if h_self == h_primary else 'b'
-            halves = self._get_dirty_halves(tab_id)
+            halves = self._get_dirty_halves(session)
             halves.add(half)
             # Persist the unsaved state so on_start2 can restore the
             # correct color after restart. Cache-guarded: only the first
             # edit of a clean half writes to disk.
-            self._update_dirty_state(tab_id, halves)
+            self._update_dirty_state(session, halves)
 
     def on_change_slow(self, ed_self):
         """Fires after the user edits and a short pause passes. Used only
@@ -1903,7 +1972,8 @@ class Command:
         prevent CudaText's session auto-save/restore from persisting the
         compare tab's content across restarts."""
         tab_id = ed_self.get_prop(ct.PROP_TAB_ID)
-        if not self._is_compare_tab(tab_id):
+        session = self._session_for(tab_id)
+        if session is None:
             return  # not a compare tab -- let CudaText handle normally
 
         # Cancel any in-flight background compare for this tab before
@@ -1914,13 +1984,13 @@ class Command:
         # handler returns. _cancel_job also releases the compare-level
         # editor lock / read-only state, so the halves are editable
         # again by the time the save finishes.
-        tab_id_str = str(tab_id)
-        job = self._jobs.pop(tab_id_str, None)
+        job = session.job
+        session.job = None
         if job is not None:
             self._cancel_job(job)
 
         # Which halves carry unsaved edits? Only those get synced.
-        dirty = self._get_dirty_halves(tab_id)
+        dirty = self._get_dirty_halves(session)
         if not dirty:
             # Neither half is dirty: nothing to sync. The old behavior
             # re-synced and re-saved BOTH files on every Ctrl+S (and on
@@ -1928,8 +1998,8 @@ class Command:
             # Clear any pending suppress counter so a later real edit is
             # not swallowed by it, keep the title green, and tell the
             # user why nothing was saved.
-            self._suppress_change.pop(tab_id_str, None)
-            self._update_dirty_state(tab_id, set())  # repair stale state
+            session.suppress_change = 0
+            self._update_dirty_state(session, set())  # repair stale state
             ed_self.set_prop(ct.PROP_TAB_COLOR_FONT, 0x00A000)  # green
             ct.msg_status(_('Differ: no unsaved changes'))
             # Block the default save (which would show a Save dialog for
@@ -1955,7 +2025,7 @@ class Command:
         if synced_a or synced_b:
             # Clear any pending suppress counter -- save overrides the
             # initial-creation suppress.
-            self._suppress_change.pop(tab_id_str, None)
+            session.suppress_change = 0
 
             # Drop the synced halves from the dirty set. A dirty half
             # whose sync failed (e.g. its original tab is gone) stays
@@ -1974,7 +2044,7 @@ class Command:
                 ed_self.set_prop(ct.PROP_TAB_COLOR_FONT, 0x00A000)  # green
             # Persist the state (legacy 'saved' flag + dirty halves) so
             # on_start2 can restore the correct color after restart.
-            self._update_dirty_state(tab_id, remaining)
+            self._update_dirty_state(session, remaining)
             # Auto-refresh diff markers so the user sees updated
             # highlights without needing to click Recompare manually.
             # self.refresh_compare(ed_self, show_dialog=False)  # automatic -- no dialog
@@ -2068,38 +2138,35 @@ class Command:
         if dead_keys:
             self._save_state(state)
 
-        # --- Rebuild in-memory caches and apply colors/markers ---
+        # --- Rebuild the sessions for the surviving compare tabs ---
         self.scroll.tab_id = set()
-        self._compare_tab_ids = set()
+        self._sessions = {}
         for tab_id_str, entry in session.items():
             if not isinstance(entry, dict):
                 continue
             try:
-                self.scroll.tab_id.add(int(tab_id_str))
+                tab_id_int = int(tab_id_str)
             except (ValueError, TypeError):
-                pass
-            self._compare_tab_ids.add(tab_id_str)
-            # Populate the saved/dirty-state caches from disk. Entries
+                tab_id_int = tab_id_str
+            self.scroll.tab_id.add(tab_id_int)
+            # A restored tab gets a full standalone session, but its
+            # Differ stays None until the first compare needs it (no
+            # 'Using ... Algo' status spam at startup; a restored tab's
+            # diff markers are not re-painted on purpose -- see the
+            # commented-out refresh above).
+            tab_session = _TabSession(tab_id_int, self._current_session_key)
+            # Populate the saved/dirty caches from disk. Entries
             # written by older plugin versions have no 'dirty' key --
             # _entry_dirty maps the legacy 'saved' flag instead (unsaved
             # -> both halves dirty, so the first Ctrl+S after upgrade
             # syncs both sides, exactly like the old always-sync-both
             # behavior).
-            dirty = self._entry_dirty(entry)
-            self._dirty_halves[tab_id_str] = dirty
-            saved = not dirty
-            self._saved_cache[tab_id_str] = saved
-            
-            # Find an editor for this compare tab and re-apply diff markers.
-            # if the user have a lot of big diff tabs they will all run at the same time and cudatext will hang for a moment, let stop diffing after restart, if the user is still interested in the compare then a simple click to refresh is not bad experience anyway
-            # for h in ct.ed_handles():
-            #     e = ct.Editor(h)
-            #     if str(e.get_prop(ct.PROP_TAB_ID)) == tab_id_str:
-            #         self.refresh_compare(e, show_dialog=False)
-            #         break
-                    
+            tab_session.dirty = self._entry_dirty(entry)
+            tab_session.saved = not tab_session.dirty
+            self._sessions[tab_id_str] = tab_session
+
             # Re-apply the title color: green only when no half is dirty.
-            if saved:
+            if tab_session.saved:
                 self._apply_color_to_tab(tab_id_str, 0x00A000)  # green
         # Re-subscribe to on_scroll event if sync_scroll is enabled.
         if self.cfg.get('sync_scroll') and self.scroll.tab_id:
@@ -2128,9 +2195,11 @@ class Command:
         # finishing race (a compare that completed right before its
         # cancellation arrived), and _app_exiting guards the callback
         # path too.
-        for job in self._jobs.values():
-            self._cancel_job(job)
-        self._jobs.clear()
+        for tab_session in self._sessions.values():
+            job = tab_session.job
+            tab_session.job = None
+            if job is not None:
+                self._cancel_job(job)
 
     '''
     def on_tab_change(self, ed_self):
@@ -2219,8 +2288,9 @@ class Command:
         the engine to stop cooperatively via diff_proc(DIF_CANCEL) if a
         background call was actually started. No-op for a Python-
         algorithm job, which never gets a job_handle. Does not touch
-        self._jobs -- callers pop/clear it themselves, since 'cancel
-        one' and 'cancel all' remove from the dict differently."""
+        the session's job slot -- callers clear session.job themselves
+        (close / save / cancel command / exit each handle it
+        differently but identically safe)."""
         job.stale = True
         # Close the engine-wait profiling pair: a cancelled compare's
         # completion callback never fires, so this is the ONLY place the
@@ -2244,9 +2314,11 @@ class Command:
         the tab, and without needing on_save_pre's close-then-save
         path."""
         tab_id = ct.ed.get_prop(ct.PROP_TAB_ID)
-        if not self._is_compare_tab(tab_id):
+        session = self._session_for(tab_id)
+        if session is None:
             return ct.msg_status(_('Differ: not a compare tab'))
-        job = self._jobs.pop(str(tab_id), None)
+        job = session.job
+        session.job = None
         if job is None:
             return ct.msg_status(_('Differ: no compare running'))
         self._cancel_job(job)
@@ -2258,13 +2330,13 @@ class Command:
         on_exit_pre, but triggerable on demand instead of only at app
         exit -- e.g. after refreshing several large-file compares at
         once and deciding none of the results are needed."""
-        n = len(self._jobs)
-        if not n:
+        jobs = [s.job for s in self._sessions.values() if s.job is not None]
+        if not jobs:
             return ct.msg_status(_('Differ: no compares running'))
-        for job in self._jobs.values():
+        for job in jobs:
+            job.session.job = None
             self._cancel_job(job)
-        self._jobs.clear()
-        ct.msg_status(_('Differ: cancelled {} compare(s)').format(n))
+        ct.msg_status(_('Differ: cancelled {} compare(s)').format(len(jobs)))
 
     # native_histogram / native_myers only work when cudatext.diff_proc
     # is present. On older CudaText builds the plugin falls back to the
@@ -2316,45 +2388,53 @@ class Command:
             ct.msg_status(_("Differ: Using Python Algo {}").format(algo))
         return dfp.Differ()
 
-    def _ensure_correct_differ(self):
-        """Check if self.diff matches the configured algorithm type, and
-        swap it if not. Called at the start of refresh_compare so the Differ
-        is always the right type before a compare runs. Preserves the
+    def _ensure_correct_differ(self, session):
+        """Check if the SESSION's Differ matches the configured algorithm
+        type, and swap it if not. Called at the start of refresh_compare
+        (per compare tab -- each session owns its Differ, so an algorithm
+        switch never disturbs another tab's records) so the Differ is
+        always the right type before a compare runs. Preserves the
         options (withdetail, beautify_alignment) but NOT the sequences:
-        neither Differ holds sequences between compares anymore — both
+        neither Differ holds sequences between compares — both
         the native Differ (compare(a_text, b_text)) and the Python
         Differ (compare(lines_a, lines_b)) take their inputs as
-        parameters at compare() time. refresh_compare always re-passes fresh
-        data to compare() right after this swap, before any compare()
-        runs.
+        parameters at compare() time. refresh_compare always re-passes
+        fresh data to compare() right after this swap, before any
+        compare() runs. Returns the (possibly new) Differ.
 
         Also applies the native→Python algorithm mapping when the native
         API is missing, so the Python Differ never receives a
         'native_*' name it cannot run.
         """
+        diff = self._session_diff(session)
         algo, want_native, fell_back = self._resolve_algorithm()
-        is_native = isinstance(self.diff, dfn.Differ)
+        is_native = isinstance(diff, dfn.Differ)
         if want_native == is_native:
             # Still refresh the effective algorithm name (handles a
             # config change between two native algos, or the fallback
             # mapping on a Python Differ that already exists).
-            self.diff.diff_algorithm = algo
-            return
+            diff.diff_algorithm = algo
+            return diff
         # Swap: preserve options only. We do NOT preserve sequences:
         #   - Both differs take their inputs as compare() params
         #     (native: raw texts; Python: line lists). There is nothing
         #     to preserve on the instance.
         # refresh_compare always calls compare(...) with fresh state right
         # after this swap, before any compare() runs, so the empty new
-        # Differ is fine.
-        old_withdetail = getattr(self.diff, 'withdetail', True)
-        old_beautify_alignment = getattr(self.diff, 'beautify_alignment', False)
-        self.diff = dfn.Differ() if want_native else dfp.Differ()
-        self.diff.withdetail = old_withdetail
-        self.diff.beautify_alignment = old_beautify_alignment
-        self.diff.diff_algorithm = algo
+        # Differ is fine. The old Differ (with the PREVIOUS diffmap)
+        # simply dies with the swap -- a hunk command reading the
+        # diffmap mid-swap sees either the old map or the new empty one,
+        # both consistent states.
+        old_withdetail = getattr(diff, 'withdetail', True)
+        old_beautify_alignment = getattr(diff, 'beautify_alignment', False)
+        diff = dfn.Differ() if want_native else dfp.Differ()
+        diff.withdetail = old_withdetail
+        diff.beautify_alignment = old_beautify_alignment
+        diff.diff_algorithm = algo
+        session.diff = diff
         # Fallback status is reported once in refresh_compare when the
         # resolved algorithm is applied — avoid a duplicate message here.
+        return diff
 
     def refresh_compare(self, ed=None, show_dialog=None):
         """Unified refresh / re-compare entry point.
@@ -2396,20 +2476,27 @@ class Command:
         if ed.get_prop(ct.PROP_EDITORS_LINKED):
             return
         tab_id = ed.get_prop(ct.PROP_TAB_ID)
-        if not self._is_compare_tab(tab_id):
-            return  # not a compare tab we manage -- skip
+        session = self._session_for(tab_id)
+        if session is None:
+            # Not a compare tab we manage. A restored-after-restart tab
+            # that on_start2 did not rebuild (different CudaText session
+            # group) lands here too -- nothing to refresh without a
+            # session world of its own.
+            return
 
-        # One compare at a time per tab. A background compare already
-        # running for this tab? While it runs, LOCK_EDITORS_WHILE_COMPARING
-        # keeps the halves locked + read-only, so their texts cannot drift
-        # under the engine -- there is nothing a queued re-run would fix.
-        # Drop this request (manual Recompare, on_change_slow auto-refresh,
-        # on_state_ed wrap sync) with a status hint instead of starting a
-        # second engine job or deferring work: the running compare finishes
-        # and paints against its own kick-off snapshots; the NEXT refresh
-        # -- the user can fire it any time after this one, or cancel first
-        # -- picks up whatever the editors hold then.
-        if self._jobs.get(str(tab_id)) is not None:
+        # One compare at a time per tab -- PER TAB: another tab's
+        # running compare never blocks this one (each session has its
+        # own job slot). While a background compare runs for THIS tab,
+        # LOCK_EDITORS_WHILE_COMPARING keeps the halves locked +
+        # read-only, so their texts cannot drift under the engine --
+        # there is nothing a queued re-run would fix. Drop this request
+        # (manual Recompare, on_change_slow auto-refresh, on_state_ed
+        # wrap sync) with a status hint instead of starting a second
+        # engine job or deferring work: the running compare finishes and
+        # paints against its own kick-off snapshots; the NEXT refresh
+        # -- the user can fire it any time after this one, or cancel
+        # first -- picks up whatever the editors hold then.
+        if session.job is not None:
             ct.msg_status(_('Differ: compare already running'))
             return
 
@@ -2460,19 +2547,20 @@ class Command:
             if micromap_on:
                 self._setup_micromap(a_ed, b_ed)
 
-            # Create or reuse the paintbox overview for this compare tab.
-            # The overview is a custom paintbox added to the right side
-            # of the editor's parent form. It shows a gap-aware mini-map
-            # of both editors side-by-side (unlike the micromap, which
-            # doesn't account for the gaps we insert for alignment).
+            # Create or reuse the paintbox overview for this compare tab
+            # (the tab's OWN session holds it -- two tabs' overviews can
+            # never mix). The overview is a custom paintbox added to the
+            # right side of the editor's parent form. It shows a gap-aware
+            # mini-map of both editors side-by-side (unlike the micromap,
+            # which doesn't account for the gaps we insert for alignment).
             tab_id_str = str(tab_id)
-            overview = self._overviews.get(tab_id_str)
+            overview = session.overview
             overview_on = self.cfg.get('enable_overview', True)
             if overview_on:
                 if overview is None:
                     overview = PaintboxOverview()
                     overview.create(a_ed, b_ed)
-                    self._overviews[tab_id_str] = overview
+                    session.overview = overview
                 else:
                     overview.a_ed = a_ed
                     overview.b_ed = b_ed
@@ -2502,7 +2590,7 @@ class Command:
                 overview.clear_data()
             elif overview is not None:
                 overview.destroy()
-                del self._overviews[tab_id_str]
+                session.overview = None
                 overview = None
 
             Profiler.start('refresh:get_text')
@@ -2515,7 +2603,9 @@ class Command:
                 self.clear(a_ed)
                 self.clear(b_ed)
                 Profiler.stop('refresh:clear')
-                self.diff.diffmap = []
+                # Clear THIS tab's diff records (the session's Differ --
+                # another tab's diffmap is never touched).
+                self._ensure_correct_differ(session).diffmap = []
                 if show_dialog:
                     t = _('The two sides are identical.')
                     ct.msg_box(t, ct.MB_OK)
@@ -2540,10 +2630,11 @@ class Command:
             # config() was already called above (before the profiling check).
             # Don't call it again here.
 
-            # Ensure the Differ instance matches the configured algorithm
-            # type (native vs Python). Swaps if the user changed the
-            # algorithm in config since the last compare.
-            self._ensure_correct_differ()
+            # Ensure the SESSION's Differ instance matches the configured
+            # algorithm type (native vs Python). Swaps if the user changed
+            # the algorithm in config since this tab's last compare -- the
+            # swap is per session, other tabs keep their own differs.
+            diff = self._ensure_correct_differ(session)
 
             # Branch on the differ type to compute the Python side's
             # line lists. The native Differ doesn't need a pre-split —
@@ -2554,7 +2645,7 @@ class Command:
             # In both cases the inputs enter as locals inside compare()
             # and are dropped when the generator returns — zero text
             # bytes persistent between compares.
-            if not isinstance(self.diff, dfn.Differ):
+            if not isinstance(diff, dfn.Differ):
                 # Python differ: consumes line lists directly (the
                 # pure-Python matchers take sequences), so the split
                 # is genuinely needed here.
@@ -2582,24 +2673,24 @@ class Command:
             self.scroll.tab_id.add(tab_id)
             self.scroll.toggle(self.cfg.get('sync_scroll'))
 
-            self.diff.withdetail = self.cfg.get('compare_with_details')
+            diff.withdetail = self.cfg.get('compare_with_details')
             # Use the resolved algorithm (native→Python mapping when
             # cudatext.diff_proc is missing). Do not pass a 'native_*'
             # name into the pure-Python Differ.
             _algo, _use_native, _fell_back = self._resolve_algorithm()
-            self.diff.diff_algorithm = _algo
+            diff.diff_algorithm = _algo
             if _fell_back:
                 ct.msg_status(
                     _('Differ: native API not available — falling back to Python algo {} '
                       '(configured: {})').format(
                         _algo, self.cfg.get('diff_algorithm', 'native_histogram')))
-            self.diff.beautify_alignment = self.cfg.get('beautify_alignment')
+            diff.beautify_alignment = self.cfg.get('beautify_alignment')
             # Ignore options -> diff_proc DIFF_IGN_* bitmask for the
             # native algorithms (applies to BOTH the line-level diff and
             # the char-level details). The pure-Python Differ simply
             # ignores this attribute -- Python algorithms compare
             # strictly by design.
-            self.diff.ignore_flags = dfn.build_ignore_flags(self.cfg)
+            diff.ignore_flags = dfn.build_ignore_flags(self.cfg)
 
             # Detect word-wrap on either side. When wrap is on, gaps must be
             # sized by the actual number of visual rows on the opposite side
@@ -2636,6 +2727,7 @@ class Command:
             # paint inline here, synchronously.
             job = _CompareJob()
             job.ed = ed
+            job.session = session
             job.tab_id = tab_id
             job.tab_id_str = tab_id_str
             job.a_ed = a_ed
@@ -2653,7 +2745,7 @@ class Command:
             job.show_dialog = show_dialog
             job.compare_start = _compare_start
             job.profiling_enabled_here = _profiling_enabled_here
-            if isinstance(self.diff, dfn.Differ):
+            if isinstance(diff, dfn.Differ):
                 job.a_text = a_text_all
                 job.b_text = b_text_all
                 del a_text_all, b_text_all
@@ -2662,7 +2754,7 @@ class Command:
                 job.lines_b = lines_b
                 del lines_a, lines_b
 
-            if isinstance(self.diff, dfn.Differ):
+            if isinstance(diff, dfn.Differ):
                 # functools.partial carries the job to the callback, so
                 # the engine's completion knows WHICH compare finished.
                 # (The refresh-while-running case was already handled at
@@ -2683,14 +2775,14 @@ class Command:
                 cb = functools.partial(self._on_native_diff_done, job)
                 job_handle = dfn.start_async_line_diff(
                     job.a_text, job.b_text,
-                    dfn.algo_id(self.diff.diff_algorithm),
-                    self.diff.ignore_flags,
+                    dfn.algo_id(diff.diff_algorithm),
+                    diff.ignore_flags,
                     cb)
                 if job_handle:
                     job.job_handle = job_handle
                     job.in_flight = True
                     job.profiler_async_token = _async_pair
-                    self._jobs[tab_id_str] = job
+                    session.job = job
                     # Editors are locked + read-only for the whole engine
                     # run (kick-off -> fully-rendered result / cancel):
                     # the paint lock shows the 'busy' placeholder in both
@@ -2805,10 +2897,12 @@ class Command:
         # Native takes raw texts (the job's snapshots); Python takes line
         # lists (split in refresh_compare). In the background mode the native
         # call receives the engine's opcodes, so the generator skips its
-        # own engine call and walks them directly.
-        if isinstance(self.diff, dfn.Differ):
-            compare_iter = self.diff.compare(job.a_text, job.b_text,
-                                             opcodes=opcodes)
+        # own engine call and walks them directly. The Differ used is the
+        # JOB'S SESSION's -- each compare tab paints from its own records.
+        diff = self._session_diff(job.session)
+        if isinstance(diff, dfn.Differ):
+            compare_iter = diff.compare(job.a_text, job.b_text,
+                                        opcodes=opcodes)
             # RELEASE the job's refs to the raw texts now that the
             # generator has its own (param) refs. The native generator
             # splits the texts into line lists inside compare() and then
@@ -2824,7 +2918,7 @@ class Command:
             job.a_text = None
             job.b_text = None
         else:
-            compare_iter = self.diff.compare(job.lines_a, job.lines_b)
+            compare_iter = diff.compare(job.lines_a, job.lines_b)
             job.lines_a = None
             job.lines_b = None
         for d in compare_iter:
@@ -3076,8 +3170,8 @@ class Command:
             # refresh_compare: the dialog only appears for the initial
             # compare and manual refresh; automatic refreshes
             # (on_change_slow / on_state_ed wrap sync) stay silent to
-            # avoid pestering the user.
-            self.diff.diffmap = []
+            # avoid pestering the user. Clears THIS session's diffmap.
+            diff.diffmap = []
             Profiler.stop('refresh')
             if show_dialog:
                 ct.msg_box(
@@ -3168,9 +3262,9 @@ class Command:
         released cancelled jobs): the halves become editable again only
         here, after the result is fully rendered.
         """
-        # This job is finished -- free the per-tab slot first of all.
-        if self._jobs.get(job.tab_id_str) is job:
-            del self._jobs[job.tab_id_str]
+        # This job is finished -- free the session's job slot first of all.
+        if job.session is not None and job.session.job is job:
+            job.session.job = None
 
         # Close the engine-wait profiling pair FIRST, before anything
         # else: its elapsed (kick-off -> now) is booked to
@@ -3194,9 +3288,9 @@ class Command:
                 return
 
             try:
-                if not isinstance(self.diff, dfn.Differ):
+                if not isinstance(self._session_diff(job.session), dfn.Differ):
                     # Algorithm switched to a Python one while the engine
-                    # was running: the current Differ cannot paint native
+                    # was running: the session's Differ cannot paint native
                     # opcodes. Release this job's lock BEFORE the re-run
                     # so the new kick-off's lock does not stack on it,
                     # then re-run the refresh with the new algorithm.
@@ -3299,9 +3393,15 @@ class Command:
         entry = None
         if tab_id is not None:
             orig_a_id, orig_b_id = self._get_orig_tab_ids(tab_id)
+            # Read the entry from the tab's OWN persisted session group
+            # (state_key carried by its session; fallback to the current
+            # group for tab ids without one).
+            tab_session = self._session_for(tab_id)
+            state_key = (tab_session.state_key if tab_session is not None
+                         else self._current_session_key)
             state = self._load_state()
-            session = state['sessions'].get(self._current_session_key, {})
-            entry = session.get(str(tab_id))
+            group = state['sessions'].get(state_key, {})
+            entry = group.get(str(tab_id))
         if not isinstance(entry, dict):
             entry = {}
         names = []
@@ -3663,11 +3763,17 @@ class Command:
             return 1, eds
 
     def jump(self, to_next=True):
-        """Jump caret to the next (or previous) diff hunk in the focused editor.
-        Wraps around at the end/start of the diffmap."""
-        if not self.diff.diffmap:
+        """Jump caret to the next (or previous) diff hunk in the focused
+        editor. Wraps around at the end/start of the FOCUSED tab's own
+        diffmap (the session's Differ -- never another tab's records)."""
+        session = self._focused_session()
+        if session is None:
+            return ct.msg_status(_('Differ: not a compare tab'))
+        diff = self._session_diff(session)
+        if not diff.diffmap:
             self.refresh_compare()
-        cnt = len(self.diff.diffmap)
+            diff = self._session_diff(session)
+        cnt = len(diff.diffmap)
         if cnt == 0:
             return ct.msg_status(_("No differences were found"))
         fc, eds = self.focused
@@ -3681,13 +3787,13 @@ class Command:
         line_cnt = eds[fc].get_line_count()
 
         if to_next:
-            for n, dif in enumerate(self.diff.diffmap):
+            for n, dif in enumerate(diff.diffmap):
                 df_y = dif[p] if dif[p] <= line_cnt - 1 else line_cnt - 1
                 if y < df_y:
                     i = n
                     break
         else: # to prev
-            for n, dif in reversed(list(enumerate(self.diff.diffmap))):
+            for n, dif in reversed(list(enumerate(diff.diffmap))):
                 _y = y if dif[p] == dif[p-1] else y + 1 # adjust y for empty diff fragments
                 if _y > dif[p]:
                     i = n
@@ -3699,7 +3805,7 @@ class Command:
             i = 0
         elif i < 0:
             i = cnt - 1
-        to = self.diff.diffmap[i]
+        to = diff.diffmap[i]
         ct.msg_status(_("{} of {} difference").format(i+1, cnt))
         a_line_cnt = eds[0].get_line_count()
         b_line_cnt = eds[1].get_line_count()
@@ -3718,14 +3824,23 @@ class Command:
 
     @property
     def get_current_change(self):
-        """Return the diffmap entry [a0, a1, b0, b1] containing the caret
-        in the focused editor, or None if the caret is not inside a diff hunk."""
-        if not self.diff.diffmap:
+        """Return the FOCUSED tab's own diffmap entry [a0, a1, b0, b1]
+        containing the caret in the focused editor, or None if the caret
+        is not inside a diff hunk (or the focus is not in a compare tab).
+        The diffmap comes from the tab's session -- a second diff tab
+        comparing in between can no longer swap the records under this
+        lookup (that was the original cross-tab bug)."""
+        session = self._focused_session()
+        if session is None:
+            return None
+        diff = self._session_diff(session)
+        if not diff.diffmap:
             self.refresh_compare()
+            diff = self._session_diff(session)
         fc, eds = self.focused
         p = fc * 2
         y = eds[fc].get_carets()[0][1]
-        for dif in self.diff.diffmap:
+        for dif in diff.diffmap:
             if dif[p] <= y < dif[p+1]:
                 return dif
 
@@ -3743,10 +3858,11 @@ class Command:
 
     def _compare_running_here(self, eds):
         """True while a background compare is in flight for the compare
-        tab the given halves belong to. Text-changing hunk commands
-        (copy / copy_line) are refused then: with
+        tab the given halves belong to (THIS tab's session job -- another
+        tab's running compare never blocks editing here). Text-changing
+        hunk commands (copy / copy_line) are refused then: with
         LOCK_EDITORS_WHILE_COMPARING the halves are read-only for the
-        whole run, and the running compare paints its kick-off
+        whole run, and the running compare would paint its kick-off
         snapshots -- any text edit now would end up misaligned. Also
         works with the constant off, where editing IS possible but the
         running compare would still paint stale snapshots."""
@@ -3756,7 +3872,8 @@ class Command:
             tab_id = eds[0].get_prop(ct.PROP_TAB_ID)
         except Exception:
             return False
-        return str(tab_id) in self._jobs
+        session = self._session_for(tab_id)
+        return session is not None and session.job is not None
 
     def copy(self, to_right=True):
         """Copy the current diff hunk's text from left to right (or right to
@@ -3845,9 +3962,13 @@ class Command:
     def sync_caret(self):
         """Mirror the caret position to the opposite editor. If the caret is
         inside a diff hunk, jump the opposite caret to the hunk's start.
-        Otherwise, map the caret line through the diffmap to the corresponding
-        line on the opposite side."""
-        if not self.diff.diffmap:
+        Otherwise, map the caret line through the FOCUSED tab's own
+        diffmap to the corresponding line on the opposite side."""
+        session = self._focused_session()
+        if session is None:
+            return
+        diff = self._session_diff(session)
+        if not diff.diffmap:
             return
         fc, eds = self.focused
         op = 0 if fc else 1
@@ -3855,13 +3976,13 @@ class Command:
 
         esc = self.cfg.get('enable_sync_caret', False)
         p = fc * 2
-        for dif in self.diff.diffmap:
+        for dif in diff.diffmap:
             if dif[p] <= y < dif[p+1]:
                 self.cfg['enable_sync_caret'] = False
                 eds[op].set_caret(0, dif[op*2])
                 self.cfg['enable_sync_caret'] = esc
                 return
-        for dif in self.diff.diffmap:
+        for dif in diff.diffmap:
             if y < dif[p]:
                 self.cfg['enable_sync_caret'] = False
                 eds[op].set_caret(x, dif[op*2]-dif[p]+y)
@@ -4022,24 +4143,26 @@ class Command:
         # 'Differ\Cancel all compares' plugin commands: they stop an
         # in-flight background compare (engine told to stop, editors
         # unlocked + made writable again). 'Cancel compare' acts on
-        # THIS tab, 'Cancel all compares' on every compare tab. Both
-        # are enabled only while a compare is actually running; the
-        # menu is rebuilt on every right-click, so the enabled state
-        # is always fresh.
+        # THIS tab (enabled while THIS tab's session has a job in
+        # flight -- another tab's running compare never enables it),
+        # 'Cancel all compares' on every compare tab (enabled while ANY
+        # session has one). Both are enabled only while a compare is
+        # actually running; the menu is rebuilt on every right-click,
+        # so the enabled state is always fresh.
         ct.menu_proc(self.compare_menu, ct.MENU_ADD, caption='-')
-        cur_tab_id_str = str(cur_ed.get_prop(ct.PROP_TAB_ID))
+        cur_session = self._session_for(cur_ed.get_prop(ct.PROP_TAB_ID))
         self.menuid_cancel = ct.menu_proc(self.compare_menu, ct.MENU_ADD,
             command='module=cuda_differ;cmd=cancel_compare;',
             caption=_('Cancel compare')
             )
         ct.menu_proc(self.menuid_cancel, ct.MENU_SET_ENABLED,
-            command=cur_tab_id_str in self._jobs)
+            command=cur_session is not None and cur_session.job is not None)
         self.menuid_cancel_all = ct.menu_proc(self.compare_menu, ct.MENU_ADD,
             command='module=cuda_differ;cmd=cancel_all_compares;',
             caption=_('Cancel all compares')
             )
         ct.menu_proc(self.menuid_cancel_all, ct.MENU_SET_ENABLED,
-            command=bool(self._jobs))
+            command=any(s.job is not None for s in self._sessions.values()))
 
     def tabmenu_chooser(self):
         """Launch 'Compare with...' via a 100ms timer (needed because menu
@@ -4106,14 +4229,19 @@ class Command:
 
     def select_all_diff(self):
         """Select all diff hunks in the focused editor as multi-caret selections."""
-        if not self.diff.diffmap:
+        session = self._focused_session()
+        if session is None:
+            return ct.msg_status(_('Differ: not a compare tab'))
+        diff = self._session_diff(session)
+        if not diff.diffmap:
             self.refresh_compare()
-        if len(self.diff.diffmap) == 0:
+            diff = self._session_diff(session)
+        if len(diff.diffmap) == 0:
             return ct.msg_status(_("No differences were found"))
         fc, eds = self.focused
         y1,y2 = (0,1) if fc == 0 else (2,3)
 
-        for n, dif in enumerate(self.diff.diffmap):
+        for n, dif in enumerate(diff.diffmap):
             id = ct.CARET_SET_ONE if n == 0 else ct.CARET_ADD
             eds[fc].set_caret(0, dif[y1], 0, dif[y2], id=id)
 
@@ -4154,9 +4282,10 @@ class Command:
         without the second half's text.
         """
         tab_id = ed_self.get_prop(ct.PROP_TAB_ID)
-        if not self._is_compare_tab(tab_id):
+        session = self._session_for(tab_id)
+        if session is None:
             return  # not a compare tab -- CudaText handles it normally
-        if self._get_dirty_halves(tab_id):
+        if self._get_dirty_halves(session):
             # Dirty half(es): unsynced edits exist -- keep the dialog.
             return
         # Clean diff tab: suppress the save dialog. Clear the flag on
@@ -4174,16 +4303,23 @@ class Command:
                 pass
 
     def on_close(self, ed_self: ct.Editor):
-        """Fires after the close is confirmed. For a compare tab: unregister
-        it from the persisted state. If this was the last compare tab,
-        disable autostart. No temp files to delete (split-tab approach).
+        """Fires after the close is confirmed. For a compare tab: destroy
+        its ENTIRE standalone session (persisted registration, overview
+        panel, in-flight job, all per-tab caches) so the tab's world is
+        fully gone and can never leak into another tab. If this was the
+        last compare tab, disable autostart. No temp files to delete
+        (split-tab approach).
 
         During app exit, the state entry and autostart are preserved so
         the compare tab can be restored after restart."""
         tab_id = ed_self.get_prop(ct.PROP_TAB_ID)
-        entry = self._unregister_compare_tab(tab_id)
-        if entry is None:
+        session = self._session_for(tab_id)
+        if session is None:
             return  # not a compare tab
+
+        # Remove the persisted registration (under the tab's OWN
+        # state_key).
+        entry = self._unregister_compare_tab(session)
 
         # Remove from in-memory scroll set.
         try:
@@ -4192,8 +4328,8 @@ class Command:
             pass
 
         # Destroy the paintbox overview for this tab.
-        tab_id_str = str(tab_id)
-        overview = self._overviews.pop(tab_id_str, None)
+        overview = session.overview
+        session.overview = None
         if overview is not None:
             overview.destroy()
 
@@ -4207,9 +4343,14 @@ class Command:
         # for the finishing race: a compare that completed right before
         # the cancellation arrived still delivers its callback, which
         # the stale check below turns into a no-op.
-        job = self._jobs.pop(tab_id_str, None)
+        job = session.job
+        session.job = None
         if job is not None:
             self._cancel_job(job)
+
+        # The session itself goes last -- after this the tab's world
+        # (Differ/diffmap, caches, timer flags) is fully gone.
+        self._sessions.pop(session.tab_id_str, None)
 
         # During app exit, keep the state entry and autostart subscription
         # so compare tabs persist restarts and the plugin auto-loads.
@@ -4218,16 +4359,16 @@ class Command:
         # so on_start2 can restore the correct title color and a restart
         # save still syncs only the halves that were dirty before exit.
         if getattr(self, '_app_exiting', False):
-            self._register_compare_tab(
-                tab_id,
-                entry.get('primary_orig_tab_id'),
-                entry.get('secondary_orig_tab_id'),
-                entry.get('primary_orig_name', ''),
-                entry.get('secondary_orig_name', ''),
-                self._current_session_key,
-                entry.get('saved', True),
-                entry.get('dirty')
-            )
+            if entry is not None:
+                self._register_compare_tab(
+                    session,
+                    entry.get('primary_orig_tab_id'),
+                    entry.get('secondary_orig_tab_id'),
+                    entry.get('primary_orig_name', ''),
+                    entry.get('secondary_orig_name', ''),
+                    entry.get('saved', True),
+                    entry.get('dirty')
+                )
             # Put both halves back to PROP_MODIFIED=True. on_close_pre
             # (which fires for every half before the exit dialogs) may
             # have cleared the flags on a CLEAN tab to skip the save
@@ -4246,8 +4387,9 @@ class Command:
                 pass
             return
 
-        # If no more compare tabs are open in the current session,
-        # disable autostart so the plugin does not load on next startup.
+        # If no more compare tabs are open in this tab's persisted
+        # session group, disable autostart so the plugin does not load
+        # on next startup.
         state = self._load_state()
-        if not state['sessions'].get(self._current_session_key, {}):
+        if not state['sessions'].get(session.state_key, {}):
             self._disable_autostart()

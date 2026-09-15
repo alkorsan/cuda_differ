@@ -95,7 +95,6 @@ Architecture:
 import time
 
 import cudatext as ct
-import cudatext_cmd as ct_cmd
 from .profiling import Profiler
 
 # Overview dialog width in pixels (docked to the right)
@@ -1178,22 +1177,27 @@ class PaintboxOverview:
             except Exception:
                 pass
 
-        # Force BOTH halves into the SAME repaint batch. set_prop alone
-        # leaves each half's repaint to its own invalidation -- subject
-        # to anti-flicker timers and to the paint-order quirks of two
-        # sibling controls -- which can put the halves into different
-        # display frames: one half visibly scrolls a few milliseconds
-        # before the other catches up. cmd_RepaintEditor maps to
-        # Ed.Update(false, true, false), a FORCED invalidation that
-        # bypasses the anti-flicker delay (CudaText's author added those
-        # parameters exactly for the cuda_sync_scroll plugin); issuing
-        # it for both halves from this one callback makes them repaint
-        # back-to-back in a single message-loop batch, i.e. in the same
-        # display frame.
+        # Paint BOTH halves SYNCHRONOUSLY, inside this one callback.
+        # set_prop alone leaves each half's repaint to its own
+        # invalidation -- subject to anti-flicker timers, to the
+        # paint-order quirks of two sibling controls, and to pending
+        # input messages (a slider drag floods the queue with mouse
+        # moves, and WM_PAINT is delivered only when the queue drains)
+        # -- which can put the halves into different display frames:
+        # one half visibly scrolls a few milliseconds before the other
+        # catches up. ed.action(EDACTION_UPDATE) maps to Ed.Repaint =
+        # Invalidate + LCL Update, so each half paints RIGHT HERE,
+        # back-to-back, before this mouse-move handler returns: both
+        # are on screen in the same frame, atomically. (The older
+        # cmd_RepaintEditor approach was only a forced INVALIDATE --
+        # still asynchronous, still frame-split under a busy queue.)
+        # The synchronous paints fire on_scroll echoes; the positions
+        # already match (both halves were just written), so the
+        # ScrollSplittedTab mirror no-ops and the cascade dies out.
         for e in (self.a_ed, self.b_ed):
             if e is None:
                 continue
             try:
-                e.cmd(ct_cmd.cmd_RepaintEditor)
+                e.action(ct.EDACTION_UPDATE)
             except Exception:
                 pass
