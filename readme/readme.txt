@@ -56,12 +56,12 @@ synced back to the original files automatically.
   the changed lines, never on the empty gap side, so the copy commands
   keep working right after a jump -- from the changed lines or from
   the line next to a gap.
-- Adds two narrow "hunk edge" columns at the left and right edges of
-  the compare view, each drawing a bracket around every difference
-  block -- text lines AND compensating gap band -- so you always see
-  exactly which lines a hunk covers (and which lines Alt+Left/
-  Alt+Right will move), like the rule lines Beyond Compare draws
-  around its difference blocks. See "Hunk edge columns" below.
+- Adds two narrow "hunk edge" columns, one at the left edge of each
+  editor of the compare view, each drawing a bracket around every
+  difference block -- text lines AND compensating gap band -- so you
+  always see exactly which lines a hunk covers (and which lines
+  Alt+Left/Alt+Right will move), like the rule lines Beyond Compare
+  draws around its difference blocks. See "Hunk edge columns" below.
 
 The compare engine implements all the best-known diff algorithms, with a
 lot of improvements on top of each: two native ones running in compiled
@@ -253,13 +253,24 @@ as a colored gap on the other side) gets its bracket around the gap
 band too, so the extent is visible on both sides.
 
 Technical notes:
-- The columns are custom-drawn panels docked outside the editors (the
-  same technique as the overview panel: a borderless dialog with an
-  image control, docked left/right of the compare view). The text area
-  is not touched at all -- unlike the previous implementation (thin
-  colored inter-line gaps inside the editors), nothing is added to the
-  editors' heights, so the side-by-side alignment and the synchronized
-  scrolling cannot be affected.
+- One column sits at the LEFT edge of each editor: the left column
+  before the left editor's gutter, the right column directly right of
+  the splitter, before the right editor's gutter (docked dialogs can
+  only sit at the form's outer edges, which would put the second
+  column at the far end after the scrollbar and the overview -- so the
+  columns are instead child controls of the grouping panel that
+  parents the two editors, and each editor is shifted right by the
+  column width: the columns cover nothing and the editors keep their
+  full gutters). The text area is not touched at all -- unlike the
+  previous implementation (thin colored inter-line gaps inside the
+  editors), nothing is added to the editors' heights, so the
+  side-by-side alignment and the synchronized scrolling cannot be
+  affected.
+- A background layout guard (a light per-tab timer) re-applies the
+  column positions whenever CudaText re-lays-out the split editors
+  (window resize, splitter drag, tab-group changes) and removes the
+  columns when the split is gone; when the feature is turned off or
+  the tab is closed, the editors get their full widths back.
 - The brackets are pixel-aligned with the text rows: their tops and
   bottoms come from the editor's own line-to-pixel conversion, which
   accounts for inter-line gaps, word wrap and the current scroll
@@ -286,10 +297,12 @@ Technical notes:
   No plugin color option is involved.
 - The columns are re-drawn on every compare (F5 / auto-refresh) and
   destroyed together with the whole per-tab session when the compare
-  tab is closed or the feature is turned off.
+  tab is closed or the feature is turned off (the editors' widths are
+  restored).
 - Turn the feature off with differ.advanced.enable_hunk_edges; the
-  column width is differ.advanced.hunk_edges_width. Changes take
-  effect on the next Recompare (F5).
+  column width is differ.advanced.hunk_edges_width (each editor gives
+  up that many pixels to its column). Changes take effect on the next
+  Recompare (F5).
 
 
 == Tab context menu ==

@@ -716,8 +716,10 @@ OPTS_META = [
      },
     {'opt': 'differ.advanced.enable_hunk_edges',
      'cmt': _('Hunk edge columns\n'
-              'When enabled, two narrow columns are added at the left and '
-              'right edges of the compare view, each drawing a bracket '
+              'When enabled, two narrow columns are added at the left '
+              'edge of EACH editor of the compare view -- one next to '
+              'the left editor, one directly right of the splitter, '
+              'next to the right editor -- each drawing a bracket '
               'around every difference block (hunk):\n'
               '  +----\n'
               '  |\n'
@@ -729,13 +731,17 @@ OPTS_META = [
               'draws around its difference blocks. One-sided differences '
               '(a colored gap on one side) get the bracket around the '
               'gap too.\n'
-              'The columns are drawn OUTSIDE the editors (the text area '
-              'is not touched; nothing is added to the editors\' '
-              'heights), use the theme\'s gutter colors (EdGutterBg / '
-              'EdGutterFont), stay pixel-aligned with the text rows '
-              'while scrolling (also with word wrap and the Beautify '
-              'line alignment option), and only visible hunks are '
-              'painted, so the cost stays small on huge files.\n'
+              'The columns are separate controls outside the editors '
+              '(each editor is shifted right by the column width, so '
+              'the text area is not touched and nothing is added to the '
+              'editors\' heights), use the theme\'s gutter colors '
+              '(EdGutterBg / EdGutterFont), stay pixel-aligned with the '
+              'text rows while scrolling (also with word wrap and the '
+              'Beautify line alignment option), and keep their position '
+              'when the window is resized or the splitter is dragged '
+              '(a background layout guard re-applies it). Only visible '
+              'hunks are painted, so the cost stays small on huge '
+              'files.\n'
               'Takes effect on the next Recompare (F5).\n'
               'Default: on.'),
      'def': True,
@@ -745,8 +751,10 @@ OPTS_META = [
     {'opt': 'differ.advanced.hunk_edges_width',
      'cmt': _('Hunk edge column width in pixels\n'
               'Width of one hunk edge column (see "Hunk edge '
-              'columns"), in pixels. The columns are intentionally '
-              'narrow -- a vertical bar plus short top/bottom arms.\n'
+              'columns"), in pixels. Each editor gives up this many '
+              'pixels of width to its column. The columns are '
+              'intentionally narrow -- a vertical bar plus short '
+              'top/bottom arms.\n'
               'Range: 6-40. Default: 12.'),
      'def': 12,
      'frm': 'int',
@@ -1110,8 +1118,8 @@ class _TabSession:
                        restart tabs defer creation -- no status spam at
                        startup), created by _session_diff()
       overview         PaintboxOverview docked to this tab, or None
-      columns          HunkColumns (the two hunk edge columns) docked
-                       to this tab, or None
+      columns          HunkColumns (the two hunk edge columns) attached
+                       to this tab's split view, or None
       job              in-flight background _CompareJob, or None
       overview_timer   True while the trailing 150ms overview repaint
                        timer is armed for this tab
@@ -1794,8 +1802,26 @@ class Command:
             # cost on big compares outweighs the benefit (the next refresh,
             # manual or automatic, paints with the new colors).
             self.config()
+            self._refresh_column_colors()
         elif state == ct.APPSTATE_THEME_SYNTAX:
             self.config()
+            self._refresh_column_colors()
+
+    def _refresh_column_colors(self):
+        """Live-update the hunk edge columns' theme colors (EdGutterBg /
+        EdGutterFont) on theme switches, for every open compare tab --
+        without waiting for the next Recompare. Cheap: two dict lookups
+        and one repaint per tab (the repaint is a background fill plus
+        the visible brackets)."""
+        for session in self._sessions.values():
+            columns = session.columns
+            if columns is None:
+                continue
+            try:
+                columns.set_colors(*_ed_gutter_colors())
+                columns.paint()
+            except Exception:
+                pass
 
     def on_state_ed(self, ed_self, state):
         """Editor-level state changes (EDSTATE_* constants -- this event,
@@ -1907,6 +1933,31 @@ class Command:
             session.overview.paint()
         if session.columns is not None:
             session.columns.paint()
+
+    def _columns_layout_timer(self, tag='', info=''):
+        """Recurring per-tab layout guard for the hunk edge columns
+        (armed by columns.HunkColumns._start_timer, one timer per compare
+        tab). CudaText re-lays-out the split editors on every window
+        resize / splitter drag / tab-group change, which would push the
+        editors back over the columns; the guard re-applies the shift
+        (and repaints) within its 400 ms interval, and destroys the
+        columns when the split tree is gone. See
+        HunkColumns.check_layout()."""
+        if not info:
+            return
+        session = self._sessions.get(info)
+        if session is None or session.columns is None:
+            # The tab (or its columns) is gone but the timer still
+            # fires -- stop it by its callback string (destroy() normally
+            # does this; this is the leaked-timer safety net).
+            ct.timer_proc(ct.TIMER_STOP,
+                          'module=cuda_differ;cmd=_columns_layout_timer;'
+                          'info={};'.format(info),0)
+            return
+        try:
+            session.columns.check_layout()
+        except Exception:
+            pass
 
     def on_caret(self, ed_self):
         """Mirror caret to opposite editor when sync_caret is enabled."""
@@ -2656,13 +2707,16 @@ class Command:
 
             # Create or reuse the hunk edge columns for this compare tab
             # (the tab's OWN session holds them -- two tabs' columns can
-            # never mix). Two narrow custom-drawn columns are docked to
-            # the left and right edges of the compare view, each drawing a
-            # bracket around every hunk's full visual footprint (text +
-            # compensating gap band) -- see columns.py. Created BEFORE the
-            # overview below so the overview (docked 'R' later) lands
-            # OUTSIDE the right column, keeping the column adjacent to
-            # the right editor's scrollbar.
+            # never mix). Two narrow custom-drawn columns are attached as
+            # child controls of the grouping panel that parents the two
+            # editors: column A at the LEFT edge of editor 1, column B at
+            # the LEFT edge of editor 2 (directly right of the splitter)
+            # -- each editor is shifted right by the column width so the
+            # columns cover nothing. Each column draws a bracket around
+            # every hunk's full visual footprint (text + compensating gap
+            # band) -- see columns.py, which also runs the per-tab layout
+            # guard that re-applies the shift after CudaText's own
+            # relayouts (window resize / splitter drag).
             tab_id_str = str(tab_id)
             columns = session.columns
             columns_on = self.cfg.get('enable_hunk_edges', True)
@@ -2672,8 +2726,10 @@ class Command:
                     columns.create(a_ed, b_ed)
                     session.columns = columns
                 else:
-                    columns.a_ed = a_ed
-                    columns.b_ed = b_ed
+                    # Re-point at the (possibly re-created) editors: sync
+                    # rebuilds the column controls when the split tree
+                    # changed, and re-checks the layout otherwise.
+                    columns.sync(a_ed, b_ed)
                 # Colors come from the ACTIVE THEME (EdGutterBg /
                 # EdGutterFont), so the columns match the editors' gutters
                 # in every theme -- no plugin color option involved.
