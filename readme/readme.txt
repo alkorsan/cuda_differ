@@ -30,7 +30,14 @@ synced back to the original files automatically.
   tab shows, and the hunk/jump/keyboard commands always act on the
   focused tab's own records.
 - Provides synchronized scrolling so both sides stay aligned as you
-  navigate.
+  navigate. The mirror runs inside the scroll event itself, skips
+  redundant writes and never re-enters, and repaints the mirrored half
+  SYNCHRONOUSLY (Ed.Repaint) inside that same event -- so the two halves
+  move in the same display frame no matter which half initiated the
+  scroll: left scrollbar, right scrollbar, mouse wheel over either half,
+  or the overview slider. Scrolling from the overview panel writes both
+  halves and paints them back-to-back inside the one mouse-event
+  callback, so they move atomically.
 - Supports word-wrap: you can turn wrap on in a compare tab and the two
   sides stay visually aligned even when corresponding lines wrap to
   different heights. Toggling wrap mode on one half turns it on in BOTH
@@ -39,13 +46,22 @@ synced back to the original files automatically.
   for the new wrap mode.
 - Optional gap-aware overview panel docked to the right of the compare
   view, showing a miniature of both editors side-by-side with colored
-  diff highlights (WinMerge-style).
+  diff highlights (WinMerge-style). Its slider behaves like a normal
+  scrollbar: drag it and the thumb tracks the mouse live (~33 fps,
+  wall-clock throttled so the CPU cost stays negligible); click the
+  track and the view jumps to that position.
 - Jump to next/previous difference always lands the caret (and moves
   the focus) on the side that HAS text: one-sided differences (added
   or deleted lines, shown as a gap on the other side) put the caret on
   the changed lines, never on the empty gap side, so the copy commands
   keep working right after a jump -- from the changed lines or from
   the line next to a gap.
+- Draws a thin horizontal rule at the start and the end of every
+  difference block, on both sides of the view (Beyond Compare-style
+  boundary lines), so you always see exactly which lines a hunk covers
+  -- and which lines Alt+Left/Alt+Right will move -- even in the middle
+  of a large changed block. One-sided differences get the lines around
+  their gap band too. See "Hunk edge lines" below.
 
 The compare engine implements all the best-known diff algorithms, with a
 lot of improvements on top of each: two native ones running in compiled
@@ -193,7 +209,8 @@ shown as a colored inter-line GAP on the other side. A gap is pure
 visual space painted between two lines -- it is not a line, so nothing
 is ever inserted into your text to keep the sides aligned, and the
 caret cannot be placed inside a gap: CudaText editors do not model
-carets in the space between lines.
+carets in the space between lines (that would need changes in the
+ATSynEdit editor control itself, which a plugin cannot ship).
 
 Because of that:
 - Jump to next/previous difference lands the caret, and moves the
@@ -208,11 +225,44 @@ Because of that:
   past its end), so a copy from the middle of a block never jumps to
   the block start.
 
-To add a line where a gap is:
+To add a line where a gap is (WinMerge lets you type inside its gaps):
 put the caret on the line above or below the gap, press Enter and type
 -- the new line takes the gap's place as soon as the compare is re-run
 (F5, or automatically with differ.advanced.enable_auto_refresh on),
 and the remaining gap shrinks by one line.
+
+
+== Hunk edge lines ==
+
+Every difference block (hunk) is framed by two thin horizontal lines:
+one directly above its first line and one directly below its last
+line, on BOTH sides of the compare view. This answers "where does this
+hunk start and end?" the way Beyond Compare does with the rule lines
+in its center column -- before you move a block with Alt+Left/Alt+Right
+you can see exactly which lines will be moved, even inside a large
+changed block where the margin markers alone are hard to follow. A
+one-sided difference (added or deleted lines, shown as a colored gap
+on the other side) gets the two lines around its gap band, so the
+extent is visible on both sides.
+
+Technical notes:
+- The lines are painted as thin colored inter-line gaps (1-10 pixels,
+  differ.advanced.hunk_edge_height) spanning the full text-area width.
+  CudaText plugins cannot custom-paint in a center column between the
+  two split halves, but a colored gap reads exactly like a drawn rule.
+- Each hunk adds the SAME height to BOTH sides at the same visual
+  rows, so the side-by-side alignment and the synchronized scrolling
+  are not affected. On the shorter side of a hunk the bottom line sits
+  below the compensating gap; on the empty side (the gap side of a
+  one-sided difference) the band is bracketed above and below.
+- The lines are re-drawn on every compare (F5 / auto-refresh), tagged
+  like all other diff markers, and wiped together with them when a
+  compare tab is closed or re-compared.
+- Colors come from the theme presets (a neutral gray that reads on
+  white, grey and dark backgrounds); with "Color theme" = Custom use
+  differ.theme.edge_color. Turn the feature off with
+  differ.advanced.enable_hunk_edges. Changes take effect on the next
+  Recompare (F5).
 
 
 == Tab context menu ==
@@ -422,18 +472,18 @@ Theme section:
       luminance of the editor background. Recommended.
     * white -- preset tuned for white editor backgrounds:
       changed #f8dfad, added #b3ffb3, deleted #ffc4c4, gap #e3e3e3,
-      ignored and ignored gap #ffffff.
+      ignored and ignored gap #ffffff, hunk edge lines #8a8a8a.
     * grey -- preset tuned for light-grey editor backgrounds (#E0E0E0,
       like the green/navy themes): the white family's colors deepened
       ~25 units, so they keep their contrast against grey.
     * black -- preset tuned for dark editor backgrounds (muted, so the
       diff blocks do not glare on dark themes).
-    * custom -- use the six color options below; every option left
+    * custom -- use the seven color options below; every option left
       empty is filled from the auto-detected preset, so a
       half-configured custom theme never falls back to nothing.
   In the grey and black presets the ignored-difference colors resolve to
   the live editor background, so ignored regions blend into the active
-  theme. The six color options below only apply in the "custom" mode.
+  theme. The seven color options below only apply in the "custom" mode.
 - differ.theme.changed_color: Color of changed lines
   Background color for lines that were modified (replaced with different
   content). Also colors the char-level highlights inside modified lines,
@@ -475,6 +525,13 @@ Theme section:
   Only used when "Color theme" is custom; leave empty to fill this slot
   from the auto-detected preset (the editor text background for the grey
   and black families, so the ignored gap then looks like empty space).
+- differ.theme.edge_color: Color of hunk edge lines
+  Color of the thin horizontal rule drawn at the start and end of every
+  difference block, on both sides of the compare view (see "Hunk edge
+  lines" above). Theme presets use a neutral gray that reads on white,
+  grey and dark backgrounds.
+  Only used when "Color theme" is custom; leave empty to fill this slot
+  from the auto-detected preset.
 
 Algorithm section:
 - differ.algorithm.diff_algorithm: Diff algorithm
@@ -573,6 +630,18 @@ Advanced section:
   you stop editing for 1-2 seconds. When disabled, you must use the
   Recompare command manually.
   Default: off.
+- differ.advanced.enable_hunk_edges: Hunk edge lines
+  When enabled, a thin horizontal line is drawn at the start and end of
+  every difference block on both sides of the compare view, so you
+  always see where a hunk begins and ends -- like the rule lines Beyond
+  Compare draws around its difference blocks (see "Hunk edge lines"
+  above). Each hunk adds the same small height to BOTH sides, so the
+  visual alignment is not affected. Takes effect on the next Recompare
+  (F5).
+  Default: on.
+- differ.advanced.hunk_edge_height: Hunk edge line height in pixels
+  Thickness of the hunk edge lines, in pixels.
+  Range: 1-10. Default: 2.
 - differ.advanced.diff_context: Context lines in unified diff
   Number of unchanged context lines shown around each change in the
   unified diff output (produced by the "Diff current document with..."
@@ -675,6 +744,31 @@ CudaText micromap (default: off). They can be enabled independently and
 used at the same time. The overview is the recommended default because
 it stays gap-aware; the micromap is faster and cheap but does not account
 for inter-line gaps.
+
+The overview panel's slider works like a normal scrollbar:
+- Drag the slider: the thumb follows the mouse live while you drag. The
+  repaints are throttled by wall clock to ~33 fps, so the thumb always
+  tracks the mouse yet the CPU cost stays negligible (each repaint is
+  one cached-bitmap copy plus the slider drawing; the expensive diff
+  rectangles are cached in a separate bitmap and never redrawn on
+  scroll). This cannot be done with a timer: during a drag the message
+  queue is flooded with mouse moves and Windows only delivers WM_TIMER
+  when the queue drains, so a timer-debounced slider would stay frozen
+  until the drag stops.
+- Click the track: the view jumps so the clicked position becomes the
+  center of the viewport, and the slider lands there immediately.
+- Scroll the editors (wheel, native scrollbars, keyboard): the slider
+  follows the scrolling live (same ~33 fps throttle), with a final
+  repaint shortly after scrolling stops.
+- Scrolling from the overview panel itself keeps the two editor halves
+  in the same display frame: both halves' positions are written first,
+  then both are repainted SYNCHRONOUSLY (Ed.Repaint via EDACTION_UPDATE)
+  inside the same mouse-event callback, so they paint back-to-back and
+  land on screen atomically -- no "one half scrolls a few ms before the
+  other" effect, even in the middle of a drag when the message queue is
+  flooded with mouse moves. The same synchronous repaint is used when
+  mirroring a wheel/scrollbar scroll of one half to the other, so the
+  sync is frame-accurate in BOTH directions.
 
 
 == Notes ==

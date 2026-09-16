@@ -172,6 +172,7 @@ _COLOR_PRESETS = {
         'gap': '#e3e3e3',
         'ignored': '#ffffff',
         'ignored_gap': '#ffffff',
+        'edge': '#8a8a8a',
     },
     'grey': {
         # The white family's colors deepened ~25 units, so they hold up
@@ -183,6 +184,7 @@ _COLOR_PRESETS = {
         'gap': '#cdcdcd',
         'ignored': None,
         'ignored_gap': None,
+        'edge': '#5f5f5f',
     },
     'black': {
         # Muted, desaturated blocks that don't glare on dark backgrounds.
@@ -192,10 +194,12 @@ _COLOR_PRESETS = {
         'gap': '#3d3d3d',
         'ignored': None,
         'ignored_gap': None,
+        'edge': '#8f8f8f',
     },
 }
 
-# Preset key -> config key (the one difference: 'gap' -> 'color_gaps').
+# Preset key -> config key (the two differences: 'gap' -> 'color_gaps'
+# and 'edge' -> 'color_hunk_edges').
 _PRESET_CFG_KEYS = {
     'changed': 'color_changed',
     'added': 'color_added',
@@ -203,6 +207,7 @@ _PRESET_CFG_KEYS = {
     'gap': 'color_gaps',
     'ignored': 'color_ignored',
     'ignored_gap': 'color_ignored_gap',
+    'edge': 'color_hunk_edges',
 }
 
 # EdTextBg fallback per family, used only when the live lookup fails
@@ -269,7 +274,7 @@ def _detect_theme_type():
 
 
 def _preset_colors(theme_type):
-    """The six compare colors (ints) of a preset family. None entries
+    """The seven compare colors (ints) of a preset family. None entries
     resolve to the live editor background, so ignored differences always
     blend into the active theme."""
     preset = _COLOR_PRESETS[theme_type]
@@ -292,14 +297,14 @@ OPTS_META = [
     # --- chapter "theme": colors used to paint the compare view ----------
     {'opt': 'differ.theme.color_theme',
      'cmt': _('Color theme\n'
-              'Which compare colors to use. The six color options below '
+              'Which compare colors to use. The seven color options below '
               'only apply in the "Custom" mode.\n'
               '- Auto-detect -- detect the light family of the current UI '
               'theme (by theme name, luminance of the editor background as '
               'fallback) and use its preset. Recommended.\n'
               '- White / Grey / Black -- use that family\'s preset colors, '
               'tuned for white / light-grey / dark editor backgrounds.\n'
-              '- Custom -- use the six color options below; each option '
+              '- Custom -- use the seven color options below; each option '
               'left empty is filled from the auto-detected preset.\n'
               'Note: in the Grey and Black presets the ignored-difference '
               'colors always resolve to the live editor background, so '
@@ -391,6 +396,21 @@ OPTS_META = [
               'this slot from the auto-detected preset -- which for the '
               'Grey and Black presets is the editor text background '
               'color, so the ignored gap then looks like empty space.'),
+     'def': '',
+     'frm': '#rgb-e',
+     'chp': 'theme',
+     },
+    {'opt': 'differ.theme.edge_color',
+     'cmt': _('Color of hunk edge lines\n'
+              'Color of the thin horizontal rule drawn at the start and '
+              'end of every difference block (hunk), on both sides of '
+              'the compare view -- like the lines Beyond Compare draws '
+              'around its difference blocks. The lines are painted as '
+              'thin colored gaps spanning the text area width, so they '
+              'show exactly which lines a hunk covers and which lines '
+              'will be moved by Alt+Left/Alt+Right.\n'
+              'Only used when "Color theme" is Custom; leave empty to fill '
+              'this slot from the auto-detected preset.'),
      'def': '',
      'frm': '#rgb-e',
      'chp': 'theme',
@@ -662,6 +682,33 @@ OPTS_META = [
               'Default: on.'),
      'def': True,
      'frm': 'bool',
+     'chp': 'advanced',
+     },
+    {'opt': 'differ.advanced.enable_hunk_edges',
+     'cmt': _('Hunk edge lines\n'
+              'When enabled, a thin horizontal line is drawn at the start '
+              'and end of every difference block (hunk) on both sides of '
+              'the compare view, so you always see where a hunk begins '
+              'and ends -- before moving it with Alt+Left/Alt+Right -- '
+              'like the rule lines Beyond Compare draws around its '
+              'difference blocks. One-sided differences (a colored gap on '
+              'one side) get the lines around the gap too.\n'
+              'The lines are implemented as 1-10 pixel colored gaps, so '
+              'each hunk adds the same small height to BOTH sides and '
+              'the visual alignment is not affected.\n'
+              'Takes effect on the next Recompare (F5).\n'
+              'Default: on.'),
+     'def': True,
+     'frm': 'bool',
+     'chp': 'advanced',
+     },
+    {'opt': 'differ.advanced.hunk_edge_height',
+     'cmt': _('Hunk edge line height in pixels\n'
+              'Thickness of the hunk edge lines (see "Hunk edge '
+              'lines"), in pixels.\n'
+              'Range: 1-10. Default: 2.'),
+     'def': 2,
+     'frm': 'int',
      'chp': 'advanced',
      },
     {'opt': 'differ.advanced.diff_context',
@@ -3184,6 +3231,20 @@ class Command:
                     ct.MB_OK)
             return
 
+        # Hunk edge lines: a thin horizontal rule above the first and
+        # below the last line of every hunk, on both halves -- so the
+        # extent of each block (and of what Alt+Left/Alt+Right will
+        # move) is always visible, Beyond Compare-style. Gated by the
+        # enable option; the diffmap is final at this point (the paint
+        # loop has consumed the whole compare generator). Runs AFTER the
+        # engine's compensating gaps so the stacking rules in
+        # _paint_hunk_edges hold (bottom edges land below a hunk's
+        # compensating gap, empty-side top edges above it via on_top).
+        if self.cfg.get('enable_hunk_edges', True):
+            Profiler.start('paint:hunk_edges')
+            self._paint_hunk_edges(a_ed, b_ed, diff.diffmap)
+            Profiler.stop('paint:hunk_edges')
+
         # Append all collected bookmarks in sorted order using
         # BOOKMARK2_APPEND (much faster than BOOKMARK2_SET — skips
         # duplicate search, sorting, event firing, and repainting).
@@ -3477,7 +3538,8 @@ class Command:
               color=self.cfg.get('color_gaps') if color is None else color
               )
 
-    def _add_raw_gap(self, e, line_index, pixel_size, color, tag=None):
+    def _add_raw_gap(self, e, line_index, pixel_size, color, tag=None,
+                     on_top=False):
         """Add a gap at the given line index with an explicit pixel size.
         `line_index` follows the e.gap() convention: the gap is inserted
         between `line_index` and `line_index+1` (i.e. after `line_index`).
@@ -3485,12 +3547,88 @@ class Command:
         takes an explicit pixel size instead of computing n*line_height,
         which is needed when wrap is on and the gap must match the actual
         number of wrapped visual rows on the opposite side.
-        tag defaults to DIFF_TAG; ignored-difference gaps pass IGN_GAP_TAG."""
+        tag defaults to DIFF_TAG; ignored-difference gaps pass IGN_GAP_TAG.
+        on_top=True asks CudaText to insert the gap BEFORE all gaps
+        already sitting at the same line index (see GAP_ADD's on_top
+        param) instead of after them -- used by the hunk edge lines to
+        paint a top edge above a hunk's compensating gap."""
         e.gap(ct.GAP_ADD, line_index, 0,
               tag=DIFF_TAG if tag is None else tag,
               size=pixel_size,
-              color=color
+              color=color,
+              on_top=on_top
               )
+
+    def _paint_hunk_edges(self, a_ed, b_ed, diffmap):
+        """Draw a thin horizontal rule at the start and the end of every
+        hunk, on BOTH sides of the compare view (Beyond Compare-style
+        boundary lines).
+
+        Why gaps: CudaText plugins cannot custom-paint between the two
+        split halves, but Editor.gap() paints a colored band spanning
+        the FULL text-area width between two lines. A 1-3px colored gap
+        at a hunk boundary therefore reads as a drawn line and shows
+        exactly which lines the hunk covers -- before Alt+Left/Alt+Right
+        moves it, and where a one-sided hunk's colored gap band begins
+        and ends.
+
+        Geometry per diffmap entry [a0, a1, b0, b1] (exclusive-end
+        ranges; the same records jump()/copy() navigate):
+        - top edge: gap after line a0-1 (b0-1) -- i.e. directly above
+          the hunk's first line; -1 = before the first line, which
+          CudaText supports;
+        - bottom edge: gap after line a1-1 (b1-1) -- directly below the
+          hunk's last line.
+
+        Stacking (several gaps may sit at the same line index, painted
+        in insertion order):
+        - On the shorter side of a hunk the engine's compensating gap
+          sits after the block end. The bottom edge (added here, after
+          the engine's gaps) lands BELOW it -- the correct hunk bottom.
+        - On an EMPTY side (pure add/delete: a0==a1) the compensating
+          gap is the hunk's whole footprint. Both edges go to the same
+          index; the top edge uses on_top=True to land ABOVE the
+          compensating gap, so the band gets bracketed top and bottom.
+        - Everywhere else on_top stays False, so an edge never jumps
+          above a wrap-compensation (ALIGN) gap that extends the
+          previous line's visual height.
+
+        Alignment safety: every hunk adds exactly two edges (2*height
+        pixels) to BOTH sides at the same visual rows, so the
+        side-by-side alignment and the scroll sync are unaffected.
+        Known cosmetic corner case: with word-wrap on, an empty side's
+        top edge can slice through the wrapped continuation rows of the
+        equal line above (on_top cannot order between an ALIGN gap and
+        a compensating gap) -- the bracket around the band is still
+        correct.
+
+        Ignored differences are not in the diffmap, so they never get
+        edge lines. Config: advanced.enable_hunk_edges (gate is at the
+        call site), advanced.hunk_edge_height px, theme edge color
+        (color_hunk_edges)."""
+        height = self.cfg.get('hunk_edge_height', 2)
+        color = self.cfg.get('color_hunk_edges')
+        if not diffmap or color is None:
+            return
+        try:
+            height = max(1, int(height))
+        except (TypeError, ValueError):
+            height = 2
+        for a0, a1, b0, b1 in diffmap:
+            # Defensive: a diffmap entry must cover lines on at least
+            # one side; skip malformed all-empty records.
+            if a0 >= a1 and b0 >= b1:
+                continue
+            # Left half: top edge above the first A line (on_top only
+            # when this side is empty -- see the stacking notes above),
+            # bottom edge below the last A line.
+            self._add_raw_gap(a_ed, a0 - 1, height, color,
+                              on_top=(a0 == a1))
+            self._add_raw_gap(a_ed, a1 - 1, height, color)
+            # Right half: same geometry.
+            self._add_raw_gap(b_ed, b0 - 1, height, color,
+                              on_top=(b0 == b1))
+            self._add_raw_gap(b_ed, b1 - 1, height, color)
 
     def _get_wrap_counts(self, ed):
         """Return a list where wrap_counts[i] = number of visual rows that
@@ -3638,13 +3776,13 @@ class Command:
                            )
 
         def get_theme():
-            """Resolve the six compare colors from the 'color_theme'
+            """Resolve the seven compare colors from the 'color_theme'
             option (see the _COLOR_PRESETS / _detect_theme_type block at
             module level):
 
             - 'auto' -- preset of the detected theme family;
             - 'white'/'grey'/'black' -- that family's preset;
-            - 'custom' -- the six differ.theme.*_color options, each
+            - 'custom' -- the seven differ.theme.*_color options, each
               option left EMPTY filled from the auto-detected preset
               (a half-configured custom theme never falls back to
               nothing).
@@ -3700,6 +3838,8 @@ class Command:
                 t['color_ignored'],
             'color_ignored_gap':
                 t['color_ignored_gap'],
+            'color_hunk_edges':
+                t['color_hunk_edges'],
             # --- algorithm ---
             'diff_algorithm':
                 get_opt('algorithm.diff_algorithm', 'native_histogram'),
@@ -3733,6 +3873,11 @@ class Command:
                 get_opt('advanced.diff_context', 3),
             'enable_profiling':
                 get_opt('advanced.enable_profiling', False),
+            # --- hunk edge lines (thin rule above/below each hunk) ---
+            'enable_hunk_edges':
+                get_opt('advanced.enable_hunk_edges', True),
+            'hunk_edge_height':
+                max(1, min(10, get_opt('advanced.hunk_edge_height', 2))),
             # --- micromap ---
             'enable_micromap':
                 get_opt('micromap.enable_micromap', False),
