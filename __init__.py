@@ -732,14 +732,18 @@ OPTS_META = [
               '(a colored gap on one side) get the bracket around the '
               'gap too.\n'
               'The columns are separate controls outside the editors '
-              '(each editor is shifted right by the column width, so '
-              'the text area is not touched and nothing is added to the '
-              'editors\' heights), use the theme\'s gutter colors '
+              '(the left column takes a strip at the panel\'s left '
+              'edge, and the split bar between the editors is widened '
+              'by the column width to host the right column -- so the '
+              'text areas are not touched and nothing is added to the '
+              'editors\' heights, and the splitter drag keeps working '
+              'as usual), use the theme\'s gutter colors '
               '(EdGutterBg / EdGutterFont), stay pixel-aligned with the '
               'text rows while scrolling (also with word wrap and the '
               'Beautify line alignment option), and keep their position '
               'when the window is resized or the splitter is dragged '
-              '(a background layout guard re-applies it). Only visible '
+              '(the split bar carries its column along; a background '
+              'layout guard repaints and cleans up). Only visible '
               'hunks are painted, so the cost stays small on huge '
               'files.\n'
               'Takes effect on the next Recompare (F5).\n'
@@ -751,9 +755,10 @@ OPTS_META = [
     {'opt': 'differ.advanced.hunk_edges_width',
      'cmt': _('Hunk edge column width in pixels\n'
               'Width of one hunk edge column (see "Hunk edge '
-              'columns"), in pixels. Each editor gives up this many '
-              'pixels of width to its column. The columns are '
-              'intentionally narrow -- a vertical bar plus short '
+              'columns"), in pixels. The left editor gives up this many '
+              'pixels of width for each of the two columns (its own '
+              'left strip plus the split bar\'s widening). The columns '
+              'are intentionally narrow -- a vertical bar plus short '
               'top/bottom arms.\n'
               'Range: 6-40. Default: 12.'),
      'def': 12,
@@ -1937,12 +1942,12 @@ class Command:
     def _columns_layout_timer(self, tag='', info=''):
         """Recurring per-tab layout guard for the hunk edge columns
         (armed by columns.HunkColumns._start_timer, one timer per compare
-        tab). CudaText re-lays-out the split editors on every window
-        resize / splitter drag / tab-group change, which would push the
-        editors back over the columns; the guard re-applies the shift
-        (and repaints) within its 400 ms interval, and destroys the
-        columns when the split tree is gone. See
-        HunkColumns.check_layout()."""
+        tab). The LCL align system keeps the columns in their slots
+        through window resizes and splitter drags on its own (the right
+        column rides inside the split bar); the guard only re-applies a
+        split-bar width that was reset behind our back, repaints after
+        size changes, and destroys the columns when the split tree is
+        gone. See HunkColumns.check_layout()."""
         if not info:
             return
         session = self._sessions.get(info)
@@ -2707,18 +2712,20 @@ class Command:
 
             # Create or reuse the hunk edge columns for this compare tab
             # (the tab's OWN session holds them -- two tabs' columns can
-            # never mix). Two narrow custom-drawn columns are attached as
-            # child controls of the grouping panel that parents the two
-            # editors, through the LCL align system: column A is
-            # Align=alLeft (the panel's left-edge strip, at the LEFT edge
-            # of editor 1) and column B is Align=alRight seeded between
-            # the splitter and editor 2 (the align pass glues it to the
-            # LEFT edge of editor 2) -- the editors themselves are never
-            # modified. Each column draws a bracket around every hunk's
-            # full visual footprint (text + compensating gap band) -- see
-            # columns.py, which also runs the per-tab layout guard that
-            # re-seeds column B after far-right splitter drags and
-            # repaints after size changes.
+            # never mix). Two narrow custom-drawn columns: column A is
+            # Align=alLeft in the grouping panel that parents the two
+            # editors (the panel's left-edge strip, at the LEFT edge of
+            # editor 1), and column B is an Align=alRight child of the
+            # split bar, which is widened by the column width so the
+            # column lands at the LEFT edge of editor 2. Hosting column B
+            # inside the split bar keeps it OUT of the panel's align
+            # chain, so the LCL splitter's drag target stays editor 2 and
+            # the splitter drag keeps working. The editors themselves
+            # are never modified. Each column draws a bracket around
+            # every hunk's full visual footprint (text + compensating gap
+            # band) -- see columns.py, which also runs the per-tab layout
+            # guard that re-applies the split-bar widening and repaints
+            # after size changes.
             tab_id_str = str(tab_id)
             columns = session.columns
             columns_on = self.cfg.get('enable_hunk_edges', True)

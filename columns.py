@@ -17,7 +17,7 @@ bracket includes the gap). A user who wants to move a block with
 Alt+Left/Alt+Right can therefore see exactly which rows will be moved, like
 the rule lines Beyond Compare draws around its difference blocks.
 
-ATTACHING THE COLUMNS (the hard part -- this module's third revision).
+ATTACHING THE COLUMNS (the hard part -- this module's fourth revision).
 
 The control dump of a split tab (dlg_proc on the PROP_HANDLE_PARENT
 handle) shows the tree the columns must live in:
@@ -27,8 +27,10 @@ handle) shows the tree the columns must live in:
       ed1       (p: 'panel_ed')   -- left editor,  Align=alClient
       ed2       (p: 'panel_ed')   -- right editor, Align=alRight
 
-(From CudaText's ff.pas, TEditorFrame.Create: EdFirst.Align:=alClient,
-EdSecond.Align:=cSplitHorzToAlign[vertical]=alRight, splitter the same.)
+(From CudaText's form_frame.pas, TEditorFrame: EdFirst.Align:=alClient,
+EdSecond.Align:=cSplitHorzToAlign[vertical]=alRight, the splitter the
+same. The alRight pass docks ed2 at the panel's right edge and the
+splitter at ed2's LEFT edge; ed1 fills what remains.)
 
 Revision 1 docked the columns as borderless dialogs to the parent form:
 docking only has form-edge slots, so column B landed at the far right of
@@ -36,63 +38,74 @@ everything, after the editor's scrollbar and the overview panel. Revision
 2 added the columns as ALIGN_NONE child controls of panel_ed and shifted
 the editors right by setting their x/w control props -- but the editors
 are ALIGN-MANAGED, and the very next LCL realign recomputed ed1 (alClient)
-back over the columns, so NOTHING was visible at all.
+back over the columns, so NOTHING was visible at all. Revision 3 worked
+WITH the align system (column A alLeft, column B alRight seeded between
+the splitter and ed2) and finally looked right -- but it BROKE THE
+SPLITTER DRAG, and that is what revision 4 fixes:
 
-Revision 3 (this one) works WITH the LCL align system instead of against
-it. The align engine places same-align siblings by their CURRENT geometry
-(LCL wincontrol.inc, CreateControlAlignList/InsertBefore): alLeft
-siblings are sorted by Left ascending and stacked from the panel's left
-edge inward; alRight siblings are sorted by right edge DESCENDING and
-stacked from the panel's right edge inward ("the first control is put
-rightmost"). So:
+LCL's TCustomSplitter picks the control it resizes GEOMETRICALLY
+(extctrls/customsplitter.inc, FindAlignControl): among the siblings whose
+Align is the splitter's own (alRight) or alClient, the one with the
+smallest Left still >= the splitter's right edge -- normally ed2. A column
+docked between the splitter and ed2 STEALS that spot: dragging then
+grows/shrinks the COLUMN, not the editor (user-visible: the drag flashes
+and snaps back, or only the column moves). So no aligned control of ours
+can ever sit in panel_ed between the splitter and ed2.
 
-  * column A gets Align=alLeft, width = column width. It takes the
-    panel's left-edge strip, and ed1 (alClient) AUTOMATICALLY shrinks to
-    the remaining space. Nothing can ever overlap it -- on any window
-    resize the align pass re-reserves the strip.
+Revision 4 (this one):
 
-  * column B gets Align=alRight, seeded at x = ed2's current left edge.
-    Its right edge (ed2.x + width) then out-ranks the splitter's (the
-    splitter's right edge IS ed2's left edge) but stays below ed2's, so
-    the sort puts it BETWEEN the splitter and ed2 -- and the align pass
-    glues it to ed2's left edge. The splitter shifts left and ed1 shrinks
-    by the column width; ed2 keeps its own rect untouched.
+  * column A keeps Align=alLeft in panel_ed: it takes the panel's
+    left-edge strip, and ed1 (alClient) AUTOMATICALLY shrinks to the
+    remaining space. An alLeft sibling is never a drag candidate for an
+    alRight splitter, so the splitter does not care about it.
 
-The editors are NEVER modified: no x/w props are set on them, so there is
-nothing to restore -- deleting the two column controls lets the align
-system re-flow the panel to its own layout at once. The LCL splitter is
-unaffected too: its resize partner is searched among alClient controls
-only (extctrls customsplitter.inc, FindAlignOtherControl -- the partner is
-ed1), so the alRight column never becomes its drag target.
+  * column B is NOT given a slot of its own in panel_ed at all -- it
+    moves INSIDE the split bar. The splitter control is widened by the
+    column width (w 5 -> 5+W); being alRight it keeps its right edge
+    glued to ed2's left edge and grows LEFTWARD, so only ed1 gives way.
+    Column B is an 'image' child of the splitter ('p': 'splitter1'),
+    Align=alRight INSIDE it: the splitter's internal align pass docks it
+    at the splitter's right edge -- right against ed2's left edge, the
+    same strip revision 3 occupied -- and keeps it there through every
+    drag and resize. FindAlignControl scans only the splitter's SIBLINGS
+    in panel_ed, so with no plugin control between the splitter and ed2
+    the drag target is ed2 again, exactly like stock CudaText.
 
-Stability: on every window resize CudaText's PanelEditorsOnResize restores
-the split ratio by setting EdSecond.Width, and the align pass re-glues
-column B to ed2's (moved) left edge automatically -- same on left-ward
-splitter drags. The single failure mode is a far-RIGHT splitter drag: the
-splitter's right edge can jump past column B's, which re-sorts the column
-to the LEFT of the splitter (where it is, again, stable). The per-tab
-recurring layout guard (400 ms) detects that (column B no longer ends at
-ed2's left edge) and re-seeds its x, and the realign snaps it back. The
-guard also self-destructs the columns when the split tree is gone (tab
+The editors are NEVER modified, and the widened splitter is restored on
+teardown. The splitter's original width is recorded in its own 'tag'
+control prop ('DifferSplitterW=<n>') when widened, so even a plugin
+reload that finds a stale widening (columns gone, width still 5+W)
+restores the true original instead of widening a second time.
+
+Stability: splitter drags and window resizes move the splitter -- with
+column B inside it -- automatically; the align pass re-glues it to ed2's
+left edge and re-docks column A at the panel's left edge. The per-tab
+recurring layout guard (400 ms) no longer fixes any geometry: it just
+re-applies the splitter widening if something reset it (e.g. the tab was
+un-split and re-split on the same controls), re-applies a drifted column
+width, repaints when a column's size changed (window resize changed its
+height), and self-destructs the columns when the split tree is gone (tab
 closed, tab un-split, split switched to horizontal -- the side-by-side
 columns are meaningless there).
 
 Drawing uses the overview panel's technique -- an 'image' control with an
 embedded bitmap that survives resize/minimize/restore automatically --
-added as a child of panel_ed via the 'p' control prop (CudaText's prop
-serializer applies 'p' first, then the geometry keys, so one PROP_SET
-call seeds the position while the control is still alNone and lets the
-final 'align' key promote the seed into the aligned slot in a single
-realignment). Painting is cheap: a background fill plus 3 canvas lines
-per VISIBLE hunk, and only visible hunks are painted at all.
+added via the 'p' control prop as a child of panel_ed (column A) or of
+the split bar (column B) (CudaText's prop serializer applies 'p' first,
+then the geometry keys, so one PROP_SET call seeds the position while
+the control is still alNone and lets the final 'align' key promote the
+seed into the aligned slot in a single realignment). Painting is cheap:
+a background fill plus 3 canvas lines per visible hunk, and only visible
+hunks are painted at all.
 
 Vertical alignment is pixel-exact: the top/bottom of every bracket come
 from ed.convert(CONVERT_CARET_TO_PIXELS) queries, which are gap-aware,
 wrap-aware and scroll-aware (they return the same Y the editor itself
-uses to draw that line, relative to the editor control). Each column is
-a sibling of its editor spanning the SAME rows (edge-aligned children
-get the panel's full height, exactly like the editors), so a Y computed
-against the editor is directly usable as the column's Y.
+uses to draw that line, relative to the editor control). Each column
+spans the SAME rows as its editor: column A is an edge-aligned child of
+the grouping panel, column B of the split bar, and both the panel and
+the split bar span the editors' full height -- so a Y computed against
+the editor is directly usable as the column's Y.
 
 Geometry (per diffmap entry [a0, a1, b0, b1], exclusive-end ranges -- the
 same records jump()/copy() navigate):
@@ -173,13 +186,14 @@ COLUMNS_WIDTH_DEFAULT = 12
 TRACK_INTERVAL = 0.030
 
 # Interval (milliseconds) of the per-tab recurring layout-guard timer.
-# The align system keeps both columns in their slots through window
-# resizes and left-ward splitter drags by itself; the guard only has to
-# (a) re-seed column B after a far-right splitter drag re-sorted it left
-# of the splitter, (b) repaint when a column's size changed (window
-# resize changed its height), and (c) self-destruct when the split tree
-# is gone. 400 ms is far below human reaction time for a geometry
-# restore, yet adds only a few control-prop reads per tick.
+# The align system keeps both columns in their slots through splitter
+# drags and window resizes by itself (column A at the panel's left
+# edge, column B inside the re-glued split bar); the guard only has to
+# (a) re-apply the split-bar widening if something reset it, (b) repaint
+# when a column's size changed (window resize changed its height), and
+# (c) self-destruct when the split tree is gone. 400 ms is far below
+# human reaction time for a geometry restore, yet adds only a few
+# control-prop reads per tick.
 LAYOUT_GUARD_INTERVAL = 400
 
 # dlg control names of the two columns (unique enough to never collide
@@ -203,17 +217,22 @@ ARM_PAD = 3
 class HunkColumns:
     """Manages the two hunk edge columns of one compare tab.
 
-    The columns are child controls of the grouping panel that parents the
-    two split editors (panel_ed), attached through the LCL align system
-    (revision 3): column A is Align=alLeft -- it occupies the panel's
-    left-edge strip and editor 1 (alClient) shrinks around it; column B is
-    Align=alRight, seeded between the splitter and editor 2 -- the align
-    pass glues it to editor 2's left edge. Neither editor is ever
-    modified, so destroying the columns restores the original layout by
-    itself. A recurring guard re-seeds column B after splitter drags that
-    re-sorted it, repaints on size changes, and self-destructs when the
-    split tree is gone. All state is per-instance, so two tabs' columns
-    can never mix (the session holds one instance).
+    Column A is an alLeft child control of the grouping panel that
+    parents the two split editors (panel_ed) -- it occupies the panel's
+    left-edge strip and editor 1 (alClient) shrinks around it. Column B
+    is an alRight child control INSIDE the split bar, which is widened
+    by the column width for the purpose (it keeps its right edge glued
+    to editor 2's left edge and grows leftward) -- this way no plugin
+    control ever sits in panel_ed between the split bar and editor 2,
+    where it would steal the LCL splitter's drag target
+    (FindAlignControl) and break the splitter drag. Neither editor is
+    ever modified; the split bar's original width is restored on
+    teardown (recognized across plugin reloads via its 'tag' prop), so
+    destroying the columns restores the original layout by itself. A
+    recurring guard re-applies a reset split-bar width, repaints on
+    size changes, and self-destructs when the split tree is gone. All
+    state is per-instance, so two tabs' columns can never mix (the
+    session holds one instance).
     """
 
     def __init__(self):
@@ -235,8 +254,15 @@ class HunkColumns:
         self.b_ed = None
         # Name of the grouping panel control that parents the editors
         # ('panel_ed' in current CudaText builds; '' when the editors sit
-        # directly in the form). Our columns are parented there too.
+        # directly in the form). Column A is parented there too.
         self._panel_name = ''
+        # The split bar that hosts column B: its dlg-control NAME ('' =
+        # not attached) and its ORIGINAL width in pixels, recorded in
+        # the splitter's own 'tag' prop as well, so a stale widening
+        # left by a dead instance (plugin reload) is recognized and
+        # restored instead of widened a second time.
+        self._splitter_name = ''
+        self._splitter_w_orig = None
         # Callback string of the recurring layout-guard timer ('' = not
         # armed).
         self._timer_cb = ''
@@ -373,20 +399,106 @@ class HunkColumns:
             return i
         return self._ctl_indices[idx]
 
+    # Marker stored in the split bar's 'tag' prop while it is widened
+    # ('DifferSplitterW=<original width>'): lets a later -- reloaded --
+    # instance recognize a stale widening and restore the true original
+    # instead of widening a second time.
+    _SPLITTER_TAG = 'DifferSplitterW='
+
+    def _find_splitter(self, panel_name):
+        """Resolve the split bar control of the split tree: the
+        'splitter'-typed child of the grouping panel ('splitter1' in
+        current CudaText builds -- matched by TYPE, with a name-prefix
+        fallback, so a renamed control still resolves). Returns
+        (index, name, props) or None."""
+        if self.h_form is None:
+            return None
+        try:
+            count = ct.dlg_proc(self.h_form, ct.DLG_CTL_COUNT)
+        except Exception:
+            return None
+        if not count:
+            return None
+        for i in range(count):
+            try:
+                props = ct.dlg_proc(self.h_form, ct.DLG_CTL_PROP_GET,
+                                    index=i)
+            except Exception:
+                continue
+            if not props:
+                continue
+            if panel_name and props.get('p', '') != panel_name:
+                continue
+            name = props.get('name', '')
+            if (props.get('type') == 'splitter' or
+                    name.lower().startswith('splitter')):
+                return i, name, props
+        return None
+
+    def _splitter_tag_value(self, props):
+        """Parse the recorded original width out of the split bar's
+        props ('tag' = 'DifferSplitterW=<n>'); None when not tagged."""
+        tag = props.get('tag', '') or ''
+        if not tag.startswith(self._SPLITTER_TAG):
+            return None
+        try:
+            return int(tag[len(self._SPLITTER_TAG):])
+        except (TypeError, ValueError):
+            return None
+
+    def _restore_splitter_width(self):
+        """Undo the split bar widening done by THIS instance -- or, via
+        the 'tag' marker, a stale one left by a dead instance after a
+        plugin reload. No-op when the split bar cannot be found or was
+        never widened. Returns True when a width was actually restored."""
+        if self.h_form is None:
+            return False
+        spl = self._find_splitter(self._panel_name)
+        if spl is None:
+            return False
+        i, _name, props = spl
+        w = props.get('w')
+        tagged = self._splitter_tag_value(props)
+        orig = self._splitter_w_orig
+        if orig is None:
+            orig = tagged
+        if orig is None or w is None or w == orig:
+            # Never widened (or already restored): just clear a stale
+            # tag if one is left.
+            if tagged is not None:
+                try:
+                    ct.dlg_proc(self.h_form, ct.DLG_CTL_PROP_SET,
+                                index=i, prop={'tag': ''})
+                except Exception:
+                    pass
+            self._splitter_name = ''
+            self._splitter_w_orig = None
+            return False
+        try:
+            ct.dlg_proc(self.h_form, ct.DLG_CTL_PROP_SET, index=i,
+                        prop={'w': orig, 'tag': ''})
+        except Exception:
+            return False
+        self._splitter_name = ''
+        self._splitter_w_orig = None
+        return True
+
     # ------------------------------------------------------------------
     # lifecycle
     # ------------------------------------------------------------------
 
     def create(self, a_ed, b_ed):
-        """Create the two columns as child controls of the grouping panel
-        that parents the two editors, attached through the LCL align
-        system: the A column is Align=alLeft (the panel's left-edge strip;
-        editor 1, alClient, shrinks around it automatically), the B column
-        is Align=alRight seeded between the splitter and editor 2 (the
-        align pass glues it to editor 2's left edge). The editors
-        themselves are never modified -- see the module docstring for why
-        the earlier revisions (docked dialogs; alNone columns plus editor
-        x/w shifts undone by the align system) failed.
+        """Create the two columns: the A column is an alLeft child of the
+        grouping panel that parents the two editors (the panel's
+        left-edge strip; editor 1, alClient, shrinks around it
+        automatically), and the B column is an alRight child of the
+        split bar, which is widened by the column width (column B then
+        docks at the split bar's right edge = editor 2's left edge).
+        The editors themselves are never modified -- see the module
+        docstring for why the earlier revisions (docked dialogs; alNone
+        columns plus editor x/w shifts undone by the align system; and
+        an alRight column between the splitter and editor 2, which
+        hijacked the splitter's drag target) failed.
 
         Args:
             a_ed: editor A (primary half)
@@ -427,7 +539,19 @@ class HunkColumns:
     def _recreate(self):
         """Attach the column controls to the current split tree. On any
         failure the object stays un-created (is_created() False) -- the
-        next sync() retries, and painting simply no-ops meanwhile."""
+        next sync() retries, and painting simply no-ops meanwhile.
+
+        Column A is an alLeft child of the grouping panel (the panel's
+        left-edge strip; editor 1, alClient, shrinks around it). Column
+        B is an alRight child INSIDE the split bar: the split bar is
+        widened by the column width (alRight keeps its right edge glued
+        to editor 2's left edge and grows LEFTWARD, so only editor 1
+        gives way), and the column docks at the split bar's right edge,
+        right against editor 2's left edge. This leaves the LCL
+        splitter's drag target -- FindAlignControl: the aligned sibling
+        next to the split bar, normally editor 2 -- untouched; see the
+        module docstring for why an alRight column of our own in
+        panel_ed would steal that spot and break the drag."""
         try:
             h_form = self.a_ed.get_prop(ct.PROP_HANDLE_PARENT)
         except Exception:
@@ -435,17 +559,15 @@ class HunkColumns:
         if not h_form:
             return
         self.h_form = h_form
-        # Drop stale columns of a previous instance/plugin reload first.
+        # Drop stale columns of a previous instance/plugin reload first,
+        # and any stale split-bar widening left behind (recognized via
+        # the split bar's 'tag' marker).
         self._delete_our_controls()
+        self._restore_splitter_width()
         loc = self._locate_editors()
         if loc is None:
             return   # no two-editor split to attach to (yet)
         self._panel_name = loc[2]
-        # ed2's current rect seeds column B's align slot: seeded at
-        # x = ed2's left, the column's right edge out-ranks the
-        # splitter's (which ends exactly at ed2's left edge) but stays
-        # below ed2's -- so the alRight sort puts it BETWEEN them and the
-        # align pass glues it to ed2's left edge.
         try:
             ed2 = ct.dlg_proc(self.h_form, ct.DLG_CTL_PROP_GET,
                               index=loc[1])
@@ -459,45 +581,97 @@ class HunkColumns:
             # to create-and-destroy them on every refresh). The next
             # sync() after a re-split attaches them.
             return
+        spl = self._find_splitter(self._panel_name)
+        if spl is None:
+            return   # no split bar in the tree (unexpected) -- retry later
+        spl_i, spl_name, spl_props = spl
+        spl_w = spl_props.get('w', 0) or 0
+        if not spl_name or spl_w <= 0:
+            return
         made = []
+        widened = False
         try:
-            for idx, align, sx, sy in (
-                # column A: alLeft -> the panel's left-edge strip
-                (0, ct.ALIGN_LEFT, 0, 0),
-                # column B: alRight, seeded at ed2's left edge
-                (1, ct.ALIGN_RIGHT, ed2['x'], ed2.get('y', 0)),
-            ):
-                i = ct.dlg_proc(self.h_form, ct.DLG_CTL_ADD, 'image')
-                # Prop order matters and is guaranteed: CudaText's prop
-                # serializer applies 'p' first (re-parent into panel_ed),
-                # then the other keys in insertion order -- so x/y/w/h
-                # seed the position while the control is still alNone,
-                # and the final 'align' key lets ONE realignment promote
-                # the seed into the aligned slot.
-                ct.dlg_proc(self.h_form, ct.DLG_CTL_PROP_SET, index=i,
-                            prop={
-                                'name': _CTL_NAMES[idx],
-                                'p': self._panel_name,
-                                'x': sx, 'y': sy,
-                                'w': self.width, 'h': 100,
-                                'align': align,
-                                'vis': True,
-                            })
-                made.append(i)
-                self._ctl_indices[idx] = i
-                self.h_dlgs[idx] = self.h_form
-                h_img = ct.dlg_proc(self.h_form, ct.DLG_CTL_HANDLE,
-                                    index=i)
-                self.h_images[idx] = h_img
-                self.h_bitmaps[idx] = ct.image_proc(
-                    h_img, ct.IMAGE_GET_BITMAP)
-                self.h_canvases[idx] = ct.bitmap_proc(
-                    self.h_bitmaps[idx], ct.BITMAP_GET_CANVAS)
+            # --- column A: alLeft -> the panel's left-edge strip ---
+            # Prop order matters and is guaranteed: CudaText's prop
+            # serializer applies 'p' first (re-parent into panel_ed),
+            # then the other keys in insertion order -- so x/y/w/h
+            # seed the position while the control is still alNone,
+            # and the final 'align' key lets ONE realignment promote
+            # the seed into the aligned slot.
+            i = ct.dlg_proc(self.h_form, ct.DLG_CTL_ADD, 'image')
+            ct.dlg_proc(self.h_form, ct.DLG_CTL_PROP_SET, index=i,
+                        prop={
+                            'name': _CTL_NAMES[0],
+                            'p': self._panel_name,
+                            'x': 0, 'y': 0,
+                            'w': self.width, 'h': 100,
+                            'align': ct.ALIGN_LEFT,
+                            'vis': True,
+                        })
+            made.append(i)
+            self._ctl_indices[0] = i
+            self.h_dlgs[0] = self.h_form
+            h_img = ct.dlg_proc(self.h_form, ct.DLG_CTL_HANDLE,
+                                index=i)
+            self.h_images[0] = h_img
+            self.h_bitmaps[0] = ct.image_proc(
+                h_img, ct.IMAGE_GET_BITMAP)
+            self.h_canvases[0] = ct.bitmap_proc(
+                self.h_bitmaps[0], ct.BITMAP_GET_CANVAS)
+            # --- widen the split bar by the column width: alRight keeps
+            # its right edge at ed2's left edge and grows LEFTWARD, so
+            # only ed1 (alClient) shrinks; ed2 and the split-ratio math
+            # (which reads the live Splitter.Width) are untouched. The
+            # original width is noted in the split bar's 'tag' prop so a
+            # reloaded plugin can recognize and undo this. ---
+            ct.dlg_proc(self.h_form, ct.DLG_CTL_PROP_SET, index=spl_i,
+                        prop={
+                            'w': spl_w + self.width,
+                            'tag': self._SPLITTER_TAG + str(spl_w),
+                        })
+            widened = True
+            self._splitter_name = spl_name
+            self._splitter_w_orig = spl_w
+            # --- column B: alRight child of the split bar, docked at
+            # its right edge = editor 2's left edge (the split bar
+            # spans the same rows as the editors, so editor Ys map
+            # 1:1; a child of the split bar never enters panel_ed's
+            # align chain, so the splitter drag keeps targeting ed2).
+            # NOTE: a child's x/y are PARENT-RELATIVE -- the column's
+            # slot inside the widened split bar starts at the original
+            # split-bar width (x = spl_w) and runs to its right edge. ---
+            i = ct.dlg_proc(self.h_form, ct.DLG_CTL_ADD, 'image')
+            ct.dlg_proc(self.h_form, ct.DLG_CTL_PROP_SET, index=i,
+                        prop={
+                            'name': _CTL_NAMES[1],
+                            'p': spl_name,
+                            'x': spl_w, 'y': 0,
+                            'w': self.width, 'h': 100,
+                            'align': ct.ALIGN_RIGHT,
+                            'vis': True,
+                        })
+            made.append(i)
+            self._ctl_indices[1] = i
+            self.h_dlgs[1] = self.h_form
+            h_img = ct.dlg_proc(self.h_form, ct.DLG_CTL_HANDLE,
+                                index=i)
+            self.h_images[1] = h_img
+            self.h_bitmaps[1] = ct.image_proc(
+                h_img, ct.IMAGE_GET_BITMAP)
+            self.h_canvases[1] = ct.bitmap_proc(
+                self.h_bitmaps[1], ct.BITMAP_GET_CANVAS)
         except Exception:
             # Roll back whatever was added and stay un-created. The
-            # editors were never touched, so there is nothing to restore.
+            # editors were never touched; the split-bar widening is
+            # undone via its 'tag' marker.
+            for i in reversed(made):
+                try:
+                    ct.dlg_proc(self.h_form, ct.DLG_CTL_DELETE, index=i)
+                except Exception:
+                    pass
+            if widened:
+                self._restore_splitter_width()
             self._clear_handles()
-            self._delete_our_controls()
             return
         self._start_timer()
 
@@ -527,14 +701,19 @@ class HunkColumns:
                 pass
 
     def _teardown(self):
-        """Remove the columns from the form: delete the controls and stop
-        the layout guard. The editors were never modified, so the align
-        system re-flows the panel to its own layout by itself. Keeps the
-        editors/hunk data (used by sync()'s rebuild path)."""
+        """Remove the columns from the form: restore the split bar's
+        original width (the align system re-flows editor 1 around it by
+        itself), delete the controls and stop the layout guard. The
+        editors were never modified, so the align system re-flows the
+        panel to its own layout by itself. Keeps the editors/hunk data
+        (used by sync()'s rebuild path)."""
         self._stop_timer()
+        self._restore_splitter_width()
         self._delete_our_controls()
         self.h_form = None
         self._panel_name = ''
+        self._splitter_name = ''
+        self._splitter_w_orig = None
         self._clear_handles()
 
     def destroy(self):
@@ -552,22 +731,25 @@ class HunkColumns:
         self.eof_bands_b = {}
 
     # ------------------------------------------------------------------
-    # layout guard: the align system keeps the slots; this only re-seeds
-    # column B after a far-right splitter drag, repaints on size changes,
-    # and self-destructs when the split tree is gone
+    # layout guard: the align system keeps every slot (column A at the
+    # panel's left edge, column B inside the re-glued split bar); this
+    # only re-applies a reset split-bar width or column width, repaints
+    # on size changes, and self-destructs when the split tree is gone
     # ------------------------------------------------------------------
 
     def check_layout(self):
         """The layout guard, armed by the per-tab recurring timer (and
         called from sync()). The LCL align system keeps both columns in
-        their slots through window resizes and left-ward splitter drags
-        by itself; what can drift is (a) column B after a splitter drag
-        far to the right re-sorted it to the LEFT of the splitter (there
-        it is stable again -- only a re-seed brings it back), and (b) the
-        painted bitmaps after a column resized. The guard fixes both,
-        repaints when it fixed something, and destroys the columns when
-        the split tree is gone (tab closed, tab un-split, split switched
-        to horizontal -- the side-by-side columns are meaningless there),
+        their slots through splitter drags and window resizes by itself
+        (column A is re-docked at the panel's left edge; column B rides
+        inside the split bar, which the align pass re-glues to editor
+        2's left edge). What the guard fixes: a split-bar width that
+        was reset behind our back (e.g. the tab was un-split and
+        re-split on the same controls), a column width that drifted
+        from the configured one, and the painted bitmaps after a
+        column resized. It also destroys the columns when the split
+        tree is gone (tab closed, tab un-split, split switched to
+        horizontal -- the side-by-side columns are meaningless there),
         which also stops the timer.
 
         Returns True while the columns are alive."""
@@ -615,20 +797,32 @@ class HunkColumns:
             except Exception:
                 pass
             moved = True
-        # Column B (alRight) must end exactly at ed2's left edge. A
-        # far-right splitter drag re-sorts it left of the splitter; a
-        # re-seeded x (its right edge then out-ranks the splitter's
-        # again) lets the realign snap it back to ed2's left edge.
-        if (bar_b.get('w') != self.width or
-                bar_b.get('x', 0) + bar_b.get('w', 0) != ed2.get('x')):
+        # Column B (alRight inside the split bar) is glued to the split
+        # bar's right edge = ed2's left edge by the align pass; only its
+        # width can drift.
+        if bar_b.get('w') != self.width:
             try:
                 ct.dlg_proc(self.h_form, ct.DLG_CTL_PROP_SET,
-                            index=bars[1],
-                            prop={'x': ed2.get('x', 0),
-                                  'w': self.width})
+                            index=bars[1], prop={'w': self.width})
             except Exception:
                 pass
             moved = True
+        # The split bar must stay widened by the column width (its
+        # position/height are align-managed; only the width is ours).
+        # A reset means something re-created or resized the split bar
+        # behind our back -- re-apply, and the realign re-glues it.
+        if self._splitter_w_orig is not None:
+            spl = self._find_splitter(self._panel_name)
+            if (spl is not None and
+                    spl[2].get('w') != self._splitter_w_orig + self.width):
+                try:
+                    ct.dlg_proc(self.h_form, ct.DLG_CTL_PROP_SET,
+                                index=spl[0],
+                                prop={'w': self._splitter_w_orig +
+                                      self.width})
+                    moved = True
+                except Exception:
+                    pass
         # Repaint when the guard fixed something or a column's control
         # size drifted from the last painted size (a window resize
         # changed the columns' height; the bitmap must follow).
@@ -685,10 +879,10 @@ class HunkColumns:
 
     def set_width(self, width):
         """Set the column width in pixels (clamped to a sane range).
-        When attached, both columns are resized in place -- the align
-        system re-flows the editors around the new widths by itself
-        (column A grows rightward from the left edge, column B leftward
-        from ed2's left edge); nothing else is touched."""
+        When attached, both columns are resized in place and the split
+        bar's widening follows (it grows/shrinks leftward from editor
+        2's left edge) -- the align system re-flows editor 1 around the
+        changes by itself; nothing else is touched."""
         try:
             width = int(width)
         except (TypeError, ValueError):
@@ -704,6 +898,16 @@ class HunkColumns:
                                 index=bi, prop={'w': self.width})
                 except Exception:
                     pass
+            if self._splitter_w_orig is not None:
+                spl = self._find_splitter(self._panel_name)
+                if spl is not None:
+                    try:
+                        ct.dlg_proc(self.h_form, ct.DLG_CTL_PROP_SET,
+                                    index=spl[0],
+                                    prop={'w': self._splitter_w_orig +
+                                          self.width})
+                    except Exception:
+                        pass
             self.paint()
 
     def set_data(self, hunks, line_count_a, line_count_b,
