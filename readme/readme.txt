@@ -56,12 +56,12 @@ synced back to the original files automatically.
   the changed lines, never on the empty gap side, so the copy commands
   keep working right after a jump -- from the changed lines or from
   the line next to a gap.
-- Draws a thin horizontal rule at the start and the end of every
-  difference block, on both sides of the view (Beyond Compare-style
-  boundary lines), so you always see exactly which lines a hunk covers
-  -- and which lines Alt+Left/Alt+Right will move -- even in the middle
-  of a large changed block. One-sided differences get the lines around
-  their gap band too. See "Hunk edge lines" below.
+- Adds two narrow "hunk edge" columns at the left and right edges of
+  the compare view, each drawing a bracket around every difference
+  block -- text lines AND compensating gap band -- so you always see
+  exactly which lines a hunk covers (and which lines Alt+Left/
+  Alt+Right will move), like the rule lines Beyond Compare draws
+  around its difference blocks. See "Hunk edge columns" below.
 
 The compare engine implements all the best-known diff algorithms, with a
 lot of improvements on top of each: two native ones running in compiled
@@ -232,37 +232,64 @@ put the caret on the line above or below the gap, press Enter and type
 and the remaining gap shrinks by one line.
 
 
-== Hunk edge lines ==
+== Hunk edge columns ==
 
-Every difference block (hunk) is framed by two thin horizontal lines:
-one directly above its first line and one directly below its last
-line, on BOTH sides of the compare view. This answers "where does this
-hunk start and end?" the way Beyond Compare does with the rule lines
-in its center column -- before you move a block with Alt+Left/Alt+Right
-you can see exactly which lines will be moved, even inside a large
-changed block where the margin markers alone are hard to follow. A
-one-sided difference (added or deleted lines, shown as a colored gap
-on the other side) gets the two lines around its gap band, so the
-extent is visible on both sides.
+Two narrow columns are added at the left and right edges of the
+compare view, and every difference block (hunk) gets a bracket drawn
+in each column:
+
+    +----
+    |
+    +----
+
+The bracket spans the hunk's full visual extent -- the text lines AND
+the compensating gap band the engine inserts inside the hunk. This
+answers "where does this hunk start and end?" the way Beyond Compare
+does with the rule lines in its center column: before you move a block
+with Alt+Left/Alt+Right you can see exactly which rows will be moved,
+even inside a large changed block where the margin markers alone are
+hard to follow. A one-sided difference (added or deleted lines, shown
+as a colored gap on the other side) gets its bracket around the gap
+band too, so the extent is visible on both sides.
 
 Technical notes:
-- The lines are painted as thin colored inter-line gaps (1-10 pixels,
-  differ.advanced.hunk_edge_height) spanning the full text-area width.
-  CudaText plugins cannot custom-paint in a center column between the
-  two split halves, but a colored gap reads exactly like a drawn rule.
-- Each hunk adds the SAME height to BOTH sides at the same visual
-  rows, so the side-by-side alignment and the synchronized scrolling
-  are not affected. On the shorter side of a hunk the bottom line sits
-  below the compensating gap; on the empty side (the gap side of a
-  one-sided difference) the band is bracketed above and below.
-- The lines are re-drawn on every compare (F5 / auto-refresh), tagged
-  like all other diff markers, and wiped together with them when a
-  compare tab is closed or re-compared.
-- Colors come from the theme presets (a neutral gray that reads on
-  white, grey and dark backgrounds); with "Color theme" = Custom use
-  differ.theme.edge_color. Turn the feature off with
-  differ.advanced.enable_hunk_edges. Changes take effect on the next
-  Recompare (F5).
+- The columns are custom-drawn panels docked outside the editors (the
+  same technique as the overview panel: a borderless dialog with an
+  image control, docked left/right of the compare view). The text area
+  is not touched at all -- unlike the previous implementation (thin
+  colored inter-line gaps inside the editors), nothing is added to the
+  editors' heights, so the side-by-side alignment and the synchronized
+  scrolling cannot be affected.
+- The brackets are pixel-aligned with the text rows: their tops and
+  bottoms come from the editor's own line-to-pixel conversion, which
+  accounts for inter-line gaps, word wrap and the current scroll
+  position. On scroll the columns follow live (a throttled immediate
+  repaint plus a final repaint after scrolling stops).
+- "Improve line alignment" (beautify) is fully supported: when the
+  beautified pairing pushes a hunk's compensating gap band ABOVE the
+  shorter side's first hunk line, the bracket top comes from the other
+  side's first line -- so the bracket brackets the band and both
+  columns stay level. A previous hunk's trailing band sitting at the
+  same line index is told apart from this hunk's own band (bands are
+  matched by the line ranges they compensate), so it never shifts the
+  bracket. Hunks that end at the end of the file on both sides include
+  their trailing bands too (the plugin records the band pixel sizes
+  the engine asked for and adds them to the EOF bottom edge).
+- Ignored differences (suppressed by the ignore options) are not in
+  the diff records, so they never get brackets.
+- Only hunks intersecting the visible line range are painted (a
+  background fill plus 3 canvas lines each), so the cost stays small
+  even for huge files with thousands of differences.
+- Colors come from the ACTIVE THEME -- the background uses EdGutterBg
+  and the bracket lines use EdGutterFont (read from the theme dicts;
+  the columns look like part of the editors' gutters in every theme).
+  No plugin color option is involved.
+- The columns are re-drawn on every compare (F5 / auto-refresh) and
+  destroyed together with the whole per-tab session when the compare
+  tab is closed or the feature is turned off.
+- Turn the feature off with differ.advanced.enable_hunk_edges; the
+  column width is differ.advanced.hunk_edges_width. Changes take
+  effect on the next Recompare (F5).
 
 
 == Tab context menu ==
@@ -472,18 +499,20 @@ Theme section:
       luminance of the editor background. Recommended.
     * white -- preset tuned for white editor backgrounds:
       changed #f8dfad, added #b3ffb3, deleted #ffc4c4, gap #e3e3e3,
-      ignored and ignored gap #ffffff, hunk edge lines #8a8a8a.
+      ignored and ignored gap #ffffff.
     * grey -- preset tuned for light-grey editor backgrounds (#E0E0E0,
       like the green/navy themes): the white family's colors deepened
       ~25 units, so they keep their contrast against grey.
     * black -- preset tuned for dark editor backgrounds (muted, so the
       diff blocks do not glare on dark themes).
-    * custom -- use the seven color options below; every option left
+    * custom -- use the six color options below; every option left
       empty is filled from the auto-detected preset, so a
       half-configured custom theme never falls back to nothing.
+      (The hunk edge columns do not use these options -- their colors
+      come from the active theme's EdGutterBg/EdGutterFont.)
   In the grey and black presets the ignored-difference colors resolve to
   the live editor background, so ignored regions blend into the active
-  theme. The seven color options below only apply in the "custom" mode.
+  theme. The six color options below only apply in the "custom" mode.
 - differ.theme.changed_color: Color of changed lines
   Background color for lines that were modified (replaced with different
   content). Also colors the char-level highlights inside modified lines,
@@ -525,13 +554,6 @@ Theme section:
   Only used when "Color theme" is custom; leave empty to fill this slot
   from the auto-detected preset (the editor text background for the grey
   and black families, so the ignored gap then looks like empty space).
-- differ.theme.edge_color: Color of hunk edge lines
-  Color of the thin horizontal rule drawn at the start and end of every
-  difference block, on both sides of the compare view (see "Hunk edge
-  lines" above). Theme presets use a neutral gray that reads on white,
-  grey and dark backgrounds.
-  Only used when "Color theme" is custom; leave empty to fill this slot
-  from the auto-detected preset.
 
 Algorithm section:
 - differ.algorithm.diff_algorithm: Diff algorithm
@@ -630,18 +652,24 @@ Advanced section:
   you stop editing for 1-2 seconds. When disabled, you must use the
   Recompare command manually.
   Default: off.
-- differ.advanced.enable_hunk_edges: Hunk edge lines
-  When enabled, a thin horizontal line is drawn at the start and end of
-  every difference block on both sides of the compare view, so you
-  always see where a hunk begins and ends -- like the rule lines Beyond
-  Compare draws around its difference blocks (see "Hunk edge lines"
-  above). Each hunk adds the same small height to BOTH sides, so the
-  visual alignment is not affected. Takes effect on the next Recompare
-  (F5).
+- differ.advanced.enable_hunk_edges: Hunk edge columns
+  When enabled, two narrow columns are added at the left and right
+  edges of the compare view, each drawing a bracket around every
+  difference block -- the text lines AND the compensating gap band
+  inside the hunk -- so you always see exactly what Alt+Left/
+  Alt+Right will move, like the rule lines Beyond Compare draws around
+  its difference blocks (see "Hunk edge columns" above). The columns
+  are drawn OUTSIDE the editors (the text area and the alignment are
+  not touched), use the theme's gutter colors (EdGutterBg /
+  EdGutterFont), stay pixel-aligned with the text rows while scrolling
+  (also with word wrap and "Improve line alignment"), and only visible
+  hunks are painted, so the cost stays small on huge files.
+  Takes effect on the next Recompare (F5).
   Default: on.
-- differ.advanced.hunk_edge_height: Hunk edge line height in pixels
-  Thickness of the hunk edge lines, in pixels.
-  Range: 1-10. Default: 2.
+- differ.advanced.hunk_edges_width: Hunk edge column width in pixels
+  Width of one hunk edge column, in pixels. The columns are
+  intentionally narrow -- a vertical bar plus short top/bottom arms.
+  Range: 6-40. Default: 12.
 - differ.advanced.diff_context: Context lines in unified diff
   Number of unchanged context lines shown around each change in the
   unified diff output (produced by the "Diff current document with..."
