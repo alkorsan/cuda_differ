@@ -255,27 +255,39 @@ band too, so the extent is visible on both sides.
 Technical notes:
 - One column sits at the LEFT edge of each editor: the left column
   before the left editor's gutter, the right column directly right of
-  the splitter, before the right editor's gutter. The columns are child
-  controls of the grouping panel that parents the two editors, attached
-  through the Lazarus align system itself: the left column is
-  Align=alLeft (it takes the panel's left-edge strip and the left
-  editor, which is Align=alClient, shrinks around it automatically) and
-  the right column is Align=alRight, seeded so the align pass sorts it
-  between the splitter and the right editor (it stays glued to the
-  right editor's left edge). The editors are never modified: no
+  the split bar, before the right editor's gutter. The left column is
+  an Align=alLeft child control of the grouping panel that parents the
+  two editors (it takes the panel's left-edge strip and the left
+  editor, which is Align=alClient, shrinks around it automatically).
+  The right column is an Align=alRight child of the SPLIT BAR itself,
+  which the plugin widens by the column width for the purpose: the
+  split bar keeps its right edge glued to the right editor's left edge
+  and grows leftward, and the column docks at its right edge -- the
+  same strip a standalone column would occupy, but without ever
+  entering the panel's align chain. That matters because the LCL
+  splitter picks the control it resizes geometrically (the aligned
+  sibling right next to the split bar -- normally the right editor):
+  a column docked between the split bar and the right editor would
+  STEAL that spot, and dragging the split bar would then resize the
+  column instead of the editor. The editors are never modified: no
   coordinates are set on them, so nothing can cover the columns and
-  there is nothing to restore when they are removed. The text area is
-  not touched at all -- unlike the earlier implementation (thin colored
-  inter-line gaps inside the editors), nothing is added to the editors'
-  heights, so the side-by-side alignment and the synchronized scrolling
-  cannot be affected.
-- A background layout guard (a light per-tab timer) re-seeds the right
-  column after splitter drags or window resizes that moved the right
-  editor's left edge past the column (there the align sort alone drops
-  the column to the left of the splitter), repaints after size changes,
-  and removes the columns when the split is gone (tab un-split, split
-  switched to horizontal, tab closed); deleting the two controls lets
-  the align system give the editors their full widths back on its own.
+  there is nothing to restore when they are removed (the split bar's
+  original width is restored on removal, and remembered in the split
+  bar's own tag so a plugin reload cannot double-widen it). The text
+  area is not touched at all -- unlike the earlier implementation
+  (thin colored inter-line gaps inside the editors), nothing is added
+  to the editors' heights, so the side-by-side alignment and the
+  synchronized scrolling cannot be affected.
+- Because the right column rides INSIDE the split bar, splitter drags
+  and window resizes carry it along automatically -- the split bar is
+  re-glued to the right editor's left edge and the column is already
+  in place; the drag keeps working exactly like an unmodified CudaText
+  split. A background layout guard (a light per-tab timer) only
+  re-applies a split-bar width that was reset behind its back, repaints
+  after size changes, and removes the columns when the split is gone
+  (tab un-split, split switched to horizontal, tab closed); deleting
+  the two controls and restoring the split bar's width lets the align
+  system give the editors their full widths back on its own.
 - The brackets are pixel-aligned with the text rows: their tops and
   bottoms come from the editor's own line-to-pixel conversion, which
   accounts for inter-line gaps, word wrap and the current scroll
