@@ -255,22 +255,27 @@ band too, so the extent is visible on both sides.
 Technical notes:
 - One column sits at the LEFT edge of each editor: the left column
   before the left editor's gutter, the right column directly right of
-  the splitter, before the right editor's gutter (docked dialogs can
-  only sit at the form's outer edges, which would put the second
-  column at the far end after the scrollbar and the overview -- so the
-  columns are instead child controls of the grouping panel that
-  parents the two editors, and each editor is shifted right by the
-  column width: the columns cover nothing and the editors keep their
-  full gutters). The text area is not touched at all -- unlike the
-  previous implementation (thin colored inter-line gaps inside the
-  editors), nothing is added to the editors' heights, so the
-  side-by-side alignment and the synchronized scrolling cannot be
-  affected.
-- A background layout guard (a light per-tab timer) re-applies the
-  column positions whenever CudaText re-lays-out the split editors
-  (window resize, splitter drag, tab-group changes) and removes the
-  columns when the split is gone; when the feature is turned off or
-  the tab is closed, the editors get their full widths back.
+  the splitter, before the right editor's gutter. The columns are child
+  controls of the grouping panel that parents the two editors, attached
+  through the Lazarus align system itself: the left column is
+  Align=alLeft (it takes the panel's left-edge strip and the left
+  editor, which is Align=alClient, shrinks around it automatically) and
+  the right column is Align=alRight, seeded so the align pass sorts it
+  between the splitter and the right editor (it stays glued to the
+  right editor's left edge). The editors are never modified: no
+  coordinates are set on them, so nothing can cover the columns and
+  there is nothing to restore when they are removed. The text area is
+  not touched at all -- unlike the earlier implementation (thin colored
+  inter-line gaps inside the editors), nothing is added to the editors'
+  heights, so the side-by-side alignment and the synchronized scrolling
+  cannot be affected.
+- A background layout guard (a light per-tab timer) re-seeds the right
+  column after splitter drags or window resizes that moved the right
+  editor's left edge past the column (there the align sort alone drops
+  the column to the left of the splitter), repaints after size changes,
+  and removes the columns when the split is gone (tab un-split, split
+  switched to horizontal, tab closed); deleting the two controls lets
+  the align system give the editors their full widths back on its own.
 - The brackets are pixel-aligned with the text rows: their tops and
   bottoms come from the editor's own line-to-pixel conversion, which
   accounts for inter-line gaps, word wrap and the current scroll
@@ -297,8 +302,7 @@ Technical notes:
   No plugin color option is involved.
 - The columns are re-drawn on every compare (F5 / auto-refresh) and
   destroyed together with the whole per-tab session when the compare
-  tab is closed or the feature is turned off (the editors' widths are
-  restored).
+  tab is closed or the feature is turned off.
 - Turn the feature off with differ.advanced.enable_hunk_edges; the
   column width is differ.advanced.hunk_edges_width (each editor gives
   up that many pixels to its column). Changes take effect on the next
