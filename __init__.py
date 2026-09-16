@@ -2709,14 +2709,16 @@ class Command:
             # (the tab's OWN session holds them -- two tabs' columns can
             # never mix). Two narrow custom-drawn columns are attached as
             # child controls of the grouping panel that parents the two
-            # editors: column A at the LEFT edge of editor 1, column B at
-            # the LEFT edge of editor 2 (directly right of the splitter)
-            # -- each editor is shifted right by the column width so the
-            # columns cover nothing. Each column draws a bracket around
-            # every hunk's full visual footprint (text + compensating gap
-            # band) -- see columns.py, which also runs the per-tab layout
-            # guard that re-applies the shift after CudaText's own
-            # relayouts (window resize / splitter drag).
+            # editors, through the LCL align system: column A is
+            # Align=alLeft (the panel's left-edge strip, at the LEFT edge
+            # of editor 1) and column B is Align=alRight seeded between
+            # the splitter and editor 2 (the align pass glues it to the
+            # LEFT edge of editor 2) -- the editors themselves are never
+            # modified. Each column draws a bracket around every hunk's
+            # full visual footprint (text + compensating gap band) -- see
+            # columns.py, which also runs the per-tab layout guard that
+            # re-seeds column B after far-right splitter drags and
+            # repaints after size changes.
             tab_id_str = str(tab_id)
             columns = session.columns
             columns_on = self.cfg.get('enable_hunk_edges', True)
