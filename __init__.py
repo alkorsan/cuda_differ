@@ -2942,6 +2942,21 @@ class Command:
         # 'ignore numbers' on -- and the user must be told the sides
         # are equal instead of staring at an uncolored compare tab.
         n_diff_events = 0
+        # Line indices that received a COMPENSATING gap (A_GAP/B_GAP
+        # events, DIFF_TAG) on each half -- NOT the wrap-compensation
+        # (ALIGN) gaps and NOT the ignored-difference (A_GAP_IGN/
+        # B_GAP_IGN) gaps. _paint_hunk_edges needs this: with beautify
+        # alignment on, a hunk's leading unpaired lines push the
+        # shorter side's compensating gap band ABOVE the hunk's first
+        # line (at the very line index of the hunk's top edge), and
+        # the top edge must then be painted ABOVE that band (on_top)
+        # to bracket the hunk's full visual footprint and stay level
+        # with the other half's top edge. Ignored gaps are excluded
+        # on purpose: they compensate the PRECEDING ignored hunk's
+        # line-count mismatch, so the top edge must stay BELOW them
+        # (below them is where the two halves' heights line up).
+        comp_gap_idx_a = set()
+        comp_gap_idx_b = set()
         Profiler.start('refresh:compare_and_paint')
         # Both differs take their inputs as compare() parameters (no
         # set_seqs() call, no persistent storage on either Differ between
@@ -3023,6 +3038,7 @@ class Command:
                     overview.add_line_state('b', y, self.cfg.get('color_changed'))
             elif diff_id == df.A_GAP:
                 a_line_after, b_start, b_end = d[1], d[2], d[3]
+                comp_gap_idx_a.add(a_line_after - 1)
                 if wrap_on:
                     Profiler.start('paint:wrap_calc')
                     total_visual = self._sum_visual_rows(
@@ -3044,6 +3060,7 @@ class Command:
                         overview.add_gap('a', a_line_after, b_end - b_start)
             elif diff_id == df.B_GAP:
                 b_line_after, a_start, a_end = d[1], d[2], d[3]
+                comp_gap_idx_b.add(b_line_after - 1)
                 if wrap_on:
                     Profiler.start('paint:wrap_calc')
                     total_visual = self._sum_visual_rows(
@@ -3239,10 +3256,12 @@ class Command:
         # loop has consumed the whole compare generator). Runs AFTER the
         # engine's compensating gaps so the stacking rules in
         # _paint_hunk_edges hold (bottom edges land below a hunk's
-        # compensating gap, empty-side top edges above it via on_top).
+        # compensating gap, top edges above it via on_top when the
+        # tracking sets say one sits at the top-edge index).
         if self.cfg.get('enable_hunk_edges', True):
             Profiler.start('paint:hunk_edges')
-            self._paint_hunk_edges(a_ed, b_ed, diff.diffmap)
+            self._paint_hunk_edges(a_ed, b_ed, diff.diffmap,
+                                   comp_gap_idx_a, comp_gap_idx_b)
             Profiler.stop('paint:hunk_edges')
 
         # Append all collected bookmarks in sorted order using
@@ -3559,7 +3578,8 @@ class Command:
               on_top=on_top
               )
 
-    def _paint_hunk_edges(self, a_ed, b_ed, diffmap):
+    def _paint_hunk_edges(self, a_ed, b_ed, diffmap, comp_gap_idx_a=None,
+                          comp_gap_idx_b=None):
         """Draw a thin horizontal rule at the start and the end of every
         hunk, on BOTH sides of the compare view (Beyond Compare-style
         boundary lines).
@@ -3585,22 +3605,36 @@ class Command:
         - On the shorter side of a hunk the engine's compensating gap
           sits after the block end. The bottom edge (added here, after
           the engine's gaps) lands BELOW it -- the correct hunk bottom.
-        - On an EMPTY side (pure add/delete: a0==a1) the compensating
-          gap is the hunk's whole footprint. Both edges go to the same
-          index; the top edge uses on_top=True to land ABOVE the
-          compensating gap, so the band gets bracketed top and bottom.
-        - Everywhere else on_top stays False, so an edge never jumps
+        - Top edge on_top=True when a COMPENSATING gap (A_GAP/B_GAP)
+          sits at the top-edge index on this half: this happens for
+          every empty side (the compensating gap is the hunk's whole
+          footprint) AND, with 'Beautify line alignment' on, when the
+          hunk's leading lines on the OTHER half are unpaired -- the
+          beautify engine then pushes the shorter half's compensating
+          band ABOVE this half's first hunk line, at the very index of
+          the top edge. Jumping above the band (on_top) brackets the
+          hunk's full visual footprint and keeps the two halves' top
+          edges level; staying below it (the old behavior) drew the
+          edge N rows too low, one row per unpaired leading line.
+          The paint loop passes the tracked indices as
+          comp_gap_idx_a/comp_gap_idx_b; without them (tests, direct
+          calls) only the empty-side rule applies.
+        - on_top stays False everywhere else, so an edge never jumps
           above a wrap-compensation (ALIGN) gap that extends the
-          previous line's visual height.
+          previous line's visual height, nor above an ignored hunk's
+          compensating gap (A_GAP_IGN/B_GAP_IGN -- it belongs to the
+          PRECEDING ignored hunk and keeps the halves' heights level,
+          so the edge belongs below it).
 
         Alignment safety: every hunk adds exactly two edges (2*height
         pixels) to BOTH sides at the same visual rows, so the
         side-by-side alignment and the scroll sync are unaffected.
-        Known cosmetic corner case: with word-wrap on, an empty side's
-        top edge can slice through the wrapped continuation rows of the
-        equal line above (on_top cannot order between an ALIGN gap and
-        a compensating gap) -- the bracket around the band is still
-        correct.
+        Known cosmetic corner case: with word-wrap on, a top edge that
+        jumps above a compensating gap (on_top=True) can slice through
+        the wrapped continuation rows of the equal line above when an
+        ALIGN gap sits at the same index (on_top cannot order between
+        an ALIGN gap and a compensating gap) -- the bracket around the
+        hunk is still correct.
 
         Ignored differences are not in the diffmap, so they never get
         edge lines. Config: advanced.enable_hunk_edges (gate is at the
@@ -3610,6 +3644,8 @@ class Command:
         color = self.cfg.get('color_hunk_edges')
         if not diffmap or color is None:
             return
+        comp_gap_idx_a = comp_gap_idx_a or set()
+        comp_gap_idx_b = comp_gap_idx_b or set()
         try:
             height = max(1, int(height))
         except (TypeError, ValueError):
@@ -3619,15 +3655,20 @@ class Command:
             # one side; skip malformed all-empty records.
             if a0 >= a1 and b0 >= b1:
                 continue
-            # Left half: top edge above the first A line (on_top only
-            # when this side is empty -- see the stacking notes above),
-            # bottom edge below the last A line.
+            # Left half: top edge above the first A line -- on_top when
+            # this side is empty (its compensating gap is the whole
+            # footprint) or when a compensating gap sits at the same
+            # index (beautify-staggered leading lines of the other
+            # half -- see the stacking notes above). Bottom edge below
+            # the last A line, after any compensating gaps there.
             self._add_raw_gap(a_ed, a0 - 1, height, color,
-                              on_top=(a0 == a1))
+                              on_top=(a0 == a1 or
+                                      (a0 - 1) in comp_gap_idx_a))
             self._add_raw_gap(a_ed, a1 - 1, height, color)
             # Right half: same geometry.
             self._add_raw_gap(b_ed, b0 - 1, height, color,
-                              on_top=(b0 == b1))
+                              on_top=(b0 == b1 or
+                                      (b0 - 1) in comp_gap_idx_b))
             self._add_raw_gap(b_ed, b1 - 1, height, color)
 
     def _get_wrap_counts(self, ed):
