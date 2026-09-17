@@ -116,9 +116,11 @@ added via the 'p' control prop as a child of panel_ed (column A) or of
 the split bar (column B) (CudaText's prop serializer applies 'p' first,
 then the geometry keys, so one PROP_SET call seeds the position while
 the control is still alNone and lets the final 'align' key promote the
-seed into the aligned slot in a single realignment). Painting is cheap:
-a background fill plus 3 canvas lines per visible hunk, and only visible
-hunks are painted at all.
+seed into the aligned slot in a single realignment). Painting draws
+EVERYTHING at once: a background fill plus 3 canvas lines per hunk, for
+ALL hunks on every repaint -- no visible-window filter. A one-sided big
+hunk must keep its bracket on BOTH columns even when this column's own
+hunk lines are scrolled out of view.
 
 Vertical alignment is pixel-exact: the top/bottom of every bracket come
 from ed.convert(CONVERT_CARET_TO_PIXELS) queries, which are gap-aware,
@@ -169,17 +171,21 @@ same records jump()/copy() navigate):
   SAME on both sides -- both columns draw the same bracket rows for a
   hunk.
 
-Performance: painting runs only for hunks intersecting the visible line
-range (PROP_LINE_TOP .. PROP_LINE_BOTTOM, a cheap property read; the
-diffmap is scanned with the visible window, not binary-searched, which is
-fine because the scan is a tuple-compare loop over integers -- for a
-100k-line file with 10k hunks that is ~10k comparisons, far cheaper than
-a single canvas call). On scroll, paint() is throttled to ~33 fps by
-track_paint() (wall-clock gate, the same approach as the overview slider)
-plus a trailing one-shot repaint from the plugin's 150 ms overview timer.
-The convert() calls only run for the visible hunks (a couple dozen at
-most), each O(log n) in the wrap table. The 400 ms layout guard reads a
-handful of control props per tick -- negligible.
+Performance: every repaint draws ALL hunks -- deliberately NO
+visible-line-window filter. A filter on this editor's visible lines
+breaks one-sided big hunks: a hunk whose lines are all (or mostly) on the
+OTHER side has an empty or tiny range on this side, so once those few
+lines left the viewport the bracket vanished from this column, even
+though the hunk was still in view on the other side (its footprint is
+shared by both columns -- that is the engine's alignment invariant).
+Drawing everything costs one linear diffmap scan, 2-3 convert() calls and
+3 canvas lines per hunk; brackets fully outside the canvas are Y-clipped
+away by a cheap rectangle compare. On scroll, paint() is throttled to
+~33 fps by track_paint() (wall-clock gate, the same approach as the
+overview slider) plus a trailing one-shot repaint from the plugin's
+150 ms overview timer. The convert() calls are each O(log n) in the wrap
+table. The 400 ms layout guard reads a handful of control props per
+tick -- negligible.
 
 Colors come from the active CudaText theme -- background EdGutterBg, line
 EdGutterFont -- so the columns visually read as part of the editors'
@@ -204,7 +210,8 @@ COLUMNS_WIDTH_DEFAULT = 12
 # Wall-clock interval (seconds) between immediate repaints while a scroll
 # burst is running -- the same gate the overview slider uses
 # (OVERVIEW_TRACK_INTERVAL). ~33 fps looks instant, and paint() here is
-# cheap (one background fill + 3 lines per visible hunk).
+# one background fill + 3 lines per hunk, for ALL hunks (no
+# visible-window filter -- see the module docstring's Performance note).
 TRACK_INTERVAL = 0.030
 
 # Interval (milliseconds) of the per-tab recurring layout-guard timer.
@@ -1065,12 +1072,16 @@ class HunkColumns:
             bottom = top + 1
         return top, bottom
 
-    def _paint_column(self, idx, ed, line_count):
-        """Paint one column: background fill plus a bracket per hunk
-        intersecting the editor's visible line range. Hunks fully above
-        or below the viewport are skipped entirely -- with a huge file
-        and thousands of hunks, only the visible couple dozen get any
-        convert() calls and canvas lines."""
+    def _paint_column(self, idx):
+        """Paint one column: background fill plus a bracket per hunk, for
+        ALL hunks at once -- there is deliberately NO visible-line-window
+        filter. Filtering by this editor's visible lines broke one-sided
+        big hunks: a hunk whose lines are all (or mostly) on the OTHER
+        side has an empty or tiny range on this side, so once this side's
+        few lines left the viewport the whole bracket vanished from this
+        column, even though the hunk was still in view on the other side.
+        Brackets fully outside the canvas are Y-clipped (a cheap rectangle
+        compare), so off-screen hunks only cost their convert() calls."""
         c = self.h_canvases[idx]
         if c is None:
             return
@@ -1091,15 +1102,6 @@ class HunkColumns:
         ct.canvas_proc(c, ct.CANVAS_RECT_FILL, x=0, y=0, x2=w, y2=h)
         if not self.hunks:
             return
-        # Visible line window of THIS column's editor (cheap property
-        # reads; PROP_LINE_BOTTOM considers word wrap).
-        try:
-            vis_top = ed.get_prop(ct.PROP_LINE_TOP) or 0
-            vis_bot = ed.get_prop(ct.PROP_LINE_BOTTOM)
-            if vis_bot is None:
-                vis_bot = line_count
-        except Exception:
-            vis_top, vis_bot = 0, line_count
         # The bracket's vertical bar / arms.
         bar_x1 = BAR_X
         arm_x2 = w - ARM_PAD - 1
@@ -1110,19 +1112,13 @@ class HunkColumns:
             # side; skip malformed all-empty records.
             if a0 >= a1 and b0 >= b1:
                 continue
-            # This column's own line range for the hunk.
-            r0, r1 = (a0, a1) if idx == 0 else (b0, b1)
-            # Skip hunks entirely outside the visible window (with a
-            # one-hunk margin so a bracket poking in from just above or
-            # below the viewport still draws).
-            if r1 - 1 < vis_top - 1 or r0 > vis_bot + 1:
-                continue
             br = self._bracket(hunk)
             if br is None:
                 continue
             top, bottom = br
-            # Pure Y clip against the column canvas: partially visible
-            # hunks draw their visible part.
+            # Pure Y clip against the column canvas (canvas bounds, NOT a
+            # visibility filter): fully off-canvas brackets are skipped,
+            # partially off-canvas brackets draw their on-canvas part.
             if bottom <= 0 or top >= h:
                 continue
             top = max(0, top)
@@ -1139,8 +1135,8 @@ class HunkColumns:
         """Repaint both columns with the current data."""
         if not self.is_created():
             return
-        self._paint_column(0, self.a_ed, self.line_count_a)
-        self._paint_column(1, self.b_ed, self.line_count_b)
+        self._paint_column(0)
+        self._paint_column(1)
 
     def track_paint(self):
         """Immediate repaint for scroll bursts, wall-clock throttled to
