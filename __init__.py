@@ -1938,12 +1938,10 @@ class Command:
             self.scroll.on_scroll(ed_self)
             if session.overview is not None:
                 session.overview.track_paint()
-            # The hunk edge columns are 1:1 aligned with the editors'
-            # rows, so they must follow every scroll too (same two-layer
-            # scheme: immediate wall-clock-throttled repaint here,
-            # trailing full repaint from the 150ms timer below).
-            if session.columns is not None:
-                session.columns.track_paint()
+            # NOTE: the hunk edge columns are NOT touched here. They
+            # paint the whole file once, overview-style (scaled to the
+            # column height), and their picture is scroll-independent
+            # -- scrolling must never repaint them (see columns.py).
             # Trailing repaint 150ms after the last scroll event.
             if not session.overview_timer:
                 session.overview_timer = True
@@ -1951,10 +1949,12 @@ class Command:
                 ct.timer_proc(ct.TIMER_START_ONE, callback, 150)
 
     def _overview_repaint_timer(self, tag='', info=''):
-        """Timer callback that repaints the overview and the hunk edge
-        columns for a given tab. Called 150ms after the last scroll
-        event to avoid excessive repaints during continuous scrolling
-        (also catches the settled position after scroll clamping)."""
+        """Timer callback that repaints the overview for a given tab.
+        Called 150ms after the last scroll event to avoid excessive
+        repaints during continuous scrolling (also catches the settled
+        position after scroll clamping). The hunk edge columns are
+        deliberately NOT repainted here: their overview-style picture
+        is scroll-independent (see columns.py)."""
         if not info:
             return
         session = self._sessions.get(info)
@@ -1963,8 +1963,6 @@ class Command:
         session.overview_timer = False
         if session.overview is not None:
             session.overview.paint()
-        if session.columns is not None:
-            session.columns.paint()
 
     def _columns_layout_timer(self, tag='', info=''):
         """Recurring per-tab layout guard for the hunk edge columns
@@ -2683,6 +2681,13 @@ class Command:
             columns.set_colors(*_ed_gutter_colors())
             columns.set_width(self.cfg.get('hunk_edges_width',
                                            COLUMNS_WIDTH_DEFAULT))
+            # Clear the previous compare's records (hunks + gap bands),
+            # exactly like the overview's clear_data() below: the paint
+            # loop re-feeds the gaps DURING the compare while the hunk
+            # records only land at the end, so the fresh compare must
+            # start from empty data (columns.py paints the whole file
+            # overview-style from these records).
+            columns.clear_data()
         elif columns is not None:
             columns.destroy()
             session.columns = None
@@ -3169,7 +3174,9 @@ class Command:
         # input and a manual repaint).
         #
         # Overview line states and gaps are also collected for the
-        # paintbox overview (gap-aware mini-map) when enabled.
+        # paintbox overview (gap-aware mini-map) when enabled; the same
+        # gap records (in visual rows) feed the hunk edge columns'
+        # overview-style scaled brackets via _feed_gap() below.
         # Micromap line highlights are painted via attr(show_on_map=1)
         # when micromap is enabled.
         pending_bkm_a = []  # list of (line, nkind) for a_ed
@@ -3183,33 +3190,19 @@ class Command:
         # 'ignore numbers' on -- and the user must be told the sides
         # are equal instead of staring at an uncolored compare tab.
         n_diff_events = 0
-        # Compensating-band records for the hunk edge columns (see
-        # columns.py) -- NOT the ignored-difference (A_GAP_IGN/B_GAP_IGN)
-        # gaps. Two structures per side:
-        #   comp_bands_x: {index: [(other_start, other_end), ...]}
-        #     which OTHER-side line range each compensating band
-        #     (A_GAP/B_GAP event) covers. The columns use this to tell
-        #     a hunk's OWN staggered band (beautify alignment can leave
-        #     a hunk's leading lines unpaired, pushing the shorter
-        #     side's band ABOVE that side's first hunk line -- the
-        #     bracket top must then come from the OTHER side's first
-        #     line) from the PREVIOUS hunk's trailing band sitting at
-        #     the very same index (it belongs to the previous hunk,
-        #     so the bracket top stays put).
-        #   eof_bands_x: {index: px}
-        #     pixel sizes of compensating + wrap-align bands, needed
-        #     only for hunks ending at EOF on BOTH sides: there
-        #     convert(CONVERT_CARET_TO_PIXELS, ..., line_count) returns
-        #     the bottom of the last line EXCLUDING trailing bands
-        #     (ATSynEdit's bAfterEnd path only sums gaps up to index
-        #     count-2), so the trailing band pixels are added back.
-        # Ignored gaps are excluded on purpose: they compensate the
-        # PRECEDING ignored hunk's line-count mismatch, and ignored
-        # hunks are not in the diffmap, so they never get brackets.
-        comp_bands_a = {}
-        comp_bands_b = {}
-        eof_bands_a = {}
-        eof_bands_b = {}
+
+        def _feed_gap(side, after_line, rows, ignored=False):
+            """Feed one compensating gap band, in VISUAL ROWS, to every
+            consumer: the paintbox overview (for its gap fills) and the
+            hunk edge columns (for their overview-style scaled brackets
+            -- the columns use the same visual-row records to place each
+            hunk's footprint; see columns.py). Defined once here so the
+            10 feed sites below can never drift apart."""
+            if overview is not None:
+                overview.add_gap(side, after_line, rows, ignored)
+            if columns is not None:
+                columns.add_gap(side, after_line, rows, ignored)
+
         Profiler.start('refresh:compare_and_paint')
         # Both differs take their inputs as compare() parameters (no
         # set_seqs() call, no persistent storage on either Differ between
@@ -3291,60 +3284,40 @@ class Command:
                     overview.add_line_state('b', y, self.cfg.get('color_changed'))
             elif diff_id == df.A_GAP:
                 a_line_after, b_start, b_end = d[1], d[2], d[3]
-                comp_bands_a.setdefault(a_line_after - 1, []).append(
-                    (b_start, b_end))
                 if wrap_on:
                     Profiler.start('paint:wrap_calc')
                     total_visual = self._sum_visual_rows(
                         wrap_counts_b, b_start, b_end)
                     Profiler.stop('paint:wrap_calc')
                     Profiler.start('paint:gap')
-                    gap_px = total_visual * line_h_a
                     self._add_raw_gap(a_ed, a_line_after - 1,
-                                      gap_px, color_gaps)
+                                      total_visual * line_h_a, color_gaps)
                     Profiler.stop('paint:gap')
-                    eof_bands_a[a_line_after - 1] = (
-                        eof_bands_a.get(a_line_after - 1, 0) + gap_px)
-                    if overview is not None:
-                        # Gap appears BEFORE a_line_after (between lines
-                        # a_line_after-1 and a_line_after)
-                        overview.add_gap('a', a_line_after, total_visual)
+                    # Gap appears BEFORE a_line_after (between lines
+                    # a_line_after-1 and a_line_after)
+                    _feed_gap('a', a_line_after, total_visual)
                 else:
                     Profiler.start('paint:gap')
                     self.set_gap(a_ed, a_line_after, b_end - b_start)
                     Profiler.stop('paint:gap')
-                    eof_bands_a[a_line_after - 1] = (
-                        eof_bands_a.get(a_line_after - 1, 0) +
-                        (b_end - b_start) * line_h_a)
-                    if overview is not None:
-                        overview.add_gap('a', a_line_after, b_end - b_start)
+                    _feed_gap('a', a_line_after, b_end - b_start)
             elif diff_id == df.B_GAP:
                 b_line_after, a_start, a_end = d[1], d[2], d[3]
-                comp_bands_b.setdefault(b_line_after - 1, []).append(
-                    (a_start, a_end))
                 if wrap_on:
                     Profiler.start('paint:wrap_calc')
                     total_visual = self._sum_visual_rows(
                         wrap_counts_a, a_start, a_end)
                     Profiler.stop('paint:wrap_calc')
                     Profiler.start('paint:gap')
-                    gap_px = total_visual * line_h_b
                     self._add_raw_gap(b_ed, b_line_after - 1,
-                                      gap_px, color_gaps)
+                                      total_visual * line_h_b, color_gaps)
                     Profiler.stop('paint:gap')
-                    eof_bands_b[b_line_after - 1] = (
-                        eof_bands_b.get(b_line_after - 1, 0) + gap_px)
-                    if overview is not None:
-                        overview.add_gap('b', b_line_after, total_visual)
+                    _feed_gap('b', b_line_after, total_visual)
                 else:
                     Profiler.start('paint:gap')
                     self.set_gap(b_ed, b_line_after, a_end - a_start)
                     Profiler.stop('paint:gap')
-                    eof_bands_b[b_line_after - 1] = (
-                        eof_bands_b.get(b_line_after - 1, 0) +
-                        (a_end - a_start) * line_h_b)
-                    if overview is not None:
-                        overview.add_gap('b', b_line_after, a_end - a_start)
+                    _feed_gap('b', b_line_after, a_end - a_start)
             elif diff_id == df.A_GAP_IGN:
                 # Compensating gap for a suppressed all-blank hunk
                 # (DIFF_IGN_BLANK_LINES): same geometry as A_GAP but
@@ -3363,17 +3336,14 @@ class Command:
                                       total_visual * line_h_a,
                                       color_ignored_gap, tag=IGN_GAP_TAG)
                     Profiler.stop('paint:gap')
-                    if overview is not None:
-                        overview.add_gap('a', a_line_after, total_visual,
-                                         ignored=True)
+                    _feed_gap('a', a_line_after, total_visual, ignored=True)
                 else:
                     Profiler.start('paint:gap')
                     self.set_gap(a_ed, a_line_after, b_end - b_start,
                                  color=color_ignored_gap, tag=IGN_GAP_TAG)
                     Profiler.stop('paint:gap')
-                    if overview is not None:
-                        overview.add_gap('a', a_line_after, b_end - b_start,
-                                         ignored=True)
+                    _feed_gap('a', a_line_after, b_end - b_start,
+                              ignored=True)
             elif diff_id == df.B_GAP_IGN:
                 b_line_after, a_start, a_end = d[1], d[2], d[3]
                 if wrap_on:
@@ -3386,17 +3356,14 @@ class Command:
                                       total_visual * line_h_b,
                                       color_ignored_gap, tag=IGN_GAP_TAG)
                     Profiler.stop('paint:gap')
-                    if overview is not None:
-                        overview.add_gap('b', b_line_after, total_visual,
-                                         ignored=True)
+                    _feed_gap('b', b_line_after, total_visual, ignored=True)
                 else:
                     Profiler.start('paint:gap')
                     self.set_gap(b_ed, b_line_after, a_end - a_start,
                                  color=color_ignored_gap, tag=IGN_GAP_TAG)
                     Profiler.stop('paint:gap')
-                    if overview is not None:
-                        overview.add_gap('b', b_line_after, a_end - a_start,
-                                         ignored=True)
+                    _feed_gap('b', b_line_after, a_end - a_start,
+                              ignored=True)
             elif diff_id == df.A_LINE_IGN:
                 # Line of a suppressed all-blank hunk: painted with
                 # the ignored color, but NOT a difference — no
@@ -3437,25 +3404,19 @@ class Command:
                         align_px = diff_rows * line_h_b
                         self._add_raw_gap(b_ed, b_line,
                                           align_px, color_gaps)
-                        eof_bands_b[b_line] = (
-                            eof_bands_b.get(b_line, 0) + align_px)
-                        if overview is not None:
-                            # _add_raw_gap inserts AFTER b_line (between
-                            # b_line and b_line+1), so record as
-                            # after_line = b_line + 1 (gap appears
-                            # before line b_line+1 in paint order).
-                            overview.add_gap('b', b_line + 1, diff_rows)
+                        # _add_raw_gap inserts AFTER b_line (between
+                        # b_line and b_line+1), so record as
+                        # after_line = b_line + 1 (gap appears
+                        # before line b_line+1 in paint order).
+                        _feed_gap('b', b_line + 1, diff_rows)
                     elif vb > va:
                         diff_rows = vb - va
                         align_px = diff_rows * line_h_a
                         self._add_raw_gap(a_ed, a_line,
                                           align_px, color_gaps)
-                        eof_bands_a[a_line] = (
-                            eof_bands_a.get(a_line, 0) + align_px)
-                        if overview is not None:
-                            # Same: gap is after a_line, so record
-                            # as after_line = a_line + 1.
-                            overview.add_gap('a', a_line + 1, diff_rows)
+                        # Same: gap is after a_line, so record
+                        # as after_line = a_line + 1.
+                        _feed_gap('a', a_line + 1, diff_rows)
                     Profiler.stop('paint:gap')
             elif diff_id == df.A_SYMBOL_DEL:
                 n_diff_events += 1
@@ -3529,18 +3490,22 @@ class Command:
 
         # Hunk edge columns: feed the fresh compare's hunk records (the
         # diffmap is final at this point -- the paint loop has consumed
-        # the whole compare generator) plus the compensating-band records
-        # to the two docked bracket columns and repaint them. Gated by
-        # the enable option (the columns object is None when disabled --
-        # see refresh_compare). See columns.HunkColumns for the bracket
-        # geometry (top/bottom rules, the beautify-staggered top band,
-        # the EOF bottom corner).
+        # the whole compare generator; the gap bands were already fed
+        # DURING the loop by _feed_gap) and the wrap counts (the same
+        # feed the overview gets), then repaint once: the columns draw
+        # the WHOLE file's edges at once, overview-style, permanently --
+        # this is their repaint_static(), not a scroll handler. Gated
+        # by the enable option (the columns object is None when
+        # disabled -- see refresh_compare). See columns.HunkColumns for
+        # the scaled bracket geometry.
         if columns is not None:
             Profiler.start('paint:hunk_edges')
             columns.set_data(diff.diffmap, a_ed.get_line_count(),
-                             b_ed.get_line_count(),
-                             comp_bands_a, comp_bands_b,
-                             eof_bands_a, eof_bands_b)
+                             b_ed.get_line_count())
+            if wrap_on:
+                columns.set_wrap_counts(wrap_counts_a, wrap_counts_b)
+            else:
+                columns.set_wrap_counts(None, None)
             columns.paint()
             Profiler.stop('paint:hunk_edges')
 
