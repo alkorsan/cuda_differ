@@ -118,22 +118,29 @@ then the geometry keys, so one PROP_SET call seeds the position while
 the control is still alNone and lets the final 'align' key promote the
 seed into the aligned slot in a single realignment).
 
-Painting -- the "paint everything at once" model, literally: each
-column owns a STRIP bitmap as tall as the editor's whole content
-(visual rows x line height), and EVERY hunk's bracket is painted into
-it ONCE per compare -- file start to end, at true 1:1 pixel positions,
-nothing scaled, nothing filtered by the viewport. The visible column
-control then just shows the viewport's WINDOW of that pre-painted
-strip: scrolling copies the window (one CANVAS_BITMAP blit per column,
-the same copy the overview performs on every one of its own paints) --
-it never draws a bracket, never runs a per-hunk convert(), never
-applies a visible-hunk filter. The previous model (paint only the
-hunks inside the visible window, at viewport-relative coordinates,
-repaint on every scroll frame) is what broke big one-sided hunks: its
-filter tested each hunk's range on THIS side only, so a huge
-insert/delete block (empty range on the other side) lost its bracket
-as soon as the few own-side lines left the viewport. With the whole
-file pre-painted there is nothing left to compute while scrolling.
+Painting -- the "create once, forget" model: each column owns a STRIP
+bitmap as tall as the editor's whole content (visual rows x line
+height), and EVERY hunk's bracket is painted into it ONCE per compare
+-- file start to end, at true 1:1 pixel positions, nothing scaled,
+nothing filtered by the viewport. A file with 10000 lines and 300 gap
+bands gets every edge of all of its hunks painted in that single
+pass; afterwards no bracket is ever drawn again until the next
+compare. The visible column control then shows the viewport's WINDOW
+of that pre-painted strip: on every scroll event the plugin copies
+exactly that window -- ONE sub-rect blit (CANVAS_COPY_RECT) per
+column, executed synchronously inside on_scroll, which CudaText
+fires immediately AFTER painting the scrolled editor itself
+(DoEventScroll, atsynedit.pas) -- so the column's update lands in the
+same UI event and display frame as the text's. No timers, no
+throttling, no trailing repaints, no per-hunk work, no convert()
+calls at all. This is as close as an overlay control can physically
+get to the native fold bar / line numbers: those are painted by the
+editor's own canvas (a plugin cannot draw 1:1 brackets there -- the
+micromap is scaled down, decor items break on gap bands, and fold-bar
+ranges fold the text when clicked), so one pre-computed window copy
+per scroll event is the minimum remaining work, and it is
+indistinguishable from "already drawn" because it happens in the
+same frame as the text.
 
 Geometry (per diffmap entry [a0, a1, b0, b1], exclusive-end ranges -- the
 same records jump()/copy() navigate). Everything is computed in VISUAL
@@ -142,21 +149,28 @@ uses: per-line wrap counts via set_wrap_counts(), compensating gap bands
 via add_gap()), then mapped to STRIP pixels at 1:1 by the measured line
 height:
 
-  line_h = pixels per visual row, measured from the editor itself:
-           the caret->pixel conversion of two visible lines divided by
-           their visual-row distance (wrapped lines and gap bands are
-           accounted for exactly)
+  line_h = pixels per visual row, read from the editor's own scroll
+           info (PROP_SCROLL_VERT_INFO -> 'char_size') -- the very
+           number ATSynEdit pitches its text rows with, so the strip
+           and the text can never disagree about the row grid
   strip pixel of visual row v = v * line_h      (content pixels, 1:1)
 
-  The window offset is calibrated against the editor as well:
+  The window offset comes from the SAME single property read:
 
-      y0 = convert_y(top_visible_line) - visual_y(top_visible_line)
-           * line_h
+      src_y = PROP_SCROLL_VERT_INFO -> 'smooth_pos'
 
-  so content pixel 0 is copied exactly where the editor draws it (any
-  constant top margin and the live scroll position are both absorbed
-  into y0) and every bracket sits beside its own text lines. A font
-  or zoom change shows up as line_h drift and rebuilds the strip.
+  which ATSynEdit defines as NPos*line_h + NPixelOffset + pixels of
+  gap bands above the viewport's top row (TATEditorScrollInfo:
+  SmoothPos = TotalOffset + NGapPos) -- exactly the CONTENT PIXEL at
+  the viewport's top edge: wrap-aware, gap-aware, sub-pixel-aware.
+  Copying strip rows [src_y, src_y+height) puts every bracket exactly
+  beside its own text lines. (This replaces the old convert()
+  calibration, which silently FROZE whenever the top visible line was
+  partially scrolled out -- CONVERT_CARET_TO_PIXELS returns None for
+  a negative pixel Y, so during smooth scrolling the columns stuck
+  at stale offsets: the "strange things while scrolling" report.) A
+  font or zoom change shows up as char_size drift and rebuilds the
+  strip.
 
   Per side, the hunk's footprint in visual rows is
 
@@ -193,17 +207,17 @@ Performance: the one-shot strip paint = one background fill + 3 canvas
 lines per hunk over the WHOLE file, plus the O(lines + gaps log gaps)
 prefix-sum index build per side (each hunk's boundaries are two
 O(log n) queries -- never a per-line walk per hunk). The scroll path
-costs 2 property reads + 2 convert() calls + one background fill +
-ONE bitmap copy per column, wall-clock throttled to ~33 fps
-(TRACK_INTERVAL, the same rate as the overview's slider) plus a
-trailing one-shot 150 ms later for the settled position. Monster
-files whose content is taller than the strip cap (STRIP_MAX_PX /
-STRIP_MAX_BYTES) get a sliding pre-painted region around the viewport:
-it is re-centered only when the window leaves it (a far scrollbar
-jump), never during ordinary scrolling of files that fit. The 400 ms
-layout guard reads a handful of control props per tick, re-copies the
-window after real size changes, and rebuilds the strips only on
-line-height drift (font/zoom change).
+costs ONE property read (PROP_SCROLL_VERT_INFO) per column plus, only
+when the position really moved, ONE sub-rect bitmap copy
+(CANVAS_COPY_RECT) of the visible window -- no bracket drawing, no
+per-hunk work, no fills while the window is inside the strip;
+mirrored scroll echoes and horizontal scrolls skip the copy entirely.
+Strips are bounded by STRIP_MAX_BYTES (a memory guard for 32-bit
+builds on monster files): beyond it a column paints background only
+-- no half-painted sliding regions, ever. The 400 ms layout guard
+reads a handful of control props per tick, re-copies the window after
+real size changes, and rebuilds the strips only on line-height drift
+(font/zoom change).
 
 Colors come from the active CudaText theme -- background EdGutterBg, line
 EdGutterFont -- so the columns visually read as part of the editors'
@@ -215,7 +229,6 @@ See: https://github.com/Alexey-T/CudaText/issues/6477
 """
 
 import bisect
-import time
 
 import cudatext as ct
 
@@ -254,21 +267,15 @@ _TIMER_CMD = '_columns_layout_timer'
 BAR_X = 3
 ARM_PAD = 3
 
-# --- "Paint everything at once" strip model ---
-# Each column owns a strip bitmap as tall as the editor's whole content;
-# ALL brackets are painted into it once per compare. The strip height is
-# capped for monster files (bounded in pixels AND in bytes); beyond the
-# cap it becomes a sliding pre-painted region around the viewport,
-# re-centered only when the window leaves it (a far scrollbar jump).
-# Files within the cap are painted once, start to end, permanently.
-STRIP_MAX_PX = 262144                # 256k px of content (~14k lines)
-STRIP_MIN_PX = 65536                 # floor for the sliding region
-STRIP_MAX_BYTES = 16 * 1024 * 1024   # memory bound per column strip
-
-# Wall-clock throttle for the scroll-path window copy (~33 fps) -- the
-# same rate at which the overview's slider tracks scrolling. The copy
-# itself is a single bitmap blit; brackets are never drawn on this path.
-TRACK_INTERVAL = 0.030
+# --- "Create once, forget" strip model ---
+# Each column owns one strip bitmap as tall as the editor's whole
+# content; ALL brackets are painted into it once per compare, and the
+# scroll path only copies the viewport's window of it (one sub-rect
+# blit). The single bound is memory: a strip taller than
+# STRIP_MAX_BYTES // (width * 4) pixels is not built at all (the
+# column then paints background only), which guards 32-bit CudaText
+# builds against monster files without half-painted sliding regions.
+STRIP_MAX_BYTES = 64 * 1024 * 1024   # memory bound per column strip
 
 
 class HunkColumns:
@@ -360,19 +367,23 @@ class HunkColumns:
         # time: side -> (line_row_prefix, gap_lines_sorted, gap_row_prefix)
         # -- see _visual_y().
         self._vis = {}
-        # --- Pre-painted strips ("paint everything once") ---
-        # Per column: a persistent bitmap as tall as the editor's whole
-        # content (visual rows x line height; capped for monster files,
-        # then a sliding region), into which ALL hunk brackets are
-        # painted ONCE per compare. Scrolling never draws into it -- it
-        # only gets copied into the column's visible bitmap (present()).
+        # --- Pre-painted strips ("create once, forget") ---
+        # Per column: one persistent bitmap as tall as the editor's
+        # whole content (visual rows x line height; not built beyond
+        # the STRIP_MAX_BYTES memory cap), into which ALL hunk
+        # brackets are painted ONCE per compare. Scrolling never draws
+        # into it -- it only gets its viewport window copied into the
+        # column's visible bitmap (_show: one CANVAS_COPY_RECT).
         self._h_strip = [None, None]
         self._h_strip_cnv = [None, None]
         self._strip_wh = [None, None]       # (w, h) of each strip
-        self._strip_region = [None, None]   # [top_px, bot_px] painted
         self._strip_line_h = [None, None]   # line height painted with
-        # Wall-clock gate for track_paint() (~33 fps, like the overview).
-        self._track_last = 0.0
+        # What each column currently shows: (src_y, w, h) of the last
+        # window copy. on_scroll fires per editor and the two halves
+        # scroll in lockstep, so the mirrored echo would re-copy the
+        # same window twice -- the key skips blits whose result is
+        # already on screen (horizontal scrolls skip them too).
+        self._shown = [None, None]
 
     # ------------------------------------------------------------------
     # control-tree resolution (indices are NOT identities -- everything is
@@ -1051,11 +1062,15 @@ class HunkColumns:
         """Clear the collected hunk/gap data. Called before a fresh
         compare (from _setup_side_panels, next to the overview's
         clear_data()) so a repaint during the compare can never mix the
-        old compare's hunks with the new compare's gaps."""
+        old compare's hunks with the new compare's gaps. The strips are
+        freed too: until the fresh compare's paint() lands, scrolling
+        shows plain background instead of the dead compare's brackets."""
         self.hunks = []
         self.gaps_a = []
         self.gaps_b = []
         self._vis = {}
+        for idx in (0, 1):
+            self._free_strip(idx)
 
     # ------------------------------------------------------------------
     # painting -- ALL edges at once, once per compare: a full-height
@@ -1146,78 +1161,35 @@ class HunkColumns:
         line_rows, _, gap_rows = self._vis[side]
         return max(1, line_rows[-1] + gap_rows[-1])
 
-    def _convert_line_y(self, ed, line):
-        """On-screen Y (client pixels) of a line's first visual row,
-        via the editor's own caret->pixels conversion. Only ever called
-        for lines the editor reports as visible, where the conversion
-        is exact. Returns None when the API fails (dead editor)."""
-        try:
-            r = ed.convert(ct.CONVERT_CARET_TO_PIXELS, 0, line)
-            return float(r[1])
-        except Exception:
-            return None
-
-    def _calibrate(self, idx):
-        """Measure this column's editor; returns (line_h, y0) or None.
-
-        line_h = pixels per visual row, measured as the pixel distance
-        between two visible lines divided by their visual-row distance
-        (wrapped lines and gap bands are accounted for exactly). Falls
-        back to the strip's own line_h (or 16 px) when the viewport
-        shows too little to measure.
-
-        y0 = the client Y at which content pixel 0 currently sits:
-        convert_y(top_visible_line) - visual_y(top_visible_line)
-        * line_h. Any constant top margin and the live scroll position
-        are both absorbed into it, so blitting the strip at y0 puts
-        every bracket exactly beside its own text lines -- 1:1, no
-        scaling, self-correcting after font/zoom changes."""
-        ed = self.a_ed if idx == 0 else self.b_ed
+    def _scroll_info(self, ed):
+        """The editor's live vertical scroll info (one property read):
+        a dict with at least 'smooth_pos' (the content pixel at the
+        viewport's top edge -- NPos*line_h + sub-pixel offset + gap
+        pixels above it) and 'char_size' (the editor's row pitch in
+        pixels). None when the editor is dead / the API fails."""
         if ed is None:
             return None
         try:
-            top = ed.get_prop(ct.PROP_LINE_TOP)
-            bot = ed.get_prop(ct.PROP_LINE_BOTTOM)
+            si = ed.get_prop(ct.PROP_SCROLL_VERT_INFO)
         except Exception:
             return None
-        if not isinstance(top, int) or top < 0:
+        if not isinstance(si, dict):
             return None
-        if not isinstance(bot, int) or bot <= top:
-            bot = top + 1
-        side = 'a' if idx == 0 else 'b'
-        count = self.line_count_a if idx == 0 else self.line_count_b
-        # Second calibration line: the bottom visible line, clamped to
-        # the file (and never equal to the top one).
-        u = bot
-        if u > count - 1:
-            u = count - 1
-        if u <= top:
-            u = top + 1
-        py_t = self._convert_line_y(ed, top)
-        if py_t is None:
-            return None
-        py_u = self._convert_line_y(ed, u)
-        vy_t = self._visual_y(side, top)
-        vy_u = self._visual_y(side, u)
-        line_h = None
-        if py_u is not None and vy_u > vy_t and py_u > py_t:
-            lh = (py_u - py_t) / float(vy_u - vy_t)
-            if 4.0 <= lh <= 200.0:
-                line_h = lh
-        if line_h is None:
-            line_h = self._strip_line_h[idx] or 16.0
-        return line_h, py_t - vy_t * line_h
+        return si
 
-    def _strip_height_cap(self, w):
-        """Max strip height for this column width: bounded both in
-        pixels and in bytes (w * h * 4 bpp), with a floor so the
-        sliding region of monster files is not hyperactive."""
-        cap = STRIP_MAX_PX
-        try:
-            cap = min(cap, STRIP_MAX_BYTES // max(4, 4 * max(1, w)))
-        except Exception:
-            pass
-        return max(STRIP_MIN_PX, cap)
+    def _line_h_of(self, idx):
+        """Row pitch (pixels per visual row) of one column's editor,
+        from the scroll info's 'char_size' -- the very number the
+        editor pitches its text rows with. Falls back to the strip's
+        own pitch (or 16 px) when the read fails."""
+        si = self._scroll_info(self.a_ed if idx == 0 else self.b_ed)
+        if si is not None:
+            cs = si.get('char_size')
+            if isinstance(cs, (int, float)) and 4 <= cs <= 200:
+                return float(cs)
+        if self._strip_line_h[idx]:
+            return self._strip_line_h[idx]
+        return 16.0
 
     def _free_strip(self, idx):
         """Free one column's pre-painted strip (control teardown or a
@@ -1230,53 +1202,30 @@ class HunkColumns:
         self._h_strip[idx] = None
         self._h_strip_cnv[idx] = None
         self._strip_wh[idx] = None
-        self._strip_region[idx] = None
         self._strip_line_h[idx] = None
+        self._shown[idx] = None
 
-    def _build_strip(self, idx, w, line_h, win_top, h_ctl):
+    def _build_strip(self, idx, w, line_h):
         """(Re)paint one column's strip -- the ONE-SHOT paint of the
         hunk edges: EVERY hunk's bracket, at 1:1 content pixels, from
-        the file's start to its end. When the content is taller than
-        the cap, the strip covers a sliding region around the viewport
-        instead (hunks are in file order, so the paint scans only the
-        intersecting part and stops at the region's bottom). This is
-        the ONLY place brackets are ever drawn; the scroll path never
-        comes here -- it only blits the finished strip."""
+        the file's start to its end, nothing scaled, nothing skipped.
+        This is the ONLY place brackets are ever drawn; the scroll
+        path never comes here -- it only copies windows of the
+        finished strip. Beyond the memory cap (STRIP_MAX_BYTES) the
+        strip is not built at all and the column stays a plain
+        background bar (guard for 32-bit builds on monster files; the
+        overview still covers those)."""
         side = 'a' if idx == 0 else 'b'
         content_h = int(round(self._total_rows(side) * line_h))
         if content_h < 1:
             content_h = 1
-        cap = self._strip_height_cap(w)
-        if content_h <= cap:
-            region = (0, content_h)
-        else:
-            # Sliding region: centered on the viewport, clamped to the
-            # content; re-centered only when a later window leaves it.
-            center = win_top + h_ctl / 2.0
-            center = min(max(center, 0.0), float(content_h))
-            top = int(center - cap / 2.0)
-            top = min(max(top, 0), content_h - cap)
-            region = (top, top + cap)
-        strip_h = region[1] - region[0]
         self._free_strip(idx)
-        hb = None
-        for try_h in (strip_h, min(strip_h, STRIP_MIN_PX)):
-            if try_h < 1:
-                continue
-            if try_h != strip_h:
-                # Retry smaller (creation failed): keep the window
-                # inside the shrunk region.
-                top = int(win_top) - try_h // 4
-                top = min(max(top, 0), max(0, content_h - try_h))
-                region = (top, top + try_h)
-                strip_h = try_h
-            try:
-                hb = ct.bitmap_proc(0, ct.BITMAP_CREATE, w, strip_h)
-                break
-            except Exception:
-                hb = None
-        if hb is None:
-            return   # cannot pre-paint; present() shows background
+        if content_h * max(1, w) * 4 > STRIP_MAX_BYTES:
+            return   # beyond the memory cap: background-only column
+        try:
+            hb = ct.bitmap_proc(0, ct.BITMAP_CREATE, w, content_h)
+        except Exception:
+            return   # cannot pre-paint; _show paints background
         try:
             cnv = ct.bitmap_proc(hb, ct.BITMAP_GET_CANVAS)
         except Exception:
@@ -1287,21 +1236,24 @@ class HunkColumns:
             return
         self._h_strip[idx] = hb
         self._h_strip_cnv[idx] = cnv
-        self._strip_wh[idx] = (w, strip_h)
-        self._strip_region[idx] = region
+        self._strip_wh[idx] = (w, content_h)
         self._strip_line_h[idx] = line_h
-        # Background first, then every bracket that meets the region.
+        self._shown[idx] = None    # force the next window copy
+        # Background first, then every bracket in the file.
         ct.canvas_proc(cnv, ct.CANVAS_SET_BRUSH, color=self.color_bg,
                        style=ct.BRUSH_SOLID)
         ct.canvas_proc(cnv, ct.CANVAS_RECT_FILL, x=0, y=0, x2=w,
-                       y2=strip_h)
+                       y2=content_h)
         if not self.hunks:
             return
-        reg_top = region[0]
         bar_x1 = BAR_X
         arm_x2 = w - ARM_PAD - 1
         ct.canvas_proc(cnv, ct.CANVAS_SET_PEN, color=self.color_line,
                        size=1)
+        # Bottom of the previous hunk's footprint on this side, in
+        # visual rows (hunks come in file order): the ownership clamp
+        # below needs it. None before the first hunk.
+        prev_bottom = None
         for hunk in self.hunks:
             a0, a1, b0, b1 = hunk
             # Defensive: a diffmap entry must cover lines on at least
@@ -1317,24 +1269,33 @@ class HunkColumns:
             # gap band, so it keeps a bracket on BOTH columns.
             top_rows = (self._visual_y(side, r0) -
                         self._gap_rows_at(side, r0))
+            # Ownership clamp: a band at r0 may belong to the PREVIOUS
+            # hunk -- its trailing compensating band sits at the same
+            # index as our leading edge, and the previous bracket
+            # already covers it (visual_y(r1_prev) counts it). Our top
+            # must never rise above the previous hunk's bottom on THIS
+            # side, or this column's bracket would swallow the band and
+            # the two columns' brackets would stop being level.
+            if prev_bottom is not None and top_rows < prev_bottom:
+                top_rows = prev_bottom
             bottom_rows = self._visual_y(side, r1)
             if bottom_rows < top_rows:
                 bottom_rows = top_rows
-            top = int(top_rows * line_h) - reg_top
-            bottom = int(bottom_rows * line_h) - reg_top
+            if prev_bottom is None or bottom_rows > prev_bottom:
+                prev_bottom = bottom_rows
+            # Pixel rows: the top arm on the hunk's FIRST pixel row,
+            # the bottom arm on its LAST pixel row (int(bottom*line_h)
+            # is the exclusive end = the next row's first pixel).
+            top = int(top_rows * line_h)
+            bottom = int(bottom_rows * line_h) - 1
             # At 1:1 every real hunk is >= line_h px tall; the 2 px
             # clamp only guards degenerate records.
             if bottom - top < 2:
                 bottom = top + 2
-            # Hunks are in file order, so once a bracket starts below
-            # the region's bottom the rest is below too.
-            if top >= strip_h:
-                break
-            if bottom <= 0:
-                continue
-            # Bounds clip (canvas bounds, NOT a visibility filter).
+            # Bounds clip (canvas bounds, NOT a visibility filter):
+            # pixels outside the bitmap do not exist.
             top = max(0, top)
-            bottom = min(strip_h - 1, bottom)
+            bottom = min(content_h - 1, bottom)
             if bottom - top < 2:
                 # Degenerate sliver: a short vertical dash.
                 ct.canvas_proc(cnv, ct.CANVAS_LINE,
@@ -1348,81 +1309,109 @@ class HunkColumns:
             ct.canvas_proc(cnv, ct.CANVAS_LINE,
                            x=bar_x1, y=bottom, x2=arm_x2, y2=bottom)
 
-    def _update(self, idx, force_rebuild=False):
-        """Bring one column on screen. Rebuilds the strip ONLY when
-        something real changed (fresh data via force_rebuild, a width
-        change, a measured line-height drift -- font/zoom --, or the
-        window leaving a capped strip's sliding region); otherwise it
-        just copies the viewport's window of the pre-painted strip into
-        the column's bitmap: one background fill + ONE blit."""
+    def _show(self, idx):
+        """Bring one column on screen: the viewport's WINDOW of the
+        pre-painted strip, copied with ONE sub-rect blit
+        (CANVAS_COPY_RECT) at the editor's live scroll offset. That is
+        the entire scroll path -- no bracket drawing, no filtering, no
+        convert() calls, no background fill while the window is fully
+        inside the strip. Skips the blit when the same window is
+        already on screen (the mirrored editor's on_scroll echo,
+        horizontal scrolls)."""
         c = self.h_canvases[idx]
         if c is None:
             return
         w, h = self._get_size(idx)
         if w <= 0 or h <= 0:
             return
-        if not self._vis:
+        si = self._scroll_info(self.a_ed if idx == 0 else self.b_ed)
+        if si is None:
             return
-        cal = self._calibrate(idx)
-        if cal is None:
-            return
-        line_h, y0 = cal
-        side = 'a' if idx == 0 else 'b'
-        # Window of content pixels currently visible (client 0..h):
-        # content pixel cp sits at client cp + y0, so the window starts
-        # at -y0.
-        win_top = -y0
-        rebuild = force_rebuild or self._h_strip[idx] is None
-        if not rebuild:
-            if (abs(self._strip_line_h[idx] - line_h) > 0.01 or
-                    self._strip_wh[idx][0] != w):
-                rebuild = True
-        if not rebuild:
-            reg_top, reg_bot = self._strip_region[idx]
-            content_h = self._total_rows(side) * line_h
-            wt = max(0.0, win_top)
-            wb = min(float(content_h), win_top + h)
-            if wt < reg_top - 0.5 or wb > reg_bot + 0.5:
-                rebuild = True
-        if rebuild:
-            self._build_strip(idx, w, line_h, win_top, h)
+        # Row pitch: prefer the editor's live one (it is the same
+        # property read that yields the offset -- no extra cost).
+        line_h = si.get('char_size')
+        if not (isinstance(line_h, (int, float)) and
+                4 <= line_h <= 200):
+            line_h = self._strip_line_h[idx] or 16.0
+        # (Re)build the strip when it is missing (fresh data, the
+        # columns were just attached, or the control had no size at
+        # paint time) or when the editor's row pitch drifted (font /
+        # zoom change) or the width changed.
+        if self._vis:
+            need = self._h_strip[idx] is None
+            if not need:
+                need = (abs(self._strip_line_h[idx] - line_h) > 0.01 or
+                        self._strip_wh[idx][0] != w)
+            if need:
+                self._build_strip(idx, w, line_h)
         # Resize the embedded bitmap to the control size (the image
         # control starts with a 0x0 bitmap; painting without resizing
-        # shows nothing).
+        # shows nothing) and prime it with the background -- this also
+        # covers whatever is below EOF later.
         if self._last_size[idx] != (w, h):
             try:
                 ct.bitmap_proc(self.h_bitmaps[idx], ct.BITMAP_SET_SIZE,
                                w, h)
             except Exception:
                 return
-        # The window copy: bg fill (covers the space below EOF), then
-        # the pre-painted strip at its calibrated offset -- one blit.
-        ct.canvas_proc(c, ct.CANVAS_SET_BRUSH, color=self.color_bg,
-                       style=ct.BRUSH_SOLID)
-        ct.canvas_proc(c, ct.CANVAS_RECT_FILL, x=0, y=0, x2=w, y2=h)
+            ct.canvas_proc(c, ct.CANVAS_SET_BRUSH, color=self.color_bg,
+                           style=ct.BRUSH_SOLID)
+            ct.canvas_proc(c, ct.CANVAS_RECT_FILL, x=0, y=0, x2=w, y2=h)
+            self._last_size[idx] = (w, h)
+            self._shown[idx] = None
+        # The content pixel at the viewport's top edge: ATSynEdit's own
+        # smooth_pos (NPos*line_h + sub-pixel offset + gap pixels
+        # above the top row) -- wrap-, gap- and sub-pixel-exact.
+        try:
+            src_y = int(si.get('smooth_pos') or 0)
+        except (TypeError, ValueError):
+            src_y = 0
+        if src_y < 0:
+            src_y = 0
+        if self._shown[idx] == (src_y, w, h):
+            return          # the same window is already on screen
+        # The window copy: strip rows [src_y, src_y+copy_h) -> the
+        # column's bitmap, ONE sub-rect blit.
+        copy_h = 0
         if self._h_strip[idx] is not None:
-            try:
-                ct.canvas_proc(c, ct.CANVAS_BITMAP,
-                               p1=self._h_strip[idx],
-                               x=0,
-                               y=int(round(y0 + self._strip_region[idx][0])))
-            except Exception:
-                pass
-        self._last_size[idx] = (w, h)
+            strip_h = self._strip_wh[idx][1]
+            avail = strip_h - src_y
+            if avail > 0:
+                copy_h = min(h, avail)
+                try:
+                    ct.canvas_proc(
+                        c, ct.CANVAS_COPY_RECT,
+                        text='0,{},{},{}'.format(src_y, w,
+                                                 src_y + copy_h),
+                        x=0, y=0, x2=w, y2=copy_h,
+                        p1=self._h_strip_cnv[idx])
+                except Exception:
+                    return
+        if copy_h < h:
+            # Below EOF (or no strip at all): the remainder is
+            # background, painted once per new window.
+            ct.canvas_proc(c, ct.CANVAS_SET_BRUSH, color=self.color_bg,
+                           style=ct.BRUSH_SOLID)
+            ct.canvas_proc(c, ct.CANVAS_RECT_FILL, x=0, y=copy_h, x2=w,
+                           y2=h)
+        self._shown[idx] = (src_y, w, h)
 
     def _line_h_changed(self):
-        """True when a measured line height drifted from the strip's
+        """True when an editor's row pitch drifted from its strip's
         (font / zoom change) -- lets the layout guard trigger a strip
-        rebuild without waiting for the next scroll."""
+        rebuild without waiting for the next scroll. One property read
+        per column; no convert() calls."""
         if not self._vis:
             return False
         for idx in (0, 1):
-            if self._h_strip[idx] is None or self._strip_line_h[idx] is None:
+            if self._strip_line_h[idx] is None:
                 continue
-            cal = self._calibrate(idx)
-            if cal is not None and abs(cal[0] -
-                                       self._strip_line_h[idx]) > 0.01:
-                return True
+            si = self._scroll_info(self.a_ed if idx == 0 else self.b_ed)
+            if si is not None:
+                cs = si.get('char_size')
+                if (isinstance(cs, (int, float)) and
+                        abs(cs - self._strip_line_h[idx]) > 0.01):
+                    return True
         return False
 
     def paint(self):
@@ -1430,35 +1419,29 @@ class HunkColumns:
         changes): rebuild the visual index and BOTH strips -- every
         hunk edge, file start to end, at 1:1 pixels -- then show the
         current windows. Scrolling never calls this; it calls
-        present()/track_paint(), which only copy windows."""
+        present(), which only copies windows."""
         if not self.is_created():
             return
         self._build_visual_index()
         for idx in (0, 1):
-            self._update(idx, force_rebuild=True)
+            w, h = self._get_size(idx)
+            if w <= 0 or h <= 0:
+                continue
+            self._build_strip(idx, w, self._line_h_of(idx))
+        self.present()
 
     def present(self):
         """Show the current viewport windows of the pre-painted strips
-        -- the scroll path. One calibrated bitmap copy per column; no
-        bracket drawing, no filtering, no per-hunk work. Rebuilds only
-        when something real changed (line-height drift, or the window
-        left a capped strip's region)."""
-        if not self.is_created() or not self._vis:
+        -- THE SCROLL PATH, called synchronously from on_scroll: the
+        copy lands in the same UI event and display frame in which the
+        editor itself painted the scrolled text. One property read per
+        column plus, only when the position really moved, one sub-rect
+        bitmap copy; no bracket drawing, no filtering, no per-hunk
+        work, no timers, no throttle."""
+        if not self.is_created():
             return
         for idx in (0, 1):
-            self._update(idx)
-
-    def track_paint(self, force=False):
-        """present() throttled by wall clock to ~33 fps
-        (TRACK_INTERVAL) -- the same gate the overview's slider uses on
-        the same scroll path. This is NOT a repaint of the edges: they
-        are already painted, whole file, once; this only re-copies the
-        visible window of that pre-painted picture."""
-        now = time.monotonic()
-        if not force and now - self._track_last < TRACK_INTERVAL:
-            return
-        self._track_last = now
-        self.present()
+            self._show(idx)
 
 
 # ----------------------------------------------------------------------

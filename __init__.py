@@ -1940,11 +1940,16 @@ class Command:
             if session.overview is not None:
                 session.overview.track_paint()
             # Hunk edge columns: the edges are ALREADY painted (whole
-            # file, once, at 1:1 -- see columns.py); scrolling only
-            # re-copies the visible window of the pre-painted strip,
-            # one bitmap blit per column (throttled ~33 fps).
+            # file, once, at 1:1 -- see columns.py); this only copies
+            # the viewport's window of the pre-painted strip -- ONE
+            # sub-rect blit per column, SYNCHRONOUSLY in this very
+            # scroll event (CudaText fires on_scroll right after
+            # painting the scrolled editor), so the columns move in
+            # the same display frame as the text. No timers, no
+            # throttle; a mirrored scroll echo or a horizontal scroll
+            # is skipped inside (same window already on screen).
             if session.columns is not None:
-                session.columns.track_paint()
+                session.columns.present()
             # Trailing repaint 150ms after the last scroll event.
             if not session.overview_timer:
                 session.overview_timer = True
@@ -1952,13 +1957,14 @@ class Command:
                 ct.timer_proc(ct.TIMER_START_ONE, callback, 150)
 
     def _overview_repaint_timer(self, tag='', info=''):
-        """Timer callback that finalizes a tab's scroll-driven updates
-        150ms after the last scroll event (avoids excessive updates
-        during continuous scrolling; also catches the settled position
-        after scroll clamping): repaints the overview (slider) and
-        re-copies the hunk edge columns' pre-painted strip windows to
-        the settled position -- no bracket drawing ever happens here,
-        the strips are already painted (see columns.py)."""
+        """Timer callback that finalizes a tab's OVERVIEW update 150ms
+        after the last scroll event (the overview's slider repaint is
+        throttled, so this catches the settled position after scroll
+        clamping). The hunk edge columns need NOTHING here: their
+        window copy runs synchronously inside every on_scroll event
+        (see on_scroll), so they are always at the settled position
+        already -- no trailing repaint, no bracket drawing, ever
+        (see columns.py)."""
         if not info:
             return
         session = self._sessions.get(info)
@@ -1967,8 +1973,6 @@ class Command:
         session.overview_timer = False
         if session.overview is not None:
             session.overview.paint()
-        if session.columns is not None:
-            session.columns.present()
 
     def _columns_layout_timer(self, tag='', info=''):
         """Recurring per-tab layout guard for the hunk edge columns
@@ -3501,7 +3505,8 @@ class Command:
         # feed the overview gets), then paint ONCE: every hunk edge,
         # file start to end, at 1:1 pixels into the pre-painted strips,
         # and show the current window. Scrolling never repaints the
-        # edges -- it only copies the strip window (see columns.py).
+        # edges -- it only copies the strip window, synchronously in
+        # on_scroll (see columns.py).
         # Gated by the enable option (the columns object is None when
         # disabled -- see refresh_compare). See columns.HunkColumns for
         # the strip geometry.

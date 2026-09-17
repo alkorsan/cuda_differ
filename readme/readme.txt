@@ -309,26 +309,55 @@ Technical notes:
   Recompare (F5). Per-editor width differences like different
   line-number digit counts are compensated too (the equality is of the
   text areas, not the editor panes).
-- The brackets are pixel-aligned with the text rows: their tops and
-  bottoms come from the editor's own line-to-pixel conversion, which
-  accounts for inter-line gaps, word wrap and the current scroll
-  position. On scroll the columns follow live (a throttled immediate
-  repaint plus a final repaint after scrolling stops).
+- The brackets are pixel-aligned with the text rows at 1:1, nothing
+  scaled. PAINTING is "create once, forget": per compare, EVERY hunk
+  edge of the WHOLE file is painted once into a full-height strip
+  bitmap (all hunks, all gap bands, file start to end -- a 10000-line
+  file with 300 gaps gets all of its edges painted in one pass; no
+  viewport filtering, so big one-sided hunks keep their brackets at
+  any scroll position). Scrolling then only copies the viewport's
+  WINDOW of that pre-painted strip into the visible column: one
+  sub-rect bitmap copy (CANVAS_COPY_RECT) per column, executed
+  SYNCHRONOUSLY inside the on_scroll event -- CudaText fires
+  on_scroll immediately after painting the scrolled editor itself,
+  so the columns move in the same display frame as the text. No
+  timers, no throttling, no trailing repaints; a mirrored scroll echo
+  or a horizontal scroll (same window) copies nothing at all.
+- Both the scroll offset and the row pitch come from a single
+  property read (PROP_SCROLL_VERT_INFO): 'smooth_pos' is ATSynEdit's
+  own content pixel of the viewport's top edge (wrap-aware, gap-aware,
+  sub-pixel-aware) and 'char_size' is its row pitch -- the very
+  numbers the editor draws with, so the strip and the text can never
+  disagree about the row grid. No convert() calls are made at all:
+  the caret-to-pixels conversion returns None when the top visible
+  line is partially scrolled out (a negative pixel Y), which used to
+  freeze the columns at stale offsets during smooth scrolling.
+- Monster files are guarded by a memory cap (64 MB per strip, i.e.
+  roughly 100k+ lines at the default width): beyond it a column shows
+  plain background instead of a half-painted picture. There are no
+  sliding regions and no scaling fallbacks -- the strip is always the
+  whole file at 1:1 or nothing. (The overview panel still covers
+  navigation on such files.)
 - "Improve line alignment" (beautify) is fully supported: when the
   beautified pairing pushes a hunk's compensating gap band ABOVE the
   shorter side's first hunk line, the bracket top comes from the other
   side's first line -- so the bracket brackets the band and both
   columns stay level. A previous hunk's trailing band sitting at the
-  same line index is told apart from this hunk's own band (bands are
-  matched by the line ranges they compensate), so it never shifts the
-  bracket. Hunks that end at the end of the file on both sides include
-  their trailing bands too (the plugin records the band pixel sizes
-  the engine asked for and adds them to the EOF bottom edge).
+  same line index is told apart from this hunk's own band by an
+  ownership clamp: a hunk's top never rises above the previous hunk's
+  bottom on the same side, so a neighbouring band never shifts the
+  bracket and the two columns' brackets stay level. Hunks that end at
+  the end of the file on both sides include their trailing bands too
+  (bands recorded at the file-end position are counted in the bottom
+  edge). A font/zoom change is caught by the row-pitch drift and the
+  strip is rebuilt once at the new 1:1 pixels.
 - Ignored differences (suppressed by the ignore options) are not in
   the diff records, so they never get brackets.
-- Only hunks intersecting the visible line range are painted (a
-  background fill plus 3 canvas lines each), so the cost stays small
-  even for huge files with thousands of differences.
+- The one-shot paint costs one background fill plus 3 canvas lines
+  per hunk over the whole file, once per compare; the scroll path
+  costs one property read per column plus (only when the position
+  really moved) one sub-rect bitmap copy -- so even files with
+  thousands of differences scroll at full speed.
 - Colors come from the ACTIVE UI THEME -- the background uses
   EdGutterBg and the bracket lines use EdGutterFont (read from the UI
   theme dict; the columns look like part of the editors' gutters in
@@ -712,8 +741,10 @@ Advanced section:
   are drawn OUTSIDE the editors (the text area and the alignment are
   not touched), use the theme's gutter colors (EdGutterBg /
   EdGutterFont), stay pixel-aligned with the text rows while scrolling
-  (also with word wrap and "Improve line alignment"), and only visible
-  hunks are painted, so the cost stays small on huge files.
+  (also with word wrap and "Improve line alignment"), are painted
+  once for the WHOLE file (no per-scroll drawing at all -- scrolling
+  only copies the visible window of the pre-painted picture), and
+  scroll at full speed even on files with thousands of differences.
   Takes effect on the next Recompare (F5).
   Default: on.
 - differ.advanced.hunk_edges_width: Hunk edge column width in pixels
