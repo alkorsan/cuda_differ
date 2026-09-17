@@ -1843,8 +1843,8 @@ class Command:
         """Live-update the hunk edge columns' theme colors (EdGutterBg /
         EdGutterFont) on theme switches, for every open compare tab --
         without waiting for the next Recompare. Cheap: two dict lookups
-        and one repaint per tab (the repaint is a background fill plus
-        the visible brackets)."""
+        and one one-shot strip repaint per tab (background fill plus
+        every bracket, whole file)."""
         for session in self._sessions.values():
             columns = session.columns
             if columns is None:
@@ -1918,7 +1918,8 @@ class Command:
 
     def on_scroll(self, ed_self):
         """Forward scroll events to ScrollSplittedTab for synchronized
-        scrolling, and keep the overview slider tracking the position.
+        scrolling, keep the overview slider tracking the position, and
+        re-copy the hunk edge columns' pre-painted strip windows.
         Routed to the scrolled tab's OWN session -- one tab's scroll never
         touches another tab's overview or timers.
 
@@ -1938,10 +1939,12 @@ class Command:
             self.scroll.on_scroll(ed_self)
             if session.overview is not None:
                 session.overview.track_paint()
-            # NOTE: the hunk edge columns are NOT touched here. They
-            # paint the whole file once, overview-style (scaled to the
-            # column height), and their picture is scroll-independent
-            # -- scrolling must never repaint them (see columns.py).
+            # Hunk edge columns: the edges are ALREADY painted (whole
+            # file, once, at 1:1 -- see columns.py); scrolling only
+            # re-copies the visible window of the pre-painted strip,
+            # one bitmap blit per column (throttled ~33 fps).
+            if session.columns is not None:
+                session.columns.track_paint()
             # Trailing repaint 150ms after the last scroll event.
             if not session.overview_timer:
                 session.overview_timer = True
@@ -1949,12 +1952,13 @@ class Command:
                 ct.timer_proc(ct.TIMER_START_ONE, callback, 150)
 
     def _overview_repaint_timer(self, tag='', info=''):
-        """Timer callback that repaints the overview for a given tab.
-        Called 150ms after the last scroll event to avoid excessive
-        repaints during continuous scrolling (also catches the settled
-        position after scroll clamping). The hunk edge columns are
-        deliberately NOT repainted here: their overview-style picture
-        is scroll-independent (see columns.py)."""
+        """Timer callback that finalizes a tab's scroll-driven updates
+        150ms after the last scroll event (avoids excessive updates
+        during continuous scrolling; also catches the settled position
+        after scroll clamping): repaints the overview (slider) and
+        re-copies the hunk edge columns' pre-painted strip windows to
+        the settled position -- no bracket drawing ever happens here,
+        the strips are already painted (see columns.py)."""
         if not info:
             return
         session = self._sessions.get(info)
@@ -1963,6 +1967,8 @@ class Command:
         session.overview_timer = False
         if session.overview is not None:
             session.overview.paint()
+        if session.columns is not None:
+            session.columns.present()
 
     def _columns_layout_timer(self, tag='', info=''):
         """Recurring per-tab layout guard for the hunk edge columns
@@ -3492,12 +3498,13 @@ class Command:
         # diffmap is final at this point -- the paint loop has consumed
         # the whole compare generator; the gap bands were already fed
         # DURING the loop by _feed_gap) and the wrap counts (the same
-        # feed the overview gets), then repaint once: the columns draw
-        # the WHOLE file's edges at once, overview-style, permanently --
-        # this is their repaint_static(), not a scroll handler. Gated
-        # by the enable option (the columns object is None when
+        # feed the overview gets), then paint ONCE: every hunk edge,
+        # file start to end, at 1:1 pixels into the pre-painted strips,
+        # and show the current window. Scrolling never repaints the
+        # edges -- it only copies the strip window (see columns.py).
+        # Gated by the enable option (the columns object is None when
         # disabled -- see refresh_compare). See columns.HunkColumns for
-        # the scaled bracket geometry.
+        # the strip geometry.
         if columns is not None:
             Profiler.start('paint:hunk_edges')
             columns.set_data(diff.diffmap, a_ed.get_line_count(),
