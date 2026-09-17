@@ -288,6 +288,27 @@ Technical notes:
   (tab un-split, split switched to horizontal, tab closed); deleting
   the two controls and restoring the split bar's width lets the align
   system give the editors their full widths back on its own.
+- The columns eat editor width ASYMMETRICALLY: the left column takes
+  its pixels from the left editor only, while the split bar's widening
+  is shared fairly by the split-ratio math. At the stock 50% split the
+  two editors' text areas therefore differ by exactly the column width
+  (with the default 12px columns: 902 vs 914 px) -- and with word-wrap
+  on, the same line then wraps at different points in the two halves
+  and the side-by-side pairing breaks. The plugin equalizes the two
+  text-area widths by moving the split position (PROP_SPLIT, so the
+  saved ratio keeps the halves equal through window resizes, plus a
+  pixel-exact editor-2 width): once when the compare tab is created
+  (the side panels are built on the still-EMPTY editors, directly
+  after the split, BEFORE the texts are loaded -- the texts load into
+  their final geometry and the first wrap calculation already sees the
+  final widths), once more right after the texts arrive (the
+  line-number gutters grow with the line counts, which shifts the
+  widths again), and on every later refresh during which the panel
+  layout changed (feature toggled, column width changed, tab
+  re-split). A splitter YOU dragged is intentionally left alone by
+  Recompare (F5). Per-editor width differences like different
+  line-number digit counts are compensated too (the equality is of the
+  text areas, not the editor panes).
 - The brackets are pixel-aligned with the text rows: their tops and
   bottoms come from the editor's own line-to-pixel conversion, which
   accounts for inter-line gaps, word wrap and the current scroll
@@ -308,10 +329,10 @@ Technical notes:
 - Only hunks intersecting the visible line range are painted (a
   background fill plus 3 canvas lines each), so the cost stays small
   even for huge files with thousands of differences.
-- Colors come from the ACTIVE THEME -- the background uses EdGutterBg
-  and the bracket lines use EdGutterFont (read from the theme dicts;
-  the columns look like part of the editors' gutters in every theme).
-  No plugin color option is involved.
+- Colors come from the ACTIVE UI THEME -- the background uses
+  EdGutterBg and the bracket lines use EdGutterFont (read from the UI
+  theme dict; the columns look like part of the editors' gutters in
+  every theme). No plugin color option is involved.
 - The columns are re-drawn on every compare (F5 / auto-refresh) and
   destroyed together with the whole per-tab session when the compare
   tab is closed or the feature is turned off.

@@ -88,6 +88,28 @@ height), and self-destructs the columns when the split tree is gone (tab
 closed, tab un-split, split switched to horizontal -- the side-by-side
 columns are meaningless there).
 
+WIDTH ASYMMETRY AND EQUALIZATION (equalize_split_clients below):
+the columns eat editor width ASYMMETRICALLY. Column A (alLeft in the
+grouping panel) takes its pixels from editor 1 only. The split bar's
+widening is shared FAIRLY: CudaText's SetSplitPos computes editor 2's
+width as ratio*(PanelEditors.Width - Splitter.Width) -- it reads the
+LIVE (widened) split-bar width -- so at the stock 50% ratio each half
+loses half the widening, and the two halves' PANE widths differ by
+exactly column A's width (user-measured with 12px columns: client
+widths 902 vs 914 px). The overview panel docks into the tab FORM and
+shrinks the grouping panel, which the ratio math shares fairly too --
+only column A is unfair. With word-wrap on, unequal client widths make
+the SAME line wrap at different points in the two halves, and the
+side-by-side pairing visibly breaks. equalize_split_clients() moves the
+split position so the two halves' CLIENT (text-area) widths match,
+through the OFFICIAL PROP_SPLIT property (which also updates the saved
+ratio, so window resizes -- which re-apply that ratio -- keep the halves
+equal) plus a pixel-exact editor-2 width fix-up. It must run BEFORE the
+compare paints (no gaps inserted yet); __init__.py calls it right after
+the side panels are (re)configured, and again in set_files after the
+texts arrive (the line-number gutters grow with the line counts, which
+re-breaks equality by a few pixels).
+
 Drawing uses the overview panel's technique -- an 'image' control with an
 embedded bitmap that survives resize/minimize/restore automatically --
 added via the 'p' control prop as a child of panel_ed (column A) or of
@@ -266,6 +288,12 @@ class HunkColumns:
         # Callback string of the recurring layout-guard timer ('' = not
         # armed).
         self._timer_cb = ''
+        # Attachment generation: incremented on every _recreate() (fresh
+        # create AND the rebuild-after-split-tree-change in sync()). The
+        # refresh flow puts it into the tab session's panels_sig, so a
+        # re-split tab (which resets the split position to 50%) gets its
+        # client widths re-equalized even though no option changed.
+        self.generation = 0
         # Colors: background = EdGutterBg, lines = EdGutterFont (from the
         # active theme; set via set_colors()).
         self.color_bg = 0xF0F0F0
@@ -559,6 +587,7 @@ class HunkColumns:
         if not h_form:
             return
         self.h_form = h_form
+        self.generation += 1
         # Drop stale columns of a previous instance/plugin reload first,
         # and any stale split-bar widening left behind (recognized via
         # the split bar's 'tag' marker).
@@ -860,7 +889,11 @@ class HunkColumns:
     def _stop_timer(self):
         if self._timer_cb:
             try:
-                ct.timer_proc(ct.TIMER_STOP, self._timer_cb)
+                # timer_proc's signature is (code, callback, interval,
+                # tag='') -- the interval value is ignored for
+                # TIMER_STOP, but the argument is required (the timer is
+                # matched by its callback string).
+                ct.timer_proc(ct.TIMER_STOP, self._timer_cb, 0)
             except Exception:
                 pass
             self._timer_cb = ''
@@ -882,12 +915,17 @@ class HunkColumns:
         When attached, both columns are resized in place and the split
         bar's widening follows (it grows/shrinks leftward from editor
         2's left edge) -- the align system re-flows editor 1 around the
-        changes by itself; nothing else is touched."""
+        changes by itself; nothing else is touched. A no-op when the
+        width did not change (every refresh calls this; skipping the
+        unchanged case avoids pointless realign churn)."""
         try:
             width = int(width)
         except (TypeError, ValueError):
             width = COLUMNS_WIDTH_DEFAULT
-        self.width = max(6, min(40, width))
+        width = max(6, min(40, width))
+        if width == self.width:
+            return
+        self.width = width
         if self.is_created():
             for idx in (0, 1):
                 bi = self._find_our_control(idx)
@@ -1115,3 +1153,196 @@ class HunkColumns:
             return
         self._track_last_paint = now
         self.paint()
+
+
+# ----------------------------------------------------------------------
+# equal client widths of the two compare halves
+# ----------------------------------------------------------------------
+
+def equalize_split_clients(a_ed, b_ed, min_pane=120):
+    """Equalize the CLIENT (text-area) widths of the two side-by-side
+    halves of a compare tab by moving the split position.
+
+    Why: the hunk edge columns eat editor width asymmetrically -- column
+    A (alLeft in the grouping panel) takes its pixels from editor 1
+    only, while the split bar's widening is shared fairly by the
+    split-ratio math (CudaText's SetSplitPos reads the live, widened
+    Splitter.Width). At the stock 50% ratio the halves' client widths
+    therefore differ by exactly the column width (user-measured with
+    12px columns: 902 vs 914 px). With word-wrap on, unequal client
+    widths make the same line wrap at different points in the two
+    halves, and the side-by-side pairing visibly breaks.
+
+    How: measure both halves' client rects (PROP_RECT_CLIENT) and pane
+    widths (the editor controls' 'w'), compute the shift
+    X = (client_a - client_b) / 2 that equalizes the clients, then
+      1. set PROP_SPLIT to the matching permille ratio -- this ALSO
+         updates the frame's SAVED ratio, so window resizes (which
+         re-apply it) keep the halves equal up to the permille rounding
+         (~1 px); SetSplitPos immediately applies
+         Round(ratio * (panel_w - splitter_w)) to editor 2's width;
+      2. set editor 2's control width directly for a pixel-exact result
+         (the same thing a splitter drag does).
+    Client widths -- not pane widths -- are equalized, so per-editor
+    chrome differences (line-number gutter digit counts, micromap) are
+    compensated too.
+
+    When to call: BEFORE the compare paints (no gaps inserted yet,
+    nothing to destroy) -- refresh_compare calls it right after the
+    side panels are (re)configured, and set_files calls it before the
+    texts are loaded AND once more after (the line-number gutters grow
+    with the line counts when the texts arrive, which re-breaks
+    equality by a few pixels).
+
+    Returns True when the split was moved. Never raises: any missing
+    control/handle just makes it return False (a compare with slightly
+    unequal halves still works -- it is only less pretty).
+    """
+    # --- resolve the split tree (the same resolution rules as
+    # _locate_editors/_find_splitter: handles first, then order/type) ---
+    try:
+        h_form = a_ed.get_prop(ct.PROP_HANDLE_PARENT)
+    except Exception:
+        h_form = 0
+    if not h_form:
+        return False
+    try:
+        count = ct.dlg_proc(h_form, ct.DLG_CTL_COUNT)
+    except Exception:
+        return False
+    if not count:
+        return False
+    try:
+        h_a = a_ed.get_prop(ct.PROP_HANDLE_SELF)
+    except Exception:
+        h_a = None
+    try:
+        h_b = b_ed.get_prop(ct.PROP_HANDLE_SELF)
+    except Exception:
+        h_b = None
+    editors = []   # (index, handle) of the editor-typed controls
+    for i in range(count):
+        try:
+            props = ct.dlg_proc(h_form, ct.DLG_CTL_PROP_GET, index=i)
+        except Exception:
+            continue
+        if not props or props.get('type') != 'editor':
+            continue
+        try:
+            h_ctl = ct.dlg_proc(h_form, ct.DLG_CTL_HANDLE, index=i)
+        except Exception:
+            h_ctl = None
+        editors.append((i, h_ctl))
+    if len(editors) < 2:
+        return False
+    idx_a = idx_b = None
+    if h_a:
+        for i, h_ctl in editors:
+            if h_ctl == h_a:
+                idx_a = i
+                break
+    if h_b:
+        for i, h_ctl in editors:
+            if h_ctl == h_b and i != idx_a:
+                idx_b = i
+                break
+    if idx_a is None or idx_b is None:
+        # Handle matching unavailable: registration order (ed1, ed2).
+        idx_a, idx_b = editors[0][0], editors[1][0]
+    try:
+        ed_a = ct.dlg_proc(h_form, ct.DLG_CTL_PROP_GET, index=idx_a)
+        ed_b = ct.dlg_proc(h_form, ct.DLG_CTL_PROP_GET, index=idx_b)
+    except Exception:
+        return False
+    if not ed_a or not ed_b:
+        return False
+    panel = ed_a.get('p', '')
+    # Only a VERTICAL side-by-side split has width semantics here; an
+    # un-split tab (editor 2 hidden) or a horizontal split must not be
+    # touched (mirrors the guard's self-destruct conditions).
+    if not ed_b.get('vis', True) or ed_b.get('y') != ed_a.get('y'):
+        return False
+    pane_a = ed_a.get('w')
+    pane_b = ed_b.get('w')
+    if not isinstance(pane_a, int) or not isinstance(pane_b, int):
+        return False
+    # The split bar of this split tree (its LIVE, possibly widened
+    # width -- SetSplitPos reads the live value too).
+    spl_w = None
+    for i in range(count):
+        try:
+            props = ct.dlg_proc(h_form, ct.DLG_CTL_PROP_GET, index=i)
+        except Exception:
+            continue
+        if not props:
+            continue
+        if panel and props.get('p', '') != panel:
+            continue
+        name = props.get('name', '')
+        if (props.get('type') == 'splitter' or
+                name.lower().startswith('splitter')):
+            spl_w = props.get('w')
+            break
+    if not isinstance(spl_w, int) or spl_w <= 0:
+        return False
+    # Column A's width (0 when the columns are not attached): the only
+    # width eater that takes from editor 1 alone.
+    col_w = 0
+    try:
+        i = ct.dlg_proc(h_form, ct.DLG_CTL_FIND, _CTL_NAMES[0])
+    except Exception:
+        i = -1
+    if i is not None and i >= 0:
+        try:
+            props = ct.dlg_proc(h_form, ct.DLG_CTL_PROP_GET, index=i)
+            if props and isinstance(props.get('w'), int):
+                col_w = props['w']
+        except Exception:
+            pass
+
+    # --- measure the client (text-area) widths and compute the shift ---
+    try:
+        ra = a_ed.get_prop(ct.PROP_RECT_CLIENT)
+        rb = b_ed.get_prop(ct.PROP_RECT_CLIENT)
+    except Exception:
+        return False
+    if not ra or not rb or len(ra) < 3 or len(rb) < 3:
+        return False
+    try:
+        client_a = int(ra[2]) - int(ra[0])
+        client_b = int(rb[2]) - int(rb[0])
+    except (TypeError, ValueError):
+        return False
+    delta = client_a - client_b
+    if abs(delta) < 2:
+        return False   # equal, or a single pixel -- nothing worth moving
+    shift = delta // 2        # px editor 2 must GAIN (may be negative)
+    new_pane_b = pane_b + shift
+    # SetSplitPos's denominator (panel_w - splitter_w), from the tiling
+    # invariant: panel_w = col_w + pane_a + spl_w + pane_b.
+    denom = col_w + pane_a + pane_b
+    if denom <= 0:
+        return False
+    new_pane_b = max(min_pane, min(denom - min_pane, new_pane_b))
+    if new_pane_b == pane_b:
+        return False          # already at the clamp -- nothing to move
+
+    # --- 1. the durable ratio (also updates the frame's saved one) ---
+    permille = int(round(new_pane_b * 1000.0 / denom))
+    permille = max(1, min(999, permille))
+    moved = False
+    try:
+        a_ed.set_prop(ct.PROP_SPLIT, ('v', permille))
+        moved = True
+    except Exception:
+        pass
+    # --- 2. pixel-exact fix-up: editor 2's width directly (what a
+    # splitter drag sets); the align pass re-glues the split bar to its
+    # left edge and gives editor 1 the remaining space. ---
+    try:
+        ct.dlg_proc(h_form, ct.DLG_CTL_PROP_SET, index=idx_b,
+                    prop={'w': new_pane_b})
+        moved = True
+    except Exception:
+        pass
+    return moved
