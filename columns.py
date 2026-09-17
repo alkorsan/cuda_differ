@@ -116,76 +116,78 @@ added via the 'p' control prop as a child of panel_ed (column A) or of
 the split bar (column B) (CudaText's prop serializer applies 'p' first,
 then the geometry keys, so one PROP_SET call seeds the position while
 the control is still alNone and lets the final 'align' key promote the
-seed into the aligned slot in a single realignment). Painting draws
-EVERYTHING at once: a background fill plus 3 canvas lines per hunk, for
-ALL hunks on every repaint -- no visible-window filter. A one-sided big
-hunk must keep its bracket on BOTH columns even when this column's own
-hunk lines are scrolled out of view.
+seed into the aligned slot in a single realignment).
 
-Vertical alignment is pixel-exact: the top/bottom of every bracket come
-from ed.convert(CONVERT_CARET_TO_PIXELS) queries, which are gap-aware,
-wrap-aware and scroll-aware (they return the same Y the editor itself
-uses to draw that line, relative to the editor control). Each column
-spans the SAME rows as its editor: column A is an edge-aligned child of
-the grouping panel, column B of the split bar, and both the panel and
-the split bar span the editors' full height -- so a Y computed against
-the editor is directly usable as the column's Y.
+Painting works EXACTLY like the overview panel (PaintboxOverview): the
+whole file's hunk edges are drawn AT ONCE into the column bitmap,
+permanently -- scaled to the column's full height -- and scrolling
+never repaints them. There is deliberately NO viewport-dependent
+painting of any kind: a previous revision computed bracket Ys from
+ed.convert(CONVERT_CARET_TO_PIXELS) (scroll-aware, viewport-relative)
+and repainted on every scroll frame; with big one-sided hunks the
+brackets then vanished mid-hunk (a per-side visible-line filter dropped
+hunks whose own-side lines had left the viewport, and scroll-gated
+repaints made edges lag/disappear during fast scrolls). The overview
+panel never had those problems because its picture is scroll-
+independent -- so the columns now use the same model: every bracket is
+always visible, at its permanent scaled position, and only a real data
+or geometry change (fresh compare, wrap counts, column resize, width or
+theme change) triggers a repaint. The 150 ms scroll timer and the 33 fps
+scroll gate are GONE for the columns; only the overview slider still
+tracks scrolling.
 
 Geometry (per diffmap entry [a0, a1, b0, b1], exclusive-end ranges -- the
-same records jump()/copy() navigate):
+same records jump()/copy() navigate). Everything is computed in VISUAL
+ROWS (wrap-aware line rows + gap rows, the same data model the overview
+uses: per-line wrap counts via set_wrap_counts(), compensating gap bands
+via add_gap()), then mapped to pixels with one scale factor:
 
-  top:
-    The hunk's footprint starts at the first line's top -- EXCEPT when the
-    engine put a compensating band ABOVE that side's first hunk line. With
-    'Beautify line alignment' on, _find_best_pairs can leave a hunk's
-    leading lines unpaired, and the shorter side's compensating band then
-    sits directly above the shorter side's first hunk line. The footprint
-    top is then the OTHER side's first hunk line top (the two are the same
-    row: that is exactly what the band compensates). So:
-      - B has OUR compensating band at index b0-1  -> top = y_A(a0)
-      - A has OUR compensating band at index a0-1  -> top = y_B(b0)
-      - otherwise                                  -> top = y_A(a0)
-    ("OUR" = the band compensates lines of THIS hunk on the other side --
-    a previous hunk's trailing band may sit at the very same index and
-    must NOT move our top; bands are matched by their compensated ranges.)
+  scale = column_height / max(total_visual_rows(a), total_visual_rows(b))
 
-  bottom:
-    The footprint ends below the last line and any trailing bands, i.e. at
-    the top of the first line AFTER the hunk (y(k+1) already includes all
-    gap bands sitting after line k):
-      - a1 < line_count_a  -> bottom = y_A(a1)
-      - b1 < line_count_b  -> bottom = y_B(b1)
-      - both at EOF        -> convert() clamps a line_count query to the
-                             bottom of the last line EXCLUDING trailing
-                             gap bands (verified in ATSynEdit's
-                             GenericCaretPosToClientPos: the bAfterEnd
-                             path adds one char height to the last line's
-                             last wrap row but only sums gaps up to index
-                             count-2), so the plugin-recorded comp+align
-                             band pixels at index count-1 are added back:
-                             bottom = max(convert(A, count_a) + bandsA,
-                                          convert(B, count_b) + bandsB)
+  ONE scale for BOTH columns, based on the taller side -- exactly the
+  overview panel's _get_scale() rule: visually-aligned rows must land
+  on the same pixel in both columns (level brackets), which per-side
+  scales would break whenever the files' total visual heights differ.
+
+  Per side, the hunk's footprint in visual rows is
+
+    top    = visual_y(r0) - gap_rows(at r0)
+    bottom = visual_y(r1)
+
+  where r0/r1 are the hunk's line range on THIS side and visual_y(k) =
+  wrap rows of lines 0..k-1 + gap rows recorded at positions <= k.
+  visual_y(r1) automatically includes every compensating band recorded
+  at the hunk's boundary positions (a leading band sits at position r0,
+  a trailing band at position r1), so:
+    - a two-sided hunk spans its own lines plus any bands at its edges;
+    - a ONE-SIDED hunk (e.g. pure insert on B, a0 == a1) still gets a
+      bracket on column A: r0 == r1, and the top extension over the gap
+      rows at r0 makes the bracket cover exactly A's compensating band;
+    - a band shared with the NEIGHBOURING hunk (the previous hunk's
+      trailing band sits at the same index as our leading band) is
+      covered by both brackets -- they simply meet there, which is the
+      honest picture of a shared alignment boundary.
+  Gaps INSIDE the range are included via visual_y(r1) automatically.
 
   By the engine's alignment invariant (every line-count and wrap-count
-  difference is compensated by a band), the [top, bottom] footprint is the
-  SAME on both sides -- both columns draw the same bracket rows for a
-  hunk.
+  difference is compensated by a band), the two sides' footprints are
+  the SAME visual-row interval -- the two columns' brackets are level.
 
-Performance: every repaint draws ALL hunks -- deliberately NO
-visible-line-window filter. A filter on this editor's visible lines
-breaks one-sided big hunks: a hunk whose lines are all (or mostly) on the
-OTHER side has an empty or tiny range on this side, so once those few
-lines left the viewport the bracket vanished from this column, even
-though the hunk was still in view on the other side (its footprint is
-shared by both columns -- that is the engine's alignment invariant).
-Drawing everything costs one linear diffmap scan, 2-3 convert() calls and
-3 canvas lines per hunk; brackets fully outside the canvas are Y-clipped
-away by a cheap rectangle compare. On scroll, paint() is throttled to
-~33 fps by track_paint() (wall-clock gate, the same approach as the
-overview slider) plus a trailing one-shot repaint from the plugin's
-150 ms overview timer. The convert() calls are each O(log n) in the wrap
-table. The 400 ms layout guard reads a handful of control props per
-tick -- negligible.
+  Drawing: a bracket taller than 2 px gets the full shape (top arm,
+  vertical bar, bottom arm); anything smaller collapses to a 2 px dash
+  so even a one-line hunk in a 100k-line file stays visible. Brackets
+  are Y-clipped to the canvas (bounds clipping, not a visibility
+  filter -- pixels outside the bitmap do not exist).
+
+Performance: one paint pass = one background fill + 3 canvas lines (or
+one short dash) per hunk, for ALL hunks, plus an O(lines + gaps log
+gaps) prefix-sum index build per side (line-row prefix sums and sorted
+gap prefix sums, so each hunk's boundaries are two O(log n) queries --
+never a per-line walk per hunk). paint() runs only on compare / wrap
+change / resize / width change / theme change -- never on scroll, so a
+scroll burst costs the columns literally nothing. The 400 ms layout
+guard reads a handful of control props per tick and only calls paint()
+when a column's size really drifted.
 
 Colors come from the active CudaText theme -- background EdGutterBg, line
 EdGutterFont -- so the columns visually read as part of the editors'
@@ -196,7 +198,7 @@ request.
 See: https://github.com/Alexey-T/CudaText/issues/6477
 """
 
-import time
+import bisect
 
 import cudatext as ct
 
@@ -206,13 +208,6 @@ import cudatext as ct
 # enough to cost less horizontal space than a scrollbar. Configurable via
 # differ.advanced.hunk_edges_width (clamped 6..40).
 COLUMNS_WIDTH_DEFAULT = 12
-
-# Wall-clock interval (seconds) between immediate repaints while a scroll
-# burst is running -- the same gate the overview slider uses
-# (OVERVIEW_TRACK_INTERVAL). ~33 fps looks instant, and paint() here is
-# one background fill + 3 lines per hunk, for ALL hunks (no
-# visible-window filter -- see the module docstring's Performance note).
-TRACK_INTERVAL = 0.030
 
 # Interval (milliseconds) of the per-tab recurring layout-guard timer.
 # The align system keeps both columns in their slots through splitter
@@ -311,29 +306,27 @@ class HunkColumns:
         # repaints when a column's control size drifted from it (window
         # resize changes the columns' height).
         self._last_size = [None, None]
-        # --- Hunk data, refreshed once per compare via set_data() ---
+        # --- Hunk data, refreshed once per compare (the same data model
+        # the overview panel uses; see the module docstring) ---
         # diffmap entries [a0, a1, b0, b1] (exclusive ends), in file order.
         self.hunks = []
         # Line counts of both editors at compare time.
         self.line_count_a = 0
         self.line_count_b = 0
-        # Compensating bands per side: {index: [(other_start, other_end)]}
-        # -- which other-side line range the band compensates. Used to
-        # decide whether a band sitting at a hunk's top-edge index belongs
-        # to THIS hunk (staggered beautify band -> the bracket top must
-        # move up to the other side's first line) or to the PREVIOUS
-        # hunk (trailing band -> the bracket top stays put).
-        self.comp_bands_a = {}
-        self.comp_bands_b = {}
-        # Compensating + wrap-align band pixel sizes per side:
-        # {index: px}. Used ONLY for the both-sides-at-EOF bottom edge,
-        # where convert() cannot see the trailing bands (see module
-        # docstring).
-        self.eof_bands_a = {}
-        self.eof_bands_b = {}
-        # Wall-clock timestamp of the last track_paint(); gates immediate
-        # repaints to TRACK_INTERVAL.
-        self._track_last_paint = 0.0
+        # Per-line visual row counts (word wrap), or None when wrapping
+        # is off (each line = 1 row). Fed via set_wrap_counts() right
+        # after the compare, together with the overview's feed.
+        self.wrap_counts_a = None
+        self.wrap_counts_b = None
+        # Compensating gap bands per side, as (after_line, gap_rows)
+        # tuples in event order -- the same records the overview gets
+        # via its add_gap(). Fed during the compare's paint loop.
+        self.gaps_a = []
+        self.gaps_b = []
+        # Per-side visual index built by _build_visual_index() at paint
+        # time: side -> (line_row_prefix, gap_lines_sorted, gap_row_prefix)
+        # -- see _visual_y().
+        self._vis = {}
 
     # ------------------------------------------------------------------
     # control-tree resolution (indices are NOT identities -- everything is
@@ -760,11 +753,11 @@ class HunkColumns:
         self._teardown()
         self.a_ed = None
         self.b_ed = None
-        self.hunks = []
-        self.comp_bands_a = {}
-        self.comp_bands_b = {}
-        self.eof_bands_a = {}
-        self.eof_bands_b = {}
+        self.clear_data()
+        self.wrap_counts_a = None
+        self.wrap_counts_b = None
+        self.line_count_a = 0
+        self.line_count_b = 0
 
     # ------------------------------------------------------------------
     # layout guard: the align system keeps every slot (column A at the
@@ -955,9 +948,7 @@ class HunkColumns:
                         pass
             self.paint()
 
-    def set_data(self, hunks, line_count_a, line_count_b,
-                 comp_bands_a=None, comp_bands_b=None,
-                 eof_bands_a=None, eof_bands_b=None):
+    def set_data(self, hunks, line_count_a, line_count_b):
         """Store the fresh compare's hunk records for painting.
 
         Args:
@@ -965,25 +956,56 @@ class HunkColumns:
                 in file order. Ignored (suppressed) differences are not
                 in the diffmap and never get brackets.
             line_count_a/b: line counts of the two editors.
-            comp_bands_a/b: {index: [(other_start, other_end), ...]} --
-                compensating bands per side, with the other-side line
-                range each band compensates (see the module docstring's
-                top-edge rule). A band recorded at index i is drawn by
-                the engine between lines i and i+1.
-            eof_bands_a/b: {index: px} -- pixel sizes of compensating +
-                wrap-align bands per side; only the entries at index
-                count-1 are used (the both-sides-at-EOF bottom edge).
         """
         self.hunks = list(hunks or [])
         self.line_count_a = line_count_a
         self.line_count_b = line_count_b
-        self.comp_bands_a = comp_bands_a or {}
-        self.comp_bands_b = comp_bands_b or {}
-        self.eof_bands_a = eof_bands_a or {}
-        self.eof_bands_b = eof_bands_b or {}
+
+    def set_wrap_counts(self, wrap_a, wrap_b):
+        """Set per-line visual row counts for wrap-aware scaling -- the
+        exact same feed the overview panel gets (and at the same point
+        in the refresh flow, right after the compare).
+
+        Args:
+            wrap_a: list where wrap_a[i] = visual rows for line i in
+                    a_ed, or None if wrapping is off (each line = 1 row).
+            wrap_b: same for b_ed.
+        """
+        self.wrap_counts_a = wrap_a
+        self.wrap_counts_b = wrap_b
+
+    def add_gap(self, side, after_line, gap_rows, ignored=False):
+        """Record a compensating gap band, in VISUAL ROWS -- the same
+        records the overview panel gets via its add_gap(), fed from the
+        same paint-loop events (see _feed_gap in __init__.py). `ignored`
+        is accepted for signature parity but unused: the columns draw
+        hunk brackets only, never gap fills.
+
+        Args:
+            side: 'a' or 'b'
+            after_line: the gap sits between lines after_line-1 and
+                after_line (it appears BEFORE line after_line in visual
+                order).
+            gap_rows: number of visual rows the gap occupies.
+        """
+        if side == 'a':
+            self.gaps_a.append((after_line, gap_rows))
+        else:
+            self.gaps_b.append((after_line, gap_rows))
+
+    def clear_data(self):
+        """Clear the collected hunk/gap data. Called before a fresh
+        compare (from _setup_side_panels, next to the overview's
+        clear_data()) so a repaint during the compare can never mix the
+        old compare's hunks with the new compare's gaps."""
+        self.hunks = []
+        self.gaps_a = []
+        self.gaps_b = []
+        self._vis = {}
 
     # ------------------------------------------------------------------
-    # painting
+    # painting -- the overview panel's model: ALL hunks at once, scaled
+    # to the column height, PERMANENT (never repainted on scroll)
     # ------------------------------------------------------------------
 
     def _get_size(self, idx):
@@ -1000,88 +1022,94 @@ class HunkColumns:
             return 0, 0
         return props.get('w', self.width), props.get('h', 600)
 
-    def _y_of(self, ed, line):
-        """Pixel Y of a line's top edge, relative to the editor control
-        (gap/wrap/scroll aware), via CONVERT_CARET_TO_PIXELS. For
-        line == line_count (one past the last line) ATSynEdit returns the
-        BOTTOM of the last line's last wrap row, excluding trailing gap
-        bands. Returns None when the conversion is unavailable."""
-        try:
-            pt = ed.convert(ct.CONVERT_CARET_TO_PIXELS, 0, line)
-            if pt:
-                return pt[1]
-        except Exception:
-            pass
-        return None
+    def _build_visual_index(self):
+        """Build the per-side visual-row index used by painting:
 
-    def _band_is_ours(self, bands, index, r0, r1):
-        """Does a compensating band recorded at `index` belong to the
-        hunk whose OTHER-side range is [r0, r1)? True when the band's
-        compensated other-side range overlaps [r0, r1) -- a previous
-        hunk's trailing band sits at the same index but compensates the
-        PREVIOUS hunk's lines, so it does not overlap and is not ours."""
-        for other_start, other_end in bands.get(index, ()):
-            if other_start < r1 and other_end > r0:
-                return True
-        return False
+            side -> (line_rows, gap_lines, gap_rows)
 
-    def _bracket(self, h):
-        """Compute the [top, bottom] pixel rows of one hunk's footprint
-        (see the module docstring for the rules). Returns (top, bottom)
-        or None when a needed conversion failed."""
-        a0, a1, b0, b1 = h
-        # --- top ---
-        if self._band_is_ours(self.comp_bands_b, b0 - 1, a0, a1):
-            # B's compensating band sits directly above B's first hunk
-            # line and belongs to THIS hunk (beautify-staggered leading
-            # lines on A): the footprint starts at A's first hunk line.
-            top = self._y_of(self.a_ed, a0)
-        elif self._band_is_ours(self.comp_bands_a, a0 - 1, b0, b1):
-            # Mirror case: A's band above A's first hunk line.
-            top = self._y_of(self.b_ed, b0)
-        else:
-            # No staggered band above either first line: both first
-            # lines sit on the same row (the engine's alignment
-            # invariant), so either query works.
-            top = self._y_of(self.a_ed, a0)
-        # --- bottom ---
-        if a1 < self.line_count_a:
-            bottom = self._y_of(self.a_ed, a1)
-        elif b1 < self.line_count_b:
-            bottom = self._y_of(self.b_ed, b1)
-        else:
-            # Both sides end at EOF: convert() clamps to the bottom of
-            # the last line EXCLUDING trailing bands, so add the recorded
-            # comp+align band pixels back, per side, and take the lower
-            # edge of the two (they are the same row by the alignment
-            # invariant; max() is just belt-and-braces).
-            ya = self._y_of(self.a_ed, self.line_count_a)
-            if ya is not None:
-                ya += self.eof_bands_a.get(self.line_count_a - 1, 0)
-            yb = self._y_of(self.b_ed, self.line_count_b)
-            if yb is not None:
-                yb += self.eof_bands_b.get(self.line_count_b - 1, 0)
-            vals = [v for v in (ya, yb) if v is not None]
-            bottom = max(vals) if vals else None
-        if top is None or bottom is None:
-            return None
-        # A footprint is at least one line tall; guard against a
-        # degenerate 0-height bracket (should not happen, but a flat
-        # bracket would be invisible).
-        if bottom <= top:
-            bottom = top + 1
-        return top, bottom
+        line_rows[k]  = visual rows of lines 0..k-1 (wrap-aware prefix
+                        sum; len = line_count + 1)
+        gap_lines     = sorted list of the gaps' after_line positions
+        gap_rows[k]   = prefix sum of gap rows over gap_lines[:k]
+
+        With these, visual_y(line) = line_rows[line] +
+        gap_rows[bisect(gap_lines, line)] is an O(log n) query -- never
+        a per-line walk -- and total_rows = line_rows[-1] + gap_rows[-1].
+        Mirrors the overview's _line_to_visual_y() /
+        _compute_visual_height() math, just precomputed for hunk-size
+        query traffic instead of a single linear paint walk.
+        """
+        self._vis = {}
+        for side, line_count, wrap, gaps in (
+                ('a', self.line_count_a, self.wrap_counts_a, self.gaps_a),
+                ('b', self.line_count_b, self.wrap_counts_b, self.gaps_b)):
+            line_rows = [0] * (line_count + 1)
+            total = 0
+            for i in range(line_count):
+                # Same defensive clamps as the overview's
+                # _line_visual_rows(): missing/short wrap lists count
+                # one row per line, absurd values are clamped to >= 1.
+                if wrap is not None and 0 <= i < len(wrap):
+                    vr = wrap[i]
+                    if not isinstance(vr, int) or vr < 1:
+                        vr = 1
+                else:
+                    vr = 1
+                total += vr
+                line_rows[i + 1] = total
+            sg = sorted(gaps)
+            gap_lines = [g[0] for g in sg]
+            gap_rows = [0] * (len(sg) + 1)
+            for k, g in enumerate(sg):
+                gap_rows[k + 1] = gap_rows[k] + max(0, g[1])
+            self._vis[side] = (line_rows, gap_lines, gap_rows)
+
+    def _visual_y(self, side, line):
+        """Visual-row Y of a line's top: wrap rows of all lines above it
+        plus all gap rows recorded at positions <= line (a gap recorded
+        at position k sits between lines k-1 and k, so it is above line
+        k and below line k-1)."""
+        line_rows, gap_lines, gap_rows = self._vis[side]
+        if line < 0:
+            line = 0
+        elif line > len(line_rows) - 1:
+            line = len(line_rows) - 1
+        # Gaps with after_line <= line: bisect_right over sorted list.
+        k = bisect.bisect_right(gap_lines, line)
+        return line_rows[line] + gap_rows[k]
+
+    def _gap_rows_at(self, side, after_line):
+        """Total gap rows recorded at exactly one position (the hunk's
+        leading-band extension: gaps at position r0 sit directly above
+        the hunk's first line and belong to its footprint)."""
+        _, gap_lines, gap_rows = self._vis[side]
+        lo = bisect.bisect_left(gap_lines, after_line)
+        hi = bisect.bisect_right(gap_lines, after_line)
+        return gap_rows[hi] - gap_rows[lo]
+
+    def _total_rows(self, side):
+        """Total visual rows on one side (lines + gaps)."""
+        line_rows, _, gap_rows = self._vis[side]
+        return max(1, line_rows[-1] + gap_rows[-1])
+
+    def _shared_scale(self, h):
+        """Pixels per visual row -- ONE scale for BOTH columns, based on
+        the taller side, exactly like the overview panel's _get_scale():
+        visually-aligned rows in the editors must land on the same pixel
+        in both columns (level brackets), which per-side scales would
+        break whenever the two files' total visual heights differ."""
+        return (float(h) /
+                max(self._total_rows('a'), self._total_rows('b')))
 
     def _paint_column(self, idx):
-        """Paint one column: background fill plus a bracket per hunk, for
-        ALL hunks at once -- there is deliberately NO visible-line-window
-        filter. Filtering by this editor's visible lines broke one-sided
-        big hunks: a hunk whose lines are all (or mostly) on the OTHER
-        side has an empty or tiny range on this side, so once this side's
-        few lines left the viewport the whole bracket vanished from this
-        column, even though the hunk was still in view on the other side.
-        Brackets fully outside the canvas are Y-clipped (a cheap rectangle
-        compare), so off-screen hunks only cost their convert() calls."""
+        """Paint one column the way the overview panel paints its
+        static bitmap: EVERY hunk's bracket at once, scaled to the
+        column's full height, permanently. There is deliberately NO
+        viewport-dependent painting -- no convert() calls, no scroll
+        tracking, no visible-window filter (see the module docstring
+        for why that model was abandoned: big one-sided hunks lost
+        their edges mid-scroll). Only canvas-bounds clipping remains
+        (pixels outside the bitmap do not exist)."""
         c = self.h_canvases[idx]
         if c is None:
             return
@@ -1102,6 +1130,8 @@ class HunkColumns:
         ct.canvas_proc(c, ct.CANVAS_RECT_FILL, x=0, y=0, x2=w, y2=h)
         if not self.hunks:
             return
+        side = 'a' if idx == 0 else 'b'
+        scale = self._shared_scale(h)
         # The bracket's vertical bar / arms.
         bar_x1 = BAR_X
         arm_x2 = w - ARM_PAD - 1
@@ -1112,17 +1142,38 @@ class HunkColumns:
             # side; skip malformed all-empty records.
             if a0 >= a1 and b0 >= b1:
                 continue
-            br = self._bracket(hunk)
-            if br is None:
-                continue
-            top, bottom = br
-            # Pure Y clip against the column canvas (canvas bounds, NOT a
-            # visibility filter): fully off-canvas brackets are skipped,
-            # partially off-canvas brackets draw their on-canvas part.
+            # This column's own line range for the hunk.
+            r0, r1 = (a0, a1) if idx == 0 else (b0, b1)
+            # Footprint in visual rows: own lines + bands at the hunk's
+            # boundary positions (leading band via the top extension,
+            # trailing/interior bands via visual_y(r1)). A one-sided
+            # hunk (r0 == r1) degenerates to exactly its compensating
+            # gap band, so it keeps a bracket on BOTH columns.
+            top_rows = (self._visual_y(side, r0) -
+                        self._gap_rows_at(side, r0))
+            bottom_rows = self._visual_y(side, r1)
+            if bottom_rows < top_rows:
+                bottom_rows = top_rows
+            top = int(top_rows * scale)
+            bottom = int(bottom_rows * scale)
+            # A bracket is at least 2 px tall -- a one-line hunk in a
+            # huge file must stay visible as a small dash.
+            if bottom - top < 2:
+                bottom = top + 2
+            # Pure Y clip against the column canvas (canvas bounds, NOT
+            # a visibility filter): fully off-canvas brackets are
+            # skipped, partially off-canvas brackets draw their
+            # on-canvas part.
             if bottom <= 0 or top >= h:
                 continue
             top = max(0, top)
             bottom = min(h - 1, bottom)
+            if bottom - top < 2:
+                # Tiny bracket: just a short vertical dash (arms would
+                # smear into a blob at this size).
+                ct.canvas_proc(c, ct.CANVAS_LINE,
+                               x=bar_x1, y=top, x2=bar_x1, y2=bottom)
+                continue
             # The bracket: top arm, vertical bar, bottom arm.
             ct.canvas_proc(c, ct.CANVAS_LINE,
                            x=bar_x1, y=top, x2=arm_x2, y2=top)
@@ -1132,23 +1183,16 @@ class HunkColumns:
                            x=bar_x1, y=bottom, x2=arm_x2, y2=bottom)
 
     def paint(self):
-        """Repaint both columns with the current data."""
+        """Repaint both columns with the current data. This is the
+        overview's repaint_static(), not a scroll handler: it runs on
+        compare / wrap-count / size / width / theme changes only --
+        scrolling NEVER calls it (the picture is scroll-independent,
+        which is the whole point of the model)."""
         if not self.is_created():
             return
+        self._build_visual_index()
         self._paint_column(0)
         self._paint_column(1)
-
-    def track_paint(self):
-        """Immediate repaint for scroll bursts, wall-clock throttled to
-        ~33 fps (the same approach as the overview's slider: a wall-clock
-        gate, never a timer, because a scroll/drag floods the message
-        queue and starves WM_TIMER). The plugin's one-shot 150 ms timer
-        does the final full repaint after scrolling stops."""
-        now = time.perf_counter()
-        if now - self._track_last_paint < TRACK_INTERVAL:
-            return
-        self._track_last_paint = now
-        self.paint()
 
 
 # ----------------------------------------------------------------------
