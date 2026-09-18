@@ -30,14 +30,7 @@ synced back to the original files automatically.
   tab shows, and the hunk/jump/keyboard commands always act on the
   focused tab's own records.
 - Provides synchronized scrolling so both sides stay aligned as you
-  navigate. The mirror runs inside the scroll event itself, skips
-  redundant writes and never re-enters, and repaints the mirrored half
-  SYNCHRONOUSLY (Ed.Repaint) inside that same event -- so the two halves
-  move in the same display frame no matter which half initiated the
-  scroll: left scrollbar, right scrollbar, mouse wheel over either half,
-  or the overview slider. Scrolling from the overview panel writes both
-  halves and paints them back-to-back inside the one mouse-event
-  callback, so they move atomically.
+  navigate.
 - Supports word-wrap: you can turn wrap on in a compare tab and the two
   sides stay visually aligned even when corresponding lines wrap to
   different heights. Toggling wrap mode on one half turns it on in BOTH
@@ -46,22 +39,13 @@ synced back to the original files automatically.
   for the new wrap mode.
 - Optional gap-aware overview panel docked to the right of the compare
   view, showing a miniature of both editors side-by-side with colored
-  diff highlights (WinMerge-style). Its slider behaves like a normal
-  scrollbar: drag it and the thumb tracks the mouse live (~33 fps,
-  wall-clock throttled so the CPU cost stays negligible); click the
-  track and the view jumps to that position.
+  diff highlights (WinMerge-style).
 - Jump to next/previous difference always lands the caret (and moves
   the focus) on the side that HAS text: one-sided differences (added
   or deleted lines, shown as a gap on the other side) put the caret on
   the changed lines, never on the empty gap side, so the copy commands
   keep working right after a jump -- from the changed lines or from
   the line next to a gap.
-- Adds two narrow "hunk edge" columns, one at the left edge of each
-  editor of the compare view, each drawing a bracket around every
-  difference block -- text lines AND compensating gap band -- so you
-  always see exactly which lines a hunk covers (and which lines
-  Alt+Left/Alt+Right will move), like the rule lines Beyond Compare
-  draws around its difference blocks. See "Hunk edge columns" below.
 
 The compare engine implements all the best-known diff algorithms, with a
 lot of improvements on top of each: two native ones running in compiled
@@ -209,8 +193,7 @@ shown as a colored inter-line GAP on the other side. A gap is pure
 visual space painted between two lines -- it is not a line, so nothing
 is ever inserted into your text to keep the sides aligned, and the
 caret cannot be placed inside a gap: CudaText editors do not model
-carets in the space between lines (that would need changes in the
-ATSynEdit editor control itself, which a plugin cannot ship).
+carets in the space between lines.
 
 Because of that:
 - Jump to next/previous difference lands the caret, and moves the
@@ -225,150 +208,11 @@ Because of that:
   past its end), so a copy from the middle of a block never jumps to
   the block start.
 
-To add a line where a gap is (WinMerge lets you type inside its gaps):
+To add a line where a gap is:
 put the caret on the line above or below the gap, press Enter and type
 -- the new line takes the gap's place as soon as the compare is re-run
 (F5, or automatically with differ.advanced.enable_auto_refresh on),
 and the remaining gap shrinks by one line.
-
-
-== Hunk edge columns ==
-
-Two narrow columns are added at the left and right edges of the
-compare view, and every difference block (hunk) gets a bracket drawn
-in each column:
-
-    +----
-    |
-    +----
-
-The bracket spans the hunk's full visual extent -- the text lines AND
-the compensating gap band the engine inserts inside the hunk. This
-answers "where does this hunk start and end?" the way Beyond Compare
-does with the rule lines in its center column: before you move a block
-with Alt+Left/Alt+Right you can see exactly which rows will be moved,
-even inside a large changed block where the margin markers alone are
-hard to follow. A one-sided difference (added or deleted lines, shown
-as a colored gap on the other side) gets its bracket around the gap
-band too, so the extent is visible on both sides.
-
-Technical notes:
-- One column sits at the LEFT edge of each editor: the left column
-  before the left editor's gutter, the right column directly right of
-  the split bar, before the right editor's gutter. The left column is
-  an Align=alLeft child control of the grouping panel that parents the
-  two editors (it takes the panel's left-edge strip and the left
-  editor, which is Align=alClient, shrinks around it automatically).
-  The right column is an Align=alRight child of the SPLIT BAR itself,
-  which the plugin widens by the column width for the purpose: the
-  split bar keeps its right edge glued to the right editor's left edge
-  and grows leftward, and the column docks at its right edge -- the
-  same strip a standalone column would occupy, but without ever
-  entering the panel's align chain. That matters because the LCL
-  splitter picks the control it resizes geometrically (the aligned
-  sibling right next to the split bar -- normally the right editor):
-  a column docked between the split bar and the right editor would
-  STEAL that spot, and dragging the split bar would then resize the
-  column instead of the editor. The editors are never modified: no
-  coordinates are set on them, so nothing can cover the columns and
-  there is nothing to restore when they are removed (the split bar's
-  original width is restored on removal, and remembered in the split
-  bar's own tag so a plugin reload cannot double-widen it). The text
-  area is not touched at all -- unlike the earlier implementation
-  (thin colored inter-line gaps inside the editors), nothing is added
-  to the editors' heights, so the side-by-side alignment and the
-  synchronized scrolling cannot be affected.
-- Because the right column rides INSIDE the split bar, splitter drags
-  and window resizes carry it along automatically -- the split bar is
-  re-glued to the right editor's left edge and the column is already
-  in place; the drag keeps working exactly like an unmodified CudaText
-  split. A background layout guard (a light per-tab timer) only
-  re-applies a split-bar width that was reset behind its back, repaints
-  after size changes, and removes the columns when the split is gone
-  (tab un-split, split switched to horizontal, tab closed); deleting
-  the two controls and restoring the split bar's width lets the align
-  system give the editors their full widths back on its own.
-- The columns eat editor width ASYMMETRICALLY: the left column takes
-  its pixels from the left editor only, while the split bar's widening
-  is shared fairly by the split-ratio math. At the stock 50% split the
-  two editors' text areas therefore differ by exactly the column width
-  (with the default 12px columns: 902 vs 914 px) -- and with word-wrap
-  on, the same line then wraps at different points in the two halves
-  and the side-by-side pairing breaks. The plugin equalizes the two
-  text-area widths by moving the split position (PROP_SPLIT, so the
-  saved ratio keeps the halves equal through window resizes, plus a
-  pixel-exact editor-2 width): once when the compare tab is created
-  (the side panels are built on the still-EMPTY editors, directly
-  after the split, BEFORE the texts are loaded -- the texts load into
-  their final geometry and the first wrap calculation already sees the
-  final widths), once more right after the texts arrive (the
-  line-number gutters grow with the line counts, which shifts the
-  widths again), and on every later refresh during which the panel
-  layout changed (feature toggled, column width changed, tab
-  re-split). A splitter YOU dragged is intentionally left alone by
-  Recompare (F5). Per-editor width differences like different
-  line-number digit counts are compensated too (the equality is of the
-  text areas, not the editor panes).
-- The brackets are pixel-aligned with the text rows at 1:1, nothing
-  scaled. PAINTING is "create once, forget": per compare, EVERY hunk
-  edge of the WHOLE file is painted once into a full-height strip
-  bitmap (all hunks, all gap bands, file start to end -- a 10000-line
-  file with 300 gaps gets all of its edges painted in one pass; no
-  viewport filtering, so big one-sided hunks keep their brackets at
-  any scroll position). Scrolling then only copies the viewport's
-  WINDOW of that pre-painted strip into the visible column: one
-  sub-rect bitmap copy (CANVAS_COPY_RECT) per column, executed
-  SYNCHRONOUSLY inside the on_scroll event -- CudaText fires
-  on_scroll immediately after painting the scrolled editor itself,
-  so the columns move in the same display frame as the text. No
-  timers, no throttling, no trailing repaints; a mirrored scroll echo
-  or a horizontal scroll (same window) copies nothing at all.
-- Both the scroll offset and the row pitch come from a single
-  property read (PROP_SCROLL_VERT_INFO): 'smooth_pos' is ATSynEdit's
-  own content pixel of the viewport's top edge (wrap-aware, gap-aware,
-  sub-pixel-aware) and 'char_size' is its row pitch -- the very
-  numbers the editor draws with, so the strip and the text can never
-  disagree about the row grid. No convert() calls are made at all:
-  the caret-to-pixels conversion returns None when the top visible
-  line is partially scrolled out (a negative pixel Y), which used to
-  freeze the columns at stale offsets during smooth scrolling.
-- Monster files are guarded by a memory cap (64 MB per strip, i.e.
-  roughly 100k+ lines at the default width): beyond it a column shows
-  plain background instead of a half-painted picture. There are no
-  sliding regions and no scaling fallbacks -- the strip is always the
-  whole file at 1:1 or nothing. (The overview panel still covers
-  navigation on such files.)
-- "Improve line alignment" (beautify) is fully supported: when the
-  beautified pairing pushes a hunk's compensating gap band ABOVE the
-  shorter side's first hunk line, the bracket top comes from the other
-  side's first line -- so the bracket brackets the band and both
-  columns stay level. A previous hunk's trailing band sitting at the
-  same line index is told apart from this hunk's own band by an
-  ownership clamp: a hunk's top never rises above the previous hunk's
-  bottom on the same side, so a neighbouring band never shifts the
-  bracket and the two columns' brackets stay level. Hunks that end at
-  the end of the file on both sides include their trailing bands too
-  (bands recorded at the file-end position are counted in the bottom
-  edge). A font/zoom change is caught by the row-pitch drift and the
-  strip is rebuilt once at the new 1:1 pixels.
-- Ignored differences (suppressed by the ignore options) are not in
-  the diff records, so they never get brackets.
-- The one-shot paint costs one background fill plus 3 canvas lines
-  per hunk over the whole file, once per compare; the scroll path
-  costs one property read per column plus (only when the position
-  really moved) one sub-rect bitmap copy -- so even files with
-  thousands of differences scroll at full speed.
-- Colors come from the ACTIVE UI THEME -- the background uses
-  EdGutterBg and the bracket lines use EdGutterFont (read from the UI
-  theme dict; the columns look like part of the editors' gutters in
-  every theme). No plugin color option is involved.
-- The columns are re-drawn on every compare (F5 / auto-refresh) and
-  destroyed together with the whole per-tab session when the compare
-  tab is closed or the feature is turned off.
-- Turn the feature off with differ.advanced.enable_hunk_edges; the
-  column width is differ.advanced.hunk_edges_width (each editor gives
-  up that many pixels to its column). Changes take effect on the next
-  Recompare (F5).
 
 
 == Tab context menu ==
@@ -587,8 +431,6 @@ Theme section:
     * custom -- use the six color options below; every option left
       empty is filled from the auto-detected preset, so a
       half-configured custom theme never falls back to nothing.
-      (The hunk edge columns do not use these options -- their colors
-      come from the active theme's EdGutterBg/EdGutterFont.)
   In the grey and black presets the ignored-difference colors resolve to
   the live editor background, so ignored regions blend into the active
   theme. The six color options below only apply in the "custom" mode.
@@ -731,26 +573,6 @@ Advanced section:
   you stop editing for 1-2 seconds. When disabled, you must use the
   Recompare command manually.
   Default: off.
-- differ.advanced.enable_hunk_edges: Hunk edge columns
-  When enabled, two narrow columns are added at the left and right
-  edges of the compare view, each drawing a bracket around every
-  difference block -- the text lines AND the compensating gap band
-  inside the hunk -- so you always see exactly what Alt+Left/
-  Alt+Right will move, like the rule lines Beyond Compare draws around
-  its difference blocks (see "Hunk edge columns" above). The columns
-  are drawn OUTSIDE the editors (the text area and the alignment are
-  not touched), use the theme's gutter colors (EdGutterBg /
-  EdGutterFont), stay pixel-aligned with the text rows while scrolling
-  (also with word wrap and "Improve line alignment"), are painted
-  once for the WHOLE file (no per-scroll drawing at all -- scrolling
-  only copies the visible window of the pre-painted picture), and
-  scroll at full speed even on files with thousands of differences.
-  Takes effect on the next Recompare (F5).
-  Default: on.
-- differ.advanced.hunk_edges_width: Hunk edge column width in pixels
-  Width of one hunk edge column, in pixels. The columns are
-  intentionally narrow -- a vertical bar plus short top/bottom arms.
-  Range: 6-40. Default: 12.
 - differ.advanced.diff_context: Context lines in unified diff
   Number of unchanged context lines shown around each change in the
   unified diff output (produced by the "Diff current document with..."
@@ -853,31 +675,6 @@ CudaText micromap (default: off). They can be enabled independently and
 used at the same time. The overview is the recommended default because
 it stays gap-aware; the micromap is faster and cheap but does not account
 for inter-line gaps.
-
-The overview panel's slider works like a normal scrollbar:
-- Drag the slider: the thumb follows the mouse live while you drag. The
-  repaints are throttled by wall clock to ~33 fps, so the thumb always
-  tracks the mouse yet the CPU cost stays negligible (each repaint is
-  one cached-bitmap copy plus the slider drawing; the expensive diff
-  rectangles are cached in a separate bitmap and never redrawn on
-  scroll). This cannot be done with a timer: during a drag the message
-  queue is flooded with mouse moves and Windows only delivers WM_TIMER
-  when the queue drains, so a timer-debounced slider would stay frozen
-  until the drag stops.
-- Click the track: the view jumps so the clicked position becomes the
-  center of the viewport, and the slider lands there immediately.
-- Scroll the editors (wheel, native scrollbars, keyboard): the slider
-  follows the scrolling live (same ~33 fps throttle), with a final
-  repaint shortly after scrolling stops.
-- Scrolling from the overview panel itself keeps the two editor halves
-  in the same display frame: both halves' positions are written first,
-  then both are repainted SYNCHRONOUSLY (Ed.Repaint via EDACTION_UPDATE)
-  inside the same mouse-event callback, so they paint back-to-back and
-  land on screen atomically -- no "one half scrolls a few ms before the
-  other" effect, even in the middle of a drag when the message queue is
-  flooded with mouse moves. The same synchronous repaint is used when
-  mirroring a wheel/scrollbar scroll of one half to the other, so the
-  sync is frame-accurate in BOTH directions.
 
 
 == Notes ==

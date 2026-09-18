@@ -12,8 +12,6 @@ import cudax_lib as ctx
 
 from . import differ_native as dfn
 from . import differ_python as dfp
-from .columns import (COLUMNS_WIDTH_DEFAULT, HunkColumns,
-                      equalize_split_clients)
 from .overview import PaintboxOverview
 from .profiling import Profiler, enable_profiling, profiling_report, reset_profiling
 from .utils import split_lines_safe, ScrollSplittedTab
@@ -226,39 +224,6 @@ def _ed_text_bg():
         return ui.get('EdTextBg', {}).get('color')
     except Exception:
         return None
-
-
-def _ed_gutter_colors():
-    """Live gutter colors (background, font) for the hunk edge columns,
-    from the active CudaText theme.
-
-    The EdGutter* keys are UI-theme keys (TAppThemeColor -- the
-    .cuda-theme-ui files); PROC_THEME_UI_DICT_GET is the definitive
-    and only source queried: it returns
-    {'EdGutterBg': {'color': int}, 'EdGutterFont': {'color': int}, ...}.
-    (PROC_THEME_SYNTAX_DICT_GET is deliberately NOT consulted: it only
-    serves lexer styles -- TAppThemeStyle has no Ed* entries.)
-
-    Fallbacks when the dict has no key (custom/minimal themes):
-    background = the live editor text background, then the classic
-    gutter grey #F0F0F0; font = a neutral grey that reads on both.
-    Colors are BGR ints, ready for canvas_proc."""
-    bg = None
-    font = None
-    try:
-        ui = ct.app_proc(ct.PROC_THEME_UI_DICT_GET, '')
-        if ui:
-            bg = (ui.get('EdGutterBg') or {}).get('color')
-            font = (ui.get('EdGutterFont') or {}).get('color')
-    except Exception:
-        pass
-    if bg is None:
-        bg = _ed_text_bg()
-    if bg is None:
-        bg = 0xF0F0F0
-    if font is None:
-        font = 0x808080
-    return bg, font
 
 
 def _color_luminance(color_int):
@@ -699,57 +664,6 @@ OPTS_META = [
      'frm': 'bool',
      'chp': 'advanced',
      },
-    {'opt': 'differ.advanced.enable_hunk_edges',
-     'cmt': _('Hunk edge columns\n'
-              'When enabled, two narrow columns are added at the left '
-              'edge of EACH editor of the compare view -- one next to '
-              'the left editor, one directly right of the splitter, '
-              'next to the right editor -- each drawing a bracket '
-              'around every difference block (hunk):\n'
-              '  +----\n'
-              '  |\n'
-              '  +----\n'
-              'The bracket spans the hunk\'s full visual extent -- the '
-              'text lines AND the compensating gap band inserted inside '
-              'the hunk -- so you always see exactly what Alt+Left/'
-              'Alt+Right will move, like the rule lines Beyond Compare '
-              'draws around its difference blocks. One-sided differences '
-              '(a colored gap on one side) get the bracket around the '
-              'gap too.\n'
-              'The columns are separate controls outside the editors '
-              '(the left column takes a strip at the panel\'s left '
-              'edge, and the split bar between the editors is widened '
-              'by the column width to host the right column -- so the '
-              'text areas are not touched and nothing is added to the '
-              'editors\' heights, and the splitter drag keeps working '
-              'as usual), use the theme\'s gutter colors '
-              '(EdGutterBg / EdGutterFont), stay pixel-aligned with the '
-              'text rows while scrolling (also with word wrap and the '
-              'Beautify line alignment option), and keep their position '
-              'when the window is resized or the splitter is dragged '
-              '(the split bar carries its column along; a background '
-              'layout guard repaints and cleans up). Only visible '
-              'hunks are painted, so the cost stays small on huge '
-              'files.\n'
-              'Takes effect on the next Recompare (F5).\n'
-              'Default: on.'),
-     'def': True,
-     'frm': 'bool',
-     'chp': 'advanced',
-     },
-    {'opt': 'differ.advanced.hunk_edges_width',
-     'cmt': _('Hunk edge column width in pixels\n'
-              'Width of one hunk edge column (see "Hunk edge '
-              'columns"), in pixels. The left editor gives up this many '
-              'pixels of width for each of the two columns (its own '
-              'left strip plus the split bar\'s widening). The columns '
-              'are intentionally narrow -- a vertical bar plus short '
-              'top/bottom arms.\n'
-              'Range: 6-40. Default: 12.'),
-     'def': 12,
-     'frm': 'int',
-     'chp': 'advanced',
-     },
     {'opt': 'differ.advanced.diff_context',
      'cmt': _('Context lines in unified diff\n'
               'Number of unchanged context lines shown around each change in '
@@ -1032,7 +946,6 @@ class _CompareJob:
         'a_text', 'b_text',         # native: raw text snapshots
         'lines_a', 'lines_b',       # python: line lists
         'overview',         # PaintboxOverview or None
-        'columns',          # HunkColumns or None
         'micromap_on', 'wrap_on',
         'wrap_counts_a', 'wrap_counts_b',
         'line_h_a', 'line_h_b',
@@ -1059,7 +972,6 @@ class _CompareJob:
         self.lines_a = None
         self.lines_b = None
         self.overview = None
-        self.columns = None
         self.micromap_on = False
         self.wrap_on = False
         self.wrap_counts_a = None
@@ -1108,15 +1020,6 @@ class _TabSession:
                        restart tabs defer creation -- no status spam at
                        startup), created by _session_diff()
       overview         PaintboxOverview docked to this tab, or None
-      columns          HunkColumns (the two hunk edge columns) attached
-                       to this tab's split view, or None
-      panels_sig       signature of the side-panel layout the client
-                       widths were last equalized for -- (hunk edges on,
-                       hunk edge width, overview on, micromap on,
-                       columns attachment generation). A refresh
-                       re-equalizes the split position only when this
-                       changes, so a deliberately dragged splitter
-                       survives F5; None = never equalized
       job              in-flight background _CompareJob, or None
       overview_timer   True while the trailing 150ms overview repaint
                        timer is armed for this tab
@@ -1129,7 +1032,7 @@ class _TabSession:
 
     __slots__ = (
         'tab_id', 'tab_id_str', 'state_key',
-        'diff', 'overview', 'columns', 'panels_sig', 'job',
+        'diff', 'overview', 'job',
         'overview_timer', 'suppress_change',
         'saved', 'dirty',
     )
@@ -1140,8 +1043,6 @@ class _TabSession:
         self.state_key = state_key
         self.diff = None
         self.overview = None
-        self.columns = None
-        self.panels_sig = None
         self.job = None
         self.overview_timer = False
         self.suppress_change = 0
@@ -1625,19 +1526,7 @@ class Command:
 
         Creates a new untitled tab, unlinks the split editors (so each half
         has independent text), splits vertically, then loads each original's
-        content and editor properties into the two halves.
-
-        ORDER MATTERS (widths and wrap): every side panel (micromap, hunk
-        edge columns, overview) eats editor width, so they are created
-        while the editors are still EMPTY, right after the split, and the
-        split position is equalized -- then the texts are loaded into
-        their final geometry and the widths are re-equalized once more
-        (the line-number gutters grow with the line counts, which shifts
-        the client widths again). Loading the texts first and docking
-        the panels afterwards would re-wrap the already-visible lines at
-        per-side DIFFERENT widths (with word-wrap on, the same line then
-        wraps at different points in the two halves and the side-by-side
-        pairing breaks)."""
+        content and editor properties into the two halves."""
         files = [file0, file1]
         # Properties to copy from originals to the compare halves.
         # These affect how text is displayed and interpreted.
@@ -1705,14 +1594,14 @@ class Command:
                             ed.set_prop(prop, val)
                         except Exception:
                             pass  # some props may not be settable on untitled tabs
-
+            
+            # Load each original's content into the two split halves.
+            a_ed.set_text_all(orig_texts[0])
+            b_ed.set_text_all(orig_texts[1])
+            
             # Register the compare tab by its PROP_TAB_ID with the original
             # tab IDs and names, plus the session key for grouping. The
             # _TabSession is the tab's standalone world from here on.
-            # (This happens BEFORE the texts are loaded: the session must
-            # exist for the side panels to be stored on it, and for the
-            # suppress_change counter below to be armed when the two
-            # spurious on_change events of set_text_all arrive.)
             compare_tab_id = ct.ed.get_prop(ct.PROP_TAB_ID)
             try:
                 session_path = ct.app_path(ct.APP_FILE_SESSION) or ''
@@ -1736,28 +1625,6 @@ class Command:
             # green color to red. The counter is decremented in on_change;
             # real user edits after this will work normally.
             session.suppress_change = 2
-
-            # Create the side panels (micromap, hunk edge columns,
-            # overview) NOW -- on the still-EMPTY editors, directly
-            # after the split -- and equalize the two halves' client
-            # widths: the texts then load into the final geometry and
-            # the first compare's wrap counts are taken at the final
-            # widths. (refresh_compare re-checks the signature and
-            # re-equalizes only when a panel option changed.)
-            self.config()
-            self._setup_side_panels(session, a_ed, b_ed)
-            equalize_split_clients(a_ed, b_ed)
-
-            # Load each original's content into the two split halves.
-            a_ed.set_text_all(orig_texts[0])
-            b_ed.set_text_all(orig_texts[1])
-
-            # Re-equalize after the load: the line-number gutters grow
-            # with the line counts (a 100-line side and a 10,000-line
-            # side have different digit counts), which shifts the client
-            # widths by a few pixels. Still safe -- the compare has not
-            # run yet, no gaps/markers exist to destroy.
-            equalize_split_clients(a_ed, b_ed)
 
             # Persistently subscribe to on_start2 so the plugin auto-loads on
             # next startup to restore compare tabs.
@@ -1834,26 +1701,8 @@ class Command:
             # cost on big compares outweighs the benefit (the next refresh,
             # manual or automatic, paints with the new colors).
             self.config()
-            self._refresh_column_colors()
         elif state == ct.APPSTATE_THEME_SYNTAX:
             self.config()
-            self._refresh_column_colors()
-
-    def _refresh_column_colors(self):
-        """Live-update the hunk edge columns' theme colors (EdGutterBg /
-        EdGutterFont) on theme switches, for every open compare tab --
-        without waiting for the next Recompare. Cheap: two dict lookups
-        and one one-shot strip repaint per tab (background fill plus
-        every bracket, whole file)."""
-        for session in self._sessions.values():
-            columns = session.columns
-            if columns is None:
-                continue
-            try:
-                columns.set_colors(*_ed_gutter_colors())
-                columns.paint()
-            except Exception:
-                pass
 
     def on_state_ed(self, ed_self, state):
         """Editor-level state changes (EDSTATE_* constants -- this event,
@@ -1918,8 +1767,7 @@ class Command:
 
     def on_scroll(self, ed_self):
         """Forward scroll events to ScrollSplittedTab for synchronized
-        scrolling, keep the overview slider tracking the position, and
-        re-copy the hunk edge columns' pre-painted strip windows.
+        scrolling, and keep the overview slider tracking the position.
         Routed to the scrolled tab's OWN session -- one tab's scroll never
         touches another tab's overview or timers.
 
@@ -1939,17 +1787,6 @@ class Command:
             self.scroll.on_scroll(ed_self)
             if session.overview is not None:
                 session.overview.track_paint()
-            # Hunk edge columns: the edges are ALREADY painted (whole
-            # file, once, at 1:1 -- see columns.py); this only copies
-            # the viewport's window of the pre-painted strip -- ONE
-            # sub-rect blit per column, SYNCHRONOUSLY in this very
-            # scroll event (CudaText fires on_scroll right after
-            # painting the scrolled editor), so the columns move in
-            # the same display frame as the text. No timers, no
-            # throttle; a mirrored scroll echo or a horizontal scroll
-            # is skipped inside (same window already on screen).
-            if session.columns is not None:
-                session.columns.present()
             # Trailing repaint 150ms after the last scroll event.
             if not session.overview_timer:
                 session.overview_timer = True
@@ -1957,14 +1794,9 @@ class Command:
                 ct.timer_proc(ct.TIMER_START_ONE, callback, 150)
 
     def _overview_repaint_timer(self, tag='', info=''):
-        """Timer callback that finalizes a tab's OVERVIEW update 150ms
-        after the last scroll event (the overview's slider repaint is
-        throttled, so this catches the settled position after scroll
-        clamping). The hunk edge columns need NOTHING here: their
-        window copy runs synchronously inside every on_scroll event
-        (see on_scroll), so they are always at the settled position
-        already -- no trailing repaint, no bracket drawing, ever
-        (see columns.py)."""
+        """Timer callback that repaints the overview for a given tab.
+        Called 150ms after the last scroll event to avoid excessive
+        repaints during continuous scrolling."""
         if not info:
             return
         session = self._sessions.get(info)
@@ -1973,33 +1805,6 @@ class Command:
         session.overview_timer = False
         if session.overview is not None:
             session.overview.paint()
-
-    def _columns_layout_timer(self, tag='', info=''):
-        """Recurring per-tab layout guard for the hunk edge columns
-        (armed by columns.HunkColumns._start_timer, one timer per compare
-        tab). The LCL align system keeps the columns in their slots
-        through window resizes and splitter drags on its own (the right
-        column rides inside the split bar); the guard only re-applies a
-        split-bar width that was reset behind our back, repaints after
-        size changes, and destroys the columns when the split tree is
-        gone. See HunkColumns.check_layout()."""
-        if not info:
-            return
-        session = self._sessions.get(info)
-        if session is None or session.columns is None:
-            # The tab (or its columns) is gone but the timer still
-            # fires -- stop it by its callback string (destroy() normally
-            # does this; this is the leaked-timer safety net). The
-            # interval argument is required by the API signature but
-            # ignored for TIMER_STOP (the timer is matched by callback).
-            ct.timer_proc(ct.TIMER_STOP,
-                          'module=cuda_differ;cmd=_columns_layout_timer;'
-                          'info={};'.format(info), 0)
-            return
-        try:
-            session.columns.check_layout()
-        except Exception:
-            pass
 
     def on_caret(self, ed_self):
         """Mirror caret to opposite editor when sync_caret is enabled."""
@@ -2636,118 +2441,6 @@ class Command:
         # resolved algorithm is applied — avoid a duplicate message here.
         return diff
 
-    def _setup_side_panels(self, session, a_ed, b_ed):
-        """Create / re-point / destroy the compare tab's side panels
-        (micromap, hunk edge columns, overview) according to the config,
-        and return (columns, overview, micromap_on).
-
-        Called from refresh_compare on every re-compare, and from
-        set_files BEFORE the texts are loaded there: every panel eats
-        editor width, and a panel docked after the texts are in would
-        re-wrap the already-loaded lines (with word-wrap on, at
-        DIFFERENT widths per side -- the side-by-side pairing breaks).
-        Creating them on the still-empty editors plus the immediate
-        client-width equalization (see the callers) means the texts
-        load into their final geometry.
-
-        The panels live on the tab's OWN session -- two tabs' panels
-        can never mix.
-        """
-        # The micromap (CudaText's per-editor mini-map) eats client
-        # width INSIDE each editor; it must be on before the widths are
-        # equalized.
-        micromap_on = self.cfg.get('enable_micromap', False)
-        if micromap_on:
-            self._setup_micromap(a_ed, b_ed)
-
-        # Hunk edge columns: two narrow custom-drawn columns, one at the
-        # LEFT edge of each editor. Column A is Align=alLeft in the
-        # grouping panel that parents the two editors; column B is an
-        # Align=alRight child of the split bar, which is widened by the
-        # column width so the column lands at the LEFT edge of editor 2.
-        # Hosting column B inside the split bar keeps it OUT of the
-        # panel's align chain, so the LCL splitter's drag target stays
-        # editor 2 and the splitter drag keeps working. The editors
-        # themselves are never modified. Each column draws a bracket
-        # around every hunk's full visual footprint (text + compensating
-        # gap band) -- see columns.py, which also runs the per-tab
-        # layout guard that re-applies the split-bar widening and
-        # repaints after size changes.
-        columns = session.columns
-        columns_on = self.cfg.get('enable_hunk_edges', True)
-        if columns_on:
-            if columns is None:
-                columns = HunkColumns()
-                columns.create(a_ed, b_ed)
-                session.columns = columns
-            else:
-                # Re-point at the (possibly re-created) editors: sync
-                # rebuilds the column controls when the split tree
-                # changed, and re-checks the layout otherwise.
-                columns.sync(a_ed, b_ed)
-            # Colors come from the ACTIVE THEME (EdGutterBg /
-            # EdGutterFont), so the columns match the editors' gutters
-            # in every theme -- no plugin color option involved.
-            columns.set_colors(*_ed_gutter_colors())
-            columns.set_width(self.cfg.get('hunk_edges_width',
-                                           COLUMNS_WIDTH_DEFAULT))
-            # Clear the previous compare's records (hunks + gap bands),
-            # exactly like the overview's clear_data() below: the paint
-            # loop re-feeds the gaps DURING the compare while the hunk
-            # records only land at the end, so the fresh compare must
-            # start from empty data (columns.py paints the whole file
-            # overview-style from these records).
-            columns.clear_data()
-        elif columns is not None:
-            columns.destroy()
-            session.columns = None
-            columns = None
-
-        # Overview: a custom paintbox added to the right side of the
-        # editor's parent form. It shows a gap-aware mini-map of both
-        # editors side-by-side (unlike the micromap, which doesn't
-        # account for the gaps we insert for alignment).
-        overview = session.overview
-        overview_on = self.cfg.get('enable_overview', True)
-        if overview_on:
-            if overview is None:
-                overview = PaintboxOverview()
-                overview.create(a_ed, b_ed)
-                session.overview = overview
-            else:
-                overview.a_ed = a_ed
-                overview.b_ed = b_ed
-            # Get the editor text background color from the UI theme so
-            # the overview matches the editor (works with both light and
-            # dark themes).
-            try:
-                ui_theme = ct.app_proc(ct.PROC_THEME_UI_DICT_GET, '')
-                color_bg = ui_theme.get('EdTextBg', {}).get('color', 0xFFFFFF)
-            except Exception:
-                color_bg = 0xFFFFFF
-            overview.set_colors(
-                color_bg,
-                self.cfg.get('color_deleted'),
-                self.cfg.get('color_added'),
-                self.cfg.get('color_changed'),
-                self.cfg.get('color_gaps'),
-                self.cfg.get('color_ignored_gap'))
-            # Pass slider opacity options. Config stores opacity as
-            # int 0..100; convert to float 0..1 for
-            # PaintboxOverview.set_slider_options().
-            # See overview.py for the three paint methods dispatched
-            # based on these values (SOLID / CLEAR / BLENDED).
-            overview.set_slider_options(
-                opacity_enabled=self.cfg.get('enable_overview_slider_opacity', True),
-                opacity=self.cfg.get('overview_slider_opacity', 40) / 100.0)
-            overview.clear_data()
-        elif overview is not None:
-            overview.destroy()
-            session.overview = None
-            overview = None
-
-        return columns, overview, micromap_on
-
     def refresh_compare(self, ed=None, show_dialog=None):
         """Unified refresh / re-compare entry point.
 
@@ -2854,39 +2547,56 @@ class Command:
             a_ed = ct.Editor(ed.get_prop(ct.PROP_HANDLE_PRIMARY))
             b_ed = ct.Editor(ed.get_prop(ct.PROP_HANDLE_SECONDARY))
 
-            # Side panels: micromap, hunk edge columns, overview.
-            # Created / re-pointed / destroyed per the config BEFORE the
-            # texts are read and any wrap counts are taken, so the
-            # editors' client widths are FINAL for this compare.
-            columns, overview, micromap_on = \
-                self._setup_side_panels(session, a_ed, b_ed)
-            tab_id_str = str(tab_id)
+            # Set up the micromap on both editors when enabled.
+            micromap_on = self.cfg.get('enable_micromap', False)
+            if micromap_on:
+                self._setup_micromap(a_ed, b_ed)
 
-            # Equal client widths: the panels eat editor width
-            # asymmetrically (column A takes its pixels from editor 1
-            # only), so after any PANEL CHANGE move the split position
-            # until the two halves' client (text-area) widths match --
-            # BEFORE the compare reads wrap counts and paints gaps, so
-            # word-wrap sees the final equal widths (with wrap on,
-            # unequal widths wrap the same line differently in the two
-            # halves and the side-by-side pairing breaks). The signature
-            # (feature flags + width + the columns' attachment
-            # generation, which bumps on a re-split) changes only when
-            # the panel layout really changed -- a user splitter DRAG
-            # does not change it, so an intentionally unequal layout
-            # survives F5. See columns.equalize_split_clients().
-            _panels_sig = (
-                bool(self.cfg.get('enable_hunk_edges', True)),
-                self.cfg.get('hunk_edges_width', COLUMNS_WIDTH_DEFAULT),
-                bool(self.cfg.get('enable_overview', True)),
-                micromap_on,
-                columns.generation if columns is not None else 0,
-            )
-            if session.panels_sig != _panels_sig:
-                Profiler.start('refresh:equalize_widths')
-                equalize_split_clients(a_ed, b_ed)
-                Profiler.stop('refresh:equalize_widths')
-                session.panels_sig = _panels_sig
+            # Create or reuse the paintbox overview for this compare tab
+            # (the tab's OWN session holds it -- two tabs' overviews can
+            # never mix). The overview is a custom paintbox added to the
+            # right side of the editor's parent form. It shows a gap-aware
+            # mini-map of both editors side-by-side (unlike the micromap,
+            # which doesn't account for the gaps we insert for alignment).
+            tab_id_str = str(tab_id)
+            overview = session.overview
+            overview_on = self.cfg.get('enable_overview', True)
+            if overview_on:
+                if overview is None:
+                    overview = PaintboxOverview()
+                    overview.create(a_ed, b_ed)
+                    session.overview = overview
+                else:
+                    overview.a_ed = a_ed
+                    overview.b_ed = b_ed
+                # Get the editor text background color from the UI theme so
+                # the overview matches the editor (works with both light and
+                # dark themes).
+                try:
+                    ui_theme = ct.app_proc(ct.PROC_THEME_UI_DICT_GET, '')
+                    color_bg = ui_theme.get('EdTextBg', {}).get('color', 0xFFFFFF)
+                except Exception:
+                    color_bg = 0xFFFFFF
+                overview.set_colors(
+                    color_bg,
+                    self.cfg.get('color_deleted'),
+                    self.cfg.get('color_added'),
+                    self.cfg.get('color_changed'),
+                    self.cfg.get('color_gaps'),
+                    self.cfg.get('color_ignored_gap'))
+                # Pass slider opacity options. Config stores opacity as
+                # int 0..100; convert to float 0..1 for
+                # PaintboxOverview.set_slider_options().
+                # See overview.py for the three paint methods dispatched
+                # based on these values (SOLID / CLEAR / BLENDED).
+                overview.set_slider_options(
+                    opacity_enabled=self.cfg.get('enable_overview_slider_opacity', True),
+                    opacity=self.cfg.get('overview_slider_opacity', 40) / 100.0)
+                overview.clear_data()
+            elif overview is not None:
+                overview.destroy()
+                session.overview = None
+                overview = None
 
             Profiler.start('refresh:get_text')
             a_text_all = a_ed.get_text_all(ends=True)
@@ -2901,12 +2611,6 @@ class Command:
                 # Clear THIS tab's diff records (the session's Differ --
                 # another tab's diffmap is never touched).
                 self._ensure_correct_differ(session).diffmap = []
-                # Identical sides: no hunks -> no brackets. Wipe the
-                # columns' data and repaint them empty.
-                if columns is not None:
-                    columns.set_data([], a_ed.get_line_count(),
-                                     b_ed.get_line_count())
-                    columns.paint()
                 if show_dialog:
                     t = _('The two sides are identical.')
                     ct.msg_box(t, ct.MB_OK)
@@ -3004,19 +2708,14 @@ class Command:
                 Profiler.start('refresh:wrap_counts')
                 wrap_counts_a = self._get_wrap_counts(a_ed)
                 wrap_counts_b = self._get_wrap_counts(b_ed)
+                __, line_h_a = a_ed.get_prop(ct.PROP_CELL_SIZE)
+                __, line_h_b = b_ed.get_prop(ct.PROP_CELL_SIZE)
                 Profiler.stop('refresh:wrap_counts')
             else:
                 wrap_counts_a = None
                 wrap_counts_b = None
-            # Char-cell heights are ALWAYS needed: wrap-on gap sizing uses
-            # them, and the hunk edge columns' EOF band records (see the
-            # A_GAP/B_GAP handlers) need the pixel height of a non-wrapped
-            # compensating band (set_gap() computes n*cell_h internally,
-            # so the same value is recorded alongside).
-            Profiler.start('refresh:wrap_counts')
-            __, line_h_a = a_ed.get_prop(ct.PROP_CELL_SIZE)
-            __, line_h_b = b_ed.get_prop(ct.PROP_CELL_SIZE)
-            Profiler.stop('refresh:wrap_counts')
+                line_h_a = 0
+                line_h_b = 0
             color_gaps = self.cfg.get('color_gaps')
             # Ignored-difference colors (WinMerge-style suppressed blank
             # lines + their compensating gaps) -- see 'ignored_color' /
@@ -3039,7 +2738,6 @@ class Command:
             job.a_ed = a_ed
             job.b_ed = b_ed
             job.overview = overview
-            job.columns = columns
             job.micromap_on = micromap_on
             job.wrap_on = wrap_on
             job.wrap_counts_a = wrap_counts_a
@@ -3160,7 +2858,6 @@ class Command:
         b_ed = job.b_ed
         micromap_on = job.micromap_on
         overview = job.overview
-        columns = job.columns
         wrap_on = job.wrap_on
         wrap_counts_a = job.wrap_counts_a
         wrap_counts_b = job.wrap_counts_b
@@ -3184,9 +2881,7 @@ class Command:
         # input and a manual repaint).
         #
         # Overview line states and gaps are also collected for the
-        # paintbox overview (gap-aware mini-map) when enabled; the same
-        # gap records (in visual rows) feed the hunk edge columns'
-        # overview-style scaled brackets via _feed_gap() below.
+        # paintbox overview (gap-aware mini-map) when enabled.
         # Micromap line highlights are painted via attr(show_on_map=1)
         # when micromap is enabled.
         pending_bkm_a = []  # list of (line, nkind) for a_ed
@@ -3200,19 +2895,6 @@ class Command:
         # 'ignore numbers' on -- and the user must be told the sides
         # are equal instead of staring at an uncolored compare tab.
         n_diff_events = 0
-
-        def _feed_gap(side, after_line, rows, ignored=False):
-            """Feed one compensating gap band, in VISUAL ROWS, to every
-            consumer: the paintbox overview (for its gap fills) and the
-            hunk edge columns (for their overview-style scaled brackets
-            -- the columns use the same visual-row records to place each
-            hunk's footprint; see columns.py). Defined once here so the
-            10 feed sites below can never drift apart."""
-            if overview is not None:
-                overview.add_gap(side, after_line, rows, ignored)
-            if columns is not None:
-                columns.add_gap(side, after_line, rows, ignored)
-
         Profiler.start('refresh:compare_and_paint')
         # Both differs take their inputs as compare() parameters (no
         # set_seqs() call, no persistent storage on either Differ between
@@ -3303,14 +2985,16 @@ class Command:
                     self._add_raw_gap(a_ed, a_line_after - 1,
                                       total_visual * line_h_a, color_gaps)
                     Profiler.stop('paint:gap')
-                    # Gap appears BEFORE a_line_after (between lines
-                    # a_line_after-1 and a_line_after)
-                    _feed_gap('a', a_line_after, total_visual)
+                    if overview is not None:
+                        # Gap appears BEFORE a_line_after (between lines
+                        # a_line_after-1 and a_line_after)
+                        overview.add_gap('a', a_line_after, total_visual)
                 else:
                     Profiler.start('paint:gap')
                     self.set_gap(a_ed, a_line_after, b_end - b_start)
                     Profiler.stop('paint:gap')
-                    _feed_gap('a', a_line_after, b_end - b_start)
+                    if overview is not None:
+                        overview.add_gap('a', a_line_after, b_end - b_start)
             elif diff_id == df.B_GAP:
                 b_line_after, a_start, a_end = d[1], d[2], d[3]
                 if wrap_on:
@@ -3322,12 +3006,14 @@ class Command:
                     self._add_raw_gap(b_ed, b_line_after - 1,
                                       total_visual * line_h_b, color_gaps)
                     Profiler.stop('paint:gap')
-                    _feed_gap('b', b_line_after, total_visual)
+                    if overview is not None:
+                        overview.add_gap('b', b_line_after, total_visual)
                 else:
                     Profiler.start('paint:gap')
                     self.set_gap(b_ed, b_line_after, a_end - a_start)
                     Profiler.stop('paint:gap')
-                    _feed_gap('b', b_line_after, a_end - a_start)
+                    if overview is not None:
+                        overview.add_gap('b', b_line_after, a_end - a_start)
             elif diff_id == df.A_GAP_IGN:
                 # Compensating gap for a suppressed all-blank hunk
                 # (DIFF_IGN_BLANK_LINES): same geometry as A_GAP but
@@ -3346,14 +3032,17 @@ class Command:
                                       total_visual * line_h_a,
                                       color_ignored_gap, tag=IGN_GAP_TAG)
                     Profiler.stop('paint:gap')
-                    _feed_gap('a', a_line_after, total_visual, ignored=True)
+                    if overview is not None:
+                        overview.add_gap('a', a_line_after, total_visual,
+                                         ignored=True)
                 else:
                     Profiler.start('paint:gap')
                     self.set_gap(a_ed, a_line_after, b_end - b_start,
                                  color=color_ignored_gap, tag=IGN_GAP_TAG)
                     Profiler.stop('paint:gap')
-                    _feed_gap('a', a_line_after, b_end - b_start,
-                              ignored=True)
+                    if overview is not None:
+                        overview.add_gap('a', a_line_after, b_end - b_start,
+                                         ignored=True)
             elif diff_id == df.B_GAP_IGN:
                 b_line_after, a_start, a_end = d[1], d[2], d[3]
                 if wrap_on:
@@ -3366,14 +3055,17 @@ class Command:
                                       total_visual * line_h_b,
                                       color_ignored_gap, tag=IGN_GAP_TAG)
                     Profiler.stop('paint:gap')
-                    _feed_gap('b', b_line_after, total_visual, ignored=True)
+                    if overview is not None:
+                        overview.add_gap('b', b_line_after, total_visual,
+                                         ignored=True)
                 else:
                     Profiler.start('paint:gap')
                     self.set_gap(b_ed, b_line_after, a_end - a_start,
                                  color=color_ignored_gap, tag=IGN_GAP_TAG)
                     Profiler.stop('paint:gap')
-                    _feed_gap('b', b_line_after, a_end - a_start,
-                              ignored=True)
+                    if overview is not None:
+                        overview.add_gap('b', b_line_after, a_end - a_start,
+                                         ignored=True)
             elif diff_id == df.A_LINE_IGN:
                 # Line of a suppressed all-blank hunk: painted with
                 # the ignored color, but NOT a difference — no
@@ -3411,22 +3103,22 @@ class Command:
                     Profiler.start('paint:gap')
                     if va > vb:
                         diff_rows = va - vb
-                        align_px = diff_rows * line_h_b
                         self._add_raw_gap(b_ed, b_line,
-                                          align_px, color_gaps)
-                        # _add_raw_gap inserts AFTER b_line (between
-                        # b_line and b_line+1), so record as
-                        # after_line = b_line + 1 (gap appears
-                        # before line b_line+1 in paint order).
-                        _feed_gap('b', b_line + 1, diff_rows)
+                                          diff_rows * line_h_b, color_gaps)
+                        if overview is not None:
+                            # _add_raw_gap inserts AFTER b_line (between
+                            # b_line and b_line+1), so record as
+                            # after_line = b_line + 1 (gap appears
+                            # before line b_line+1 in paint order).
+                            overview.add_gap('b', b_line + 1, diff_rows)
                     elif vb > va:
                         diff_rows = vb - va
-                        align_px = diff_rows * line_h_a
                         self._add_raw_gap(a_ed, a_line,
-                                          align_px, color_gaps)
-                        # Same: gap is after a_line, so record
-                        # as after_line = a_line + 1.
-                        _feed_gap('a', a_line + 1, diff_rows)
+                                          diff_rows * line_h_a, color_gaps)
+                        if overview is not None:
+                            # Same: gap is after a_line, so record
+                            # as after_line = a_line + 1.
+                            overview.add_gap('a', a_line + 1, diff_rows)
                     Profiler.stop('paint:gap')
             elif diff_id == df.A_SYMBOL_DEL:
                 n_diff_events += 1
@@ -3485,41 +3177,12 @@ class Command:
             # (on_change_slow / on_state_ed wrap sync) stay silent to
             # avoid pestering the user. Clears THIS session's diffmap.
             diff.diffmap = []
-            # No real differences -> no brackets. Wipe the columns'
-            # data and repaint them empty.
-            if columns is not None:
-                columns.set_data([], a_ed.get_line_count(),
-                                 b_ed.get_line_count())
-                columns.paint()
             Profiler.stop('refresh')
             if show_dialog:
                 ct.msg_box(
                     _('No differences found (with current ignore options).'),
                     ct.MB_OK)
             return
-
-        # Hunk edge columns: feed the fresh compare's hunk records (the
-        # diffmap is final at this point -- the paint loop has consumed
-        # the whole compare generator; the gap bands were already fed
-        # DURING the loop by _feed_gap) and the wrap counts (the same
-        # feed the overview gets), then paint ONCE: every hunk edge,
-        # file start to end, at 1:1 pixels into the pre-painted strips,
-        # and show the current window. Scrolling never repaints the
-        # edges -- it only copies the strip window, synchronously in
-        # on_scroll (see columns.py).
-        # Gated by the enable option (the columns object is None when
-        # disabled -- see refresh_compare). See columns.HunkColumns for
-        # the strip geometry.
-        if columns is not None:
-            Profiler.start('paint:hunk_edges')
-            columns.set_data(diff.diffmap, a_ed.get_line_count(),
-                             b_ed.get_line_count())
-            if wrap_on:
-                columns.set_wrap_counts(wrap_counts_a, wrap_counts_b)
-            else:
-                columns.set_wrap_counts(None, None)
-            columns.paint()
-            Profiler.stop('paint:hunk_edges')
 
         # Append all collected bookmarks in sorted order using
         # BOOKMARK2_APPEND (much faster than BOOKMARK2_SET — skips
@@ -3814,8 +3477,7 @@ class Command:
               color=self.cfg.get('color_gaps') if color is None else color
               )
 
-    def _add_raw_gap(self, e, line_index, pixel_size, color, tag=None,
-                     on_top=False):
+    def _add_raw_gap(self, e, line_index, pixel_size, color, tag=None):
         """Add a gap at the given line index with an explicit pixel size.
         `line_index` follows the e.gap() convention: the gap is inserted
         between `line_index` and `line_index+1` (i.e. after `line_index`).
@@ -3823,16 +3485,11 @@ class Command:
         takes an explicit pixel size instead of computing n*line_height,
         which is needed when wrap is on and the gap must match the actual
         number of wrapped visual rows on the opposite side.
-        tag defaults to DIFF_TAG; ignored-difference gaps pass IGN_GAP_TAG.
-        on_top=True asks CudaText to insert the gap BEFORE all gaps
-        already sitting at the same line index (see GAP_ADD's on_top
-        param) instead of after them -- currently unused by callers,
-        kept as a documented passthrough of the GAP_ADD capability."""
+        tag defaults to DIFF_TAG; ignored-difference gaps pass IGN_GAP_TAG."""
         e.gap(ct.GAP_ADD, line_index, 0,
               tag=DIFF_TAG if tag is None else tag,
               size=pixel_size,
-              color=color,
-              on_top=on_top
+              color=color
               )
 
     def _get_wrap_counts(self, ed):
@@ -3900,9 +3557,7 @@ class Command:
         """Set a line decorator (margin symbol) on editor e at row.
         Shows a colored DECOR_CHAR in the left margin to mark changed/added/
         deleted lines."""
-        # API 1.0.485+: "bold" and "italic" params were removed from
-        # decor(); the styles are set via style="b" / "i" instead.
-        e.decor(ct.DECOR_SET, row, DIFF_TAG, text, color, style="b")
+        e.decor(ct.DECOR_SET, row, DIFF_TAG, text, color)
 
     def clear(self, e):
         """Remove all diff markers, gaps, decorators, and bookmarks tagged
@@ -4078,12 +3733,6 @@ class Command:
                 get_opt('advanced.diff_context', 3),
             'enable_profiling':
                 get_opt('advanced.enable_profiling', False),
-            # --- hunk edge columns (bracket columns at both edges) ---
-            'enable_hunk_edges':
-                get_opt('advanced.enable_hunk_edges', True),
-            'hunk_edges_width':
-                max(6, min(40, get_opt('advanced.hunk_edges_width',
-                                       COLUMNS_WIDTH_DEFAULT))),
             # --- micromap ---
             'enable_micromap':
                 get_opt('micromap.enable_micromap', False),
@@ -4759,16 +4408,11 @@ class Command:
         except (ValueError, TypeError):
             pass
 
-        # Destroy the paintbox overview and the hunk edge columns for
-        # this tab.
+        # Destroy the paintbox overview for this tab.
         overview = session.overview
         session.overview = None
         if overview is not None:
             overview.destroy()
-        columns = session.columns
-        session.columns = None
-        if columns is not None:
-            columns.destroy()
 
         # Drop any in-flight background compare for this tab and CANCEL
         # the engine compare: closing the tab means the result will
