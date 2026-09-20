@@ -41,12 +41,24 @@ Architecture:
       x=0..SEP_LINE_WIDTH is a grey vertical separator line spanning the
       FULL panel height (the button boxes included), visually separating
       the overview from the editor / the editor's scrollbar.
-    The ▲/▼ boxes use the theme's ScrollBack color as background and the
-    theme's ScrollArrow color for the arrow glyph, both read via
-    PROC_THEME_UI_DICT_GET. The glyph is centered in its box and the box
-    has no border, like the scrollbar buttons of editors and browsers.
+    The ▲/▼ boxes use the OVERVIEW background color (the theme's
+    EdTextBg) so they blend into the panel, and the theme's ScrollArrow
+    color for the arrow glyph (read via PROC_THEME_UI_DICT_GET). The
+    arrow is a solid triangle drawn with CANVAS_POLYGON (no font glyph:
+    a font's ▲/▼ ink and its line box are slightly larger than the
+    measured text cell, which made the glyph bleed past the button
+    rectangle's edges). It is centered in its box and the box has no
+    border, like the scrollbar buttons of editors and browsers.
     Pressing a button scrolls one line at once, and after a short hold it
     starts auto-repeating (like real scrollbar buttons) until released.
+
+  - THEME-COLORED SLIDER:
+    The slider uses the SAME theme colors the editor's own scrollbars
+    use for their thumb (CudaText's ATScrollbarTheme): fill = ScrollFill,
+    border = ScrollRect, and the 3 grip lines = ScrollRect (native
+    scrollbars draw the thumb decor with the thumb border color too).
+    So the slider automatically plays well with every light or dark
+    theme, instead of one hardcoded grey for all themes.
 
   - WINMERGE-STYLE PAINTING (the "Location Pane" approach):
     With huge files (1M lines, 200k diffs) painting every colored line is
@@ -96,6 +108,24 @@ Architecture:
     auto-repeat would survive the released button (the "mouse is not
     released" bug).
 
+  - SCROLLING LIKE A NATIVE SCROLLBAR (big-file performance):
+    Overview-driven scrolls (slider drag, track jump, ▲/▼ repeat) only
+    write the scroll position via set_prop(PROP_SCROLL_VERT_INFO) and
+    let each editor repaint ITSELF through its native optimized scroll
+    path — the exact same path the editor's own scrollbar uses (blit +
+    paint of the newly exposed lines only). No EDACTION_UPDATE is issued
+    on these paths: ed.action(EDACTION_UPDATE) is a forced SYNCHRONOUS
+    FULL repaint (Invalidate + Update + Repaint on Windows), and a full
+    repaint of a million-line compare view (with its hundreds of
+    thousands of colored diff lines) costs 100+ ms — issuing up to 6-8
+    of them per mouse move made the slider lag 300-500 ms behind the
+    mouse and made the ▲/▼ buttons scroll one line only every 300-500
+    ms. While the overview is driving both halves, __init__.py's
+    on_scroll also skips the ScrollSplittedTab mirror (is_driving_scroll):
+    the mirror would re-write the lagging half and force another full
+    EDACTION_UPDATE repaint of it. Both halves are written back-to-back
+    in the same handler instead, so they still land in the same frame.
+
   See: https://github.com/CudaText-addons/cuda_differ/issues/29
 """
 
@@ -133,10 +163,14 @@ SEP_LINE_COLOR = 0x808080  # grey — visible on both light and dark themes
 # Height of the ▲/▼ scroll button boxes at the top and bottom of the
 # overview panel (like a scrollbar's arrow buttons).
 BUTTON_HEIGHT = 16
-# Font used for the ▲/▼ glyphs (falls back to the platform default when
-# unavailable; a solid triangle is drawn when even that lacks the glyph).
-BUTTON_FONT_NAME = 'Segoe UI'
-BUTTON_FONT_SIZE = 9
+# ▲/▼ arrow geometry: the solid triangle drawn in each button box is
+# (2*ARROW_HALF_WIDTH+1) x (2*ARROW_HALF_HEIGHT+1) px centered in the box
+# (9x7 px in a 16px box, leaving >=3px margin on every side). Drawn with
+# CANVAS_POLYGON -- a fixed geometric shape always fits inside the button
+# rectangle, unlike a font glyph whose ink + line box bleed past the
+# measured text cell (the "arrows drawn outside their rectangle" bug).
+ARROW_HALF_WIDTH = 4
+ARROW_HALF_HEIGHT = 3
 
 # Auto-repeat behaviour of the ▲/▼ buttons, mimicking Windows scrollbar
 # arrow buttons: the first click scrolls one line; if the button is kept
@@ -192,9 +226,11 @@ class PaintboxOverview:
         self.color_changed = 0xAAAAAA  # overridden by set_colors()
         self.color_gap = 0xEEEEEE      # overridden by set_colors()
         self.color_ignored_gap = 0xEEEEEE  # overridden by set_colors()
-        # ▲/▼ button colors (theme ScrollBack / ScrollArrow), refreshed by
-        # set_colors() from PROC_THEME_UI_DICT_GET.
-        self.color_btn_bg = 0xE0E0E0
+        # ▲/▼ button colors: the box background is the OVERVIEW
+        # background (set by set_colors -- the buttons blend into the
+        # panel); the arrow glyph is the theme's ScrollArrow color,
+        # refreshed by set_colors() from PROC_THEME_UI_DICT_GET.
+        self.color_btn_bg = 0xFFFFFF
         self.color_btn_arrow = 0x000000
         # Slider state for drag-to-scroll
         self._slider_top = 0
@@ -208,11 +244,15 @@ class PaintboxOverview:
         # Wall-clock timestamp of the last track_paint(); gates the
         # immediate slider repaints to OVERVIEW_TRACK_INTERVAL.
         self._track_last_paint = 0.0
-        # Wall-clock timestamp of the last synchronous editor repaint
-        # (EDACTION_UPDATE pair) issued from a slider drag — keeps the
-        # heavy full repaints of big-file editors at ~33 fps during the
-        # drag while set_prop keeps the scroll position itself exact.
-        self._editor_update_last = 0.0
+        # True while the overview is DRIVING both editors' scroll
+        # positions itself (slider drag, track jump, ▲/▼ auto-repeat).
+        # __init__.py's on_scroll checks is_driving_scroll() to skip the
+        # ScrollSplittedTab mirror then -- the overview writes both
+        # halves itself, and the mirror's redundant write + synchronous
+        # EDACTION_UPDATE full repaint of the lagging half is exactly the
+        # 300-500ms-per-move cost that made big-file drags feel slow.
+        # (See the module docstring, "SCROLLING LIKE A NATIVE SCROLLBAR".)
+        self._driving = False
         # Re-entrancy guard for the message pump (_repaint_control_now):
         # True while app_proc(PROC_IDLE) dispatches pending messages so
         # a nested pump can never recurse.
@@ -223,17 +263,20 @@ class PaintboxOverview:
         # +1 while ▼ is held. Drives the one-line scroll + auto-repeat.
         self._btn_dir = None
 
-        # Slider fill color (solid fill — one CANVAS_RECT call, no
-        # transparency, no per-row overhead).
+        # Slider fill color (theme ScrollFill -- the same color the
+        # theme's own scrollbars use for the thumb fill). Solid fill —
+        # one CANVAS_RECT call, no transparency, no per-row overhead.
         self._slider_fill = 0xEAEAEA
-        # Border color. Darker than the fill so the border stays clearly
-        # visible against any background (light theme or dark theme).
+        # Border color (theme ScrollRect -- the native scrollbar's thumb
+        # border color). Refreshed by set_colors() from the UI theme.
         self._slider_border = 0x666666
         # Grabber line color (3 horizontal lines in the slider middle).
-        # Lighter than the border (0x999999 vs 0x666666) so the grabber
-        # is visually distinct from the border — the border frames the
-        # slider while the grabber sits inside it as a lighter accent.
-        self._slider_grabber_dark = 0x999999
+        # Native CudaText scrollbars draw the thumb's decor lines with
+        # the thumb BORDER color (ATScrollbarTheme.ColorThumbDecor =
+        # ColorThumbBorder = ScrollRect), so the grip lines follow the
+        # border color too -- they stay visible against the ScrollFill
+        # in every theme by design.
+        self._slider_grabber_dark = 0x666666
         # Grabber geometry: 3 lines, 2px thick, 6px apart (center-to-center).
         # Triple the original 2px spacing; 2x the original 1px thickness.
         self._slider_grabber_thickness = 2
@@ -320,6 +363,8 @@ class PaintboxOverview:
     def destroy(self):
         """Undock and free the overview dialog and static bitmap."""
         self._stop_button_repeat()
+        self._driving = False
+        self._dragging = False
         self._free_static_bitmap()
         if self.h_dlg is not None:
             try:
@@ -372,10 +417,21 @@ class PaintboxOverview:
                    color_gap, color_ignored_gap=None):
         """Set the colors used for painting the overview.
 
-        Also refreshes the ▲/▼ button colors from the current UI theme
-        (ScrollBack for the box background, ScrollArrow for the glyph) —
-        called on every compare start, so a theme switch is picked up by
-        the next compare.
+        Also refreshes the button and slider colors from the current UI
+        theme (PROC_THEME_UI_DICT_GET) — called on every compare start,
+        so a theme switch is picked up by the next compare:
+
+          * ▲/▼ boxes: the OVERVIEW background (color_bg, the theme's
+            EdTextBg) so the buttons blend into the panel; the arrow
+            glyph keeps the theme's ScrollArrow color;
+          * slider: the same colors the theme's own scrollbars use for
+            their thumb (CudaText ATScrollbarTheme) — fill = ScrollFill,
+            border = ScrollRect, grip lines = ScrollRect (the native
+            decor color is the thumb border color too). This replaces
+            the old one-grey-for-all-themes slider, which clashed with
+            most themes.
+
+        Falls back to neutral values if the theme dict cannot be read.
 
         Args:
             color_bg: background color (theme EdTextBg)
@@ -395,16 +451,26 @@ class PaintboxOverview:
         self.color_gap = color_gap
         if color_ignored_gap is not None:
             self.color_ignored_gap = color_ignored_gap
-        # ▲/▼ button colors from the UI theme (same source the editor's
-        # own scrollbars use). Fall back to neutral values if the theme
-        # dict cannot be read.
+        # The ▲/▼ boxes use the overview background so they blend into
+        # the panel (the old ScrollBack box made the buttons stand out
+        # as a colored strip against the map area).
+        self.color_btn_bg = color_bg
+        # Button arrow + slider colors from the UI theme (the same
+        # source the editor's own scrollbars use).
         try:
             ui = ct.app_proc(ct.PROC_THEME_UI_DICT_GET, '')
-            self.color_btn_bg = ui.get('ScrollBack', {}).get('color', 0xE0E0E0)
-            self.color_btn_arrow = ui.get('ScrollArrow', {}).get('color', 0x000000)
+            self.color_btn_arrow = ui.get('ScrollArrow', {}).get(
+                'color', 0x000000)
+            self._slider_fill = ui.get('ScrollFill', {}).get(
+                'color', 0xEAEAEA)
+            self._slider_border = ui.get('ScrollRect', {}).get(
+                'color', 0x666666)
+            self._slider_grabber_dark = self._slider_border
         except Exception:
-            self.color_btn_bg = 0xE0E0E0
             self.color_btn_arrow = 0x000000
+            self._slider_fill = 0xEAEAEA
+            self._slider_border = 0x666666
+            self._slider_grabber_dark = 0x666666
 
     def set_line_counts(self, a_count, b_count):
         """Set the total line counts for both editors (without gaps)."""
@@ -713,10 +779,12 @@ class PaintboxOverview:
         """Paint the ▲/▼ scroll button boxes at the top and bottom of
         the panel.
 
-        Background: the theme's ScrollBack color; the arrow glyph: the
-        theme's ScrollArrow color, centered both vertically and
-        horizontally. No borders on the boxes, like the scrollbar arrow
-        buttons of usual editors and browsers.
+        Background: the OVERVIEW background color (color_bg, set by
+        set_colors from the theme's EdTextBg) so the boxes blend into
+        the panel; the arrow glyph: the theme's ScrollArrow color,
+        centered both vertically and horizontally. No borders on the
+        boxes, like the scrollbar arrow buttons of usual editors and
+        browsers.
         """
         if h <= 2 * BUTTON_HEIGHT:
             return  # degenerate tiny panel: buttons don't fit
@@ -729,38 +797,36 @@ class PaintboxOverview:
         self._paint_arrow(c, 0, h - BUTTON_HEIGHT, w, BUTTON_HEIGHT, up=False)
 
     def _paint_arrow(self, c, bx, by, bw, bh, up):
-        """Draw one ▲/▼ arrow centered in its button box.
+        """Draw one ▲/▼ arrow as a solid triangle centered in its button
+        box.
 
-        Draws the ▲ (up) / ▼ (down) glyph with the theme's ScrollArrow
-        color, centered vertically and horizontally. When the canvas
-        font cannot render the glyph (measured size 0), a solid triangle
-        polygon is drawn instead — same shape, resolution-independent.
+        A canvas POLYGON is used (NOT a font glyph): the font's ▲/▼ ink
+        plus its line box are slightly larger than the measured text
+        cell, so the rendered glyph bled past the button rectangle's
+        edges (a dark smudge below the ▲ box / above the ▼ box). The
+        polygon is a fixed 9x7 px triangle (ARROW_HALF_WIDTH/HEIGHT)
+        centered in the box, so it always fits inside with a >=3px
+        margin — and it is resolution-independent (no font, no DPI, no
+        antialiased text-cell quirks).
+
+        The triangle uses the theme's ScrollArrow color, like the arrows
+        of the editor's native scrollbars.
         """
-        glyph = '▲' if up else '▼'
-        ct.canvas_proc(c, ct.CANVAS_SET_FONT, text=BUTTON_FONT_NAME,
-                       color=self.color_btn_arrow, size=BUTTON_FONT_SIZE)
-        size = ct.canvas_proc(c, ct.CANVAS_GET_TEXT_SIZE, text=glyph)
-        try:
-            tw, th = size
-        except (TypeError, ValueError):
-            tw = th = 0
-        if tw > 0 and th > 0:
-            ct.canvas_proc(c, ct.CANVAS_TEXT, text=glyph,
-                           x=bx + (bw - tw) // 2, y=by + (bh - th) // 2)
+        cx = bx + bw // 2
+        cy = by + bh // 2
+        hw = ARROW_HALF_WIDTH
+        hh = ARROW_HALF_HEIGHT
+        if up:
+            # apex on top, base on the bottom
+            pts = (cx, cy - hh, cx + hw, cy + hh, cx - hw, cy + hh)
         else:
-            # Fallback: solid triangle polygon.
-            cx = bx + bw // 2
-            cy = by + bh // 2
-            r = max(2, min(bw, bh) // 4)
-            if up:
-                pts = (cx, cy - r, cx + r, cy + r, cx - r, cy + r)
-            else:
-                pts = (cx, cy + r, cx + r, cy - r, cx - r, cy - r)
-            ct.canvas_proc(c, ct.CANVAS_SET_PEN,
-                           color=self.color_btn_arrow, size=1)
-            ct.canvas_proc(c, ct.CANVAS_SET_BRUSH,
-                           color=self.color_btn_arrow, style=ct.BRUSH_SOLID)
-            ct.canvas_proc(c, ct.CANVAS_POLYGON, text=pts)
+            # apex on the bottom, base on the top
+            pts = (cx, cy + hh, cx + hw, cy - hh, cx - hw, cy - hh)
+        ct.canvas_proc(c, ct.CANVAS_SET_PEN,
+                       color=self.color_btn_arrow, size=1)
+        ct.canvas_proc(c, ct.CANVAS_SET_BRUSH,
+                       color=self.color_btn_arrow, style=ct.BRUSH_SOLID)
+        ct.canvas_proc(c, ct.CANVAS_POLYGON, text=pts)
 
     def _paint_separator(self, c, w, h):
         """Paint the grey vertical separator line at the very left of
@@ -919,9 +985,12 @@ class PaintboxOverview:
         """Solid-fill slider: opaque fill + border + grabber.
 
         The only slider-paint method: one CANVAS_RECT call draws both
-        the fill (brush) and the border (pen) in one shot, then the
-        grabber lines — minimal work per paint, no transparency, no
-        per-row blending loop, nothing to configure.
+        the fill (brush, theme ScrollFill) and the border (pen, theme
+        ScrollRect) in one shot, then the grabber lines (theme
+        ScrollRect) — minimal work per paint, no transparency, no
+        per-row blending loop, nothing to configure. The colors are the
+        same ones the theme's own scrollbars use for their thumb, so
+        the slider matches every theme.
         """
         ct.canvas_proc(c, ct.CANVAS_SET_PEN, color=self._slider_border, size=1)
         ct.canvas_proc(c, ct.CANVAS_SET_BRUSH, color=self._slider_fill, style=ct.BRUSH_SOLID)
@@ -939,8 +1008,10 @@ class PaintboxOverview:
           - Lines are 6px apart center-to-center (triple the original
             2px spacing), giving a clean modern look with proper
             visual padding from the slider's top/bottom border
-          - Single dark grey color (no white bevel) for a flat modern
-            appearance instead of the old 3D bevelled look
+          - Color = the slider BORDER color (theme ScrollRect) — the same
+            color native CudaText scrollbars use for the thumb's decor
+            lines (ATScrollbarTheme.ColorThumbDecor = ColorThumbBorder);
+            no white bevel, flat modern look
         """
         mid_y = py_top + py_height // 2
         grab_x1 = max(2 + SEP_LINE_WIDTH, w // 4)
@@ -948,8 +1019,8 @@ class PaintboxOverview:
         spacing = self._slider_grabber_spacing  # 6px center-to-center
         thickness = self._slider_grabber_thickness  # 2px per line
 
-        # 3 dark grabber lines, 2px thick, 6px apart (center-to-center).
-        # No white bevel — flat modern look.
+        # 3 grabber lines in the border color (theme ScrollRect),
+        # 2px thick, 6px apart (center-to-center). No white bevel.
         ct.canvas_proc(c, ct.CANVAS_SET_PEN,
                        color=self._slider_grabber_dark, size=thickness)
         ct.canvas_proc(c, ct.CANVAS_LINE,
@@ -1011,10 +1082,14 @@ class PaintboxOverview:
         if self._slider_top <= y <= self._slider_top + self._slider_height:
             # Click inside slider — start drag
             self._dragging = True
+            self._driving = True
             self._drag_offset = y - self._slider_top
         else:
-            # Click outside slider — jump (centered on click)
+            # Click outside slider — jump (centered on click). The
+            # overview drives both halves from here until the button
+            # is released (see is_driving_scroll).
             self._dragging = False
+            self._driving = True
             self._scroll_overview_pixel(y, center=True)
             # Immediate slider update (bypassing the throttle): the
             # thumb must land on the clicked position right away --
@@ -1065,6 +1140,7 @@ class PaintboxOverview:
             self._stop_button_repeat()
             was_dragging = self._dragging
             self._dragging = False
+            self._driving = False
             if was_dragging:
                 self.track_paint(force=True)
                 self._repaint_control_now()
@@ -1104,9 +1180,30 @@ class PaintboxOverview:
         self._stop_button_repeat()
         was_dragging = self._dragging
         self._dragging = False
+        self._driving = False
         if was_dragging:
             self.track_paint(force=True)
             self._repaint_control_now()
+
+    def is_driving_scroll(self):
+        """True while the overview is driving BOTH editors' scroll
+        positions itself (slider drag in progress, track jump pressed,
+        ▲/▼ auto-repeat running).
+
+        __init__.py's on_scroll checks this to SKIP the ScrollSplittedTab
+        mirror while the overview writes both halves back-to-back itself:
+        the mirror would see the half that is written one set_prop behind
+        as "lagging", re-write it, and force a synchronous EDACTION_UPDATE
+        FULL repaint of it. On huge compare files that full repaint costs
+        100+ ms, so with the mirror active every overview-driven mouse
+        move / repeat tick paid it -- the slider lagged 300-500 ms behind
+        the mouse and the ▲/▼ buttons scrolled one line only every
+        300-500 ms. With the mirror skipped, each editor repaints itself
+        through its native optimized scroll path (like when its own
+        scrollbar is used), which is what makes the overview feel
+        instantaneous on any file size.
+        """
+        return self._driving
 
     def _on_mouse_exit(self, id_dlg, id_ctl, data='', info=''):
         """Called when the pointer leaves the overview panel. On
@@ -1118,8 +1215,10 @@ class PaintboxOverview:
         Like _on_mouse_up, this runs even while _pumping is True: a
         stop event must never be swallowed by the pump."""
         self._stop_button_repeat()
-        if self._dragging:
-            self._dragging = False
+        was_dragging = self._dragging
+        self._dragging = False
+        self._driving = False
+        if was_dragging:
             self.track_paint(force=True)
 
     # ------------------------------------------------------------------
@@ -1131,9 +1230,12 @@ class PaintboxOverview:
         arm the initial-delay one-shot timer which starts the repeating
         timer for the auto-scroll (like holding a usual scrollbar's
         arrow button: one line per click, continuous scrolling after a
-        short hold)."""
+        short hold). While the button is held the overview drives both
+        halves (is_driving_scroll) — see _scroll_one_line for why the
+        ScrollSplittedTab mirror must stay out of the way then."""
         self._stop_button_repeat()
         self._btn_dir = direction
+        self._driving = True
         self._scroll_one_line(direction)
         ct.timer_proc(ct.TIMER_START_ONE, self._btn_delay_tick,
                       BUTTON_INITIAL_DELAY_MS)
@@ -1171,7 +1273,16 @@ class PaintboxOverview:
     def _scroll_one_line(self, direction):
         """Scroll both editors one line up (direction -1) or down
         (+1), like a scrollbar's arrow button. One line = the editor's
-        char_size (row height in pixels) of smooth scrolling."""
+        char_size (row height in pixels) of smooth scrolling.
+
+        Only set_prop runs here — each editor then repaints ITSELF
+        through its native optimized one-line scroll path, exactly like
+        when the editor's own scrollbar arrow is clicked. (The old code
+        also issued ed.action(EDACTION_UPDATE) on both halves per tick;
+        that is a forced synchronous FULL repaint, which costs 100+ ms
+        on million-line compare views — the reason the ▲/▼ buttons
+        scrolled one line only every 300-500 ms on big files.)
+        """
         if self.a_ed is None:
             return
         scroll_info = self.a_ed.get_prop(ct.PROP_SCROLL_VERT_INFO)
@@ -1183,12 +1294,8 @@ class PaintboxOverview:
         target = max(0, scroll_info.get('smooth_pos', 0) + direction * char_size)
         for e in (self.a_ed, self.b_ed):
             if e is not None:
-                try:
-                    e.set_prop(ct.PROP_SCROLL_VERT_INFO,
-                               {'smooth_pos': target})
-                    e.action(ct.EDACTION_UPDATE)
-                except Exception:
-                    pass
+                e.set_prop(ct.PROP_SCROLL_VERT_INFO,
+                           {'smooth_pos': target})
         self.track_paint(force=True)
         self._repaint_control_now()
 
@@ -1277,6 +1384,23 @@ class PaintboxOverview:
         which corresponds to half the visible page).
         If center=False (dragging), the position becomes the slider top.
 
+        Both halves are written back-to-back with set_prop and NOTHING
+        else is done here — each editor then repaints ITSELF through
+        its native optimized scroll path (blit + paint of the newly
+        exposed lines), the exact same path used when the editor's own
+        scrollbar is dragged. The old code also forced a synchronous
+        ed.action(EDACTION_UPDATE) pair here (Invalidate + Update +
+        Repaint = a FULL repaint per half); on million-line compare
+        views a full repaint costs 100+ ms, so issuing it on every
+        mouse move made the slider lag 300-500 ms behind the mouse.
+        The halves still land in the same display frame without it:
+        both set_props run back-to-back inside this one handler, so
+        both invalidations are delivered together in the next paint
+        batch (the mouse handlers' _repaint_control_now pump). The
+        on_scroll echoes fire at paint time; while the overview is
+        driving both halves __init__.py also skips the ScrollSplittedTab
+        mirror (see is_driving_scroll), so the cascade dies out.
+
         Args:
             overview_y: pixel Y position in the overview
             center: if True, center the viewport on Y. If False, Y
@@ -1312,52 +1436,10 @@ class PaintboxOverview:
         # Clamp to valid range
         target_smooth_pos = max(0, target_smooth_pos)
 
-        # Scroll both editors via set_prop(PROP_SCROLL_VERT_INFO, {'smooth_pos': ...})
+        # Scroll both editors via set_prop(PROP_SCROLL_VERT_INFO,
+        # {'smooth_pos': ...}) and let them repaint themselves (see the
+        # docstring -- no EDACTION_UPDATE here).
         for e in (self.a_ed, self.b_ed):
             if e is not None:
-                try:
-                    e.set_prop(ct.PROP_SCROLL_VERT_INFO,
-                               {'smooth_pos': target_smooth_pos})
-                except Exception:
-                    pass
-
-        # Paint BOTH halves SYNCHRONOUSLY, inside this one callback.
-        # set_prop alone leaves each half's repaint to its own
-        # invalidation -- subject to anti-flicker timers, to the
-        # paint-order quirks of two sibling controls, and to pending
-        # input messages (a slider drag floods the queue with mouse
-        # moves, and WM_PAINT is delivered only when the queue drains)
-        # -- which can put the halves into different display frames:
-        # one half visibly scrolls a few milliseconds before the other
-        # catches up. ed.action(EDACTION_UPDATE) maps to Ed.Repaint =
-        # Invalidate + LCL Update, so each half paints RIGHT HERE,
-        # back-to-back, before this mouse-move handler returns: both
-        # are on screen in the same frame, atomically. (The older
-        # cmd_RepaintEditor approach was only a forced INVALIDATE --
-        # still asynchronous, still frame-split under a busy queue.)
-        # The synchronous paints fire on_scroll echoes; the positions
-        # already match (both halves were just written), so the
-        # ScrollSplittedTab mirror no-ops and the cascade dies out.
-        # During a drag the repaint pair is wall-clock throttled to
-        # ~33 fps: a full repaint of a big-file editor is expensive,
-        # and the exact positions are re-asserted by every set_prop
-        # anyway, so the editors still land exactly where the mouse
-        # says when the queue drains.
-        if center:
-            # Single click jump: always paint now.
-            for e in (self.a_ed, self.b_ed):
-                if e is not None:
-                    try:
-                        e.action(ct.EDACTION_UPDATE)
-                    except Exception:
-                        pass
-        else:
-            now = time.monotonic()
-            if now - self._editor_update_last >= OVERVIEW_TRACK_INTERVAL:
-                self._editor_update_last = now
-                for e in (self.a_ed, self.b_ed):
-                    if e is not None:
-                        try:
-                            e.action(ct.EDACTION_UPDATE)
-                        except Exception:
-                            pass
+                e.set_prop(ct.PROP_SCROLL_VERT_INFO,
+                           {'smooth_pos': target_smooth_pos})
