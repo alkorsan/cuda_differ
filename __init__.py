@@ -740,28 +740,6 @@ OPTS_META = [
      'frm': 'bool',
      'chp': 'micromap',
      },
-    {'opt': 'differ.micromap.enable_overview_slider_opacity',
-     'cmt': _('Enable overview slider transparency\n'
-              'When enabled, the overview panel\'s slider is rendered with '
-              'simulated alpha blending so the colored diff lines remain '
-              'visible through the slider, like in WinMerge. When disabled, '
-              'the slider uses a fast opaque solid fill.\n'
-              'Only has an effect when differ.micromap.enable_overview is '
-              'on.\n'
-              'Default: on.'),
-     'def': True,
-     'frm': 'bool',
-     'chp': 'micromap',
-     },
-    {'opt': 'differ.micromap.overview_slider_opacity',
-     'cmt': _('Overview slider opacity in percent\n'
-              'Opacity of the overview panel slider.\n'
-              'Only used when enable_overview_slider_opacity is on.\n'
-              'Range: 0-100. Default: 40.'),
-     'def': 40,
-     'frm': 'int',
-     'chp': 'micromap',
-     },
 ]
 
 DIFF_TAB_COUNT = 1
@@ -846,8 +824,6 @@ _OLD_OPT_NAMES = {
     # micromap
     'differ.enable_micromap': 'differ.micromap.enable_micromap',
     'differ.enable_overview': 'differ.micromap.enable_overview',
-    'differ.enable_overview_slider_opacity': 'differ.micromap.enable_overview_slider_opacity',
-    'differ.overview_slider_opacity': 'differ.micromap.overview_slider_opacity',
 }
 
 
@@ -2677,14 +2653,6 @@ class Command:
                     self.cfg.get('color_changed'),
                     self.cfg.get('color_gaps'),
                     self.cfg.get('color_ignored_gap'))
-                # Pass slider opacity options. Config stores opacity as
-                # int 0..100; convert to float 0..1 for
-                # PaintboxOverview.set_slider_options().
-                # See overview.py for the three paint methods dispatched
-                # based on these values (SOLID / CLEAR / BLENDED).
-                overview.set_slider_options(
-                    opacity_enabled=self.cfg.get('enable_overview_slider_opacity', True),
-                    opacity=self.cfg.get('overview_slider_opacity', 40) / 100.0)
                 overview.clear_data()
             elif overview is not None:
                 overview.destroy()
@@ -3827,13 +3795,6 @@ class Command:
                 get_opt('micromap.enable_overview', True),
             'hide_builtin_scrollbars':
                 get_opt('micromap.hide_builtin_scrollbars', True),
-            # Overview slider opacity. Stored as int 0..100, passed
-            # to PaintboxOverview as a float 0..1. See
-            # overview.set_slider_options().
-            'enable_overview_slider_opacity':
-                get_opt('micromap.enable_overview_slider_opacity', True),
-            'overview_slider_opacity':
-                max(0, min(100, get_opt('micromap.overview_slider_opacity', 40))),
         }
 
         new_nkind(NKIND_DELETED, config.get('color_deleted'))
