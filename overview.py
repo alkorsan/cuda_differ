@@ -63,12 +63,14 @@ Architecture:
     ScrollRect == ScrollFill makes the 3 grip lines invisible. So each
     color is then passed through _color_contrast(): minimal ~10% lightness
     steps (hue preserved) until its luminance differs from what it sits
-    on by a safe margin (0.20 for the big fill block, 0.28 for the thin
-    border / grip lines / arrows). This works on black, white and grey
-    theme families alike: an already-contrasting theme color is kept
-    EXACTLY as the theme defines it, a colliding one is nudged just far
-    enough to be clearly visible. Computed once per compare in
-    set_colors() -- zero per-paint overhead.
+    on by a safe margin -- 0.12 for the big fill block on LIGHT
+    backgrounds (keeps the thumb a light grey close to the theme's own
+    ScrollFill, "not too dark on white themes"), 0.20 on dark
+    backgrounds, 0.28 for the thin border / grip lines / arrows. This
+    works on black, white and grey theme families alike: an
+    already-contrasting theme color is kept EXACTLY as the theme defines
+    it, a colliding one is nudged just far enough to be clearly visible.
+    Computed once per compare in set_colors() -- zero per-paint overhead.
 
   - WINMERGE-STYLE PAINTING (the "Location Pane" approach):
     With huge files (1M lines, 200k diffs) painting every colored line is
@@ -102,46 +104,63 @@ Architecture:
     mathematically consistent: when smooth_pos reaches its max
     (smooth_max - smooth_page), py_top lands flush at the track bottom.
 
-  - LIVE SLIDER DRAG:
-    A drag floods the message queue with mouse moves, and WM_PAINT is
-    only delivered when the queue is empty — so although paint() keeps
-    updating the bitmap in memory, the on-screen control appears frozen
-    until the drag stops. To make the thumb track the mouse like a real
-    scrollbar, the mouse handlers pump the message queue once
-    (app_proc(PROC_IDLE)) right after painting, which delivers the
-    pending WM_PAINT synchronously — guarded against re-entrancy by the
-    _pumping flag. The pump also dispatches pending INPUT messages: only
-    mouse MOVES are dropped while pumping (breaking the move→pump→move
-    recursion; the newest position arrives with the next event).
-    Mouse UP / EXIT / DOWN are always processed — a release dispatched
-    during a pump must never be swallowed, or the drag and the ▲/▼
-    auto-repeat would survive the released button (the "mouse is not
-    released" bug).
+  - LIVE SLIDER DRAG (the native-scrollbar pipeline):
+    A native scrollbar never lets the thumb wait for the text: the
+    scrollbar control paints its own thumb at the mouse position
+    immediately, while the editor's text repaints asynchronously at
+    whatever rate it can paint. The overview mirrors that split
+    exactly, with two decoupled streams per RAW mouse move:
 
-    The drag work itself is COALESCED to ~33 apply units per second
-    (OVERVIEW_TRACK_INTERVAL): one unit writes the scroll position to
-    both editors, invalidates them, repaints the slider and pumps the
-    queue. Every unit consumes the NEWEST mouse position — a move that
-    arrives inside a closed throttle window only updates the pending
-    target, and a deferred one-shot timer applies it when the mouse
-    stops, so the thumb always lands exactly under the cursor (see the
-    SCROLLING LIKE A NATIVE SCROLLBAR section for the O(gaps) costs
-    this bounds on million-line compares).
+    1) THUMB: the slider bitmap is repainted at the mouse-derived
+    position (_thumb_preview_y -- the position being DRIVEN to, not the
+    round-tripped editor position) and the message queue is pumped
+    (app_proc(PROC_IDLE)) so its WM_PAINT is delivered right away --
+    but ONLY while the editors are clean. The pump (ProcessMessages)
+    delivers EVERYTHING pending: pumping right after invalidating the
+    editors would deliver both editors' full viewport paints
+    SYNCHRONOUSLY inside the mouse handler -- 100-200 ms per move on
+    million-line compares, the "slider waits to follow the mouse" bug.
+    Pumping while clean delivers only the tiny overview repaint (~1ms).
+    The pump also dispatches pending INPUT messages: mouse MOVES are
+    dropped while pumping (breaking the move→pump→move recursion; the
+    newest position arrives with the next event); UP / EXIT / DOWN are
+    always processed — a release dispatched during a pump must never be
+    swallowed, or the drag and the ▲/▼ auto-repeat would survive the
+    released button (the "mouse is not released" bug).
+
+    2) TEXT: the scroll position is written to both editors
+    (set_prop + the async cmd_RepaintEditor invalidate) at a bounded
+    rate — at most every OVERVIEW_TRACK_INTERVAL AND only after the
+    editors have PAINTED the previous apply (_editors_dirty cleared by
+    note_scroll_painted: TATSynEdit fires on_scroll at the END of every
+    viewport paint, a free completion signal wired in from
+    __init__.py's on_scroll). At most ONE apply is ever pending, and
+    the editors' paints are always delivered by the natural
+    message-loop drain between mouse handlers — never synchronously
+    inside a handler. Identical consecutive writes are skipped, and a
+    deferred one-shot timer applies the pending newest position when
+    the mouse stops (WM_TIMER starvation), so the thumb always lands
+    exactly under the cursor.
+
+    Net effect: the thumb is glued to the mouse at the input rate; the
+    text follows at the editors' paint rate — on huge files that is
+    exactly what the native scrollbar delivers (its paint cost is the
+    floor for everyone), on small files both are instant.
 
   - SCROLLING LIKE A NATIVE SCROLLBAR (big-file performance):
     A native scrollbar thumb drag does, per thumb move:
-    write the scroll position, then InvalidateEx(true) -- the editor is
-    invalidated ASYNCHRONOUSLY and paints its viewport on the next
-    message-queue drain. The overview does exactly the same: every
-    overview-driven scroll (slider drag, track jump, ▲/▼ repeat) writes
-    set_prop(PROP_SCROLL_VERT_INFO) and follows it with
+    write the scroll position, then invalidate (InvalidateEx) — the
+    editor paints its viewport on the next message-queue drain, never
+    synchronously in the scroll handler. The overview does exactly the
+    same: every overview-driven scroll (slider drag, track jump, ▲/▼
+    repeat) writes set_prop(PROP_SCROLL_VERT_INFO) and follows it with
     ed.cmd(cmd_RepaintEditor) (= Ed.Update(false, true, false) =
-    InvalidateEx(true), the identical async invalidate), then the mouse
-    handler's message pump delivers all pending paints (both editors +
-    the overview) in one batch. No EDACTION_UPDATE is ever issued on
-    these paths: that is a forced SYNCHRONOUS full repaint (Invalidate +
-    Update + Repaint on Windows), which costs 100+ ms per call on
-    million-line compare views.
+    InvalidateEx, the identical async invalidate) — and then returns
+    WITHOUT pumping, so the paint lands in the next natural drain.
+    No EDACTION_UPDATE is ever issued on these paths: that is a forced
+    SYNCHRONOUS full repaint (Invalidate + Update + Repaint on
+    Windows), which costs 100+ ms per call on million-line compare
+    views.
 
     Why set_prop alone was not enough (the "text scrolls slowly" bug):
     EditorStringToScrollInfo writes the scroll records and updates
@@ -152,21 +171,19 @@ Architecture:
     cmd_RepaintEditor closes that gap and makes the overview drive the
     editors through the editor's exact native scroll+repaint path.
 
-    The second cost on huge compares is O(gaps): every scroll write and
-    every editor repaint walks the differ's ~10^5 inter-line alignment
-    gaps inside ATSynEdit (GapsSizeForRange / UpdateGapForms). Per RAW
-    mouse event (60-125 moves/s during a fast drag) that multiplies into
-    a seconds-long backlog -- the slider lagging 300-500 ms behind the
-    mouse. So the drag applies at a wall-clock-gated ~33 fps (see
-    OVERVIEW_TRACK_INTERVAL): every 30 ms one apply unit (both halves
-    written + invalidated + slider repainted + queue pumped) consumes the
-    NEWEST mouse position; moves inside a closed window only update the
-    pending target. A deferred one-shot timer applies the pending target
-    when the mouse stops mid-window, so the thumb always lands exactly
-    under the cursor. While the overview is driving both halves,
-    __init__.py's on_scroll also skips the ScrollSplittedTab mirror
-    (is_driving_scroll): the mirror would re-write the lagging half and
-    force a synchronous EDACTION_UPDATE full repaint of it.
+    The ▲/▼ buttons use the same order per repeat tick (thumb preview
+    + cheap pump first, then write + invalidate) but write on EVERY
+    tick like a native arrow button: the editor data advances one line
+    per 50 ms, so each delivered paint shows the accumulated position
+    and the text glides in multi-line steps instead of crawling one
+    line per paint (the old "one line every 100-200 ms" — the tick's
+    own pump ran the paint pair synchronously and delayed the next
+    tick).
+
+    While the overview is driving both halves, __init__.py's on_scroll
+    also skips the ScrollSplittedTab mirror (is_driving_scroll): the
+    mirror would re-write the lagging half and force a synchronous
+    EDACTION_UPDATE full repaint of it.
 
   See: https://github.com/CudaText-addons/cuda_differ/issues/29
 """
@@ -186,44 +203,51 @@ OVERVIEW_WIDTH = 40
 # space. The panel is docked and resizable, so users can drag it wider
 # if they want more detail.
 
-# Wall-clock interval (seconds) between immediate slider repaints while
-# tracking the mouse (slider drag) or a scroll burst. ~33 fps looks
-# instant to the eye, and paint() is cheap here (one cached-bitmap copy
-# + the slider drawing -- the expensive static rectangles never run),
-# so the CPU cost stays negligible even during fast drags. The gate is
-# WALL-CLOCK, not a timer: during a drag the message queue is flooded
-# with mouse moves and WM_TIMER is only delivered when the queue drains,
-# so a timer-driven repaint would freeze the slider until the drag ends
-# (exactly the "thumb does not move until I stop" bug this fixes).
-OVERVIEW_TRACK_INTERVAL = 0.030
-# Wall-clock interval (seconds) between whole APPLY units while dragging
-# the overview slider (one apply unit = write the scroll position to both
-# editors + invalidate them + repaint the slider + pump the message
-# queue). EVERY editor scroll write is O(total gap count) inside ATSynEdit
-# (GapsSizeForRange walks), and every delivered editor repaint is O(gaps)
-# too -- the differ's inter-line alignment gaps make that ~10^5 items on
-# million-line compares. Applying per RAW mouse event (a fast drag floods
-# 60-125 moves/second) multiplied those walks into a seconds-long backlog:
-# the slider lagged 300-500 ms behind the mouse. The gate bounds the work
-# to ~33 apply units per second no matter how fast the mouse moves; each
-# unit always applies the NEWEST position (moves inside a closed window
-# are coalesced -- only the latest target is remembered). A deferred
-# one-shot timer (see OVERVIEW_DEFER_MS) applies the newest target when
-# the mouse STOPS inside a closed window, so the thumb always lands
+# Wall-clock interval (seconds) between slider repaints on the
+# track_paint() path (user-initiated scrolls: the editor's own scrollbar,
+# keyboard, mouse wheel) and between whole APPLY units while dragging the
+# overview slider (one apply unit = write the scroll position to both
+# editors + invalidate them). ~33 fps looks instant to the eye, and
+# paint() is cheap here (one cached-bitmap copy + the slider drawing --
+# the expensive static rectangles never run). During a DRAG the thumb
+# itself is NOT gated by this -- it is painted on every raw mouse move
+# (see the module docstring, LIVE SLIDER DRAG); this interval only caps
+# how often the text position is (re)written and how often on_scroll-
+# driven repaints run. The gate is WALL-CLOCK, not a timer: during a drag
+# the message queue is flooded with mouse moves and WM_TIMER is only
+# delivered when the queue drains, so a timer-driven repaint would
+# freeze the slider until the drag ends.
+# On huge files the paint-completion gate (OVERVIEW_APPLY_STALL /
+# note_scroll_painted) paces applies further to the editors' actual
+# paint rate, so no backlog can ever build up: every editor scroll write
+# is O(total gap count) inside ATSynEdit (GapsSizeForRange walks) and
+# every delivered editor repaint is O(gaps) too -- the differ's
+# inter-line alignment gaps make that ~10^5 items on million-line
+# compares. A deferred one-shot timer (see OVERVIEW_DEFER_MS) applies
+# the newest target when the mouse STOPS, so the thumb always lands
 # exactly under the cursor, like a native scrollbar thumb.
-#
-# The gate is WALL-CLOCK, not a timer: during a drag the message queue is
-# flooded with mouse moves and WM_TIMER is only delivered when the queue
-# drains, so a timer-driven apply would freeze the slider until the drag
-# ends. WM_TIMER's low priority is exactly what makes the deferred
-# catch-up timer safe: it never fires mid-drag (the queue is never empty
-# then), it fires precisely when the mouse has stopped.
+OVERVIEW_TRACK_INTERVAL = 0.030
 
 # Deferred-apply one-shot timer interval (ms): armed when a drag move fell
 # inside a closed throttle window. Must be >= OVERVIEW_TRACK_INTERVAL so
 # a continuing drag never sees it fire; it only fires after the mouse
 # stops (WM_TIMER starvation) to apply the coalesced newest position.
 OVERVIEW_DEFER_MS = 40
+
+# Safety timeout (seconds) for the paint-completion gate (see
+# _editors_ready): apply a new drag position even if no editor paint was
+# noted since the last apply. Normally the gate re-opens as soon as the
+# editors paint (on_scroll fires at the END of every editor viewport
+# paint -- TATSynEdit.Paint -> DoEventScroll), so this only matters if
+# paint notifications are delayed or lost (e.g. a hidden window).
+OVERVIEW_APPLY_STALL = 0.25
+
+# Control-size cache refresh interval (seconds) for paint(): a cached
+# (w, h) avoids a DLG_CTL_PROP_GET bridge round-trip on every slider
+# repaint (the drag path paints per RAW mouse move, up to 125 times/s).
+# The cache is also refreshed by repaint_static(), so resizes are picked
+# up immediately on compare/resize and within this TTL otherwise.
+OVERVIEW_SIZE_TTL = 0.20
 
 # Width of the grey vertical separator line at the very left of the
 # overview panel (full panel height, buttons included). Separates the
@@ -233,10 +257,18 @@ SEP_LINE_COLOR = 0x808080  # grey — visible on both light and dark themes
 
 # --- Slider visibility: guaranteed-contrast color derivation -----------
 # Minimum luminance difference between the slider FILL and the overview
-# background. 0.20 is the contrast real scrollbar thumbs have on their
-# track (light grey thumb ~0.8 luminance on a white track); enough to be
+# background on DARK backgrounds (bg luminance < 0.5). 0.20 is the
+# contrast real scrollbar thumbs have on their track; enough to be
 # clearly visible, not garish.
 SLIDER_FILL_LUM_DIFF = 0.20
+# Minimum luminance difference for the slider FILL on LIGHT backgrounds
+# (bg luminance >= 0.5). Lighter than the dark-background value: on a
+# white/light overview the thumb should stay CLOSE to the theme's own
+# ScrollFill (light grey, like the native scrollbar thumb of light
+# themes) instead of being pushed far down to mid-grey -- the thin
+# ScrollRect border (contrasted at 0.28) provides the visual definition,
+# so the big fill block only needs a subtle-but-visible 0.12.
+SLIDER_FILL_LUM_DIFF_LIGHT = 0.12
 # Minimum luminance difference for the THIN elements: the slider border,
 # the 3 grip lines, the ▲/▼ arrows. Thin 1-2px strokes need more contrast
 # than a big solid block to read as visible.
@@ -297,6 +329,80 @@ def _color_shift(color, darker):
         g = min(255, g + max(8, g // 10))
         b = min(255, b + max(8, b // 10))
     return r | (g << 8) | (b << 16)
+
+
+def _slider_fill_min_diff(bg):
+    """Minimum fill-vs-background luminance difference for a given
+    background color: light backgrounds (lum >= 0.5) use the subtler
+    SLIDER_FILL_LUM_DIFF_LIGHT so the thumb stays a LIGHT grey close to
+    the theme's own ScrollFill; dark backgrounds keep the strong
+    SLIDER_FILL_LUM_DIFF."""
+    if _color_lum(bg) >= 0.5:
+        return SLIDER_FILL_LUM_DIFF_LIGHT
+    return SLIDER_FILL_LUM_DIFF
+
+
+def _color_scale_to_lum(color, target_lum):
+    """Scale a color's channels proportionally so its luminance becomes
+    target_lum (hue preserved).
+
+    Returns None when scaling is impossible (pure black) or the result
+    would clamp away the target (the caller checks the luminance anyway).
+    Luminance is linear in the channels, so a single factor k hits the
+    target exactly for greys and near-exactly for colors -- unlike the
+    ~10% channel steps of _color_shift, which always OVERSHOOT the
+    threshold (white -> 0.12 target -> 0.19 actual: a visibly darker
+    thumb than needed on white themes)."""
+    r = color & 0xFF
+    g = (color >> 8) & 0xFF
+    b = (color >> 16) & 0xFF
+    l0 = _color_lum(color)
+    if l0 <= 1e-9:
+        return None
+    k = target_lum / l0
+    nr = min(255, max(0, int(round(r * k))))
+    ng = min(255, max(0, int(round(g * k))))
+    nb = min(255, max(0, int(round(b * k))))
+    return nr | (ng << 8) | (nb << 16)
+
+
+def _color_contrast_light(color, base, min_diff):
+    """_color_contrast for the slider FILL on LIGHT backgrounds
+    (bg luminance >= 0.5): same contract, but the shift is an EXACT
+    proportional scaling to the threshold luminance instead of ~10%
+    lightness steps.
+
+    WHY: the step loop overshoots (its channel steps are max(8, ~10%)),
+    so a white-theme thumb landed at ~0.19 luminance below the background
+    when 0.12 suffices -- "the slider is a little bit darker on white
+    themes, make it lighter". Scaling to exactly base_lum -/+ min_diff
+    keeps the thumb as light (close to the theme's own ScrollFill) as
+    visibility allows. Dark backgrounds keep the step loop (their look
+    was approved as-is); thin elements (border/grips/arrows) keep the
+    loop too (their 0.28 threshold overshoot is fine for 1-2px strokes).
+
+    Falls back to _color_contrast when the exact scaling cannot meet
+    the difference (saturation / rounding).
+    """
+    base_lum = _color_lum(base)
+    out_lum = _color_lum(color)
+    if abs(out_lum - base_lum) >= min_diff - 1e-9:
+        return color
+    # Away from the base on the side the color already leans; a fill at
+    # exactly the base's luminance goes darker (matching _color_contrast
+    # for light backgrounds).
+    go_darker = out_lum <= base_lum
+    for margin in (0.0, 0.02):
+        if go_darker:
+            target = base_lum - (min_diff + margin)
+        else:
+            target = base_lum + (min_diff + margin)
+        if 0.0 <= target <= 1.0:
+            out = _color_scale_to_lum(color, target)
+            if out is not None and \
+                    abs(_color_lum(out) - base_lum) >= min_diff - 1e-9:
+                return out
+    return _color_contrast(color, base, min_diff)
 
 
 def _color_contrast(color, base, min_diff):
@@ -436,6 +542,44 @@ class PaintboxOverview:
         # a nested pump can never recurse.
         self._pumping = False
 
+        # --- Native-scrollbar drag pipeline state -------------------
+        # Track-pixel y the slider is shown at while the overview drives
+        # the scroll (slider drag / track jump / ▲/▼ repeat): the thumb is
+        # painted at the position we are DRIVING to (straight from the
+        # mouse / the tick target), NOT at the round-tripped editor
+        # position -- a native scrollbar thumb is also glued to the mouse
+        # while the editor's text repaint catches up. None = not driving,
+        # paint() reads the truth from PROP_SCROLL_VERT_INFO.
+        self._thumb_preview_y = None
+        # True from our own ed.cmd(cmd_RepaintEditor) invalidation until
+        # an editor viewport paint is noted (note_scroll_painted -- on_scroll
+        # fires at the END of every editor paint). While True the drag
+        # pipeline does NOT pump the message queue (the pump would deliver
+        # the pending editor paints SYNCHRONOUSLY inside the mouse
+        # handler -- the old 100-200 ms per-move freeze on million-line
+        # compares) and does not apply a new position (no backlog: at
+        # most one scroll write is ever pending).
+        self._editors_dirty = False
+        # Wall clock of the invalidation that set _editors_dirty.
+        self._editors_dirty_at = 0.0
+        # Wall clock of the last drag APPLY unit (write+invalidate).
+        self._last_apply = 0.0
+        # Last smooth position written by _write_scroll_position (drag /
+        # jump / repeat). Identical consecutive writes are skipped: the
+        # write is a pure no-op for the editor data, and the paired
+        # cmd_RepaintEditor would only force a full viewport repaint of
+        # identical content (50-100 ms wasted per call on huge files).
+        # Reset to None when an interaction starts/ends so external
+        # scrolls can never make the dedup stale.
+        self._last_written_pos = None
+        # smooth_pos_last / smooth_page from the last truth read of
+        # PROP_SCROLL_VERT_INFO (used to clamp written targets and map
+        # positions to preview thumb pixels).
+        self._smooth_pos_last = 0
+        self._smooth_page = 0
+        # Cached control size (w, h, fetched_at) -- see OVERVIEW_SIZE_TTL.
+        self._size_cache = (0, 0, 0.0)
+
         # --- ▲/▼ button auto-repeat state ---
         # _btn_dir: None while no button is held, -1 while ▲ is held,
         # +1 while ▼ is held. Drives the one-line scroll + auto-repeat.
@@ -543,6 +687,8 @@ class PaintboxOverview:
         self._driving = False
         self._dragging = False
         self._drag_target_y = None
+        self._thumb_preview_y = None
+        self._last_written_pos = None
         if self._defer_armed:
             self._defer_armed = False
             ct.timer_proc(ct.TIMER_STOP, self._drag_deferred_tick,
@@ -660,8 +806,21 @@ class PaintboxOverview:
         # each element is clearly visible on ANY theme (black, white,
         # grey). Already-contrasting colors pass through unchanged, so
         # well-designed themes keep their exact look.
-        self._slider_fill = _color_contrast(fill, color_bg,
-                                            SLIDER_FILL_LUM_DIFF)
+        #
+        # The FILL threshold is background-dependent: dark backgrounds
+        # keep the strong 0.20 diff with the approved step-loop look,
+        # LIGHT backgrounds use the subtler 0.12 with an EXACT proportional
+        # scaling so the thumb stays as light as the theme's own
+        # light-grey ScrollFill instead of being pushed to mid-grey ("the
+        # slider is a little bit darker on white themes, make it lighter")
+        # -- the 0.28-contrasted border + grips carry the visual
+        # definition.
+        if _color_lum(color_bg) >= 0.5:
+            self._slider_fill = _color_contrast_light(
+                fill, color_bg, SLIDER_FILL_LUM_DIFF_LIGHT)
+        else:
+            self._slider_fill = _color_contrast(fill, color_bg,
+                                                SLIDER_FILL_LUM_DIFF)
         self._slider_border = _color_contrast(border, color_bg,
                                               SLIDER_LINE_LUM_DIFF)
         self._slider_grabber_dark = _color_contrast(
@@ -740,6 +899,23 @@ class PaintboxOverview:
         props = ct.dlg_proc(self.h_dlg, ct.DLG_CTL_PROP_GET, index=self._ctl_index)
         w = props.get('w', OVERVIEW_WIDTH)
         h = props.get('h', 600)
+        return w, h
+
+    def _get_size_cached(self):
+        """Get the control size through the OVERVIEW_SIZE_TTL cache.
+
+        paint() runs per RAW mouse move while dragging (up to ~125/s);
+        a DLG_CTL_PROP_GET marshals the whole control-property dict across
+        the Python<->Pascal bridge each call, so the cached entry keeps the
+        per-move cost to the bitmap copy + slider drawing only. Resizes
+        are picked up by repaint_static() (immediate) or within the TTL."""
+        w, h, fetched = self._size_cache
+        if w > 0 and h > 0:
+            now = time.monotonic()
+            if now - fetched < OVERVIEW_SIZE_TTL:
+                return w, h
+        w, h = self._get_size()
+        self._size_cache = (w, h, time.monotonic())
         return w, h
 
     # ------------------------------------------------------------------
@@ -1048,6 +1224,10 @@ class PaintboxOverview:
         w, h = self._get_size()
         if w <= 0 or h <= 0:
             return
+        # Refresh the size cache too: paint() (drag path) reuses it for
+        # up to OVERVIEW_SIZE_TTL, and a stale entry right after a resize
+        # would blit a mismatched static bitmap.
+        self._size_cache = (w, h, time.monotonic())
         self._free_static_bitmap()
         self._ensure_static_bitmap(w, h)
         self.paint()
@@ -1072,7 +1252,7 @@ class PaintboxOverview:
         if self.h_canvas is None:
             return
 
-        w, h = self._get_size()
+        w, h = self._get_size_cached()
         if w <= 0 or h <= 0:
             return
 
@@ -1119,6 +1299,17 @@ class PaintboxOverview:
         flush at the bottom of the track. No special-casing needed for
         the bottom edge.
 
+        While the overview is DRIVING the scroll (slider drag / track
+        jump / ▲/▼ repeat) _thumb_preview_y is set: the thumb is drawn
+        at the pixel the interaction is driving to (the raw mouse
+        position / the tick target), NOT the round-tripped editor
+        position. This is exactly how a native scrollbar behaves -- the
+        thumb is glued to the mouse while the editor's text repaint
+        catches up asynchronously. It also skips the get_prop bridge
+        round-trip on the per-move paint path. The preview is cleared on
+        interaction end (release / exit / self-heal), where the final
+        paint reads the editor truth (which reflects any clamping).
+
         Args:
             w: width in pixels
             h: height in pixels
@@ -1127,18 +1318,6 @@ class PaintboxOverview:
             return
 
         c = self.h_canvas
-
-        # Get pixel-based scroll info from editor a_ed.
-        scroll_info = self.a_ed.get_prop(ct.PROP_SCROLL_VERT_INFO)
-        if not scroll_info:
-            return
-
-        smooth_pos = scroll_info.get('smooth_pos', 0)
-        smooth_max = scroll_info.get('smooth_max', 1)
-        smooth_page = scroll_info.get('smooth_page', 0)
-
-        if smooth_max <= 0:
-            smooth_max = 1
 
         track_y0, track_h = self._track_rect(h)
 
@@ -1152,19 +1331,51 @@ class PaintboxOverview:
         # scroll position reaches its max (plain int() truncation would
         # leave a 1px gap: int(t*p/m) + int(t*p/m) != t).
         min_h = self._slider_min_height
-        if smooth_page > 0:
-            py_height = int(track_h * smooth_page / smooth_max + 0.5)
-            py_height = max(min_h, min(track_h, py_height))
+        if self._thumb_preview_y is not None and self._smooth_max > 0:
+            # Driving: page/max/height don't change mid-interaction --
+            # reuse the geometry from the last truth read (no get_prop).
+            smooth_max = self._smooth_max
+            smooth_page = self._smooth_page
+            if smooth_page > 0:
+                py_height = int(track_h * smooth_page / smooth_max + 0.5)
+                py_height = max(min_h, min(track_h, py_height))
+            else:
+                py_height = min(min_h, track_h)
+            # Thumb glued to the driven position (already track-clamped
+            # by the callers; clamp again for safety).
+            py_top = self._thumb_preview_y
+            py_top = max(track_y0, min(py_top,
+                                       track_y0 + track_h - py_height))
         else:
-            # No page info (e.g., very early init) — fall back to min.
-            py_height = min(min_h, track_h)
+            # Get pixel-based scroll info from editor a_ed.
+            scroll_info = self.a_ed.get_prop(ct.PROP_SCROLL_VERT_INFO)
+            if not scroll_info:
+                return
 
-        # Map editor scroll position to track pixels:
-        # slider_top = track_top + track_h * editor_scroll / editor_total
-        py_top = track_y0 + int(track_h * smooth_pos / smooth_max + 0.5)
+            smooth_pos = scroll_info.get('smooth_pos', 0)
+            smooth_max = scroll_info.get('smooth_max', 1)
+            smooth_page = scroll_info.get('smooth_page', 0)
 
-        # Clamp slider within the track
-        py_top = max(track_y0, min(py_top, track_y0 + track_h - py_height))
+            if smooth_max <= 0:
+                smooth_max = 1
+
+            if smooth_page > 0:
+                py_height = int(track_h * smooth_page / smooth_max + 0.5)
+                py_height = max(min_h, min(track_h, py_height))
+            else:
+                # No page info (e.g., very early init) — fall back to min.
+                py_height = min(min_h, track_h)
+
+            # Map editor scroll position to track pixels:
+            # slider_top = track_top + track_h * editor_scroll / editor_total
+            py_top = track_y0 + int(track_h * smooth_pos / smooth_max + 0.5)
+
+            # Clamp slider within the track
+            py_top = max(track_y0, min(py_top,
+                                       track_y0 + track_h - py_height))
+            self._smooth_pos_last = scroll_info.get(
+                'smooth_pos_last', max(0, smooth_max - smooth_page))
+            self._smooth_page = smooth_page
 
         # Solid slider: one CANVAS_RECT call (pen border + brush fill).
         # No transparency blending — zero per-row overhead.
@@ -1272,6 +1483,11 @@ class PaintboxOverview:
         w, h = self._get_size()
         if h <= 0:
             return
+        # A new interaction: the write-dedup and the paint-completion
+        # gate start from a clean slate (an external scroll may have
+        # moved the editors since the last interaction).
+        self._last_written_pos = None
+        self._editors_dirty = False
 
         # ▲/▼ button boxes (top / bottom).
         if y < BUTTON_HEIGHT and h > 2 * BUTTON_HEIGHT:
@@ -1291,15 +1507,26 @@ class PaintboxOverview:
             # Click outside slider — jump (centered on click). The
             # overview drives both halves from here until the button
             # is released (see is_driving_scroll).
+            # THUMB FIRST, WRITE SECOND (the native-scrollbar order):
+            # the thumb is painted at the clicked position and pumped
+            # to the screen while the editors are still clean -- the
+            # pump then only delivers the tiny overview repaint. Only
+            # after that do we write the scroll position + invalidate
+            # the editors; their (expensive on huge files) viewport
+            # paints are then delivered asynchronously by the natural
+            # message-loop drain, never synchronously inside this
+            # handler.
             self._dragging = False
             self._driving = True
-            self._scroll_overview_pixel(y, center=True)
-            # Immediate slider update (bypassing the throttle): the
-            # thumb must land on the clicked position right away --
-            # the 150ms debounce timer fires much later, or not at all
-            # if the click turns into a drag.
-            self.track_paint(force=True)
-            self._repaint_control_now()
+            target = self._pixel_to_smooth_pos(y, center=True)
+            if target is not None:
+                preview = self._preview_y_for_pos(target)
+                if preview is not None:
+                    self._thumb_preview_y = preview
+                self.paint()
+                if not self._editors_dirty:
+                    self._repaint_control_now()
+                self._write_scroll_position(target)
 
     @staticmethod
     def _left_button_held(data):
@@ -1317,23 +1544,31 @@ class PaintboxOverview:
         return None
 
     def _on_mouse_move(self, id_dlg, id_ctl, data='', info=''):
-        """Called on mouse move. If dragging, scroll the editor to follow
-        and repaint the slider so its thumb tracks the mouse like a
-        normal scrollbar, then force the on-screen control repaint so the
-        thumb actually MOVES with the mouse instead of freezing until the
-        drag stops (see _repaint_control_now).
+        """Called on mouse move. If dragging, drive the scroll after the
+        mouse like a native scrollbar thumb:
 
-        THROTTLED TO ~33 APPLY UNITS PER SECOND (see OVERVIEW_TRACK_
-        INTERVAL): every editor scroll write is O(total gap count) inside
-        ATSynEdit and every delivered editor repaint is O(gaps) too, so
-        applying per RAW mouse event (60-125 moves/s during a fast drag)
-        buried the message queue under a seconds-long backlog -- the
-        300-500 ms slider lag on million-line compares. A move inside a
-        closed throttle window only updates the pending target
-        (_drag_target_y); the newest position is applied by the next
-        open-window move, by the deferred catch-up timer when the mouse
-        stops (_drag_deferred_tick), or at drag end -- the thumb always
-        ends up exactly under the cursor.
+        1) THUMB GLUED TO THE MOUSE (every raw move, ungated): the
+           slider bitmap is repainted at the mouse-derived position and
+           the message queue is pumped -- but ONLY while the editors are
+           clean (_editors_dirty is False). The pump (ProcessMessages)
+           delivers EVERYTHING pending, including both editors' viewport
+           paints; on million-line compares each paint walks the ~200k
+           alignment gaps several times and takes 50-100 ms, so pumping
+           right after invalidating the editors (what the old code did)
+           froze the handler for 100-200 ms per move -- the slider
+           "waiting" to follow the mouse. Pumping while clean costs
+           ~1-2 ms (only the tiny overview repaint is pending).
+        2) APPLY (write the scroll position to both editors + invalidate
+           them) at a bounded rate: at most every OVERVIEW_TRACK_INTERVAL
+           AND only when the editors have painted the previous apply
+           (on_scroll fires at the end of every editor paint --
+           note_scroll_painted). At most ONE apply is ever pending, so
+           the text always shows the newest applied position and the
+           editors' paints run in natural queue-drain windows between
+           mouse handlers -- exactly the pipeline of a native scrollbar
+           drag. A deferred one-shot timer applies the pending target
+           when the mouse stops, so the thumb always lands exactly under
+           the cursor.
 
         Also SELF-HEALS a lost release: a move arriving without the
         left button held (data['state'] lacks 'L') while a drag or a
@@ -1355,6 +1590,8 @@ class PaintboxOverview:
             was_dragging = self._dragging
             self._dragging = False
             self._driving = False
+            self._thumb_preview_y = None
+            self._last_written_pos = None
             if was_dragging:
                 self._apply_pending_drag_target()
                 self.track_paint(force=True)
@@ -1362,37 +1599,44 @@ class PaintboxOverview:
             return
         if not self._dragging:
             return
-        # Drag: the slider top follows the mouse (accounting for offset).
-        # Store the NEWEST target first -- even when the throttle window
-        # is closed -- so deferred apply paths always land on the latest
-        # mouse position.
+        # Drag: the slider top follows the mouse (accounting for the
+        # press offset), clamped to the track (the visible thumb can
+        # never leave the track -- the written position clamps at the
+        # editor side too).
         target_y = y - self._drag_offset
+        max_y = self._track_y0 + self._track_h - self._slider_height
+        target_y = max(self._track_y0, min(target_y, max_y))
         self._drag_target_y = target_y
+
+        # --- 1) thumb glued to the mouse ---
+        self._thumb_preview_y = target_y
+        self.paint()
+        if not self._editors_dirty:
+            self._repaint_control_now()
+
+        # --- 2) apply at a bounded rate, no backlog ---
         now = time.monotonic()
-        if now - self._track_last_paint < OVERVIEW_TRACK_INTERVAL:
-            # Closed window: coalesce. Arm the deferred catch-up timer
-            # (fires only when the mouse STOPS -- WM_TIMER starves while
-            # moves keep flooding the queue) so the newest position is
-            # still applied even if no further move opens a window.
-            if not self._defer_armed:
-                self._defer_armed = True
-                ct.timer_proc(ct.TIMER_START_ONE, self._drag_deferred_tick,
-                              OVERVIEW_DEFER_MS)
-            return
-        self._track_last_paint = now
-        self._apply_pending_drag_target()
-        # Immediate slider repaint (the gate already passed -- force, so
-        # the throttle in track_paint cannot skip the paint that matches
-        # the position we just wrote).
-        self.track_paint(force=True)
-        self._repaint_control_now()
+        applied = False
+        if now - self._last_apply >= OVERVIEW_TRACK_INTERVAL and \
+                self._editors_ready(now):
+            self._last_apply = now
+            self._apply_pending_drag_target()
+            applied = True
+        if not applied and not self._defer_armed:
+            # Arm the deferred catch-up timer (fires only when the mouse
+            # STOPS -- WM_TIMER starves while moves keep flooding the
+            # queue) so the newest position is still applied even if no
+            # further move opens the gates.
+            self._defer_armed = True
+            ct.timer_proc(ct.TIMER_START_ONE, self._drag_deferred_tick,
+                          OVERVIEW_DEFER_MS)
 
     def _apply_pending_drag_target(self):
         """Write the newest not-yet-applied drag position (if any) to the
         editors and clear it.
 
         Called from every path that ends or catches up a drag: the
-        open-window branch of _on_mouse_move, the deferred catch-up
+        open-gate branch of _on_mouse_move, the deferred catch-up
         timer, and mouse up / exit / self-heal. Consuming the pending
         target on release is what makes the thumb land EXACTLY where the
         cursor was released even when the last move was coalesced away.
@@ -1401,34 +1645,51 @@ class PaintboxOverview:
             return
         target = self._drag_target_y
         self._drag_target_y = None
-        self._scroll_overview_pixel(target, center=False)
+        pos = self._pixel_to_smooth_pos(target, center=False)
+        if pos is not None:
+            self._write_scroll_position(pos)
 
     def _drag_deferred_tick(self, tag=''):
-        """One-shot timer callback (OVERVIEW_DEFER_MS): a drag move fell
-        inside a closed throttle window and no further move has arrived --
-        the mouse STOPPED with the button still held. Apply the pending
-        newest position now so the thumb catches up to the cursor (a
+        """One-shot timer callback (OVERVIEW_DEFER_MS): a drag move was
+        not applied (closed throttle window or editors still painting
+        the previous apply) and no further move has arrived -- the mouse
+        STOPPED with the button still held. Apply the pending newest
+        position now so the thumb and text catch up to the cursor (a
         native scrollbar does exactly this). WM_TIMER is only delivered
         when the message queue drains, so this never fires while the
         mouse is still moving -- the newest move always wins.
+
+        If the editors have not painted the previous apply yet (huge
+        files: the paint pair is still running), re-arm the one-shot
+        once more instead of dropping the pending target: WM_PAINT beats
+        WM_TIMER, so by the next tick the paints are done, the gate is
+        open, and the newest position lands right after them. The
+        OVERVIEW_APPLY_STALL timeout bounds the total wait.
         """
         self._defer_armed = False
         if not self._dragging or self._drag_target_y is None:
             return
+        if not self._editors_ready(time.monotonic()):
+            if not self._defer_armed:
+                self._defer_armed = True
+                ct.timer_proc(ct.TIMER_START_ONE, self._drag_deferred_tick,
+                              OVERVIEW_DEFER_MS)
+            return
         self._apply_pending_drag_target()
-        self.track_paint(force=True)
-        self._repaint_control_now()
+        # The thumb bitmap already shows the pending position (painted
+        # per move); no repaint needed here. The write's invalidate
+        # delivers the text in the next natural queue drain.
 
     def _on_mouse_up(self, id_dlg, id_ctl, data='', info=''):
         """Called on mouse up. Stops the ▲/▼ auto-repeat and dragging,
-        then does one final slider repaint with the throttle bypassed,
-        so the thumb lands exactly where the drag ended (the throttled
-        repaints during the drag may have skipped the very last
-        position). The newest drag position is applied first
-        (_apply_pending_drag_target): if the last move was coalesced
-        away inside a closed throttle window, its position was never
-        written -- writing it here is what makes the thumb and the text
-        land exactly under the release point.
+        applies the newest drag position (so the thumb and text land
+        exactly under the release point even when the last move was
+        coalesced away), clears the thumb preview and repaints the
+        slider from the editor truth (which reflects any position
+        clamping), then pumps the queue ONCE for an atomic final frame
+        -- the interaction is over, so the pump's cost (it also delivers
+        the editors' last pending paints) is no longer on the
+        interaction's latency path.
 
         CRITICAL: the release is processed EVEN WHEN _pumping is True.
         _repaint_control_now() pumps the message queue, and the pump
@@ -1445,12 +1706,45 @@ class PaintboxOverview:
         control repaint while pumping loses nothing."""
         self._stop_button_repeat()
         was_dragging = self._dragging
+        was_button = self._btn_dir is not None
         self._dragging = False
         self._driving = False
+        self._thumb_preview_y = None
+        self._last_written_pos = None
         if was_dragging:
+            # Final landing: always apply, regardless of the gates.
             self._apply_pending_drag_target()
+        if was_dragging or was_button:
+            # Truth repaint (drops the preview; the editor's clamped
+            # position wins over the un-clamped drag target).
             self.track_paint(force=True)
-            self._repaint_control_now()
+            if was_dragging:
+                self._repaint_control_now()
+
+    def note_scroll_painted(self):
+        """Note that an editor viewport paint has completed.
+
+        Called from __init__.py's on_scroll while the overview is
+        driving: TATSynEdit fires OnScroll at the END of every viewport
+        paint (Paint -> ScrollEventNeeded -> DoEventScroll), so this is
+        a free, reliable 'the editors painted' completion signal. It
+        re-opens the drag pipeline's paint-completion gate
+        (_editors_ready): the next apply is only written once the
+        editors have shown the previous one -- no backlog ever builds
+        up, and the message pump in the per-move path stays cheap
+        (pumping while the editors are dirty would deliver their
+        pending viewport paints synchronously inside the mouse
+        handler)."""
+        self._editors_dirty = False
+
+    def _editors_ready(self, now):
+        """True when a new drag apply may be written: the editors have
+        painted the previous apply (note_scroll_painted) or the
+        OVERVIEW_APPLY_STALL safety timeout has passed (paint
+        notifications delayed or lost)."""
+        if not self._editors_dirty:
+            return True
+        return now - self._editors_dirty_at >= OVERVIEW_APPLY_STALL
 
     def is_driving_scroll(self):
         """True while the overview is driving BOTH editors' scroll
@@ -1479,16 +1773,24 @@ class PaintboxOverview:
         only signal that interaction ended — stop the ▲/▼ auto-repeat
         and any running drag here. The newest pending drag position is
         applied first (same as mouse up) so the thumb lands where the
-        pointer left the panel, not one throttle window behind.
+        pointer left the panel, not one throttle window behind; the
+        preview is cleared and the slider repainted from the editor
+        truth. No message pump here: the pointer is already outside
+        the panel and the natural queue drain delivers the final frames
+        (input messages outrank generated WM_PAINTs anyway).
 
         Like _on_mouse_up, this runs even while _pumping is True: a
         stop event must never be swallowed by the pump."""
         self._stop_button_repeat()
         was_dragging = self._dragging
+        was_button = self._btn_dir is not None
         self._dragging = False
         self._driving = False
+        self._thumb_preview_y = None
+        self._last_written_pos = None
         if was_dragging:
             self._apply_pending_drag_target()
+        if was_dragging or was_button:
             self.track_paint(force=True)
 
     # ------------------------------------------------------------------
@@ -1545,20 +1847,31 @@ class PaintboxOverview:
         (+1), like a scrollbar's arrow button. One line = the editor's
         char_size (row height in pixels) of smooth scrolling.
 
-        After writing the position each editor is invalidated ASYNC via
-        ed.cmd(cmd_RepaintEditor) — the exact call a native scrollbar's
-        thumb/arrow path makes (InvalidateEx(true), a plain invalidate,
-        NOT a synchronous repaint). The caller's message pump then
-        delivers the editors' viewport paints in the same batch as the
-        overview's own repaint, so both halves step together.
+        Per tick (the 50 ms auto-repeat / the initial press):
+        1) the thumb is previewed at the new position and pumped to the
+           screen while the editors are clean (instant thumb, cheap
+           pump), then
+        2) the position is written to both halves + they are invalidated
+           with ed.cmd(cmd_RepaintEditor) — the exact async invalidate
+           (InvalidateEx) a native scrollbar's arrow path makes. Their
+           viewport paints are delivered by the natural message-loop
+           drain, never synchronously inside this tick.
+
+        The WRITE runs on every tick (not gated by paint completion,
+        exactly like a native arrow button's repeats): the editor data
+        advances one line per 50 ms, and each delivered paint shows the
+        accumulated position — the text glides in multi-line steps at
+        the editors' paint rate instead of crawling one line per paint
+        (the old bug: the tick's message pump ran the paint pair
+        synchronously, so the next 50 ms tick only fired 100-200 ms
+        later — "one line every 100-200 ms"). No-op writes (already at
+        the top/bottom edge) are skipped: the write would not move the
+        text and the paired invalidate would only force a full repaint
+        of identical content.
 
         The old code also issued ed.action(EDACTION_UPDATE) on both
         halves per tick; that is a forced synchronous FULL repaint,
-        which costs 100+ ms on million-line compare views — the reason
-        the ▲/▼ buttons scrolled one line only every 300-500 ms on big
-        files. (Writing set_prop alone was not enough either — see
-        _scroll_overview_pixel — the editor never repaints without the
-        explicit invalidate.)
+        which costs 100+ ms on million-line compare views.
         """
         if self.a_ed is None:
             return
@@ -1568,14 +1881,30 @@ class PaintboxOverview:
         char_size = scroll_info.get('char_size', 0)
         if char_size <= 0:
             return
-        target = max(0, scroll_info.get('smooth_pos', 0) + direction * char_size)
-        for e in (self.a_ed, self.b_ed):
-            if e is not None:
-                e.set_prop(ct.PROP_SCROLL_VERT_INFO,
-                           {'smooth_pos': target})
-                e.cmd(ct_cmd.cmd_RepaintEditor)
-        self.track_paint(force=True)
-        self._repaint_control_now()
+        smooth_max = scroll_info.get('smooth_max', 0)
+        smooth_page = scroll_info.get('smooth_page', 0)
+        pos_last = scroll_info.get(
+            'smooth_pos_last', max(0, smooth_max - smooth_page))
+        target = scroll_info.get('smooth_pos', 0) + direction * char_size
+        # Clamp to the valid smooth range (no useless writes at the
+        # edges: at the top/bottom the position cannot move).
+        target = max(0, min(target, pos_last))
+        if target == scroll_info.get('smooth_pos', 0):
+            return  # editor data already there: nothing to write/paint
+        # Keep the mapping caches fresh (used by _preview_y_for_pos).
+        if smooth_max > 0:
+            self._smooth_max = smooth_max
+            self._smooth_pos_last = pos_last
+            self._smooth_page = smooth_page
+        # 1) thumb first
+        preview = self._preview_y_for_pos(target)
+        if preview is not None:
+            self._thumb_preview_y = preview
+            self.paint()
+            if not self._editors_dirty:
+                self._repaint_control_now()
+        # 2) write + invalidate
+        self._write_scroll_position(target)
 
     # ------------------------------------------------------------------
     # Repaint scheduling
@@ -1593,11 +1922,12 @@ class PaintboxOverview:
         when the queue drains, so a timer-debounced slider appears
         FROZEN until the drag stops.
 
-        The DRAG path does its own gating of the whole apply unit in
-        _on_mouse_move (write + invalidate + paint + pump — the gate
-        timestamp is this same _track_last_paint) and calls this with
-        force=True, because a paint that does not match the just-
-        written position would show a slider one step behind the text.
+        While the overview is DRIVING an interaction the slider is
+        painted per raw mouse move by _on_mouse_move itself (the thumb
+        preview path), so this method mostly matters for user-initiated
+        scrolls and the final truth repaints on interaction end (those
+        pass force=True: landing on the exact position matters more
+        than the rate limit).
 
         paint() is cheap on this path (one cached-bitmap copy + the
         slider drawing -- the expensive static segments never run),
@@ -1606,9 +1936,9 @@ class PaintboxOverview:
         how densely scroll events arrive.
 
         Args:
-            force: bypass the throttle (drag apply units, final repaint
-                on mouse-up and after a click jump, where landing on the
-                exact position matters more than the rate limit).
+            force: bypass the throttle (final repaints on mouse-up and
+                after a click jump, where landing on the exact position
+                matters more than the rate limit).
         """
         now = time.monotonic()
         if not force and now - self._track_last_paint < OVERVIEW_TRACK_INTERVAL:
@@ -1656,53 +1986,34 @@ class PaintboxOverview:
     # Scroll mapping
     # ------------------------------------------------------------------
 
-    def _scroll_overview_pixel(self, overview_y, center=True):
-        """Scroll the editors based on a pixel Y position in the overview.
+    def _pixel_to_smooth_pos(self, overview_y, center=True):
+        """Map an overview pixel Y to an editor smooth scroll position.
 
         Pure pixel-based mapping onto the TRACK area (between the ▲/▼
         buttons):
-          editor_target_scroll = smooth_max * (y - track_y0) / track_h
+            editor_target_scroll = smooth_max * (y - track_y0) / track_h
 
         If center=True, the clicked position becomes the center of the
         viewport (the target is pulled up by half the slider height,
         which corresponds to half the visible page).
         If center=False (dragging), the position becomes the slider top.
 
-        Both halves are written back-to-back with set_prop + an
-        asynchronous ed.cmd(cmd_RepaintEditor) invalidate per editor —
-        the exact pair of operations a native scrollbar thumb drag
-        performs per move (position write + InvalidateEx(true)). The
-        set_prop alone does NOT repaint the editor: with the built-in
-        scrollbars hidden (the overview replaces them) nothing else
-        invalidates the editors, so the text would only move when some
-        unrelated invalidation arrived — the "text scrolls slowly"
-        half of the big-file lag. The explicit invalidate fixes that
-        without any EDACTION_UPDATE: ed.action(EDACTION_UPDATE) is a
-        forced synchronous FULL repaint (Invalidate + Update +
-        Repaint on Windows = 100+ ms per half on million-line compare
-        views), which is the OTHER half of the old lag — issuing it on
-        every mouse move buried the message queue. With the async
-        invalidate, both halves land in the same display frame anyway:
-        both writes run back-to-back inside this one handler and the
-        mouse handlers' _repaint_control_now pump delivers all pending
-        paints (both editors + the overview) in one batch. The
-        on_scroll echoes fire at paint time; while the overview is
-        driving both halves __init__.py also skips the ScrollSplittedTab
-        mirror (see is_driving_scroll), so the cascade dies out.
+        The result is clamped to the editor's valid smooth range
+        [0, smooth_pos_last] — so a drag past the track ends writes the
+        end-of-file position instead of a no-op-beyond-end value (the
+        editor would clamp it internally anyway, but clamping here
+        keeps the thumb preview and the written position consistent).
 
-        Args:
-            overview_y: pixel Y position in the overview
-            center: if True, center the viewport on Y. If False, Y
-                    becomes the top of the viewport (for dragging).
+        Returns None when the geometry/mapping is not usable yet.
         """
         h = self._overview_height
         if h <= 0:
-            w, h = self._get_size()
+            w, h = self._get_size_cached()
         if h <= 0:
-            return
+            return None
         track_y0, track_h = self._track_rect(h)
         if track_h <= 0:
-            return
+            return None
 
         ty = overview_y - track_y0
         if center:
@@ -1715,35 +2026,72 @@ class PaintboxOverview:
             if scroll_info:
                 smooth_max = scroll_info.get('smooth_max', 0)
             if smooth_max <= 0:
-                return
+                return None
             self._smooth_max = smooth_max
 
         # Map overview track pixel to editor scroll pixel:
         # editor_scroll = smooth_max * overview_y / track_h
         target_smooth_pos = int(smooth_max * ty / track_h)
 
-        # Clamp to valid range
-        target_smooth_pos = max(0, target_smooth_pos)
+        # Clamp to the valid smooth range
+        pos_last = self._smooth_pos_last
+        if pos_last <= 0:
+            scroll_info = self.a_ed.get_prop(ct.PROP_SCROLL_VERT_INFO) if self.a_ed else None
+            pos_last = scroll_info.get(
+                'smooth_pos_last', 0) if scroll_info else 0
+            if pos_last <= 0 and scroll_info:
+                pos_last = max(0, smooth_max -
+                               scroll_info.get('smooth_page', 0))
+            self._smooth_pos_last = pos_last
+        return max(0, min(target_smooth_pos, pos_last))
 
-        # Scroll both editors: set_prop(PROP_SCROLL_VERT_INFO) writes the
-        # scroll records, and ed.cmd(cmd_RepaintEditor) invalidates each
-        # editor ASYNCHRONOUSLY — the exact pair of operations a native
-        # scrollbar thumb drag performs per move (position write +
-        # InvalidateEx(true)). The set_prop alone does NOT repaint the
-        # editor (EditorStringToScrollInfo updates records and scrollbar
-        # data only), and with the built-in scrollbars hidden nothing
-        # else would ever repaint them — that was the "text scrolls
-        # slowly / one line every 300-500 ms" bug: the editors only
-        # moved when some unrelated invalidation happened to arrive.
-        # With the explicit invalidate, the caller's message pump
-        # delivers both editors' viewport paints together with the
-        # overview's repaint, in one batch — both halves always land in
-        # the same frame, without any synchronous EDACTION_UPDATE.
-        # (See the docstring -- no EDACTION_UPDATE here: it is a forced
-        # synchronous FULL repaint, 100+ ms per call on million-line
-        # compare views.)
+    def _preview_y_for_pos(self, smooth_pos):
+        """Map a smooth scroll position to the track-pixel Y the slider
+        thumb should be shown at (the inverse of the paint mapping:
+        py_top = track_y0 + track_h * smooth_pos / smooth_max), clamped
+        to the track. Returns None when the mapping is not usable yet
+        (no truth read done, smooth_max unknown)."""
+        smooth_max = self._smooth_max
+        track_h = self._track_h
+        track_y0 = self._track_y0
+        if smooth_max <= 0 or track_h <= 0:
+            return None
+        py_top = track_y0 + int(track_h * smooth_pos / smooth_max + 0.5)
+        py_height = self._slider_height
+        return max(track_y0, min(py_top, track_y0 + track_h - py_height))
+
+    def _write_scroll_position(self, target_smooth_pos):
+        """Write the smooth scroll position to both editors and
+        invalidate them for an asynchronous repaint.
+
+        The write pair (set_prop + ed.cmd(cmd_RepaintEditor)) is exactly
+        what a native scrollbar performs per scroll step: the position
+        write (EditorStringToScrollInfo updates the scroll records and
+        scrollbar data) plus the invalidate (InvalidateEx). The set_prop
+        alone does NOT repaint the editor, and with the built-in
+        scrollbars hidden (the overview replaces them) nothing else
+        would ever repaint them — that was the "text scrolls slowly"
+        half of the old bug. No EDACTION_UPDATE is ever issued on these
+        paths: that is a forced synchronous FULL repaint (Invalidate +
+        Update + Repaint on Windows = 100+ ms per half on million-line
+        compare views).
+
+        Identical consecutive writes are skipped (the editor data
+        already shows the position; the paired invalidate would only
+        force a full repaint of identical content). The invalidation
+        also sets _editors_dirty: the drag pipeline then waits for the
+        paint completion signal (note_scroll_painted) before writing
+        the next position, and never pumps the message queue while the
+        editors' paints are pending (the pump would deliver them
+        synchronously inside the mouse handler).
+        """
+        if target_smooth_pos == self._last_written_pos:
+            return
+        self._last_written_pos = target_smooth_pos
         for e in (self.a_ed, self.b_ed):
             if e is not None:
                 e.set_prop(ct.PROP_SCROLL_VERT_INFO,
                            {'smooth_pos': target_smooth_pos})
                 e.cmd(ct_cmd.cmd_RepaintEditor)
+        self._editors_dirty = True
+        self._editors_dirty_at = time.monotonic()
