@@ -88,7 +88,13 @@ Architecture:
     scrollbar, the mouse handlers pump the message queue once
     (app_proc(PROC_IDLE)) right after painting, which delivers the
     pending WM_PAINT synchronously — guarded against re-entrancy by the
-    _pumping flag.
+    _pumping flag. The pump also dispatches pending INPUT messages: only
+    mouse MOVES are dropped while pumping (breaking the move→pump→move
+    recursion; the newest position arrives with the next event).
+    Mouse UP / EXIT / DOWN are always processed — a release dispatched
+    during a pump must never be swallowed, or the drag and the ▲/▼
+    auto-repeat would survive the released button (the "mouse is not
+    released" bug).
 
   See: https://github.com/CudaText-addons/cuda_differ/issues/29
 """
@@ -217,25 +223,11 @@ class PaintboxOverview:
         # +1 while ▼ is held. Drives the one-line scroll + auto-repeat.
         self._btn_dir = None
 
-        # --- Slider opacity options (user-configurable) ---
-        # opt_slider_opacity_enabled: if False, use the OLD solid-fill
-        #   slider (fast, no blending). If True, use either BRUSH_CLEAR
-        #   (opacity < 8%) or the pre-blend method (opacity >= 8%).
-        # opt_slider_opacity: 0.0 = invisible, 1.0 = fully opaque.
-        #   Default 0.4 = 40% opaque (WinMerge-style).
-        #   See _paint_dynamic() for the dispatch logic.
-        # Threshold below which we use BRUSH_CLEAR instead of pre-blend
-        # (BRUSH_CLEAR is faster — no per-row blending loop).
-        self.opt_slider_opacity_enabled = True
-        self.opt_slider_opacity = 0.4
-        self._slider_clear_threshold = 0.08  # <8% → BRUSH_CLEAR
-
-        # Slider fill color used by SOLID, BLENDED, and CLEAR (border only).
-        # Light grey, matching the original solid-fill slider.
+        # Slider fill color (solid fill — one CANVAS_RECT call, no
+        # transparency, no per-row overhead).
         self._slider_fill = 0xEAEAEA
-        # Border color, shared by all three methods. Darker than the old
-        # 0x999999 so the border stays clearly visible against any
-        # background (light theme, dark theme, or pre-blended fill).
+        # Border color. Darker than the fill so the border stays clearly
+        # visible against any background (light theme or dark theme).
         self._slider_border = 0x666666
         # Grabber line color (3 horizontal lines in the slider middle).
         # Lighter than the border (0x999999 vs 0x666666) so the grabber
@@ -249,15 +241,6 @@ class PaintboxOverview:
         # Min slider height in pixels — keeps the slider grabbable even
         # when the file is much taller than the viewport.
         self._slider_min_height = 30
-
-        # Per-row segment index: list of length h, where each row is a
-        # list of (x_start, x_end, color) tuples in paint order (later
-        # entries visually overwrite earlier ones). Rebuilt only in
-        # _paint_static() (from the segments actually DRAWN — the WinMerge
-        # pixel-dedup skips are not recorded); consumed by
-        # _paint_dynamic(). Empty until the first static repaint
-        # completes. Only used by the BLENDED slider method.
-        self._row_segments = []
 
     def is_created(self):
         """Return True if the overview dialog has been created."""
@@ -384,30 +367,6 @@ class PaintboxOverview:
         self._static_w = w
         self._static_h = h
         self._paint_static(self._h_static_cnv, w, h)
-
-    def set_slider_options(self, opacity_enabled=None, opacity=None):
-        """Configure the overview slider's transparency behaviour.
-
-        Two user-facing options:
-          - differ.micromap.enable_overview_slider_opacity
-                (bool, default True):
-                False -> use the OLD solid-fill slider (fast, no blending).
-                True  -> use BRUSH_CLEAR if opacity < 8%, else the pre-blend
-                         method (per-row simulated alpha blend).
-          - differ.micromap.overview_slider_opacity
-                (int 0..100 in the JSON, passed here as float 0..1,
-                default 0.4):
-                Slider opacity. 0 = invisible (BRUSH_CLEAR), 1 = opaque.
-                Only used when opacity_enabled is True.
-
-        Args:
-            opacity_enabled: bool or None. None = leave unchanged.
-            opacity: float in [0.0, 1.0], or None = leave unchanged.
-        """
-        if opacity_enabled is not None:
-            self.opt_slider_opacity_enabled = bool(opacity_enabled)
-        if opacity is not None:
-            self.opt_slider_opacity = max(0.0, min(1.0, float(opacity)))
 
     def set_colors(self, color_bg, color_deleted, color_added, color_changed,
                    color_gap, color_ignored_gap=None):
@@ -536,10 +495,6 @@ class PaintboxOverview:
         is skipped — so the canvas call count is bounded by the panel's
         pixel height, not by the file's line/diff count.
 
-        Also builds _row_segments — the per-row segment index used by
-        _paint_dynamic() to precompute transparent-slider blends. Only
-        the segments actually drawn are recorded.
-
         Args:
             c: canvas handle (static bitmap canvas)
             w: width in pixels
@@ -548,11 +503,6 @@ class PaintboxOverview:
         # Clear background
         ct.canvas_proc(c, ct.CANVAS_SET_BRUSH, color=self.color_bg, style=ct.BRUSH_SOLID)
         ct.canvas_proc(c, ct.CANVAS_RECT_FILL, x=0, y=0, x2=w, y2=h)
-
-        # (Re)build the per-row segment index — start with full-width
-        # background for every row. _paint_side_segments() /
-        # _paint_buttons() / _paint_separator() append layers on top.
-        self._row_segments = [[(0, w, self.color_bg)] for _ in range(h)]
 
         # Map area: between the buttons, right of the separator line.
         track_y0, track_h = self._track_rect(h)
@@ -757,7 +707,6 @@ class PaintboxOverview:
                 last_color = color
             ct.canvas_proc(c, ct.CANVAS_RECT_FILL,
                            x=x_start, y=ps, x2=x_end, y2=pe)
-            self._record_segment(x_start, ps, x_end, pe, color)
             prev_end = y0 + int(end_row * scale)
 
     def _paint_buttons(self, c, w, h):
@@ -776,8 +725,6 @@ class PaintboxOverview:
         for y0 in (0, h - BUTTON_HEIGHT):
             ct.canvas_proc(c, ct.CANVAS_RECT_FILL,
                            x=0, y=y0, x2=w, y2=y0 + BUTTON_HEIGHT)
-            self._record_segment(0, y0, w, y0 + BUTTON_HEIGHT,
-                                 self.color_btn_bg)
         self._paint_arrow(c, 0, 0, w, BUTTON_HEIGHT, up=True)
         self._paint_arrow(c, 0, h - BUTTON_HEIGHT, w, BUTTON_HEIGHT, up=False)
 
@@ -825,55 +772,6 @@ class PaintboxOverview:
                        style=ct.BRUSH_SOLID)
         ct.canvas_proc(c, ct.CANVAS_RECT_FILL,
                        x=0, y=0, x2=SEP_LINE_WIDTH, y2=h)
-        self._record_segment(0, 0, SEP_LINE_WIDTH, h, SEP_LINE_COLOR)
-
-    def _record_segment(self, x1, y1, x2, y2, color):
-        """Record a colored rectangle in the per-row segment index.
-
-        Called for every CANVAS_RECT_FILL the static painting actually
-        issues (WinMerge-skipped segments are NOT recorded — they are
-        not on screen). Each affected row gets (x1, x2, color) appended
-        to its segment list — later appends visually overwrite earlier
-        ones (matching the on-screen paint order). Used by
-        _paint_dynamic() to know the exact final color of every Y row,
-        so the transparent slider can be filled with pre-blended colors.
-
-        Args:
-            x1, y1, x2, y2: rectangle in pixels (y1 inclusive, y2 exclusive)
-            color: RGB int color of the rectangle
-        """
-        if not self._row_segments:
-            return
-        h = len(self._row_segments)
-        row_start = max(0, y1)
-        row_end = min(h, y2)
-        for row in range(row_start, row_end):
-            self._row_segments[row].append((x1, x2, color))
-
-    @staticmethod
-    def _blend_color(orig, fill, alpha):
-        """Per-channel alpha blend: result = orig*(1-α) + fill*α.
-
-        Works for any slider color (light or dark). Returns an RGB int.
-        CudaText colors are 0xRRGGBB stored as 0xBBGGRR (little-endian
-        BGR int), so we mask channels accordingly.
-
-        Args:
-            orig: underlying pixel color (BGR int, as used by canvas_proc)
-            fill: slider fill color (BGR int)
-            alpha: slider opacity in [0.0, 1.0]; 0 = invisible, 1 = opaque
-        """
-        inv = 1.0 - alpha
-        r1 = orig & 0xFF
-        g1 = (orig >> 8) & 0xFF
-        b1 = (orig >> 16) & 0xFF
-        r2 = fill & 0xFF
-        g2 = (fill >> 8) & 0xFF
-        b2 = (fill >> 16) & 0xFF
-        r = int(r1 * inv + r2 * alpha)
-        g = int(g1 * inv + g2 * alpha)
-        b = int(b1 * inv + b2 * alpha)
-        return r | (g << 8) | (b << 16)
 
     def repaint_static(self):
         """Force a full repaint of the static bitmap. Called after a
@@ -948,10 +846,9 @@ class PaintboxOverview:
                             (proportional, clamped to min 30px so it
                             stays grabbable, and to the track height)
             slider_top    = track_y0 + track_h * smooth_pos / smooth_max
-        - Dispatch to one of three slider-paint methods based on options:
-            * opt_slider_opacity_enabled == False  → _paint_slider_solid
-            * opacity < 8%                          → _paint_slider_clear
-            * opacity >= 8%                         → _paint_slider_blended
+        - Draw via _paint_slider_solid: one CANVAS_RECT call (pen border
+          + solid brush fill) + the grabber lines — no transparency
+          blending, so zero overhead per paint.
 
         The slider_top formula is mathematically consistent: when
         smooth_pos reaches its max (smooth_max - smooth_page),
@@ -1006,18 +903,9 @@ class PaintboxOverview:
         # Clamp slider within the track
         py_top = max(track_y0, min(py_top, track_y0 + track_h - py_height))
 
-        # --- Dispatch to the selected slider-paint method ---
-        if not self.opt_slider_opacity_enabled:
-            # Method 1 (OLD): solid fill — fastest, no transparency.
-            self._paint_slider_solid(c, w, py_top, py_height)
-        elif self.opt_slider_opacity < self._slider_clear_threshold:
-            # Method 2: border-only via BRUSH_CLEAR. Used for very low
-            # opacity (0..7%) because pre-blending at near-zero alpha
-            # would be wasteful — the visual difference is invisible.
-            self._paint_slider_clear(c, w, py_top, py_height)
-        else:
-            # Method 3 (NEW): per-row pre-blend — true simulated alpha.
-            self._paint_slider_blended(c, w, py_top, py_height)
+        # Solid slider: one CANVAS_RECT call (pen border + brush fill).
+        # No transparency blending — zero per-row overhead.
+        self._paint_slider_solid(c, w, py_top, py_height)
 
         # Store slider geometry and scroll info for click/drag handling
         self._slider_top = py_top
@@ -1028,89 +916,16 @@ class PaintboxOverview:
         self._smooth_max = smooth_max
 
     def _paint_slider_solid(self, c, w, py_top, py_height):
-        """OLD slider: opaque solid fill + border + grabber. Fastest method.
+        """Solid-fill slider: opaque fill + border + grabber.
 
-        Used when opt_slider_opacity_enabled is False (the user explicitly
-        disabled the transparent look). One CANVAS_RECT call draws both
-        the fill (brush) and border (pen) in one shot.
+        The only slider-paint method: one CANVAS_RECT call draws both
+        the fill (brush) and the border (pen) in one shot, then the
+        grabber lines — minimal work per paint, no transparency, no
+        per-row blending loop, nothing to configure.
         """
         ct.canvas_proc(c, ct.CANVAS_SET_PEN, color=self._slider_border, size=1)
         ct.canvas_proc(c, ct.CANVAS_SET_BRUSH, color=self._slider_fill, style=ct.BRUSH_SOLID)
         ct.canvas_proc(c, ct.CANVAS_RECT, x=SEP_LINE_WIDTH, y=py_top, x2=w - 1, y2=py_top + py_height)
-        self._paint_slider_grabber(c, w, py_top, py_height)
-
-    def _paint_slider_clear(self, c, w, py_top, py_height):
-        """Border-only slider via BRUSH_CLEAR (no fill). Fastest transparent
-        option — used when opacity is 0%..7%.
-
-        The static bitmap's colors show through the slider rectangle
-        completely, just outlined by the pen border. Equivalent to the
-        "empty rectangle" suggestion from the CudaText author, but only
-        used at very low opacity where the pre-blend method would be
-        wasteful (the alpha-blended fill would be visually indistinguishable
-        from no fill).
-        """
-        ct.canvas_proc(c, ct.CANVAS_SET_PEN, color=self._slider_border, size=1)
-        ct.canvas_proc(c, ct.CANVAS_SET_BRUSH, color=self._slider_fill, style=ct.BRUSH_CLEAR)
-        ct.canvas_proc(c, ct.CANVAS_RECT, x=SEP_LINE_WIDTH, y=py_top, x2=w - 1, y2=py_top + py_height)
-        self._paint_slider_grabber(c, w, py_top, py_height)
-
-    def _paint_slider_blended(self, c, w, py_top, py_height):
-        """NEW slider: per-row pre-blend + border + grabber. Simulates
-        true alpha blending without needing canvas alpha support.
-
-        Walks the slider's py_height rows and fills each segment with
-        `blend(orig_color, slider_fill, alpha)` per-channel. The segment
-        index is built in _paint_static() and records the final color
-        of every Y row of the static bitmap (background / gap / line).
-
-        Cost: ~2 * py_height CANVAS_RECT_FILL calls per paint. For a
-        30px slider that's ~60 calls; for a 100px slider (large viewport)
-        ~200 calls. All negligible vs the static repaint.
-
-        Falls back to solid fill if the segment index isn't built yet
-        (e.g., before the first compare completes).
-        """
-        alpha = self.opt_slider_opacity
-        fill_color = self._slider_fill
-
-        if self._row_segments and alpha > 0.0:
-            # Pre-blend per row. Walk all py_height rows of the slider.
-            row_count = len(self._row_segments)
-            for i in range(py_height):
-                row = py_top + i
-                if 0 <= row < row_count:
-                    for x1, x2, col in self._row_segments[row]:
-                        # Keep the left separator line untouched.
-                        x1 = max(x1, SEP_LINE_WIDTH)
-                        if x2 <= x1:
-                            continue
-                        blended = self._blend_color(col, fill_color, alpha)
-                        ct.canvas_proc(c, ct.CANVAS_SET_BRUSH,
-                                       color=blended, style=ct.BRUSH_SOLID)
-                        ct.canvas_proc(c, ct.CANVAS_RECT_FILL,
-                                       x=x1, y=row, x2=x2, y2=row + 1)
-        else:
-            # No segment index yet (e.g., before first compare) — fall
-            # back to a solid fill so the slider is always visible.
-            ct.canvas_proc(c, ct.CANVAS_SET_BRUSH,
-                           color=fill_color, style=ct.BRUSH_SOLID)
-            ct.canvas_proc(c, ct.CANVAS_RECT_FILL,
-                           x=SEP_LINE_WIDTH, y=py_top, x2=w, y2=py_top + py_height)
-
-        # Border: use CANVAS_RECT + BRUSH_CLEAR (NOT CANVAS_RECT_FRAME).
-        # The SOLID and CLEAR methods both draw the border via CANVAS_RECT
-        # (pen + brush). BLENDED must use the SAME call so the border
-        # renders identically. With BRUSH_CLEAR, the brush does not fill
-        # anything (so the pre-blended fill underneath is preserved), and
-        # the pen draws the border on top — same as the other two methods.
-        # CANVAS_RECT_FRAME was previously used here, but it renders a
-        # thinner frame that becomes nearly invisible against the
-        # pre-blended fill.
-        ct.canvas_proc(c, ct.CANVAS_SET_PEN, color=self._slider_border, size=1)
-        ct.canvas_proc(c, ct.CANVAS_SET_BRUSH, color=self._slider_fill, style=ct.BRUSH_CLEAR)
-        ct.canvas_proc(c, ct.CANVAS_RECT, x=SEP_LINE_WIDTH, y=py_top, x2=w - 1, y2=py_top + py_height)
-
         self._paint_slider_grabber(c, w, py_top, py_height)
 
     def _paint_slider_grabber(self, c, w, py_top, py_height):
@@ -1120,16 +935,12 @@ class PaintboxOverview:
           - 3 horizontal lines, evenly spaced around the slider's vertical
             center (mid_y - spacing, mid_y, mid_y + spacing)
           - Each line is 2px thick (pen size = 2) so it stays clearly
-            visible against any fill (solid, clear, or pre-blended)
+            visible against the fill
           - Lines are 6px apart center-to-center (triple the original
             2px spacing), giving a clean modern look with proper
             visual padding from the slider's top/bottom border
           - Single dark grey color (no white bevel) for a flat modern
             appearance instead of the old 3D bevelled look
-
-        Shared by all three slider-paint methods so the visual identity
-        of the slider stays consistent regardless of which fill
-        strategy is active.
         """
         mid_y = py_top + py_height // 2
         grab_x1 = max(2 + SEP_LINE_WIDTH, w // 4)
@@ -1174,9 +985,13 @@ class PaintboxOverview:
         """Called on mouse down. Route the press by the panel layout:
         ▲/▼ button boxes scroll one line (with auto-repeat while held);
         inside the track, a press on the slider starts a drag, a press
-        elsewhere jumps the slider there (centered on the click)."""
-        if self._pumping:
-            return
+        elsewhere jumps the slider there (centered on the click).
+
+        Runs even while _pumping is True: a click dispatched by the
+        message pump must not be swallowed, or rapid clicks during the
+        ▲/▼ auto-repeat repaints get lost (dead clicks). All work here
+        is synchronous; the nested _repaint_control_now() calls guard
+        themselves."""
         x, y = self._parse_mouse(data, info)
         if x is None:
             return
@@ -1208,17 +1023,53 @@ class PaintboxOverview:
             self.track_paint(force=True)
             self._repaint_control_now()
 
+    @staticmethod
+    def _left_button_held(data):
+        """True / False when the event's data says whether the LEFT mouse
+        button is held; None when the data carries no button state.
+
+        CudaText encodes the held buttons in data['state']: 'L' = left,
+        'R' = right, 'M' = middle (proc_miscutils.pas
+        ConvertShiftStateToString). The legacy 'x,y' info-string form
+        carries no button info — None (unknown) so callers cannot
+        mistake it for "button up".
+        """
+        if isinstance(data, dict) and 'state' in data:
+            return 'L' in data['state']
+        return None
+
     def _on_mouse_move(self, id_dlg, id_ctl, data='', info=''):
         """Called on mouse move. If dragging, scroll the editor to follow
         and repaint the slider so its thumb tracks the mouse like a
         normal scrollbar (throttled to ~33 fps -- see track_paint), then
         force the on-screen control repaint so the thumb actually MOVES
         with the mouse instead of freezing until the drag stops (see
-        _repaint_control_now)."""
-        if self._pumping or not self._dragging:
+        _repaint_control_now).
+
+        Also SELF-HEALS a lost release: a move arriving without the
+        left button held (data['state'] lacks 'L') while a drag or a
+        ▲/▼ auto-repeat is running means the button is physically up
+        and the mouse-up was lost somewhere (any event path we did not
+        foresee) — end the interaction right here instead of letting
+        the slider keep following a mouse that presses nothing.
+        """
+        if self._pumping:
             return
         x, y = self._parse_mouse(data, info)
         if x is None:
+            return
+        if (self._dragging or self._btn_dir is not None) and \
+                self._left_button_held(data) is False:
+            # Left button is physically up but the release never
+            # reached us -- treat this move as the release.
+            self._stop_button_repeat()
+            was_dragging = self._dragging
+            self._dragging = False
+            if was_dragging:
+                self.track_paint(force=True)
+                self._repaint_control_now()
+            return
+        if not self._dragging:
             return
         # Drag: the slider top follows the mouse (accounting for offset)
         target_y = y - self._drag_offset
@@ -1235,9 +1086,21 @@ class PaintboxOverview:
         then does one final slider repaint with the throttle bypassed,
         so the thumb lands exactly where the drag ended (the throttled
         repaints during the drag may have skipped the very last
-        position)."""
-        if self._pumping:
-            return
+        position).
+
+        CRITICAL: the release is processed EVEN WHEN _pumping is True.
+        _repaint_control_now() pumps the message queue, and the pump
+        dispatches pending mouse messages — a WM_LBUTTONUP pending at
+        that moment re-enters this handler with _pumping set. The old
+        `if self._pumping: return` swallowed that release, and the
+        drag then kept following the mouse / the ▲/▼ auto-repeat kept
+        scrolling forever after the button was no longer held (the
+        "sometimes the mouse is not released" bug — timing-dependent,
+        because the up is only lost when it is queued exactly during
+        a pump). _repaint_control_now() guards itself against nested
+        pumps, and the pump that dispatched this very event delivers
+        the pending WM_PAINT when it returns, so skipping the explicit
+        control repaint while pumping loses nothing."""
         self._stop_button_repeat()
         was_dragging = self._dragging
         self._dragging = False
@@ -1246,14 +1109,14 @@ class PaintboxOverview:
             self._repaint_control_now()
 
     def _on_mouse_exit(self, id_dlg, id_ctl, data='', info=''):
-        """Called when the pointer leaves the overview panel. The image
-        control cannot capture the mouse, so a button released outside
-        the panel never delivers on_mouse_up — stop the ▲/▼ auto-repeat
-        and any running drag here (a real scrollbar keeps the drag via
-        mouse capture; without capture the events stop anyway, so
-        stopping is the only sane behaviour)."""
-        if self._pumping:
-            return
+        """Called when the pointer leaves the overview panel. On
+        platforms where the press is not captured (a button released
+        outside the control never delivers on_mouse_up), this is the
+        only signal that interaction ended — stop the ▲/▼ auto-repeat
+        and any running drag here.
+
+        Like _on_mouse_up, this runs even while _pumping is True: a
+        stop event must never be swallowed by the pump."""
         self._stop_button_repeat()
         if self._dragging:
             self._dragging = False
@@ -1375,11 +1238,18 @@ class PaintboxOverview:
         Pumping the queue once here (app_proc(PROC_IDLE) —
         Application.ProcessMessages + one idle pass) delivers the
         pending WM_PAINT right away, so the thumb moves with the mouse
-        like in usual scrollbars. Re-entrancy: pending mouse moves
-        dispatched by the pump re-enter the handlers; the _pumping flag
-        makes those nested calls return at once (the newest position is
-        picked up by the next event after the pump returns), and the
-        pump itself can never nest.
+        like in usual scrollbars.
+
+        Re-entrancy: the pump also dispatches pending INPUT messages,
+        which re-enter the mouse handlers. The _pumping flag makes the
+        nested handlers behave correctly: mouse MOVES return at once
+        (the newest position is picked up by the next event after the
+        pump returns, and dropping them breaks the move→pump→move
+        recursion), while mouse UP / EXIT / DOWN are still fully
+        processed — a release dispatched by the pump must never be
+        swallowed, or the drag / ▲/▼ auto-repeat would keep running
+        with the button no longer held (the "mouse is not released"
+        bug). _repaint_control_now itself can never nest.
         """
         if self._pumping or self.h_dlg is None:
             return

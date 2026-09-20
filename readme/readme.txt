@@ -644,19 +644,6 @@ Micromap section:
   mouse.
   Only has an effect when differ.micromap.enable_overview is on.
   Default: on.
-- differ.micromap.enable_overview_slider_opacity: Enable overview slider
-  transparency
-  When enabled, the overview panel's slider is rendered with simulated
-  alpha blending so the colored diff lines remain visible through the
-  slider, like in WinMerge. When disabled, the slider uses a fast
-  opaque solid fill.
-  Only has an effect when differ.micromap.enable_overview is on.
-  Default: on.
-- differ.micromap.overview_slider_opacity: Overview slider opacity in
-  percent
-  Opacity of the overview panel slider, in percent.
-  Only used when enable_overview_slider_opacity is on.
-  Range: 0-100. Default: 40.
 
 
 == Diff algorithms and best practices ==
