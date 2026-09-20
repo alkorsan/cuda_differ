@@ -255,12 +255,12 @@ def cancel_async_line_diff(job):
 
 def algo_id(algorithm_name):
     """Map a configured algorithm name to the diff_proc DIFF_ALGO_* id:
-    'native_myers' -> DIFF_ALGO_MYERS, anything else ->
-    DIFF_ALGO_HISTOGRAM (the recommended default, which also covers
-    'native_histogram' and unexpected values)."""
-    if algorithm_name == 'native_myers':
-        return CudaDiffNativeMatcher._ALGO_MYERS
-    return CudaDiffNativeMatcher._ALGO_HISTOGRAM
+    'native_histogram' -> DIFF_ALGO_HISTOGRAM, anything else (including
+    'native_myers' and unexpected values) -> DIFF_ALGO_MYERS (the
+    plugin's default and fastest on large/very different files)."""
+    if algorithm_name == 'native_histogram':
+        return CudaDiffNativeMatcher._ALGO_HISTOGRAM
+    return CudaDiffNativeMatcher._ALGO_MYERS
 
 
 # Internal benchmark toggle. When set to True, Differ.compare() prints the
@@ -356,7 +356,7 @@ class Differ:
     def __init__(self):
         """Initialize the Differ.
 
-        Sets default options: native_histogram algorithm, detailed
+        Sets default options: native_myers algorithm, detailed
         compare on. The algorithm can be changed later via
         self.diff_algorithm before calling compare().
 
@@ -379,7 +379,7 @@ class Differ:
         b_ed.get_text_all().
         """
         self.withdetail = True
-        self.diff_algorithm = 'native_histogram'
+        self.diff_algorithm = 'native_myers'
         self.beautify_alignment = False
         self.ignore_flags = 0  # DIFF_IGN_* bitmask (see build_ignore_flags)
         self.diffmap = []
@@ -499,16 +499,17 @@ class Differ:
             # Synchronous mode: the engine runs HERE, on the caller's
             # thread, while the generator is being consumed.
             Profiler.start('compare:algorithm')
-            if self.diff_algorithm == 'native_myers':
+            if self.diff_algorithm == 'native_histogram':
                 diff = CudaDiffNativeMatcher(
-                    None, algo=CudaDiffNativeMatcher._ALGO_MYERS,
+                    None, algo=CudaDiffNativeMatcher._ALGO_HISTOGRAM,
                     flags=self.ignore_flags,
                     a_text=a_text, b_text=b_text)
             else:
-                # Default to histogram (covers 'native_histogram' and any
-                # unexpected value — histogram is the recommended default).
+                # Default to myers (covers 'native_myers' and any
+                # unexpected value — myers is the fastest on large/very
+                # different files and the plugin's default).
                 diff = CudaDiffNativeMatcher(
-                    None, algo=CudaDiffNativeMatcher._ALGO_HISTOGRAM,
+                    None, algo=CudaDiffNativeMatcher._ALGO_MYERS,
                     flags=self.ignore_flags,
                     a_text=a_text, b_text=b_text)
 

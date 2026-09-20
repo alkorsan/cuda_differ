@@ -21,27 +21,52 @@ Architecture:
     restore automatically — no need for on_act/on_resize/on_show handlers.
   - Uses a two-bitmap optimization (see _ensure_static_bitmap / paint):
     * Static bitmap: a separate persistent bitmap (via bitmap_proc) that
-      stores the colored line/gap rectangles. Only repainted on compare/resize
-      via repaint_static(). This is the expensive part (hundreds of
-      CANVAS_RECT_FILL calls).
+      stores the colored diff segments, the scroll buttons and the
+      separator line. Only repainted on compare/resize via
+      repaint_static().
     * Dynamic: on each paint(), copy the static bitmap to the image's
       embedded bitmap via CANVAS_BITMAP, then draw the slider and
       grabber on top. This is cheap (one bitmap copy + a few
       CANVAS_RECT / CANVAS_LINE calls).
-  - On scroll, two repaint paths keep the overview cheap AND responsive:
-    * Immediate: track_paint() (called from the slider drag handlers and
-      from the plugin's on_scroll) repaints at up to ~33 fps, gated by
-      WALL CLOCK -- never by a timer, because a drag floods the message
-      queue and starves WM_TIMER, which would freeze the thumb until
-      the drag stops.
-    * Trailing: a one-shot 150ms timer (armed by the plugin's on_scroll)
-      does the final repaint after scrolling stops.
-    Both only copy the static bitmap and draw the dynamic part (slider +
-    grabber) -- the static bitmap is reused, so the expensive rectangle
-    loop never runs on scroll.
-  - On compare/resize: repaint_static() is called first, which frees the
-    old static bitmap and creates a new one with fresh content. Then
-    paint() copies it + draws the dynamic part.
+
+  - PANEL LAYOUT (like a usual scrollbar):
+      +----------------+
+      |       ▲        |  BUTTON_HEIGHT px, ▲ scrolls one line up
+      |----------------|
+      | left | map  |  |  track: the two editors' mini-maps side by side
+      | line | area |  |  slider lives here (between the buttons)
+      |----------------|
+      |       ▼        |  BUTTON_HEIGHT px, ▼ scrolls one line down
+      +----------------+
+      x=0..SEP_LINE_WIDTH is a grey vertical separator line spanning the
+      FULL panel height (the button boxes included), visually separating
+      the overview from the editor / the editor's scrollbar.
+    The ▲/▼ boxes use the theme's ScrollBack color as background and the
+    theme's ScrollArrow color for the arrow glyph, both read via
+    PROC_THEME_UI_DICT_GET. The glyph is centered in its box and the box
+    has no border, like the scrollbar buttons of editors and browsers.
+    Pressing a button scrolls one line at once, and after a short hold it
+    starts auto-repeating (like real scrollbar buttons) until released.
+
+  - WINMERGE-STYLE PAINTING (the "Location Pane" approach):
+    With huge files (1M lines, 200k diffs) painting every colored line is
+    pointless: the panel is only ~600 pixels tall, so thousands of
+    consecutive sub-pixel segments would just keep overwriting the same
+    pixel rows — you cannot paint half a pixel. WinMerge's LocationView
+    solves this by converting only the diff blocks to pixels and SKIPPING
+    every block whose end pixel equals the previous block's end pixel
+    (it is fully covered by what is already drawn). This plugin does the
+    same, plus run coalescing:
+      * consecutive same-colored lines merge into one segment;
+      * each side's line/gap positions are converted to visual rows ONCE
+        via a prefix-sum pass (itertools.accumulate, C speed) instead of
+        per-line O(n) Python loops;
+      * the draw loop skips every segment whose end pixel equals the
+        previous segment's end pixel (the WinMerge
+        `nPrevEndY != bottom_coord` rule), so the number of actual
+        canvas calls is bounded by the panel's pixel HEIGHT, not by the
+        number of diffs — 200k diffs still paint at most ~600 rects per
+        side.
 
   - PROPORTIONAL SLIDER HEIGHT:
     Like real scrollbars in browsers/editors, the slider grows/shrinks
@@ -49,53 +74,29 @@ Architecture:
       smooth_max     = total content height (pixels, INCLUDES page)
       smooth_page    = visible viewport height (pixels)
       smooth_pos     = current scroll position (pixels)
-    So slider_height = h * smooth_page / smooth_max, clamped to a 30px
-    minimum so the slider stays grabbable. When the entire file fits in
-    the viewport, slider_height == h (full track). When the file is huge,
-    slider_height shrinks toward 30px. The slider_top formula
-    `py_top = h * smooth_pos / smooth_max` is unchanged — mathematically,
-    when smooth_pos reaches its max (smooth_max - smooth_page), py_top
-    becomes h - slider_height, so the slider lands flush at the bottom.
+    So slider_height = track_h * smooth_page / smooth_max, clamped to a
+    30px minimum so the slider stays grabbable. The slider_top formula
+    `py_top = track_y0 + track_h * smooth_pos / smooth_max` is
+    mathematically consistent: when smooth_pos reaches its max
+    (smooth_max - smooth_page), py_top lands flush at the track bottom.
 
-  - SLIDER OPACITY (three paint methods, dispatched by _paint_dynamic):
-    CudaText canvas_proc has NO alpha-blend primitive (only BRUSH_SOLID =
-    opaque, BRUSH_CLEAR = no fill). Three methods are provided so users
-    can trade off looks vs performance:
-
-    1. SOLID (opt_slider_opacity_enabled = False):
-       Original method. One CANVAS_RECT call (pen + solid brush). Fastest.
-
-    2. CLEAR (opt_slider_opacity_enabled = True AND opacity < 8%):
-       Border-only slider via BRUSH_CLEAR. One CANVAS_RECT call with no
-       fill. Fastest transparent option — used for very low opacity.
-
-    3. BLENDED (opt_slider_opacity_enabled = True AND opacity >= 8%):
-       Per-row pre-blend. A per-row segment index (_row_segments) is built
-       in _paint_static(), recording the final color of every Y row of
-       the static bitmap (background / gap / line-state). On each paint(),
-       _paint_dynamic() walks the slider rows (py_height of them) and
-       fills each segment with `blend(orig_color, slider_fill, alpha)` —
-       per-channel `orig*(1-α) + fill*α`. This produces a pixel-exact
-       simulation of true alpha blending. Cost: ~2 * py_height
-       CANVAS_RECT_FILL calls per scroll. The slider border + grabber
-       lines are drawn on top, unchanged.
-
-  - SLIDER GRABBER PATTERN:
-    3 horizontal dark-grey lines, each 2px thick, spaced 6px apart
-    (center-to-center) vertically centered in the slider. Triple the
-    spacing of the old 1px-thick 2px-apart 6-line bevel pattern, with
-    the white bevel lines removed for a cleaner modern scrollbar look
-    (matches WinMerge / modern editor sliders). The 2px thickness makes
-    the lines clearly visible against any fill (solid, clear, or
-    pre-blended).
+  - LIVE SLIDER DRAG:
+    A drag floods the message queue with mouse moves, and WM_PAINT is
+    only delivered when the queue is empty — so although paint() keeps
+    updating the bitmap in memory, the on-screen control appears frozen
+    until the drag stops. To make the thumb track the mouse like a real
+    scrollbar, the mouse handlers pump the message queue once
+    (app_proc(PROC_IDLE)) right after painting, which delivers the
+    pending WM_PAINT synchronously — guarded against re-entrancy by the
+    _pumping flag.
 
   See: https://github.com/CudaText-addons/cuda_differ/issues/29
 """
 
 import time
+from itertools import accumulate
 
 import cudatext as ct
-from .profiling import Profiler
 
 # Overview dialog width in pixels (docked to the right)
 OVERVIEW_WIDTH = 40
@@ -117,6 +118,27 @@ OVERVIEW_WIDTH = 40
 # (exactly the "thumb does not move until I stop" bug this fixes).
 OVERVIEW_TRACK_INTERVAL = 0.030
 
+# Width of the grey vertical separator line at the very left of the
+# overview panel (full panel height, buttons included). Separates the
+# overview from the editor / the editor's scrollbar.
+SEP_LINE_WIDTH = 1
+SEP_LINE_COLOR = 0x808080  # grey — visible on both light and dark themes
+
+# Height of the ▲/▼ scroll button boxes at the top and bottom of the
+# overview panel (like a scrollbar's arrow buttons).
+BUTTON_HEIGHT = 16
+# Font used for the ▲/▼ glyphs (falls back to the platform default when
+# unavailable; a solid triangle is drawn when even that lacks the glyph).
+BUTTON_FONT_NAME = 'Segoe UI'
+BUTTON_FONT_SIZE = 9
+
+# Auto-repeat behaviour of the ▲/▼ buttons, mimicking Windows scrollbar
+# arrow buttons: the first click scrolls one line; if the button is kept
+# pressed, after this initial delay the scrolling repeats at the repeat
+# interval until the button is released.
+BUTTON_INITIAL_DELAY_MS = 400
+BUTTON_REPEAT_MS = 50
+
 
 class PaintboxOverview:
     """Manages a docked image overview panel for a compare tab.
@@ -134,14 +156,17 @@ class PaintboxOverview:
         self._ctl_index = None  # control index in the dialog
         self._owns_dlg = False  # True if we created a separate dialog
         # Static bitmap (persistent — only repainted on compare/resize).
-        # Stores the colored line/gap rectangles so they don't need to be
-        # repainted on every scroll. See paint() for how it's used.
+        # Stores the colored diff segments, the scroll buttons and the
+        # separator line so they don't need to be repainted on every
+        # scroll. See paint() for how it's used.
         self._h_static_bmp = None
         self._h_static_cnv = None
         self._static_w = 0
         self._static_h = 0
-        # Line states: {('a', line): color, ('b', line): color}
-        self.line_states = {}
+        # Line states per side: {line: color}. Filled by add_line_state()
+        # while the compare events are painted.
+        self.line_states_a = {}
+        self.line_states_b = {}
         # Gap info: list of (after_line, gap_visual_rows, ignored) per gap
         self.gaps_a = []  # list of (after_line, gap_visual_rows, ignored)
         self.gaps_b = []
@@ -161,16 +186,36 @@ class PaintboxOverview:
         self.color_changed = 0xAAAAAA  # overridden by set_colors()
         self.color_gap = 0xEEEEEE      # overridden by set_colors()
         self.color_ignored_gap = 0xEEEEEE  # overridden by set_colors()
+        # ▲/▼ button colors (theme ScrollBack / ScrollArrow), refreshed by
+        # set_colors() from PROC_THEME_UI_DICT_GET.
+        self.color_btn_bg = 0xE0E0E0
+        self.color_btn_arrow = 0x000000
         # Slider state for drag-to-scroll
         self._slider_top = 0
         self._slider_height = 0
         self._overview_height = 0
+        self._track_y0 = 0
+        self._track_h = 0
         self._dragging = False
         self._drag_offset = 0
         self._smooth_max = 0
         # Wall-clock timestamp of the last track_paint(); gates the
         # immediate slider repaints to OVERVIEW_TRACK_INTERVAL.
         self._track_last_paint = 0.0
+        # Wall-clock timestamp of the last synchronous editor repaint
+        # (EDACTION_UPDATE pair) issued from a slider drag — keeps the
+        # heavy full repaints of big-file editors at ~33 fps during the
+        # drag while set_prop keeps the scroll position itself exact.
+        self._editor_update_last = 0.0
+        # Re-entrancy guard for the message pump (_repaint_control_now):
+        # True while app_proc(PROC_IDLE) dispatches pending messages so
+        # a nested pump can never recurse.
+        self._pumping = False
+
+        # --- ▲/▼ button auto-repeat state ---
+        # _btn_dir: None while no button is held, -1 while ▲ is held,
+        # +1 while ▼ is held. Drives the one-line scroll + auto-repeat.
+        self._btn_dir = None
 
         # --- Slider opacity options (user-configurable) ---
         # opt_slider_opacity_enabled: if False, use the OLD solid-fill
@@ -208,8 +253,10 @@ class PaintboxOverview:
         # Per-row segment index: list of length h, where each row is a
         # list of (x_start, x_end, color) tuples in paint order (later
         # entries visually overwrite earlier ones). Rebuilt only in
-        # _paint_static(); consumed by _paint_dynamic(). Empty until the
-        # first static repaint completes. Only used by the BLENDED method.
+        # _paint_static() (from the segments actually DRAWN — the WinMerge
+        # pixel-dedup skips are not recorded); consumed by
+        # _paint_dynamic(). Empty until the first static repaint
+        # completes. Only used by the BLENDED slider method.
         self._row_segments = []
 
     def is_created(self):
@@ -269,10 +316,13 @@ class PaintboxOverview:
         ct.dlg_proc(self.h_dlg, ct.DLG_CTL_PROP_SET, index=self._ctl_index, prop={
             'name': 'overview_image',
             'align': ct.ALIGN_CLIENT,
-            'on_click': self._on_click,
             'on_mouse_down': self._on_mouse_down,
             'on_mouse_move': self._on_mouse_move,
             'on_mouse_up': self._on_mouse_up,
+            # Without mouse capture, a button released OUTSIDE the control
+            # never delivers on_mouse_up — stop the ▲/▼ auto-repeat (and
+            # any drag) when the pointer leaves the panel instead.
+            'on_mouse_exit': self._on_mouse_exit,
         })
 
         # Get the image control handle and its embedded bitmap + canvas
@@ -286,6 +336,7 @@ class PaintboxOverview:
 
     def destroy(self):
         """Undock and free the overview dialog and static bitmap."""
+        self._stop_button_repeat()
         self._free_static_bitmap()
         if self.h_dlg is not None:
             try:
@@ -315,14 +366,14 @@ class PaintboxOverview:
     def _ensure_static_bitmap(self, w, h):
         """Create or resize the persistent static bitmap to match (w, h).
 
-        The static bitmap stores the colored line/gap rectangles (the
-        expensive part that takes hundreds of CANVAS_RECT_FILL calls).
-        It's only repainted here when the size changes or when
-        repaint_static() is called after a fresh compare.
+        The static bitmap stores the colored diff segments, the scroll
+        buttons and the separator line (the expensive part). It's only
+        repainted here when the size changes or when repaint_static() is
+        called after a fresh compare.
 
         Once created, the static bitmap is reused on every paint() call
         — paint() just copies it to the image's embedded bitmap and draws
-        the cursor/viewport on top, which is very fast.
+        the slider on top, which is very fast.
         """
         if self._h_static_bmp is not None:
             if self._static_w == w and self._static_h == h:
@@ -362,6 +413,11 @@ class PaintboxOverview:
                    color_gap, color_ignored_gap=None):
         """Set the colors used for painting the overview.
 
+        Also refreshes the ▲/▼ button colors from the current UI theme
+        (ScrollBack for the box background, ScrollArrow for the glyph) —
+        called on every compare start, so a theme switch is picked up by
+        the next compare.
+
         Args:
             color_bg: background color (theme EdTextBg)
             color_deleted: color for deleted lines (config color_deleted)
@@ -380,6 +436,16 @@ class PaintboxOverview:
         self.color_gap = color_gap
         if color_ignored_gap is not None:
             self.color_ignored_gap = color_ignored_gap
+        # ▲/▼ button colors from the UI theme (same source the editor's
+        # own scrollbars use). Fall back to neutral values if the theme
+        # dict cannot be read.
+        try:
+            ui = ct.app_proc(ct.PROC_THEME_UI_DICT_GET, '')
+            self.color_btn_bg = ui.get('ScrollBack', {}).get('color', 0xE0E0E0)
+            self.color_btn_arrow = ui.get('ScrollArrow', {}).get('color', 0x000000)
+        except Exception:
+            self.color_btn_bg = 0xE0E0E0
+            self.color_btn_arrow = 0x000000
 
     def set_line_counts(self, a_count, b_count):
         """Set the total line counts for both editors (without gaps)."""
@@ -397,17 +463,6 @@ class PaintboxOverview:
         self.wrap_counts_a = wrap_a
         self.wrap_counts_b = wrap_b
 
-    def _line_visual_rows(self, side, line):
-        """Return the number of visual rows a line occupies (1 if no
-        wrapping, or wrap_counts[i] if wrapping is on)."""
-        if side == 'a':
-            wc = self.wrap_counts_a
-        else:
-            wc = self.wrap_counts_b
-        if wc is None or line < 0 or line >= len(wc):
-            return 1
-        return max(1, wc[line])
-
     def add_line_state(self, side, line, color):
         """Record that a line has a specific color (deleted/added/changed).
 
@@ -416,7 +471,10 @@ class PaintboxOverview:
             line: line index (0-based)
             color: RGB int color
         """
-        self.line_states[(side, line)] = color
+        if side == 'a':
+            self.line_states_a[line] = color
+        else:
+            self.line_states_b[line] = color
 
     def add_gap(self, side, after_line, gap_visual_rows, ignored=False):
         """Record a gap inserted after a line.
@@ -437,118 +495,23 @@ class PaintboxOverview:
     def clear_data(self):
         """Clear all collected line states and gaps. Called before a
         fresh compare."""
-        self.line_states.clear()
+        self.line_states_a.clear()
+        self.line_states_b.clear()
         self.gaps_a.clear()
         self.gaps_b.clear()
 
-    def _compute_visual_height(self, side):
-        """Compute the total visual height (lines + gaps) for one side.
+    # ------------------------------------------------------------------
+    # Layout helpers
+    # ------------------------------------------------------------------
 
-        Each line's visual height is its wrap count (1 if no wrapping),
-        plus gap rows. This ensures both sides have equal visual heights
-        when the diff is correct.
-
-        Returns: int — total visual rows for the given side.
-        """
-        if side == 'a':
-            line_count = self.a_line_count
-            gaps = self.gaps_a
-        else:
-            line_count = self.b_line_count
-            gaps = self.gaps_b
-        # Sum line visual rows (wrap-aware)
-        total = 0
-        for line in range(line_count):
-            total += self._line_visual_rows(side, line)
-        # Add gap rows
-        for _, gap_rows, _ign in gaps:
-            total += gap_rows
-        return max(total, 1)
-
-    def _sorted_gaps(self, side):
-        """Return gaps for the given side, sorted by after_line.
-
-        Gaps are collected in event order (which may not be sorted),
-        so we sort them before using in position calculations.
-        """
-        gaps = self.gaps_a if side == 'a' else self.gaps_b
-        return sorted(gaps, key=lambda g: g[0])
-
-    def _line_to_visual_y(self, side, line):
-        """Map a line index to its visual Y position (in visual rows),
-        accounting for both gaps and wrapping.
-
-        Args:
-            side: 'a' or 'b'
-            line: line index (0-based)
-
-        Returns: float — visual Y position in visual-row units.
-        """
-        gaps = self._sorted_gaps(side)
-        # Sum visual rows of all lines before this one (wrap-aware)
-        y = 0
-        for i in range(line):
-            y += self._line_visual_rows(side, i)
-        # Add gap rows for gaps at or before this line
-        for after_line, gap_rows, _ign in gaps:
-            if after_line <= line:
-                y += gap_rows
-            else:
-                break
-        return y
-
-    def _visual_y_to_line_wrap_aware(self, side, visual_y):
-        """Map a visual Y position (in visual rows) back to a line index,
-        accounting for BOTH gaps AND wrapping.
-
-        Walks lines in order, subtracting each line's wrap count and
-        gap rows from the visual Y until we reach the target line.
-
-        Args:
-            side: 'a' or 'b'
-            visual_y: visual Y position in visual-row units
-
-        Returns: int — line index (0-based).
-        """
-        if side == 'a':
-            line_count = self.a_line_count
-        else:
-            line_count = self.b_line_count
-        gaps = self._sorted_gaps(side)
-        gap_map = {}
-        for after_line, gap_rows, _ign in gaps:
-            gap_map[after_line] = gap_map.get(after_line, 0) + gap_rows
-
-        remaining = visual_y
-        for line in range(line_count):
-            # Subtract gap before this line
-            if line in gap_map:
-                remaining -= gap_map[line]
-                if remaining < 0:
-                    return max(0, line - 1)
-            # Subtract this line's visual rows (wrap-aware)
-            line_vr = self._line_visual_rows(side, line)
-            remaining -= line_vr
-            if remaining < 0:
-                return line
-        return max(0, line_count - 1)
-
-    def _get_scale(self, h):
-        """Compute the pixel-per-visual-row scale factor.
-
-        Both sides use the same scale (based on the taller side) so that
-        visually-aligned lines in the editors are also aligned in the
-        overview.
-
-        Args:
-            h: pixel height of the image control
-
-        Returns: float — pixels per visual row.
-        """
-        vis_h_a = self._compute_visual_height('a')
-        vis_h_b = self._compute_visual_height('b')
-        max_vis_h = max(vis_h_a, vis_h_b)
-        return h / max_vis_h if max_vis_h > 0 else 1
+    def _track_rect(self, h):
+        """(y, height) of the slider track — the map area between the
+        ▲/▼ button boxes. The slider and the mini-maps live here."""
+        track_h = h - 2 * BUTTON_HEIGHT
+        if track_h < 1:
+            # Degenerate tiny panel: no room for buttons, use everything.
+            return 0, max(1, h)
+        return BUTTON_HEIGHT, track_h
 
     def _get_size(self):
         """Get the current image control size (w, h) in pixels."""
@@ -557,20 +520,25 @@ class PaintboxOverview:
         h = props.get('h', 600)
         return w, h
 
-    def _paint_static(self, c, w, h):
-        """Paint the static part (background, line states, gaps) on the
-        given canvas. This is the expensive part that only needs to run
-        on compare/resize, not on scroll.
+    # ------------------------------------------------------------------
+    # Static painting (WinMerge "Location Pane" model)
+    # ------------------------------------------------------------------
 
-        The static bitmap stores the result of this method so it can be
-        reused on every paint() call without re-executing the expensive
-        CANVAS_RECT_FILL loop.
+    def _paint_static(self, c, w, h):
+        """Paint the static part (background, diff segments, buttons,
+        separator) on the given canvas. Only runs on compare/resize.
+
+        The heavy work is the per-side segment painting
+        (_paint_side_segments), which uses the WinMerge Location Pane
+        approach: lines are converted to pixel segments once (prefix
+        sums), consecutive same-colored lines are coalesced into runs,
+        and every segment that would collapse onto already-painted pixels
+        is skipped — so the canvas call count is bounded by the panel's
+        pixel height, not by the file's line/diff count.
 
         Also builds _row_segments — the per-row segment index used by
-        _paint_dynamic() to precompute transparent-slider blends. Each
-        row starts as a full-width background segment; _paint_side()
-        appends line/gap segments on top in paint order so the last
-        color wins (matching the on-screen visual).
+        _paint_dynamic() to precompute transparent-slider blends. Only
+        the segments actually drawn are recorded.
 
         Args:
             c: canvas handle (static bitmap canvas)
@@ -582,27 +550,293 @@ class PaintboxOverview:
         ct.canvas_proc(c, ct.CANVAS_RECT_FILL, x=0, y=0, x2=w, y2=h)
 
         # (Re)build the per-row segment index — start with full-width
-        # background for every row. _paint_side() will append layers on
-        # top via _record_segment().
+        # background for every row. _paint_side_segments() /
+        # _paint_buttons() / _paint_separator() append layers on top.
         self._row_segments = [[(0, w, self.color_bg)] for _ in range(h)]
-        # Also record the background itself for completeness.
-        self._record_segment(0, 0, w, h, self.color_bg)
 
-        # Paint both sides
-        scale = self._get_scale(h)
-        half_w = w // 2
-        self._paint_side(c, 'a', 0, half_w, h, scale)
-        self._paint_side(c, 'b', half_w, w, h, scale)
+        # Map area: between the buttons, right of the separator line.
+        track_y0, track_h = self._track_rect(h)
+        x_start = SEP_LINE_WIDTH
+        half_w = (w - SEP_LINE_WIDTH) // 2
+        if track_h > 0:
+            self._paint_side_segments(c, 'a', x_start, x_start + half_w,
+                                      track_y0, track_h)
+            self._paint_side_segments(c, 'b', x_start + half_w, w,
+                                      track_y0, track_h)
+
+        # ▲/▼ buttons and the separator line on top
+        self._paint_buttons(c, w, h)
+        self._paint_separator(c, w, h)
+
+    def _prefix_sums(self, side):
+        """One-pass conversion of a side's line/gap layout to visual rows.
+
+        Returns (cum, total, gap_map):
+          cum[i]     visual row where line i starts (all gaps above it
+                     included); cum[n] = end of the last line (trailing
+                     gaps excluded);
+          total      total visual rows (lines + all gaps, trailing ones
+                     included);
+          gap_map    position -> [total_rows, ignored_rows]: a gap
+                     "after line L" sits before line L+1, so its position
+                     is L+1 clamped to n (positions >= n are trailing
+                     gaps after the last line); several gaps at the same
+                     position accumulate.
+
+        Built with itertools.accumulate (C speed) — a 1M-line side is
+        one pass instead of the per-line Python loops the old code ran
+        (separate O(n) walks in _compute_visual_height, _get_scale and
+        the paint loop itself).
+        """
+        if side == 'a':
+            n, gaps, wrap = self.a_line_count, self.gaps_a, self.wrap_counts_a
+        else:
+            n, gaps, wrap = self.b_line_count, self.gaps_b, self.wrap_counts_b
+
+        gap_map = {}
+        for after, rows, ign in gaps:
+            # Gap "after line L" sits before line L+1. Clamp to [0, n]:
+            # L >= n is a trailing gap (after the last line), and a
+            # defensive L < 0 is treated as "before line 0" so an
+            # out-of-range position can never write through a negative
+            # list index below.
+            if after < 0:
+                pos = 0
+            elif after > n:
+                pos = n
+            else:
+                pos = after
+            ent = gap_map.setdefault(pos, [0, 0])
+            ent[0] += rows
+            if ign:
+                ent[1] += rows
+
+        # Gaps that shift line starts (positions < n); gaps at n are
+        # trailing and only extend the total height.
+        gap_shift = [0] * (n + 1)
+        trailing = 0
+        for pos, ent in gap_map.items():
+            if pos < n:
+                gap_shift[pos] += ent[0]
+            else:
+                trailing += ent[0]
+
+        # cum[i] = (visual rows of lines 0..i-1) + (gap rows at
+        # positions <= i) — the accumulated gap shift is aligned with the
+        # line prefix by construction. Shortcut when no gaps shift
+        # anything: cum is just the line prefix itself (range object,
+        # no 1M-element list allocation).
+        if wrap is not None and len(wrap) >= n:
+            line_prefix = accumulate(wrap[:n], initial=0)
+        else:
+            line_prefix = range(n + 1)
+        has_shifting_gaps = any(ent[0] for pos, ent in gap_map.items()
+                                if pos < n)
+        if has_shifting_gaps:
+            gap_acc = accumulate(gap_shift)
+            cum = [lp + ga for lp, ga in zip(line_prefix, gap_acc)]
+        elif wrap is not None and len(wrap) >= n:
+            cum = list(line_prefix)
+        else:
+            cum = range(n + 1)
+        total = cum[n] + trailing
+        return cum, total, gap_map
+
+    def _build_segments(self, side, cum=None, gap_map=None):
+        """Build the colored segments of one side, in visual order.
+
+        Returns a list of (start_row, end_row, color) tuples:
+          - line runs: consecutive lines with the same color, merged
+            when they are visually adjacent (no gap between them) —
+            one rect instead of per-line rects;
+          - gaps: one rect per gap position, split into its ignored
+            portion (if any) and its regular portion.
+
+        The list is ascending by start_row (paint order).
+
+        cum / gap_map may be passed in (from a _prefix_sums call the
+        caller already made) or computed here when omitted.
+        """
+        if side == 'a':
+            n, wrap = self.a_line_count, self.wrap_counts_a
+            states = self.line_states_a
+        else:
+            n, wrap = self.b_line_count, self.wrap_counts_b
+            states = self.line_states_b
+        if cum is None or gap_map is None:
+            cum, _total, gap_map = self._prefix_sums(side)
+
+        def line_rows(i):
+            if wrap is not None and 0 <= i < len(wrap) and wrap[i] > 0:
+                return wrap[i]
+            return 1
+
+        # Line runs: consecutive same-colored lines merge while they are
+        # visually adjacent (line == prev+1 AND no gap before this line).
+        runs = []
+        prev_line = -2
+        for line, color in sorted(states.items()):
+            if line < 0 or line >= n:
+                continue
+            end_row = cum[line] + line_rows(line)
+            if (runs and line == prev_line + 1
+                    and line not in gap_map
+                    and runs[-1][2] == color):
+                runs[-1][1] = end_row  # extend the current run
+            else:
+                runs.append([cum[line], end_row, color])
+            prev_line = line
+
+        # Gap segments (positions in ascending order). The ignored
+        # portion of a gap (a DIFF_IGN_BLANK_LINES-suppressed hunk's
+        # compensating rows) is emitted as its OWN segment covering the
+        # top of the rect, and the regular gap color covers the rest —
+        # two non-overlapping segments instead of a paint-on-top
+        # overlay, so the dedup rule can never discard the ignored
+        # color of a fully-ignored gap (same final look as the old
+        # base-then-overlay layering).
+        gap_segs = []
+        for pos in sorted(gap_map):
+            rows_total, rows_ign = gap_map[pos]
+            if rows_total <= 0:
+                continue
+            if pos < n:
+                start = cum[pos] - rows_total
+            else:
+                start = cum[n]  # trailing: right after the last line
+            ign_rows = min(rows_ign, rows_total)
+            if ign_rows > 0:
+                gap_segs.append((start, start + ign_rows,
+                                 self.color_ignored_gap))
+            if ign_rows < rows_total:
+                gap_segs.append((start + ign_rows, start + rows_total,
+                                 self.color_gap))
+
+        # Merge both ascending streams by start row; a gap before line i
+        # ends where line i starts, so ties cannot happen between a run
+        # and a gap. The sort is stable, keeping a gap's split portions
+        # in their emitted (ignored, then regular) order.
+        segments = gap_segs + [tuple(r) for r in runs]
+        segments.sort(key=lambda seg: seg[0])
+        return segments
+
+    def _paint_side_segments(self, c, side, x_start, x_end, y0, track_h):
+        """Paint one side's colored segments into the track area.
+
+        The WinMerge Location Pane draw loop: convert each segment to
+        pixels once, then SKIP every segment whose end pixel equals the
+        previous segment's end pixel — it would only repaint pixels that
+        are already covered ("we cannot write to half a pixel"). A
+        segment that collapses to zero height is bumped to 1 pixel so
+        the first sub-pixel diff of a region stays visible. The number
+        of CANVAS_RECT_FILL calls is therefore bounded by the track
+        height in pixels, not by the line/diff count.
+        """
+        cum, total, gap_map = self._prefix_sums(side)
+        if total <= 0 or track_h <= 0:
+            return
+        segments = self._build_segments(side, cum, gap_map)
+        if not segments:
+            return
+        scale = track_h / total
+
+        prev_end = -1     # raw end pixel of the previous segment (WinMerge's nPrevEndY)
+        last_color = None
+        for start_row, end_row, color in segments:
+            ps = y0 + int(start_row * scale)
+            pe = y0 + int(end_row * scale)
+            if pe == prev_end:
+                # Collapses onto pixels the previous segment already
+                # covered — useless write, skip it.
+                continue
+            if pe <= ps:
+                pe = ps + 1  # sub-pixel segment: draw at least one pixel
+            if color != last_color:
+                ct.canvas_proc(c, ct.CANVAS_SET_BRUSH, color=color,
+                               style=ct.BRUSH_SOLID)
+                last_color = color
+            ct.canvas_proc(c, ct.CANVAS_RECT_FILL,
+                           x=x_start, y=ps, x2=x_end, y2=pe)
+            self._record_segment(x_start, ps, x_end, pe, color)
+            prev_end = y0 + int(end_row * scale)
+
+    def _paint_buttons(self, c, w, h):
+        """Paint the ▲/▼ scroll button boxes at the top and bottom of
+        the panel.
+
+        Background: the theme's ScrollBack color; the arrow glyph: the
+        theme's ScrollArrow color, centered both vertically and
+        horizontally. No borders on the boxes, like the scrollbar arrow
+        buttons of usual editors and browsers.
+        """
+        if h <= 2 * BUTTON_HEIGHT:
+            return  # degenerate tiny panel: buttons don't fit
+        ct.canvas_proc(c, ct.CANVAS_SET_BRUSH, color=self.color_btn_bg,
+                       style=ct.BRUSH_SOLID)
+        for y0 in (0, h - BUTTON_HEIGHT):
+            ct.canvas_proc(c, ct.CANVAS_RECT_FILL,
+                           x=0, y=y0, x2=w, y2=y0 + BUTTON_HEIGHT)
+            self._record_segment(0, y0, w, y0 + BUTTON_HEIGHT,
+                                 self.color_btn_bg)
+        self._paint_arrow(c, 0, 0, w, BUTTON_HEIGHT, up=True)
+        self._paint_arrow(c, 0, h - BUTTON_HEIGHT, w, BUTTON_HEIGHT, up=False)
+
+    def _paint_arrow(self, c, bx, by, bw, bh, up):
+        """Draw one ▲/▼ arrow centered in its button box.
+
+        Draws the ▲ (up) / ▼ (down) glyph with the theme's ScrollArrow
+        color, centered vertically and horizontally. When the canvas
+        font cannot render the glyph (measured size 0), a solid triangle
+        polygon is drawn instead — same shape, resolution-independent.
+        """
+        glyph = '▲' if up else '▼'
+        ct.canvas_proc(c, ct.CANVAS_SET_FONT, text=BUTTON_FONT_NAME,
+                       color=self.color_btn_arrow, size=BUTTON_FONT_SIZE)
+        size = ct.canvas_proc(c, ct.CANVAS_GET_TEXT_SIZE, text=glyph)
+        try:
+            tw, th = size
+        except (TypeError, ValueError):
+            tw = th = 0
+        if tw > 0 and th > 0:
+            ct.canvas_proc(c, ct.CANVAS_TEXT, text=glyph,
+                           x=bx + (bw - tw) // 2, y=by + (bh - th) // 2)
+        else:
+            # Fallback: solid triangle polygon.
+            cx = bx + bw // 2
+            cy = by + bh // 2
+            r = max(2, min(bw, bh) // 4)
+            if up:
+                pts = (cx, cy - r, cx + r, cy + r, cx - r, cy + r)
+            else:
+                pts = (cx, cy + r, cx + r, cy - r, cx - r, cy - r)
+            ct.canvas_proc(c, ct.CANVAS_SET_PEN,
+                           color=self.color_btn_arrow, size=1)
+            ct.canvas_proc(c, ct.CANVAS_SET_BRUSH,
+                           color=self.color_btn_arrow, style=ct.BRUSH_SOLID)
+            ct.canvas_proc(c, ct.CANVAS_POLYGON, text=pts)
+
+    def _paint_separator(self, c, w, h):
+        """Paint the grey vertical separator line at the very left of
+        the overview panel (x = 0..SEP_LINE_WIDTH), spanning the FULL
+        panel height — the ▲/▼ button boxes included — so the overview
+        is visually separated from the editor / the editor's scrollbar
+        by the same line all the way down."""
+        ct.canvas_proc(c, ct.CANVAS_SET_BRUSH, color=SEP_LINE_COLOR,
+                       style=ct.BRUSH_SOLID)
+        ct.canvas_proc(c, ct.CANVAS_RECT_FILL,
+                       x=0, y=0, x2=SEP_LINE_WIDTH, y2=h)
+        self._record_segment(0, 0, SEP_LINE_WIDTH, h, SEP_LINE_COLOR)
 
     def _record_segment(self, x1, y1, x2, y2, color):
         """Record a colored rectangle in the per-row segment index.
 
-        Called from _paint_side() for every CANVAS_RECT_FILL it issues.
-        Each affected row gets (x1, x2, color) appended to its segment
-        list — later appends visually overwrite earlier ones (matching
-        the on-screen paint order). Used by _paint_dynamic() to know
-        the exact final color of every Y row, so the transparent
-        slider can be filled with pre-blended colors.
+        Called for every CANVAS_RECT_FILL the static painting actually
+        issues (WinMerge-skipped segments are NOT recorded — they are
+        not on screen). Each affected row gets (x1, x2, color) appended
+        to its segment list — later appends visually overwrite earlier
+        ones (matching the on-screen paint order). Used by
+        _paint_dynamic() to know the exact final color of every Y row,
+        so the transparent slider can be filled with pre-blended colors.
 
         Args:
             x1, y1, x2, y2: rectangle in pixels (y1 inclusive, y2 exclusive)
@@ -641,106 +875,6 @@ class PaintboxOverview:
         b = int(b1 * inv + b2 * alpha)
         return r | (g << 8) | (b << 16)
 
-    def _paint_gap_rect(self, c, x_start, x_end, py, scale, rows_total,
-                        rows_ignored):
-        """Paint one inter-line gap rectangle.
-
-        Regular rows are painted with color_gap; ignored rows (gaps that
-        compensate a DIFF_IGN_BLANK_LINES-suppressed hunk) are painted
-        with color_ignored_gap on top, stacked inside the same rect.
-        When a regular and an ignored gap share a position their heights
-        add up, and the ignored portion is drawn at the top of the rect.
-        Both segments are recorded for the transparent-slider blending.
-        """
-        gap_h = max(1, int(rows_total * scale))
-        ct.canvas_proc(c, ct.CANVAS_SET_BRUSH, color=self.color_gap,
-                       style=ct.BRUSH_SOLID)
-        ct.canvas_proc(c, ct.CANVAS_RECT_FILL, x=x_start, y=py,
-                       x2=x_end, y2=py + gap_h)
-        self._record_segment(x_start, py, x_end, py + gap_h,
-                             self.color_gap)
-        if rows_ignored > 0:
-            ign_h = min(gap_h, max(1, int(rows_ignored * scale)))
-            ct.canvas_proc(c, ct.CANVAS_SET_BRUSH,
-                           color=self.color_ignored_gap,
-                           style=ct.BRUSH_SOLID)
-            ct.canvas_proc(c, ct.CANVAS_RECT_FILL, x=x_start, y=py,
-                           x2=x_end, y2=py + ign_h)
-            self._record_segment(x_start, py, x_end, py + ign_h,
-                                 self.color_ignored_gap)
-
-    def _paint_side(self, c, side, x_start, x_end, h, scale):
-        """Paint one side of the overview (either a_ed or b_ed half).
-
-        Walks the lines in order, painting each line as a 1-pixel-tall
-        colored rectangle. Gaps are painted as rectangles in the regular
-        gap color; gaps that compensate ignored (suppressed) differences
-        are painted in the ignored-gap color (see _paint_gap_rect). The visual
-        position accounts for gaps so the overview stays in sync with
-        the actual editor layout.
-
-        Args:
-            c: canvas handle
-            side: 'a' or 'b'
-            x_start: left X pixel of this side's area
-            x_end: right X pixel of this side's area
-            h: total pixel height
-            scale: pixels per visual row
-        """
-        if side == 'a':
-            line_count = self.a_line_count
-            gaps = self._sorted_gaps('a')
-        else:
-            line_count = self.b_line_count
-            gaps = self._sorted_gaps('b')
-
-        # Build a gap map: after_line -> [total gap rows, ignored rows]
-        # at that position. A gap with after_line == N means it appears
-        # between line N-1 and line N (i.e., BEFORE line N in visual
-        # order). Several gaps (regular + ignored) can share a position;
-        # their heights add up and the ignored portion is painted on
-        # top (see _paint_gap_rect).
-        gap_map = {}
-        for after_line, gap_rows, gap_ign in gaps:
-            ent = gap_map.setdefault(after_line, [0, 0])
-            ent[0] += gap_rows
-            if gap_ign:
-                ent[1] += gap_rows
-
-        vis_y = 0
-
-        # Paint gaps and lines in order
-        for line in range(line_count):
-            # Paint gap before this line (if any).
-            # Gap with after_line == line means: between line-1 and line.
-            if line in gap_map:
-                rows_total, rows_ign = gap_map[line]
-                py = int(vis_y * scale)
-                self._paint_gap_rect(c, x_start, x_end, py, scale,
-                                     rows_total, rows_ign)
-                vis_y += rows_total
-
-            # Paint the line (only if it has a state — changed lines)
-            color = self.line_states.get((side, line))
-            if color is not None:
-                py = int(vis_y * scale)
-                # Use wrap-aware line height
-                line_vr = self._line_visual_rows(side, line)
-                line_h = max(1, int(line_vr * scale) + 1)
-                ct.canvas_proc(c, ct.CANVAS_SET_BRUSH, color=color, style=ct.BRUSH_SOLID)
-                ct.canvas_proc(c, ct.CANVAS_RECT_FILL, x=x_start, y=py, x2=x_end, y2=py + line_h)
-                # Record segment for transparent-slider blending
-                self._record_segment(x_start, py, x_end, py + line_h, color)
-            vis_y += self._line_visual_rows(side, line)
-
-        # Paint any remaining gaps after the last line
-        for after_line, gap_rows, gap_ign in gaps:
-            if after_line >= line_count:
-                py = int(vis_y * scale)
-                self._paint_gap_rect(c, x_start, x_end, py, scale,
-                                     gap_rows, 1 if gap_ign else 0)
-                vis_y += gap_rows
-
     def repaint_static(self):
         """Force a full repaint of the static bitmap. Called after a
         fresh compare or when colors change.
@@ -760,21 +894,19 @@ class PaintboxOverview:
     def paint(self):
         """Repaint the overview using the static/dynamic bitmap approach.
 
-        The static bitmap (line states + gaps) is reused — it's only
-        repainted when the diff changes (via repaint_static). On scroll,
-        this method just:
+        The static bitmap (diff segments + buttons + separator) is
+        reused — it's only repainted when the diff changes (via
+        repaint_static). On scroll, this method just:
         1. Ensures the static bitmap exists and matches current size.
         2. Resizes the image's embedded bitmap to match (if needed).
         3. Copies the static bitmap to the image's embedded bitmap via
            CANVAS_BITMAP (fast — one bitmap copy).
-        4. Draws the dynamic part (slider + grabber)
-           on top of the image's bitmap (a few CANVAS_RECT / CANVAS_LINE
-           calls).
+        4. Draws the dynamic part (slider + grabber) on top.
 
-        This avoids the expensive CANVAS_RECT_FILL loop on every scroll,
-        dramatically reducing CPU usage. The image control's embedded
-        bitmap handles resize/minimize/restore automatically, so no
-        on_act/on_resize/on_show handlers are needed.
+        This avoids the expensive segment loop on every scroll. The
+        image control's embedded bitmap handles resize/minimize/restore
+        automatically, so no on_act/on_resize/on_show handlers are
+        needed.
         """
         if self.h_canvas is None:
             return
@@ -801,7 +933,7 @@ class PaintboxOverview:
         ct.canvas_proc(self.h_canvas, ct.CANVAS_BITMAP,
                        p1=self._h_static_bmp, x=0, y=0)
 
-        # Draw dynamic part (cursor + viewport) on top
+        # Draw dynamic part (slider) on top
         self._paint_dynamic(w, h)
 
     def _paint_dynamic(self, w, h):
@@ -811,10 +943,11 @@ class PaintboxOverview:
         - Get the editor's total content height (smooth_max), current
           scroll position (smooth_pos), and visible page (smooth_page)
           from PROP_SCROLL_VERT_INFO.
-        - Map to overview pixels:
-            slider_height = h * smooth_page / smooth_max (proportional,
-                            clamped to min 30px so it stays grabbable)
-            slider_top    = h * smooth_pos / smooth_max
+        - Map to the track area between the ▲/▼ buttons:
+            slider_height = track_h * smooth_page / smooth_max
+                            (proportional, clamped to min 30px so it
+                            stays grabbable, and to the track height)
+            slider_top    = track_y0 + track_h * smooth_pos / smooth_max
         - Dispatch to one of three slider-paint methods based on options:
             * opt_slider_opacity_enabled == False  → _paint_slider_solid
             * opacity < 8%                          → _paint_slider_clear
@@ -822,9 +955,9 @@ class PaintboxOverview:
 
         The slider_top formula is mathematically consistent: when
         smooth_pos reaches its max (smooth_max - smooth_page),
-        py_top = h * (smooth_max - smooth_page) / smooth_max =
-        h - slider_height, so the slider lands flush at the bottom of
-        the track. No special-casing needed for the bottom edge.
+        py_top = track_y0 + track_h - slider_height, so the slider lands
+        flush at the bottom of the track. No special-casing needed for
+        the bottom edge.
 
         Args:
             w: width in pixels
@@ -847,26 +980,31 @@ class PaintboxOverview:
         if smooth_max <= 0:
             smooth_max = 1
 
+        track_y0, track_h = self._track_rect(h)
+
         # --- Compute proportional slider height (like a real scrollbar) ---
         # smooth_max is the total content height in pixels (includes the
         # page size, per CudaText API docs). smooth_page is the visible
         # viewport height. slider_height proportional to page/total,
-        # clamped to [min_height, h] so the slider always fits the track
-        # and stays grabbable.
+        # clamped to [min_height, track_h] so the slider always fits the
+        # track and stays grabbable. Both values use round-half-up so
+        # the slider lands EXACTLY flush at the track bottom when the
+        # scroll position reaches its max (plain int() truncation would
+        # leave a 1px gap: int(t*p/m) + int(t*p/m) != t).
         min_h = self._slider_min_height
         if smooth_page > 0:
-            py_height = int(h * smooth_page / smooth_max)
-            py_height = max(min_h, min(h, py_height))
+            py_height = int(track_h * smooth_page / smooth_max + 0.5)
+            py_height = max(min_h, min(track_h, py_height))
         else:
             # No page info (e.g., very early init) — fall back to min.
-            py_height = min(min_h, h)
+            py_height = min(min_h, track_h)
 
-        # Map editor scroll position to overview pixels:
-        # slider_top = overview_height * editor_scroll / editor_total
-        py_top = int(h * smooth_pos / smooth_max)
+        # Map editor scroll position to track pixels:
+        # slider_top = track_top + track_h * editor_scroll / editor_total
+        py_top = track_y0 + int(track_h * smooth_pos / smooth_max + 0.5)
 
-        # Clamp slider within the overview
-        py_top = max(0, min(py_top, h - py_height))
+        # Clamp slider within the track
+        py_top = max(track_y0, min(py_top, track_y0 + track_h - py_height))
 
         # --- Dispatch to the selected slider-paint method ---
         if not self.opt_slider_opacity_enabled:
@@ -885,6 +1023,8 @@ class PaintboxOverview:
         self._slider_top = py_top
         self._slider_height = py_height
         self._overview_height = h
+        self._track_y0 = track_y0
+        self._track_h = track_h
         self._smooth_max = smooth_max
 
     def _paint_slider_solid(self, c, w, py_top, py_height):
@@ -896,7 +1036,7 @@ class PaintboxOverview:
         """
         ct.canvas_proc(c, ct.CANVAS_SET_PEN, color=self._slider_border, size=1)
         ct.canvas_proc(c, ct.CANVAS_SET_BRUSH, color=self._slider_fill, style=ct.BRUSH_SOLID)
-        ct.canvas_proc(c, ct.CANVAS_RECT, x=0, y=py_top, x2=w - 1, y2=py_top + py_height)
+        ct.canvas_proc(c, ct.CANVAS_RECT, x=SEP_LINE_WIDTH, y=py_top, x2=w - 1, y2=py_top + py_height)
         self._paint_slider_grabber(c, w, py_top, py_height)
 
     def _paint_slider_clear(self, c, w, py_top, py_height):
@@ -912,7 +1052,7 @@ class PaintboxOverview:
         """
         ct.canvas_proc(c, ct.CANVAS_SET_PEN, color=self._slider_border, size=1)
         ct.canvas_proc(c, ct.CANVAS_SET_BRUSH, color=self._slider_fill, style=ct.BRUSH_CLEAR)
-        ct.canvas_proc(c, ct.CANVAS_RECT, x=0, y=py_top, x2=w - 1, y2=py_top + py_height)
+        ct.canvas_proc(c, ct.CANVAS_RECT, x=SEP_LINE_WIDTH, y=py_top, x2=w - 1, y2=py_top + py_height)
         self._paint_slider_grabber(c, w, py_top, py_height)
 
     def _paint_slider_blended(self, c, w, py_top, py_height):
@@ -926,7 +1066,7 @@ class PaintboxOverview:
 
         Cost: ~2 * py_height CANVAS_RECT_FILL calls per paint. For a
         30px slider that's ~60 calls; for a 100px slider (large viewport)
-        ~200 calls. All negligible vs the static repaint's hundreds.
+        ~200 calls. All negligible vs the static repaint.
 
         Falls back to solid fill if the segment index isn't built yet
         (e.g., before the first compare completes).
@@ -941,6 +1081,10 @@ class PaintboxOverview:
                 row = py_top + i
                 if 0 <= row < row_count:
                     for x1, x2, col in self._row_segments[row]:
+                        # Keep the left separator line untouched.
+                        x1 = max(x1, SEP_LINE_WIDTH)
+                        if x2 <= x1:
+                            continue
                         blended = self._blend_color(col, fill_color, alpha)
                         ct.canvas_proc(c, ct.CANVAS_SET_BRUSH,
                                        color=blended, style=ct.BRUSH_SOLID)
@@ -952,7 +1096,7 @@ class PaintboxOverview:
             ct.canvas_proc(c, ct.CANVAS_SET_BRUSH,
                            color=fill_color, style=ct.BRUSH_SOLID)
             ct.canvas_proc(c, ct.CANVAS_RECT_FILL,
-                           x=0, y=py_top, x2=w, y2=py_top + py_height)
+                           x=SEP_LINE_WIDTH, y=py_top, x2=w, y2=py_top + py_height)
 
         # Border: use CANVAS_RECT + BRUSH_CLEAR (NOT CANVAS_RECT_FRAME).
         # The SOLID and CLEAR methods both draw the border via CANVAS_RECT
@@ -965,7 +1109,7 @@ class PaintboxOverview:
         # pre-blended fill.
         ct.canvas_proc(c, ct.CANVAS_SET_PEN, color=self._slider_border, size=1)
         ct.canvas_proc(c, ct.CANVAS_SET_BRUSH, color=self._slider_fill, style=ct.BRUSH_CLEAR)
-        ct.canvas_proc(c, ct.CANVAS_RECT, x=0, y=py_top, x2=w - 1, y2=py_top + py_height)
+        ct.canvas_proc(c, ct.CANVAS_RECT, x=SEP_LINE_WIDTH, y=py_top, x2=w - 1, y2=py_top + py_height)
 
         self._paint_slider_grabber(c, w, py_top, py_height)
 
@@ -988,7 +1132,7 @@ class PaintboxOverview:
         strategy is active.
         """
         mid_y = py_top + py_height // 2
-        grab_x1 = max(2, w // 4)
+        grab_x1 = max(2 + SEP_LINE_WIDTH, w // 4)
         grab_x2 = min(w - 3, w * 3 // 4)
         spacing = self._slider_grabber_spacing  # 6px center-to-center
         thickness = self._slider_grabber_thickness  # 2px per line
@@ -1004,51 +1148,55 @@ class PaintboxOverview:
         ct.canvas_proc(c, ct.CANVAS_LINE,
                        x=grab_x1, y=mid_y + spacing, x2=grab_x2, y2=mid_y + spacing)
 
-    def _on_click(self, id_dlg, id_ctl, data='', info=''):
-        """Called when the image is clicked. Scrolls the editor so the
-        clicked position becomes the center of the slider.
+    # ------------------------------------------------------------------
+    # Mouse handling: slider drag, track jump, ▲/▼ buttons
+    # ------------------------------------------------------------------
 
-        Pure pixel-based mapping:
-          editor_scroll = smooth_max * click_y / overview_height
-        Then centers by subtracting half the visible page.
-        """
-        if not info:
-            return
-        try:
-            parts = info.split(',')
-            x = int(parts[0])
-            y = int(parts[1])
-        except (ValueError, IndexError):
-            return
+    @staticmethod
+    def _parse_mouse(data, info):
+        """Extract (x, y) from a mouse-event callback's arguments.
 
-        self._scroll_overview_pixel(y, center=True)
-
-    def _on_mouse_down(self, id_dlg, id_ctl, data='', info=''):
-        """Called on mouse down. Supports click-to-scroll and drag-to-scroll.
-
-        If click is inside the slider, start dragging.
-        If click is outside, jump to that position (centered).
+        data is the dict {'btn', 'state', 'x', 'y'} the live-callback
+        form delivers; info is the legacy 'x,y' string form. Returns
+        (None, None) when neither carries usable coordinates.
         """
         if isinstance(data, dict):
-            x = data.get('x', 0)
-            y = data.get('y', 0)
-        elif info:
+            return data.get('x', 0), data.get('y', 0)
+        if info:
             try:
                 parts = info.split(',')
-                x = int(parts[0])
-                y = int(parts[1])
+                return int(parts[0]), int(parts[1])
             except (ValueError, IndexError):
-                return
-        else:
+                return None, None
+        return None, None
+
+    def _on_mouse_down(self, id_dlg, id_ctl, data='', info=''):
+        """Called on mouse down. Route the press by the panel layout:
+        ▲/▼ button boxes scroll one line (with auto-repeat while held);
+        inside the track, a press on the slider starts a drag, a press
+        elsewhere jumps the slider there (centered on the click)."""
+        if self._pumping:
+            return
+        x, y = self._parse_mouse(data, info)
+        if x is None:
+            return
+        w, h = self._get_size()
+        if h <= 0:
             return
 
-        slider_top = getattr(self, '_slider_top', 0)
-        slider_height = getattr(self, '_slider_height', 0)
+        # ▲/▼ button boxes (top / bottom).
+        if y < BUTTON_HEIGHT and h > 2 * BUTTON_HEIGHT:
+            self._start_button_repeat(-1)
+            return
+        if y >= h - BUTTON_HEIGHT and h > 2 * BUTTON_HEIGHT:
+            self._start_button_repeat(1)
+            return
 
-        if slider_top <= y <= slider_top + slider_height:
+        # Track: slider drag or centered jump.
+        if self._slider_top <= y <= self._slider_top + self._slider_height:
             # Click inside slider — start drag
             self._dragging = True
-            self._drag_offset = y - slider_top
+            self._drag_offset = y - self._slider_top
         else:
             # Click outside slider — jump (centered on click)
             self._dragging = False
@@ -1058,21 +1206,19 @@ class PaintboxOverview:
             # the 150ms debounce timer fires much later, or not at all
             # if the click turns into a drag.
             self.track_paint(force=True)
+            self._repaint_control_now()
 
     def _on_mouse_move(self, id_dlg, id_ctl, data='', info=''):
         """Called on mouse move. If dragging, scroll the editor to follow
         and repaint the slider so its thumb tracks the mouse like a
-        normal scrollbar (throttled to ~33 fps -- see track_paint)."""
-        if not getattr(self, '_dragging', False):
+        normal scrollbar (throttled to ~33 fps -- see track_paint), then
+        force the on-screen control repaint so the thumb actually MOVES
+        with the mouse instead of freezing until the drag stops (see
+        _repaint_control_now)."""
+        if self._pumping or not self._dragging:
             return
-        if isinstance(data, dict):
-            y = data.get('y', 0)
-        elif info:
-            try:
-                y = int(info.split(',')[1])
-            except (ValueError, IndexError):
-                return
-        else:
+        x, y = self._parse_mouse(data, info)
+        if x is None:
             return
         # Drag: the slider top follows the mouse (accounting for offset)
         target_y = y - self._drag_offset
@@ -1082,16 +1228,110 @@ class PaintboxOverview:
         # track_paint for why (WM_TIMER starvation under the flooded
         # message queue).
         self.track_paint()
+        self._repaint_control_now()
 
     def _on_mouse_up(self, id_dlg, id_ctl, data='', info=''):
-        """Called on mouse up. Stops dragging and does one final slider
-        repaint with the throttle bypassed, so the thumb lands exactly
-        where the drag ended (the throttled repaints during the drag may
-        have skipped the very last position)."""
+        """Called on mouse up. Stops the ▲/▼ auto-repeat and dragging,
+        then does one final slider repaint with the throttle bypassed,
+        so the thumb lands exactly where the drag ended (the throttled
+        repaints during the drag may have skipped the very last
+        position)."""
+        if self._pumping:
+            return
+        self._stop_button_repeat()
         was_dragging = self._dragging
         self._dragging = False
         if was_dragging:
             self.track_paint(force=True)
+            self._repaint_control_now()
+
+    def _on_mouse_exit(self, id_dlg, id_ctl, data='', info=''):
+        """Called when the pointer leaves the overview panel. The image
+        control cannot capture the mouse, so a button released outside
+        the panel never delivers on_mouse_up — stop the ▲/▼ auto-repeat
+        and any running drag here (a real scrollbar keeps the drag via
+        mouse capture; without capture the events stop anyway, so
+        stopping is the only sane behaviour)."""
+        if self._pumping:
+            return
+        self._stop_button_repeat()
+        if self._dragging:
+            self._dragging = False
+            self.track_paint(force=True)
+
+    # ------------------------------------------------------------------
+    # ▲/▼ button auto-repeat (like scrollbar arrow buttons)
+    # ------------------------------------------------------------------
+
+    def _start_button_repeat(self, direction):
+        """Begin a ▲/▼ button press: scroll one line immediately, then
+        arm the initial-delay one-shot timer which starts the repeating
+        timer for the auto-scroll (like holding a usual scrollbar's
+        arrow button: one line per click, continuous scrolling after a
+        short hold)."""
+        self._stop_button_repeat()
+        self._btn_dir = direction
+        self._scroll_one_line(direction)
+        ct.timer_proc(ct.TIMER_START_ONE, self._btn_delay_tick,
+                      BUTTON_INITIAL_DELAY_MS)
+
+    def _stop_button_repeat(self):
+        """Stop the ▲/▼ auto-repeat (mouse released / left the panel /
+        dialog destroyed). Disables both timers; the one-shot delay
+        timer may already have fired and deleted itself — stopping a
+        missing timer is a harmless no-op."""
+        if self._btn_dir is None:
+            return
+        self._btn_dir = None
+        ct.timer_proc(ct.TIMER_STOP, self._btn_delay_tick,
+                      BUTTON_INITIAL_DELAY_MS)
+        ct.timer_proc(ct.TIMER_STOP, self._btn_repeat_tick,
+                      BUTTON_REPEAT_MS)
+
+    def _btn_delay_tick(self, tag=''):
+        """One-shot timer callback fired BUTTON_INITIAL_DELAY_MS after
+        the button went down: the button is still held, so switch to
+        the repeating auto-scroll timer."""
+        if self._btn_dir is None:
+            return
+        ct.timer_proc(ct.TIMER_START, self._btn_repeat_tick,
+                      BUTTON_REPEAT_MS)
+
+    def _btn_repeat_tick(self, tag=''):
+        """Repeating timer callback: the button is still held — scroll
+        one more line (stops itself via _stop_button_repeat when the
+        mouse is released or leaves the panel)."""
+        if self._btn_dir is None:
+            return
+        self._scroll_one_line(self._btn_dir)
+
+    def _scroll_one_line(self, direction):
+        """Scroll both editors one line up (direction -1) or down
+        (+1), like a scrollbar's arrow button. One line = the editor's
+        char_size (row height in pixels) of smooth scrolling."""
+        if self.a_ed is None:
+            return
+        scroll_info = self.a_ed.get_prop(ct.PROP_SCROLL_VERT_INFO)
+        if not scroll_info:
+            return
+        char_size = scroll_info.get('char_size', 0)
+        if char_size <= 0:
+            return
+        target = max(0, scroll_info.get('smooth_pos', 0) + direction * char_size)
+        for e in (self.a_ed, self.b_ed):
+            if e is not None:
+                try:
+                    e.set_prop(ct.PROP_SCROLL_VERT_INFO,
+                               {'smooth_pos': target})
+                    e.action(ct.EDACTION_UPDATE)
+                except Exception:
+                    pass
+        self.track_paint(force=True)
+        self._repaint_control_now()
+
+    # ------------------------------------------------------------------
+    # Repaint scheduling
+    # ------------------------------------------------------------------
 
     def track_paint(self, force=False):
         """Repaint the overview immediately, throttled by WALL CLOCK to
@@ -1106,7 +1346,7 @@ class PaintboxOverview:
         drag stops.
 
         paint() is cheap on this path (one cached-bitmap copy + the
-        slider drawing -- the expensive static rectangles never run),
+        slider drawing -- the expensive static segments never run),
         so ~33 repaints per second cost little CPU; the wall-clock gate
         keeps the rate bounded no matter how fast the mouse moves or
         how densely scroll events arrive.
@@ -1122,28 +1362,70 @@ class PaintboxOverview:
         self._track_last_paint = now
         self.paint()
 
+    def _repaint_control_now(self):
+        """Force the on-screen image control to repaint IMMEDIATELY.
+
+        paint() draws into the image's embedded bitmap, but the control
+        itself only repaints when a WM_PAINT is delivered — and WM_PAINT
+        is generated only while the message queue is EMPTY. During a
+        slider drag the queue is continuously fed with mouse moves, so
+        the thumb would stay frozen on screen (while the bitmap in
+        memory is already up to date) until the drag stops.
+
+        Pumping the queue once here (app_proc(PROC_IDLE) —
+        Application.ProcessMessages + one idle pass) delivers the
+        pending WM_PAINT right away, so the thumb moves with the mouse
+        like in usual scrollbars. Re-entrancy: pending mouse moves
+        dispatched by the pump re-enter the handlers; the _pumping flag
+        makes those nested calls return at once (the newest position is
+        picked up by the next event after the pump returns), and the
+        pump itself can never nest.
+        """
+        if self._pumping or self.h_dlg is None:
+            return
+        self._pumping = True
+        try:
+            ct.app_proc(ct.PROC_IDLE, 'false')
+        except Exception:
+            pass
+        finally:
+            self._pumping = False
+
+    # ------------------------------------------------------------------
+    # Scroll mapping
+    # ------------------------------------------------------------------
+
     def _scroll_overview_pixel(self, overview_y, center=True):
         """Scroll the editors based on a pixel Y position in the overview.
 
-        Pure pixel-based mapping (no line/gap calculations):
-          editor_target_scroll = smooth_max * overview_y / overview_height
+        Pure pixel-based mapping onto the TRACK area (between the ▲/▼
+        buttons):
+          editor_target_scroll = smooth_max * (y - track_y0) / track_h
 
-        If center=True, subtract half the visible page so the clicked
-        position becomes the center of the viewport.
-        If center=False (dragging), the clicked position becomes the top.
+        If center=True, the clicked position becomes the center of the
+        viewport (the target is pulled up by half the slider height,
+        which corresponds to half the visible page).
+        If center=False (dragging), the position becomes the slider top.
 
         Args:
             overview_y: pixel Y position in the overview
             center: if True, center the viewport on Y. If False, Y
                     becomes the top of the viewport (for dragging).
         """
-        h = getattr(self, '_overview_height', 0)
+        h = self._overview_height
         if h <= 0:
             w, h = self._get_size()
         if h <= 0:
             return
+        track_y0, track_h = self._track_rect(h)
+        if track_h <= 0:
+            return
 
-        smooth_max = getattr(self, '_smooth_max', 0)
+        ty = overview_y - track_y0
+        if center:
+            ty -= self._slider_height // 2
+
+        smooth_max = self._smooth_max
         if smooth_max <= 0:
             # Get it from the editor
             scroll_info = self.a_ed.get_prop(ct.PROP_SCROLL_VERT_INFO) if self.a_ed else None
@@ -1151,31 +1433,23 @@ class PaintboxOverview:
                 smooth_max = scroll_info.get('smooth_max', 0)
             if smooth_max <= 0:
                 return
+            self._smooth_max = smooth_max
 
-        # Map overview pixel to editor scroll pixel:
-        # editor_scroll = smooth_max * overview_y / overview_height
-        target_smooth_pos = int(smooth_max * overview_y / h)
-
-        if center:
-            # Subtract half the visible page so the click is centered
-            scroll_info = self.a_ed.get_prop(ct.PROP_SCROLL_VERT_INFO) if self.a_ed else None
-            smooth_page = scroll_info.get('smooth_page', 0) if scroll_info else 0
-            target_smooth_pos -= smooth_page // 2
+        # Map overview track pixel to editor scroll pixel:
+        # editor_scroll = smooth_max * overview_y / track_h
+        target_smooth_pos = int(smooth_max * ty / track_h)
 
         # Clamp to valid range
         target_smooth_pos = max(0, target_smooth_pos)
 
         # Scroll both editors via set_prop(PROP_SCROLL_VERT_INFO, {'smooth_pos': ...})
-        if self.a_ed is not None:
-            try:
-                self.a_ed.set_prop(ct.PROP_SCROLL_VERT_INFO, {'smooth_pos': target_smooth_pos})
-            except Exception:
-                pass
-        if self.b_ed is not None:
-            try:
-                self.b_ed.set_prop(ct.PROP_SCROLL_VERT_INFO, {'smooth_pos': target_smooth_pos})
-            except Exception:
-                pass
+        for e in (self.a_ed, self.b_ed):
+            if e is not None:
+                try:
+                    e.set_prop(ct.PROP_SCROLL_VERT_INFO,
+                               {'smooth_pos': target_smooth_pos})
+                except Exception:
+                    pass
 
         # Paint BOTH halves SYNCHRONOUSLY, inside this one callback.
         # set_prop alone leaves each half's repaint to its own
@@ -1194,10 +1468,26 @@ class PaintboxOverview:
         # The synchronous paints fire on_scroll echoes; the positions
         # already match (both halves were just written), so the
         # ScrollSplittedTab mirror no-ops and the cascade dies out.
-        for e in (self.a_ed, self.b_ed):
-            if e is None:
-                continue
-            try:
-                e.action(ct.EDACTION_UPDATE)
-            except Exception:
-                pass
+        # During a drag the repaint pair is wall-clock throttled to
+        # ~33 fps: a full repaint of a big-file editor is expensive,
+        # and the exact positions are re-asserted by every set_prop
+        # anyway, so the editors still land exactly where the mouse
+        # says when the queue drains.
+        if center:
+            # Single click jump: always paint now.
+            for e in (self.a_ed, self.b_ed):
+                if e is not None:
+                    try:
+                        e.action(ct.EDACTION_UPDATE)
+                    except Exception:
+                        pass
+        else:
+            now = time.monotonic()
+            if now - self._editor_update_last >= OVERVIEW_TRACK_INTERVAL:
+                self._editor_update_last = now
+                for e in (self.a_ed, self.b_ed):
+                    if e is not None:
+                        try:
+                            e.action(ct.EDACTION_UPDATE)
+                        except Exception:
+                            pass

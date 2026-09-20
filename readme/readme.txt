@@ -39,7 +39,10 @@ synced back to the original files automatically.
   for the new wrap mode.
 - Optional gap-aware overview panel docked to the right of the compare
   view, showing a miniature of both editors side-by-side with colored
-  diff highlights (WinMerge-style).
+  diff highlights (WinMerge-style), with its own scrollbar-like slider,
+  one-line scroll buttons and separator line. While the overview is on,
+  the editors' built-in vertical scrollbars can be hidden (they are
+  replaced by the overview's slider).
 - Jump to next/previous difference always lands the caret (and moves
   the focus) on the side that HAS text: one-sided differences (added
   or deleted lines, shown as a gap on the other side) put the caret on
@@ -153,6 +156,13 @@ Copy current line to the left
 Config...
     Opens the options dialog.
 
+Resize editors to equal width
+    Resizes the two split editors of the current compare tab back to
+    equal widths (the 50/50 split), useful after you drag the editor
+    splitter. Also available at the end of the diff tab's right-click
+    menu. Works on any split tab; reports a status message when the
+    current tab is not split.
+
 
 == Keyboard shortcuts ==
 
@@ -224,6 +234,10 @@ Right-clicking a tab title shows "Differ" submenu with:
   If the list is too long, the first entry "More tabs..." opens a dialog
   with a scrollbar to pick any open tab.
 - Recompare -- re-run the compare on both sides of the compare tab.
+- "Cancel compare" / "Cancel all compares" -- stop in-flight background
+  compares (enabled only while a compare is actually running).
+- Resize editors to equal width -- set the split back to 50/50 after
+  dragging the editor splitter. This is the last entry of the menu.
 - Five checkable "ignore" options (below Recompare, after a separator):
   Ignore case, Ignore whitespace, Ignore blank lines, Ignore line endings,
   Ignore numbers. Shown only while a native algorithm is the effective
@@ -494,7 +508,6 @@ Algorithm section:
       --histogram"). Behaves like Patience diff when unique common lines
       exist, with graceful fallback when they don't. Fast and
       high-quality (more human-readable in some cases).
-      This is the default and recommended option for regular files.
     * native_myers -- Native Myers diff (port of WinMerge's bundled GNU
       diffutils Myers O(ND), the same algorithm git uses for "git diff
       --myers"), the fastest on large/very different files. It is faster
@@ -502,6 +515,9 @@ Algorithm section:
       WinMerge that JGit lacks, such as Paul Eggert's TOO_EXPENSIVE
       heuristic, line-purging heuristics like DiscardConfusingLines, and
       other optimizations.
+      This is the default: it renders the compare the way WinMerge / GNU
+      diffutils side-by-side (sdiff) output does, and it is the fastest
+      engine on huge files.
   The other algorithms are pure-Python so they may be slower with very
   big files:
     * hybrid -- Pure-Python Hybrid, combines Patience (anchoring on
@@ -525,7 +541,7 @@ Algorithm section:
   cleaner results.
   If you're comparing massive files and need maximum speed, stick with
   the Native Myers algorithm instead.
-  Default: native_histogram.
+  Default: native_myers.
 - differ.algorithm.compare_with_details: Detailed comparison
   When enabled, modified lines are compared character-by-character,
   highlighting specific differences within the line. This uses a ported
@@ -556,7 +572,7 @@ Algorithm section:
   Applies to both native and Python algorithms.
   Equal-count REPLACE blocks (da == db) are positional in BOTH modes, so
   this option only affects unequal-count REPLACE blocks.
-  Default: on.
+  Default: off.
 
 Advanced section:
 - differ.advanced.sync_scroll: Synchronized scrolling
@@ -583,7 +599,7 @@ Advanced section:
   When enabled, prints a detailed timing report to the console after
   each compare, breaking down time spent in the diff algorithm, opcode
   realignment, event generation, char-level diffing (native vs Python),
-  and UI painting (bookmarks, decor, gaps, attributes). The report
+  and UI painting (bookmarks, gaps, attributes). The report
   header also names what was compared: per side the original file's
   path, or -- for untitled tabs -- the original tab's title. Use for
   debugging performance issues only -- adds small overhead (~1-2us per
@@ -605,10 +621,28 @@ Micromap section:
   the compare view: a miniature of both editors side-by-side with
   colored rectangles for deleted (red), added (green) and changed
   (yellow) lines, gray rectangles for gaps and white for unchanged
-  lines.
+  lines, laid out like a usual scrollbar: a one-line-scroll button
+  (arrow) at the top and bottom, the slider track between them, and a
+  grey separator line at the panel's left edge (also under the buttons)
+  separating it from the editor.
   Unlike the built-in micromap, the overview accounts for the inter-line
   gaps inserted for visual alignment, so it stays in sync with what you
-  actually see (it works like the micromap but is slower).
+  actually see. The painting uses the WinMerge "Location Pane"
+  approach: only the diff segments are drawn, coalesced into runs, and
+  any segment that would collapse onto already-painted pixels is
+  skipped -- so even a 1M-line file with 200k differences paints at
+  most a few hundred rectangles.
+  Default: on.
+- differ.micromap.hide_builtin_scrollbars: Hide built-in scrollbars in
+  compare tabs
+  When enabled (and the overview panel is on), the vertical scrollbar of
+  both compare editors is hidden on every compare start -- the
+  overview's own slider (drag it to scroll, click the track to jump,
+  hold the arrow buttons to auto-scroll) replaces it, like in WinMerge.
+  When the overview panel is disabled, the built-in scrollbars are
+  never hidden: without them there would be no way to scroll with the
+  mouse.
+  Only has an effect when differ.micromap.enable_overview is on.
   Default: on.
 - differ.micromap.enable_overview_slider_opacity: Enable overview slider
   transparency
@@ -640,18 +674,19 @@ differ.algorithm.diff_algorithm option.
 
 Two option combinations cover the two extreme needs:
 
-Fastest compare (very big files, minimum CPU and memory):
-- Set differ.algorithm.diff_algorithm to "native_myers".
+Fastest compare (very big files, minimum CPU and memory) -- this is
+also the default configuration except for the two detail options:
+- Set differ.algorithm.diff_algorithm to "native_myers" (the default).
 - Disable differ.algorithm.compare_with_details (no
   character-by-character comparison inside changed lines).
-- Disable differ.algorithm.beautify_alignment (no similarity-based
-  re-pairing of changed blocks).
+- Disable differ.algorithm.beautify_alignment (off by default: no
+  similarity-based re-pairing of changed blocks).
 - Disable differ.micromap.enable_overview (no overview panel painting).
 This combination gives the fastest compare and the smallest memory
 footprint. The output is rendered exactly the way GNU diffutils /
 WinMerge side-by-side (sdiff) output does.
 
-Best human-readable compare (the recommended default):
+Best human-readable compare:
 - Set differ.algorithm.diff_algorithm to "native_histogram".
 - Enable differ.algorithm.compare_with_details (highlights the exact
   changed characters inside each modified line).
@@ -675,6 +710,38 @@ CudaText micromap (default: off). They can be enabled independently and
 used at the same time. The overview is the recommended default because
 it stays gap-aware; the micromap is faster and cheap but does not account
 for inter-line gaps.
+
+The overview panel is laid out like a usual scrollbar:
+- The top and bottom rows are one-line scroll buttons (arrow glyphs,
+  using the theme's ScrollBack background and ScrollArrow arrow colors,
+  no borders). A single click scrolls one line; holding the button
+  pressed starts auto-repeating the scroll (like holding a scrollbar's
+  arrow button).
+- Between the buttons is the track with the miniature maps of both
+  files. The slider (viewport indicator) lives there: drag it to scroll
+  (it follows the mouse continuously, like a real scrollbar -- the
+  plugin forces the pending repaint through the message queue during
+  the drag), click the track to jump the viewport there, and use the
+  mouse wheel / keyboard as usual in the editors.
+- A grey vertical separator line runs along the panel's left edge,
+  separating the overview from the editor (and the editor's scrollbar,
+  when visible) -- the buttons' boxes sit right of the same line.
+
+While the overview is enabled, the option
+"differ.micromap.hide_builtin_scrollbars" (default: on) hides the
+editors' built-in vertical scrollbars: the overview's slider fully
+replaces them. With the overview disabled the built-in scrollbars are
+never hidden -- without them there would be no way to scroll with the
+mouse.
+
+Big files are handled the WinMerge "Location Pane" way: the panel is
+only a few hundred pixels tall, so painting every changed line of a
+1M-line file would just keep overwriting the same pixel rows (you
+cannot paint half a pixel). The overview coalesces consecutive
+same-colored lines into runs, converts each run/gap to pixels once, and
+skips every segment that would collapse onto already-painted pixels --
+the number of actual draw calls is bounded by the panel's pixel height,
+not by the file's size or diff count.
 
 
 == Notes ==
