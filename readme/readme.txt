@@ -708,10 +708,9 @@ The overview panel is laid out like a usual scrollbar:
   auto-repeating the scroll (like holding a scrollbar's arrow button).
 - Between the buttons is the track with the miniature maps of both
   files. The slider (viewport indicator) lives there: drag it to scroll
-  (it follows the mouse continuously and instantly, like a real
-  scrollbar -- the plugin forces the pending repaint through the
-  message queue during the drag, and coalesces the drag work to
-  ~33 updates per second so even million-line files stay smooth),
+  (the thumb is glued to the mouse on every raw move, like a real
+  scrollbar, while the text repaints asynchronously at whatever rate
+  the editors can paint -- see "Overview-driven scrolling" below),
   click the track to jump the viewport there, and use the mouse wheel /
   keyboard as usual in the editors.
   The slider starts from the same theme colors the editor's own
@@ -724,7 +723,11 @@ The overview panel is laid out like a usual scrollbar:
   equaled ScrollFill (invisible grip lines). Themes whose colors
   already contrast well keep them EXACTLY as the theme defines them;
   the adjustment only kicks in for colliding themes, so the slider
-  stays visible on black, white and grey theme families alike.
+  stays visible on black, white and grey theme families alike. On
+  LIGHT themes the fill keeps a subtle contrast and is scaled EXACTLY
+  to the visibility threshold (a light grey close to the theme's own
+  ScrollFill, with the border and grips providing the definition);
+  dark themes keep the stronger contrast.
 - A grey vertical separator line runs along the panel's left edge,
   separating the overview from the editor (and the editor's scrollbar,
   when visible) -- the buttons' boxes sit right of the same line.
@@ -746,25 +749,43 @@ the number of actual draw calls is bounded by the panel's pixel height,
 not by the file's size or diff count.
 
 Overview-driven scrolling (dragging the slider, holding the ▲/▼
-buttons, clicking the track) is as fast on a 1M-line file as on a small
-one. Two things make that work:
+buttons, clicking the track) follows the native scrollbar architecture
+exactly, so the thumb is as responsive on a 1M-line file as on a small
+one:
+- The thumb and the text are DECOUPLED, like in every editor: the
+  slider bitmap is repainted at the mouse-derived position on EVERY
+  raw mouse move and pushed to the screen through a message-queue
+  pump -- but only while the editors have no pending paints. (Pumping
+  right after invalidating the editors would deliver both editors'
+  full viewport paints synchronously INSIDE the mouse handler; on
+  million-line compares each paint walks the inter-line alignment gaps
+  several times and costs 50-100 ms -- that was the "slider waits
+  100-200 ms to follow the mouse" bug.)
 - After writing the scroll position, each editor is invalidated
   ASYNCHRONOUSLY (ed.cmd(cmd_RepaintEditor) -- the exact call the
-  editor's own scrollbar path makes). A bare position write does not
-  repaint the editor at all, and with the built-in scrollbars hidden
-  the text would only move when some unrelated repaint happened to
-  arrive. No forced SYNCHRONOUS full repaints are ever issued on these
-  paths (a full repaint of a huge compare view costs 100+ ms).
-- The drag work is throttled and coalesced to ~33 updates per second.
-  Every scroll write and every editor repaint walks the compare's
-  inter-line alignment gaps internally (O(gaps) -- tens of thousands
-  of items on million-line compares), so applying per RAW mouse event
-  (60-125 moves per second during a fast drag) buried the message
-  queue under a backlog and made the slider lag hundreds of
-  milliseconds behind. Each 33fps update always applies the NEWEST
-  mouse position; a deferred one-shot timer applies it when the mouse
-  stops mid-window, and the release always lands exactly on the final
-  cursor position -- the same behavior as native scrollbars.
+  editor's own scrollbar path makes) and the handler RETURNS without
+  pumping: the editors' paints are delivered by the natural
+  message-loop drain between mouse handlers, never synchronously
+  inside a handler. A bare position write does not repaint the editor
+  at all, and with the built-in scrollbars hidden the text would only
+  move when some unrelated repaint happened to arrive. No forced
+  SYNCHRONOUS full repaints are ever issued on these paths (a full
+  repaint of a huge compare view costs 100+ ms).
+- The position writes are paced so no backlog can build: at most every
+  30 ms AND only after the editors have PAINTED the previous write
+  (CudaText fires on_scroll at the end of every editor viewport paint,
+  which re-opens the gate; a 250 ms safety timeout covers lost
+  notifications). Every scroll write and every editor repaint walks
+  the compare's inter-line alignment gaps internally (O(gaps) -- tens
+  of thousands of items on million-line compares), so an unpaced
+  stream of writes buried the message queue and made the slider lag
+  hundreds of milliseconds behind. Each apply always consumes the
+  NEWEST mouse position; a deferred one-shot timer applies it when the
+  mouse stops, and the release always lands exactly on the final
+  cursor position -- the same behavior as native scrollbars. The ▲/▼
+  buttons write one line per repeat tick (like native arrow buttons)
+  so the text glides at the editors' paint rate instead of crawling
+  one line per paint.
 
 
 == Notes ==

@@ -1797,6 +1797,15 @@ class Command:
         keyboard, mouse wheel) are never affected: the flag is only
         set while an overview interaction is running.
 
+        While driving, the event itself is the overview's PAINT-
+        COMPLETION signal: TATSynEdit fires on_scroll at the END of
+        every editor viewport paint, so overview.note_scroll_painted()
+        re-opens the drag pipeline's apply gate (the next scroll
+        position is only written once the editors have painted the
+        previous one -- no backlog, and the per-move message pump
+        stays cheap because it never runs while editor paints are
+        pending).
+
         The overview update is two-layered:
         - immediate: overview.track_paint() repaints the slider at up to
           ~33 fps (wall-clock throttled), so the thumb follows scrolling
@@ -1811,7 +1820,13 @@ class Command:
         session = self._session_for(tab_id)
         if session is not None:
             overview = session.overview
-            if overview is None or not overview.is_driving_scroll():
+            if overview is None:
+                self.scroll.on_scroll(ed_self)
+            elif overview.is_driving_scroll():
+                # Paint-completion signal for the overview's drag
+                # pipeline (no mirror: the overview writes both halves).
+                overview.note_scroll_painted()
+            else:
                 self.scroll.on_scroll(ed_self)
             if overview is not None:
                 overview.track_paint()
