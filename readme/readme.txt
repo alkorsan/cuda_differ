@@ -710,12 +710,21 @@ The overview panel is laid out like a usual scrollbar:
   files. The slider (viewport indicator) lives there: drag it to scroll
   (it follows the mouse continuously and instantly, like a real
   scrollbar -- the plugin forces the pending repaint through the
-  message queue during the drag), click the track to jump the viewport
-  there, and use the mouse wheel / keyboard as usual in the editors.
-  The slider uses the same theme colors the editor's own scrollbars
-  use for their thumb: fill = ScrollFill, border = ScrollRect, and the
-  3 grip lines = ScrollRect -- so it matches every light or dark
-  theme instead of one fixed grey.
+  message queue during the drag, and coalesces the drag work to
+  ~33 updates per second so even million-line files stay smooth),
+  click the track to jump the viewport there, and use the mouse wheel /
+  keyboard as usual in the editors.
+  The slider starts from the same theme colors the editor's own
+  scrollbars use for their thumb (fill = ScrollFill, border =
+  ScrollRect, the 3 grip lines = ScrollRect) -- and because those
+  colors are designed against the scrollbar TRACK, not the editor
+  background the overview uses, each color is then lightness-adjusted
+  just enough to stay clearly visible: in some themes ScrollFill
+  equaled the overview background (invisible slider) or ScrollRect
+  equaled ScrollFill (invisible grip lines). Themes whose colors
+  already contrast well keep them EXACTLY as the theme defines them;
+  the adjustment only kicks in for colliding themes, so the slider
+  stays visible on black, white and grey theme families alike.
 - A grey vertical separator line runs along the panel's left edge,
   separating the overview from the editor (and the editor's scrollbar,
   when visible) -- the buttons' boxes sit right of the same line.
@@ -738,12 +747,24 @@ not by the file's size or diff count.
 
 Overview-driven scrolling (dragging the slider, holding the ▲/▼
 buttons, clicking the track) is as fast on a 1M-line file as on a small
-one: the plugin only writes the scroll position and lets each editor
-repaint itself through the same optimized native scroll path used when
-the editor's own scrollbar is dragged -- no forced synchronous full
-repaints are issued on these paths (a full repaint of a huge compare
-view costs 100+ ms, and the plugin used to trigger up to 6-8 of them
-per mouse move).
+one. Two things make that work:
+- After writing the scroll position, each editor is invalidated
+  ASYNCHRONOUSLY (ed.cmd(cmd_RepaintEditor) -- the exact call the
+  editor's own scrollbar path makes). A bare position write does not
+  repaint the editor at all, and with the built-in scrollbars hidden
+  the text would only move when some unrelated repaint happened to
+  arrive. No forced SYNCHRONOUS full repaints are ever issued on these
+  paths (a full repaint of a huge compare view costs 100+ ms).
+- The drag work is throttled and coalesced to ~33 updates per second.
+  Every scroll write and every editor repaint walks the compare's
+  inter-line alignment gaps internally (O(gaps) -- tens of thousands
+  of items on million-line compares), so applying per RAW mouse event
+  (60-125 moves per second during a fast drag) buried the message
+  queue under a backlog and made the slider lag hundreds of
+  milliseconds behind. Each 33fps update always applies the NEWEST
+  mouse position; a deferred one-shot timer applies it when the mouse
+  stops mid-window, and the release always lands exactly on the final
+  cursor position -- the same behavior as native scrollbars.
 
 
 == Notes ==
