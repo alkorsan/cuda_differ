@@ -1783,6 +1783,20 @@ class Command:
         Routed to the scrolled tab's OWN session -- one tab's scroll never
         touches another tab's overview or timers.
 
+        While the overview is driving BOTH halves itself (slider drag,
+        track jump, ▲/▼ auto-repeat -- overview.is_driving_scroll()),
+        the ScrollSplittedTab mirror is SKIPPED: the overview writes both
+        positions back-to-back in the same handler, and the mirror would
+        see the half that is one set_prop behind as "lagging", re-write
+        it, and force a synchronous EDACTION_UPDATE FULL repaint of it.
+        On million-line compare files that full repaint costs 100+ ms,
+        so with the mirror active every overview-driven mouse move /
+        repeat tick paid it -- the slider lagged 300-500 ms behind the
+        mouse and the ▲/▼ buttons scrolled one line only every
+        300-500 ms. User-initiated scrolls (the editor's own scrollbar,
+        keyboard, mouse wheel) are never affected: the flag is only
+        set while an overview interaction is running.
+
         The overview update is two-layered:
         - immediate: overview.track_paint() repaints the slider at up to
           ~33 fps (wall-clock throttled), so the thumb follows scrolling
@@ -1796,9 +1810,11 @@ class Command:
         tab_id = ed_self.get_prop(ct.PROP_TAB_ID)
         session = self._session_for(tab_id)
         if session is not None:
-            self.scroll.on_scroll(ed_self)
-            if session.overview is not None:
-                session.overview.track_paint()
+            overview = session.overview
+            if overview is None or not overview.is_driving_scroll():
+                self.scroll.on_scroll(ed_self)
+            if overview is not None:
+                overview.track_paint()
             # Trailing repaint 150ms after the last scroll event.
             if not session.overview_timer:
                 session.overview_timer = True

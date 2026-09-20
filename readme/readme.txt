@@ -699,17 +699,23 @@ it stays gap-aware; the micromap is faster and cheap but does not account
 for inter-line gaps.
 
 The overview panel is laid out like a usual scrollbar:
-- The top and bottom rows are one-line scroll buttons (arrow glyphs,
-  using the theme's ScrollBack background and ScrollArrow arrow colors,
-  no borders). A single click scrolls one line; holding the button
-  pressed starts auto-repeating the scroll (like holding a scrollbar's
-  arrow button).
+- The top and bottom rows are one-line scroll buttons: solid arrow
+  triangles in the theme's ScrollArrow color, drawn on the overview's
+  own background color so the buttons blend into the panel (no
+  borders). The arrows are fixed-size geometric triangles (9x7 px in
+  the 16px button box) that always fit inside their button rectangle.
+  A single click scrolls one line; holding the button pressed starts
+  auto-repeating the scroll (like holding a scrollbar's arrow button).
 - Between the buttons is the track with the miniature maps of both
   files. The slider (viewport indicator) lives there: drag it to scroll
-  (it follows the mouse continuously, like a real scrollbar -- the
-  plugin forces the pending repaint through the message queue during
-  the drag), click the track to jump the viewport there, and use the
-  mouse wheel / keyboard as usual in the editors.
+  (it follows the mouse continuously and instantly, like a real
+  scrollbar -- the plugin forces the pending repaint through the
+  message queue during the drag), click the track to jump the viewport
+  there, and use the mouse wheel / keyboard as usual in the editors.
+  The slider uses the same theme colors the editor's own scrollbars
+  use for their thumb: fill = ScrollFill, border = ScrollRect, and the
+  3 grip lines = ScrollRect -- so it matches every light or dark
+  theme instead of one fixed grey.
 - A grey vertical separator line runs along the panel's left edge,
   separating the overview from the editor (and the editor's scrollbar,
   when visible) -- the buttons' boxes sit right of the same line.
@@ -729,6 +735,15 @@ same-colored lines into runs, converts each run/gap to pixels once, and
 skips every segment that would collapse onto already-painted pixels --
 the number of actual draw calls is bounded by the panel's pixel height,
 not by the file's size or diff count.
+
+Overview-driven scrolling (dragging the slider, holding the ▲/▼
+buttons, clicking the track) is as fast on a 1M-line file as on a small
+one: the plugin only writes the scroll position and lets each editor
+repaint itself through the same optimized native scroll path used when
+the editor's own scrollbar is dragged -- no forced synchronous full
+repaints are issued on these paths (a full repaint of a huge compare
+view costs 100+ ms, and the plugin used to trigger up to 6-8 of them
+per mouse move).
 
 
 == Notes ==
