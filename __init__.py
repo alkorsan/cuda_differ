@@ -37,7 +37,6 @@ NKIND_DELETED = 24
 NKIND_ADDED = 25
 NKIND_CHANGED = 26
 GAP_WIDTH = 5000
-DECOR_CHAR = '■'
 DEFAULT_SYNC_SCROLL = '1'
 U_PREFIX = 'untitled:'
 
@@ -451,11 +450,11 @@ OPTS_META = [
               'stick with the Native Myers algorithm instead.\n'
               'See the "Diff algorithms and best practices" section in '
               'readme.txt for recommended option combinations.\n'
-              'Default: native_histogram.'),
-     'def': 'native_histogram',
+              'Default: native_myers.'),
+     'def': 'native_myers',
      'frm': 'str2s',
-     'dct': [('native_histogram', _('Native Histogram (More human-readable, recommended)')),
-             ('native_myers',     _('Native Myers O(ND) (Fastest on large/different files)')),
+     'dct': [('native_myers',     _('Native Myers O(ND) (Fastest on large/different files, recommended)')),
+             ('native_histogram', _('Native Histogram (More human-readable in some cases)')),
              ('hybrid',           _('Hybrid (Python: Patience + Myers O(NP))')),
              ('myers',            _('Myers O(NP) (Python)')),
              ('vscode',           _('VSCode (Python: DP + Myers O(ND))')),
@@ -501,8 +500,8 @@ OPTS_META = [
               'Equal-count REPLACE blocks (da == db) are positional in BOTH '
               'modes, so this option only affects unequal-count REPLACE '
               'blocks.\n'
-              'Default: on.'),
-     'def': True,
+              'Default: off.'),
+     'def': False,
      'frm': 'bool',
      'chp': 'algorithm',
      },
@@ -718,6 +717,24 @@ OPTS_META = [
               'sync with what you actually see (it works like the micromap '
               'but is slower).\n'
               'Can be used together with the built-in micromap.\n'
+              'Default: on.'),
+     'def': True,
+     'frm': 'bool',
+     'chp': 'micromap',
+     },
+    {'opt': 'differ.micromap.hide_builtin_scrollbars',
+     'cmt': _('Hide built-in scrollbars in compare tabs\n'
+              'When enabled, and the gap-aware overview panel is on, the '
+              'vertical scrollbar of both compare editors is hidden on '
+              'every compare start: the overview\'s own slider (drag it to '
+              'scroll, click the track to jump, use the arrow buttons to '
+              'scroll one line) replaces the built-in scrollbar.\n'
+              'When the overview panel is disabled, the built-in '
+              'scrollbars are NEVER hidden -- without the overview (and '
+              'without the built-in scrollbars) there would be no way to '
+              'scroll with the mouse.\n'
+              'Only has an effect when differ.micromap.enable_overview is '
+              'on.\n'
               'Default: on.'),
      'def': True,
      'frm': 'bool',
@@ -1035,6 +1052,7 @@ class _TabSession:
         'diff', 'overview', 'job',
         'overview_timer', 'suppress_change',
         'saved', 'dirty',
+        'scrollstyle_orig',
     )
 
     def __init__(self, tab_id, state_key=''):
@@ -1048,6 +1066,13 @@ class _TabSession:
         self.suppress_change = 0
         self.saved = True
         self.dirty = set()
+        # Vertical scrollbar style the editors had before Differ hid it
+        # (see _apply_scrollbar_visibility): None while Differ has not
+        # hidden any scrollbar, otherwise the captured original value
+        # to restore when hiding is switched off. Gutter fold/states
+        # removal and scrollbar hiding are per-tab, so this never leaks
+        # into another compare tab's editors.
+        self.scrollstyle_orig = None
 
 
 class Command:
@@ -1574,6 +1599,17 @@ class Command:
 
         a_ed = ct.Editor(ct.ed.get_prop(ct.PROP_HANDLE_PRIMARY))
         b_ed = ct.Editor(ct.ed.get_prop(ct.PROP_HANDLE_SECONDARY))
+        # Clean up the editors' gutters after the split: the folding bar
+        # (PROP_GUTTER_FOLD) and the "line states" bar (PROP_GUTTER_STATES)
+        # are useless in a compare view -- no folding happens on the diff
+        # gap-padded text, and the saved/modified line states of the
+        # temp-like compare halves only distract from the compare colors.
+        # Values are set directly, no defensive code: the plugin requires
+        # api 1.0.483, which has both properties.
+        a_ed.set_prop(ct.PROP_GUTTER_FOLD, False)
+        b_ed.set_prop(ct.PROP_GUTTER_FOLD, False)
+        a_ed.set_prop(ct.PROP_GUTTER_STATES, False)
+        b_ed.set_prop(ct.PROP_GUTTER_STATES, False)
         try:
             a_ed.action(ct.EDACTION_LOCK)
             b_ed.action(ct.EDACTION_LOCK)
@@ -2343,6 +2379,51 @@ class Command:
             self._cancel_job(job)
         ct.msg_status(_('Differ: cancelled {} compare(s)').format(len(jobs)))
 
+    def resize_equal_width(self, ed=None):
+        """Command: resize the split editors of the given tab to equal
+        widths. Useful after the user drags the editor splitter and wants
+        the 50/50 layout back: sets the split position to the middle
+        (PROP_SPLIT permille 500), keeping the split orientation as-is.
+        Works on any vertically/horizontally split tab (a compare tab is
+        split vertically); reports a status message when the tab is not
+        split.
+
+        Args:
+            ed: an editor of the tab to resize. None (the default, used
+                by the exposed plugin command) = the focused editor
+                (ct.ed). The tab context menu passes the right-clicked
+                tab's editor (see tabmenu_equal_width -- the right-clicked
+                tab is not necessarily the focused one).
+        """
+        if ed is None:
+            ed = ct.ed
+        split = ed.get_prop(ct.PROP_SPLIT)
+        if not split or split[0] == '-':
+            return ct.msg_status(_('Differ: current tab has no split editors'))
+        ed.set_prop(ct.PROP_SPLIT, (split[0], 500))
+        ct.msg_status(_('Differ: editors resized to equal widths'))
+
+    @staticmethod
+    def _editor_by_tab_id(tab_id):
+        """Editor of the tab with the given PROP_TAB_ID, or None when no
+        open tab matches (tab closed since the menu was built)."""
+        if tab_id in (None, ''):
+            return None
+        for h in ct.ed_handles():
+            e = ct.Editor(h)
+            if str(e.get_prop(ct.PROP_TAB_ID)) == str(tab_id):
+                return e
+        return None
+
+    def tabmenu_equal_width(self, info=''):
+        """Diff-tab context-menu callback for "Resize editors to equal
+        width": 'info' carries the RIGHT-CLICKED tab's PROP_TAB_ID (the
+        right-clicked tab is not necessarily the focused one, so the
+        plain command's focused-tab default would act on the wrong tab).
+        Falls back to the focused tab when the recorded tab is gone."""
+        ed = self._editor_by_tab_id(info)
+        self.resize_equal_width(ed)
+
     # native_histogram / native_myers only work when cudatext.diff_proc
     # is present. On older CudaText builds the plugin falls back to the
     # closest pure-Python algorithm (documented in OPTS_META):
@@ -2362,7 +2443,7 @@ class Command:
         fell_back is True when the user configured a native algo but
         the native API is missing, so a Python equivalent is used.
         """
-        algo = self.cfg.get('diff_algorithm', 'native_histogram')
+        algo = self.cfg.get('diff_algorithm', 'native_myers')
         if algo in self._NATIVE_TO_PYTHON_FALLBACK:
             if dfn._HAS_NATIVE_DIFF:
                 return algo, True, False
@@ -2385,7 +2466,7 @@ class Command:
             ct.msg_status(_("Differ: Using Native Algo {}").format(algo))
             return dfn.Differ()
         if fell_back:
-            configured = self.cfg.get('diff_algorithm', 'native_histogram')
+            configured = self.cfg.get('diff_algorithm', 'native_myers')
             ct.msg_status(
                 _('Differ: native API not available — falling back to Python algo {} '
                   '(configured: {})').format(algo, configured))
@@ -2561,6 +2642,18 @@ class Command:
             tab_id_str = str(tab_id)
             overview = session.overview
             overview_on = self.cfg.get('enable_overview', True)
+            # Hide the built-in vertical scrollbars while the overview
+            # (which has its own slider + arrow buttons) replaces them.
+            # Only when the overview is enabled AND the
+            # 'hide_builtin_scrollbars' option is on -- with the overview
+            # off the built-in scrollbars must stay, otherwise there
+            # would be no way to scroll with the mouse. Runs on every
+            # compare start; the original style is remembered per tab
+            # session so a later compare with hiding switched off
+            # restores it.
+            self._apply_scrollbar_visibility(
+                session, a_ed, b_ed,
+                overview_on and self.cfg.get('hide_builtin_scrollbars', True))
             if overview_on:
                 if overview is None:
                     overview = PaintboxOverview()
@@ -2688,7 +2781,7 @@ class Command:
                 ct.msg_status(
                     _('Differ: native API not available — falling back to Python algo {} '
                       '(configured: {})').format(
-                        _algo, self.cfg.get('diff_algorithm', 'native_histogram')))
+                        _algo, self.cfg.get('diff_algorithm', 'native_myers')))
             diff.beautify_alignment = self.cfg.get('beautify_alignment')
             # Ignore options -> diff_proc DIFF_IGN_* bitmask for the
             # native algorithms (applies to BOTH the line-level diff and
@@ -2931,9 +3024,6 @@ class Command:
             if diff_id == df.A_LINE_DEL:
                 n_diff_events += 1
                 pending_bkm_a.append((y, NKIND_DELETED))
-                Profiler.start('paint:decor')
-                self.set_decor(a_ed, y, DECOR_CHAR, self.cfg.get('color_deleted'))
-                Profiler.stop('paint:decor')
                 if micromap_on:
                     Profiler.start('paint:micromap')
                     self.set_attr(a_ed, y=y, bg=self.cfg.get('color_deleted'),
@@ -2944,9 +3034,6 @@ class Command:
             elif diff_id == df.B_LINE_ADD:
                 n_diff_events += 1
                 pending_bkm_b.append((y, NKIND_ADDED))
-                Profiler.start('paint:decor')
-                self.set_decor(b_ed, y, DECOR_CHAR, self.cfg.get('color_added'))
-                Profiler.stop('paint:decor')
                 if micromap_on:
                     Profiler.start('paint:micromap')
                     self.set_attr(b_ed, y=y, bg=self.cfg.get('color_added'),
@@ -3072,9 +3159,6 @@ class Command:
                 # bookmark, no diffmap entry, not counted in
                 # n_diff_events (a file differing only in blank
                 # lines still reports "No differences found").
-                Profiler.start('paint:decor')
-                self.set_decor(a_ed, y, DECOR_CHAR, color_ignored)
-                Profiler.stop('paint:decor')
                 if micromap_on:
                     Profiler.start('paint:micromap')
                     self.set_attr(a_ed, y=y, bg=color_ignored,
@@ -3083,9 +3167,6 @@ class Command:
                 if overview is not None:
                     overview.add_line_state('a', y, color_ignored)
             elif diff_id == df.B_LINE_IGN:
-                Profiler.start('paint:decor')
-                self.set_decor(b_ed, y, DECOR_CHAR, color_ignored)
-                Profiler.stop('paint:decor')
                 if micromap_on:
                     Profiler.start('paint:micromap')
                     self.set_attr(b_ed, y=y, bg=color_ignored,
@@ -3136,30 +3217,18 @@ class Command:
                     overview.add_line_state('b', y, self.cfg.get('color_added'))
             elif diff_id == df.A_DECOR_YELLOW:
                 n_diff_events += 1
-                Profiler.start('paint:decor')
-                self.set_decor(a_ed, y, DECOR_CHAR, self.cfg.get('color_changed'))
-                Profiler.stop('paint:decor')
                 if overview is not None:
                     overview.add_line_state('a', y, self.cfg.get('color_changed'))
             elif diff_id == df.B_DECOR_YELLOW:
                 n_diff_events += 1
-                Profiler.start('paint:decor')
-                self.set_decor(b_ed, y, DECOR_CHAR, self.cfg.get('color_changed'))
-                Profiler.stop('paint:decor')
                 if overview is not None:
                     overview.add_line_state('b', y, self.cfg.get('color_changed'))
             elif diff_id == df.A_DECOR_RED:
                 n_diff_events += 1
-                Profiler.start('paint:decor')
-                self.set_decor(a_ed, y, DECOR_CHAR, self.cfg.get('color_deleted'))
-                Profiler.stop('paint:decor')
                 if overview is not None:
                     overview.add_line_state('a', y, self.cfg.get('color_deleted'))
             elif diff_id == df.B_DECOR_GREEN:
                 n_diff_events += 1
-                Profiler.start('paint:decor')
-                self.set_decor(b_ed, y, DECOR_CHAR, self.cfg.get('color_added'))
-                Profiler.stop('paint:decor')
                 if overview is not None:
                     overview.add_line_state('b', y, self.cfg.get('color_added'))
         Profiler.stop('refresh:compare_and_paint')
@@ -3553,20 +3622,13 @@ class Command:
                 total += 1
         return total
 
-    def set_decor(self, e, row, text, color):
-        """Set a line decorator (margin symbol) on editor e at row.
-        Shows a colored DECOR_CHAR in the left margin to mark changed/added/
-        deleted lines."""
-        e.decor(ct.DECOR_SET, row, DIFF_TAG, text, color)
-
     def clear(self, e):
-        """Remove all diff markers, gaps, decorators, and bookmarks tagged
+        """Remove all diff markers, gaps, and bookmarks tagged
         with DIFF_TAG from editor e. Called before re-applying a fresh diff."""
         if e is None:
             return
         e.attr(ct.MARKERS_DELETE_BY_TAG, DIFF_TAG)
         e.gap(ct.GAP_DELETE_ALL, 0, 0)
-        e.decor(ct.DECOR_DELETE_BY_TAG, tag=DIFF_TAG)
         e.bookmark(ct.BOOKMARK2_DELETE_BY_TAG, 0, tag=DIFF_TAG)
 
     def config(self):
@@ -3587,6 +3649,31 @@ class Command:
         # (No menu re-sync needed anymore: the diff-tab context menu is
         # rebuilt from the settings file by tabmenu_init on every
         # right-click, so it always mirrors the current values.)
+
+    def _apply_scrollbar_visibility(self, session, a_ed, b_ed, hide):
+        """Hide or restore the built-in vertical scrollbars of a compare
+        tab's two editors (config 'differ.micromap.hide_builtin_scrollbars').
+
+        Called on every compare start, with hide=True only when the
+        overview panel is enabled -- the overview's own slider then
+        replaces the built-in scrollbar. When the overview is disabled
+        (or the option is off) the built-in scrollbars are never hidden:
+        without them there would be no way to scroll with the mouse.
+
+        The first hide captures the editors' original scrollbar style
+        into session.scrollstyle_orig; a later compare with hide=False
+        restores exactly that value, so toggling the option (or the
+        overview) and recomparing always ends at the app-default look.
+        """
+        if hide:
+            if session.scrollstyle_orig is None:
+                session.scrollstyle_orig = a_ed.get_prop(ct.PROP_SCROLLSTYLE_VERT)
+            a_ed.set_prop(ct.PROP_SCROLLSTYLE_VERT, ct.SCROLLSTYLE_HIDE)
+            b_ed.set_prop(ct.PROP_SCROLLSTYLE_VERT, ct.SCROLLSTYLE_HIDE)
+        elif session.scrollstyle_orig is not None:
+            a_ed.set_prop(ct.PROP_SCROLLSTYLE_VERT, session.scrollstyle_orig)
+            b_ed.set_prop(ct.PROP_SCROLLSTYLE_VERT, session.scrollstyle_orig)
+            session.scrollstyle_orig = None
 
     def _setup_micromap(self, a_ed, b_ed):
         """Set up the micromap on both split editors when enable_micromap
@@ -3702,11 +3789,11 @@ class Command:
                 t['color_ignored_gap'],
             # --- algorithm ---
             'diff_algorithm':
-                get_opt('algorithm.diff_algorithm', 'native_histogram'),
+                get_opt('algorithm.diff_algorithm', 'native_myers'),
             'compare_with_details':
                 get_opt('algorithm.compare_with_details', True),
             'beautify_alignment':
-                get_opt('algorithm.beautify_alignment', True),
+                get_opt('algorithm.beautify_alignment', False),
             # --- ignore options (diff_proc DIFF_IGN_* flags; collected
             # into the bitmask for the native algorithms by
             # differ_native.build_ignore_flags -- see refresh_compare) ---
@@ -3738,6 +3825,8 @@ class Command:
                 get_opt('micromap.enable_micromap', False),
             'enable_overview':
                 get_opt('micromap.enable_overview', True),
+            'hide_builtin_scrollbars':
+                get_opt('micromap.hide_builtin_scrollbars', True),
             # Overview slider opacity. Stored as int 0..100, passed
             # to PaintboxOverview as a float 0..1. See
             # overview.set_slider_options().
@@ -4244,6 +4333,21 @@ class Command:
             )
         ct.menu_proc(self.menuid_cancel_all, ct.MENU_SET_ENABLED,
             command=any(s.job is not None for s in self._sessions.values()))
+
+        # "Resize editors to equal width" at the very end of the menu:
+        # handy after dragging the editor splitter and wanting the 50/50
+        # layout back (same as the exposed 'Differ\Resize editors to
+        # equal width' command). The command info carries the
+        # RIGHT-CLICKED tab's id -- the right-clicked tab is not
+        # necessarily the focused one (see tabmenu_equal_width).
+        ct.menu_proc(self.compare_menu, ct.MENU_ADD, caption='-')
+        self.menuid_equal_width = ct.menu_proc(self.compare_menu, ct.MENU_ADD,
+            command='module=cuda_differ;cmd=tabmenu_equal_width;info={};'.format(
+                cur_ed.get_prop(ct.PROP_TAB_ID)),
+            caption=_('Resize editors to equal width')
+            )
+        ct.menu_proc(self.menuid_equal_width, ct.MENU_SET_ENABLED,
+            command=is_compare)
 
     def tabmenu_chooser(self):
         """Launch 'Compare with...' via a 100ms timer (needed because menu

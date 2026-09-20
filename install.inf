@@ -41,6 +41,11 @@ section=commands
 caption=Differ\Cancel all compares
 method=cancel_all_compares
 
+[item4d]
+section=commands
+caption=Differ\Resize editors to equal width
+method=resize_equal_width
+
 [item5]
 section=commands
 caption=Differ\Focus the opposite file
