@@ -63,14 +63,17 @@ Architecture:
     ScrollRect == ScrollFill makes the 3 grip lines invisible. So each
     color is then passed through _color_contrast(): minimal ~10% lightness
     steps (hue preserved) until its luminance differs from what it sits
-    on by a safe margin -- 0.12 for the big fill block on LIGHT
-    backgrounds (keeps the thumb a light grey close to the theme's own
-    ScrollFill, "not too dark on white themes"), 0.20 on dark
-    backgrounds, 0.28 for the thin border / grip lines / arrows. This
-    works on black, white and grey theme families alike: an
-    already-contrasting theme color is kept EXACTLY as the theme defines
-    it, a colliding one is nudged just far enough to be clearly visible.
-    Computed once per compare in set_colors() -- zero per-paint overhead.
+    on by a safe margin -- 0.07 for the big fill block on LIGHT
+    backgrounds, where the fill is additionally scaled UP into a light
+    band just under the background luminance (the theme's own ScrollFill
+    is a mid grey there, and left as-is it reads as "a little bit
+    darker" on white themes), 0.20 on dark backgrounds, 0.28 for the
+    thin border / grip lines / arrows. This works on black, white and
+    grey theme families alike: a fill lighter than the background and
+    thin elements already contrasting are kept EXACTLY as the theme
+    defines them, a colliding one is shifted just far enough to be
+    clearly visible. Computed once per compare in set_colors() -- zero
+    per-paint overhead.
 
   - WINMERGE-STYLE PAINTING (the "Location Pane" approach):
     With huge files (1M lines, 200k diffs) painting every colored line is
@@ -262,13 +265,15 @@ SEP_LINE_COLOR = 0x808080  # grey — visible on both light and dark themes
 # clearly visible, not garish.
 SLIDER_FILL_LUM_DIFF = 0.20
 # Minimum luminance difference for the slider FILL on LIGHT backgrounds
-# (bg luminance >= 0.5). Lighter than the dark-background value: on a
-# white/light overview the thumb should stay CLOSE to the theme's own
-# ScrollFill (light grey, like the native scrollbar thumb of light
-# themes) instead of being pushed far down to mid-grey -- the thin
-# ScrollRect border (contrasted at 0.28) provides the visual definition,
-# so the big fill block only needs a subtle-but-visible 0.12.
-SLIDER_FILL_LUM_DIFF_LIGHT = 0.12
+# (bg luminance >= 0.5). Deliberately subtle: on a white/light overview
+# the thumb must stay a LIGHT grey close to the background (like the
+# modern native scrollbar thumb of light themes) instead of the mid-grey
+# the theme's own ScrollFill has (e.g. #CDCDCD on the white 'syn'
+# theme -- "the slider is a little bit darker on white themes, make it
+# more lighter"); the thin ScrollRect border and the 3 grip lines,
+# contrasted at SLIDER_LINE_LUM_DIFF, carry the thumb's visual
+# definition, so the big fill block only needs a subtle 0.07.
+SLIDER_FILL_LUM_DIFF_LIGHT = 0.07
 # Minimum luminance difference for the THIN elements: the slider border,
 # the 3 grip lines, the ▲/▼ arrows. Thin 1-2px strokes need more contrast
 # than a big solid block to read as visible.
@@ -351,8 +356,7 @@ def _color_scale_to_lum(color, target_lum):
     Luminance is linear in the channels, so a single factor k hits the
     target exactly for greys and near-exactly for colors -- unlike the
     ~10% channel steps of _color_shift, which always OVERSHOOT the
-    threshold (white -> 0.12 target -> 0.19 actual: a visibly darker
-    thumb than needed on white themes)."""
+    threshold."""
     r = color & 0xFF
     g = (color >> 8) & 0xFF
     b = (color >> 16) & 0xFF
@@ -368,39 +372,51 @@ def _color_scale_to_lum(color, target_lum):
 
 def _color_contrast_light(color, base, min_diff):
     """_color_contrast for the slider FILL on LIGHT backgrounds
-    (bg luminance >= 0.5): same contract, but the shift is an EXACT
-    proportional scaling to the threshold luminance instead of ~10%
-    lightness steps.
+    (bg luminance >= 0.5): the fill is scaled to a FIXED light target
+    luminance just under the background's (base_lum - min_diff)
+    instead of _color_contrast's minimal-nudge behavior.
 
-    WHY: the step loop overshoots (its channel steps are max(8, ~10%)),
-    so a white-theme thumb landed at ~0.19 luminance below the background
-    when 0.12 suffices -- "the slider is a little bit darker on white
-    themes, make it lighter". Scaling to exactly base_lum -/+ min_diff
-    keeps the thumb as light (close to the theme's own ScrollFill) as
-    visibility allows. Dark backgrounds keep the step loop (their look
-    was approved as-is); thin elements (border/grips/arrows) keep the
-    loop too (their 0.28 threshold overshoot is fine for 1-2px strokes).
+    WHY: the theme's own ScrollFill is designed against the scrollbar
+    TRACK (ScrollBack), and on light themes it is usually a MID grey
+    (e.g. #CDCDCD on the white 'syn' theme) -- kept as-is it reads as
+    "the slider is a little bit darker" on the white/light overview
+    background. The user asked for a LIGHT thumb (the modern native
+    scrollbar look): scale the fill UP to a light band just under the
+    background luminance (hue preserved by the proportional channel
+    scaling, so tinted themes keep their tint); the thin ScrollRect
+    border and grip lines (contrasted at SLIDER_LINE_LUM_DIFF) provide
+    the thumb's definition. A fill already on the LIGHT side of the
+    background keeps the exact-contrast contract: unchanged when
+    already visible, otherwise lifted to base_lum + min_diff.
 
     Falls back to _color_contrast when the exact scaling cannot meet
-    the difference (saturation / rounding).
+    the difference (pure black / saturation clamping). Dark
+    backgrounds and the thin elements (border/grips/arrows) keep the
+    step-loop look (dark themes were approved as-is).
     """
     base_lum = _color_lum(base)
     out_lum = _color_lum(color)
-    if abs(out_lum - base_lum) >= min_diff - 1e-9:
-        return color
-    # Away from the base on the side the color already leans; a fill at
-    # exactly the base's luminance goes darker (matching _color_contrast
-    # for light backgrounds).
-    go_darker = out_lum <= base_lum
+    if out_lum > base_lum:
+        # Lighter than the background: keep it when already visible
+        # (native light-on-grey look); else lift it further up.
+        if out_lum - base_lum >= min_diff - 1e-9:
+            return color
+        for margin in (0.0, 0.02):
+            out = _color_scale_to_lum(color, base_lum + min_diff + margin)
+            if out is not None and \
+                    _color_lum(out) - base_lum >= min_diff - 1e-9:
+                return out
+        return _color_contrast(color, base, min_diff)
+    # On the dark side of the background (or equal): scale UP to
+    # exactly base_lum - min_diff -- even when the raw contrast would
+    # already pass, a mid-grey fill is exactly the "a little bit
+    # darker" look light themes must not keep.
     for margin in (0.0, 0.02):
-        if go_darker:
-            target = base_lum - (min_diff + margin)
-        else:
-            target = base_lum + (min_diff + margin)
-        if 0.0 <= target <= 1.0:
+        target = base_lum - (min_diff + margin)
+        if target >= 0.0:
             out = _color_scale_to_lum(color, target)
             if out is not None and \
-                    abs(_color_lum(out) - base_lum) >= min_diff - 1e-9:
+                    base_lum - _color_lum(out) >= min_diff - 1e-9:
                 return out
     return _color_contrast(color, base, min_diff)
 
@@ -809,12 +825,13 @@ class PaintboxOverview:
         #
         # The FILL threshold is background-dependent: dark backgrounds
         # keep the strong 0.20 diff with the approved step-loop look,
-        # LIGHT backgrounds use the subtler 0.12 with an EXACT proportional
-        # scaling so the thumb stays as light as the theme's own
-        # light-grey ScrollFill instead of being pushed to mid-grey ("the
-        # slider is a little bit darker on white themes, make it lighter")
-        # -- the 0.28-contrasted border + grips carry the visual
-        # definition.
+        # LIGHT backgrounds use the subtle 0.07 and scale the fill to a
+        # FIXED light band just under the background luminance -- the
+        # theme's own ScrollFill is a mid grey on light themes (designed
+        # against the scrollbar track, not the editor background), and
+        # left as-is it reads as "the slider is a little bit darker on
+        # white themes, make it more lighter" -- the 0.28-contrasted
+        # border + grips carry the thumb's visual definition.
         if _color_lum(color_bg) >= 0.5:
             self._slider_fill = _color_contrast_light(
                 fill, color_bg, SLIDER_FILL_LUM_DIFF_LIGHT)

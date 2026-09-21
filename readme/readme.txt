@@ -724,10 +724,13 @@ The overview panel is laid out like a usual scrollbar:
   already contrast well keep them EXACTLY as the theme defines them;
   the adjustment only kicks in for colliding themes, so the slider
   stays visible on black, white and grey theme families alike. On
-  LIGHT themes the fill keeps a subtle contrast and is scaled EXACTLY
-  to the visibility threshold (a light grey close to the theme's own
-  ScrollFill, with the border and grips providing the definition);
-  dark themes keep the stronger contrast.
+  LIGHT themes the fill is lifted into a LIGHT band just under the
+  background luminance (the modern native-scrollbar thumb look: the
+  theme's own ScrollFill is usually a mid grey designed against the
+  scrollbar track, and left as-is it reads as "a little bit darker"
+  on white overviews), with the thin border and grips providing the
+  thumb's definition; dark themes keep the theme's own look and the
+  stronger contrast.
 - A grey vertical separator line runs along the panel's left edge,
   separating the overview from the editor (and the editor's scrollbar,
   when visible) -- the buttons' boxes sit right of the same line.
@@ -747,6 +750,24 @@ same-colored lines into runs, converts each run/gap to pixels once, and
 skips every segment that would collapse onto already-painted pixels --
 the number of actual draw calls is bounded by the panel's pixel height,
 not by the file's size or diff count.
+
+The diff MARKERS in the editors are windowed for the same big-file
+reason: a 1M-line compare can collect 100-200k markers, and CudaText
+walks ALL of an editor's markers on every repaint of its micromap
+column, so a fully-marked million-line compare paid 100-200 ms per
+paint -- the slider and the text lagging behind the mouse, the ▲/▼
+buttons advancing one line only every 100-200 ms (deleting the markers
+with ed.attr(MARKERS_DELETE_ALL) made scrolling instant, which pinned
+the cost on the marker volume). Differ therefore COLLECTS the markers
+during the compare and applies only the window around the current
+viewport (+/- 1500 lines) in batched marker calls (one editor update
+per batch instead of one per marker -- this also removed the
+multi-second marker phase of big compares). When scrolling leaves the
+window, it is re-applied around the new position (a few ms; at most a
+few thousand markers). Scrolling big files is now as instant as on
+small files, exactly like the editors' own scrollbars. After an edit
+(which shifts line numbers) the markers already in the editor stay as
+they are until the next compare rebuilds them.
 
 Overview-driven scrolling (dragging the slider, holding the ▲/▼
 buttons, clicking the track) follows the native scrollbar architecture
