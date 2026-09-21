@@ -8,25 +8,54 @@ The native engine is 10-30x faster than the pure-Python matchers on
 large files. For Python-only algorithms (hybrid, myers, vscode, patience,
 difflib), use differ_python.py instead.
 
-The line-level compare runs in a background thread: CudaText's
-diff_proc API accepts an optional `callback` argument, and this module
-starts the engine call through it (start_async_line_diff). The engine
-compares on its own OS thread and calls back on the main thread with
-the opcode list; Differ.compare() then walks the precomputed opcodes
-instead of running the engine again. The pure-Python matchers cannot
-do this (plugin Python code runs on the main thread only), so the
-asynchronous mode is native-only. start_async_line_diff returns the
-engine's job handle; when a compare's result will never be consumed
-(diff tab closed, plugin exiting), pass the handle to
-cancel_async_line_diff -- diff_proc(DIF_CANCEL) stops the engine's
-thread cooperatively and its callback is then never invoked.
+TWO-PHASE ASYNCHRONOUS DESIGN (both engine jobs run off the UI thread):
+
+  Phase 1 -- line-level diff. start_async_line_diff() starts
+  cudatext.diff_proc(DIF_TEXTS, ..., callback) on the engine's own OS
+  thread; the plugin's main thread returns at once, CudaText stays
+  responsive, and the engine calls back on the main thread with the
+  opcode list (start_async_line_diff returns the job handle; pass it to
+  cancel_async_line_diff when the result will never be consumed --
+  diff_proc(DIF_CANCEL) stops the engine cooperatively and the callback
+  is then never invoked).
+
+  Phase 2 -- BATCHED char-level diff. When the line opcodes arrive
+  (Command._on_native_diff_done), the Differ walks them ONCE in COLLECT
+  mode (Differ.collect_char_pairs): the exact same pairing walk that
+  paints later, but instead of calling the engine per line pair,
+  _char_diff just records each (line_a, line_b) pair. The collected
+  pairs go to the engine in ONE call -- start_async_char_diff() starts
+  cudatext.diff_proc(DIF_CHARS, pairs, ..., callback) (the BATCHED
+  DIF_CHARS: the whole list of pairs is compared in a single background
+  engine run, re-checking the cancel flag between pairs). When the
+  engine calls back with the per-pair opcode lists, the paint pass runs
+  the SAME walk in REPLAY mode: _char_diff pops the precomputed result
+  for each pair (same walk order -> same pop order), so no engine call
+  happens during painting.
+
+  Why batched: the old design made ONE diff_proc(DIF_CHARS) call PER
+  pair -- ~800k API round-trips (argument parsing, string marshalling,
+  result building) on a 1M-line compare, which dominated the runtime
+  (the per-call overhead was ~3/4 of the total char-diff time). The
+  batched form pays that overhead ONCE for the whole compare.
+
+  The collect and replay passes run the IDENTICAL walk code
+  (_replace_block_chunks -> _positional_pairs_events /
+  _find_best_pairs_events) -- the only difference is what _char_diff
+  does (record the pair vs pop the precomputed ops). The walk is a
+  deterministic function of (a_lines, b_lines, opcodes, config), so
+  both passes request char diffs in exactly the same order and the
+  replay's pops stay aligned with the collect's records. The line
+  lists are split ONCE (in collect_char_pairs) and cached on the
+  Differ for the replay pass, so the expensive split does not run
+  twice.
 
 Ignore options: the plugin's 'ignoreopt.*' settings are collected into
 a DIFF_IGN_* bitmask (see build_ignore_flags) and applied to BOTH the
 line-level diff (diff_proc DIF_TEXTS) and the char-level detail diff
-inside modified lines (diff_proc DIF_CHARS). The pure-Python
-algorithms in differ_python.py do NOT support ignore options — they
-always compare strictly.
+(batched diff_proc DIF_CHARS). The pure-Python algorithms in
+differ_python.py do NOT support ignore options — they always compare
+strictly.
 
 Code is intentionally duplicated from differ_python.py to allow
 independent evolution of the native and Python codepaths. As more
@@ -253,6 +282,81 @@ def cancel_async_line_diff(job):
     return bool(_ct.diff_proc(_ct.DIF_CANCEL, job))
 
 
+def start_async_char_diff(pairs, flags, callback):
+    """Start a BATCHED char-level compare of ALL line pairs in ONE
+    background engine job: the asynchronous form of
+    cudatext.diff_proc(DIF_CHARS) (the `callback` argument).
+
+    'pairs' is the list of (text1, text2) string tuples collected by
+    Differ.collect_char_pairs() -- the whole batch is marshalled into
+    the engine in ONE API call, and the engine compares every pair on
+    its own OS thread (it re-checks the job's cancel flag between
+    pairs, so a batch of hundreds of thousands of small pairs also
+    stops promptly on DIF_CANCEL).
+
+    Returns the engine's job handle (a positive int) when the
+    background compare was started: the engine invokes
+    `callback(results)` on the main thread when it finishes, where
+    'results' is a list with ONE opcode list per input pair, in the
+    same order as 'pairs' (element k describes pairs[k][0] vs
+    pairs[k][1], in the same (tag, i1, i2, j1, j2) format
+    start_async_line_diff's callback delivers for whole texts), or None
+    when the engine failed. Returns 0 when the background compare
+    could not be started (caller falls back to the synchronous batched
+    form, sync_char_diff).
+
+    Keep the job handle and pass it to cancel_async_char_diff() when
+    the batch's result will never be consumed (tab closed, plugin
+    exiting): diff_proc(DIF_CANCEL, handle) stops the engine's thread
+    cooperatively, and the callback of a cancelled compare is never
+    invoked. Works exactly like cancel_async_line_diff -- DIF_CANCEL
+    does not distinguish line and char jobs.
+    """
+    if not _HAS_NATIVE_DIFF or not pairs:
+        return 0
+    result = _ct.diff_proc(
+        _ct.DIF_CHARS, pairs, None, 0, flags, callback)
+    if isinstance(result, int) and result > 0:
+        return result
+    return 0
+
+
+def cancel_async_char_diff(job):
+    """Cooperatively cancel a background batched char compare started
+    by start_async_char_diff().
+
+    Identical mechanism to cancel_async_line_diff() (the engine's
+    DIF_CANCEL finds the job by handle whether it is a DIF_TEXTS or a
+    DIF_CHARS job): a DIF_CHARS batch re-checks the cancel flag between
+    pairs, so even a batch of many small pairs stops within a couple of
+    seconds. Returns True when the job was found and cancellation was
+    requested; False when no such job is running.
+    """
+    if not job:
+        return False
+    return bool(_ct.diff_proc(_ct.DIF_CANCEL, job))
+
+
+def sync_char_diff(pairs, flags):
+    """Synchronous BATCHED char-level compare: the whole 'pairs' list
+    in ONE blocking diff_proc(DIF_CHARS) call.
+
+    Fallback for the rare case start_async_char_diff() could not start
+    the background job: still ONE call for the whole batch (the
+    per-pair overhead that dominated the old design is paid once), but
+    it blocks the main thread for the whole batch time -- acceptable
+    only as an emergency path, never the normal flow.
+
+    Returns the per-pair opcode list (same format as
+    start_async_char_diff's callback argument), or None on engine
+    error (the caller then paints every pair as a full REPLACE via the
+    replay mode's None-element fallback).
+    """
+    if not _HAS_NATIVE_DIFF or not pairs:
+        return None
+    return _ct.diff_proc(_ct.DIF_CHARS, pairs, None, 0, flags)
+
+
 def algo_id(algorithm_name):
     """Map a configured algorithm name to the diff_proc DIFF_ALGO_* id:
     'native_histogram' -> DIFF_ALGO_HISTOGRAM, anything else (including
@@ -384,56 +488,195 @@ class Differ:
         self.beautify_alignment = False
         self.ignore_flags = 0  # DIFF_IGN_* bitmask (see build_ignore_flags)
         self.diffmap = []
+        # --- two-phase char-diff state (see the module docstring) ---
+        # Active pair-collection list of the COLLECT pass, or None when
+        # not collecting. _char_diff switches on this: while a list is
+        # bound here, every call RECORDS its pair into it and returns
+        # [] instead of touching the engine.
+        self._char_pairs_pending = None
+        # Precomputed per-pair opcode lists of the REPLAY pass, or None
+        # when not replaying. While bound, every _char_diff call POPS
+        # the next element (walk order == collect order). An element of
+        # None is the engine-failure fallback: paint a full REPLACE.
+        self._char_ops = None
+        # Pop position inside self._char_ops (the list is indexed, not
+        # popped, so the engine's result list is never mutated).
+        self._char_ops_pos = 0
+        # Line lists cached between the collect and replay passes:
+        # collect_char_pairs() splits the raw texts once and parks the
+        # lists here; the following compare() call takes them over
+        # (instead of splitting again) and clears the cache. Also
+        # cleared by drop_cached_state() on the abandonment paths.
+        self._lines_a = None
+        self._lines_b = None
+
+    # Very-long-line guard (chars, not bytes): a pair with either side
+    # over this limit skips the engine entirely and renders as a
+    # single full-line REPLACE. The Pascal DoDiffChars would do the
+    # same inside diff_proc(DIF_CHARS) (its Tokenize pre-allocates N
+    # tokens where N = byte length, which for 100KB+ lines causes
+    # massive heap allocation that led to EAccessViolation when
+    # repeated across many line pairs). The SAME check runs in the
+    # collect pass (pair not recorded) and in the replay pass (local
+    # REPLACE, no pop) so the record/pop positions stay aligned: the
+    # condition is a pure function of the pair's two strings, which are
+    # identical in both passes. In the legacy synchronous path it
+    # simply avoids the engine round-trip and the heap churn.
+    _CHAR_GUARD_LEN = 100000
 
     def _char_diff(self, line_a, line_b):
-        """Compute char-level diff between two single-line strings.
+        """Char-level diff of one line pair -- THREE modes, selected by
+        the two-phase state fields (see the module docstring):
 
-        Uses the native cudatext.diff_proc(DIF_CHARS) API, passing
-        self.ignore_flags (the DIFF_IGN_* bitmask from the plugin's
-        'ignoreopt.*' settings) so the char-level detail highlights
-        honor the same ignore options as the line-level diff.
-        Falls back to the Python char_diff only if the native
+        COLLECT pass (self._char_pairs_pending is a list): record the
+        pair into the list and return [] -- NO engine call. The caller
+        drives the exact same walk that will paint later, so the record
+        order equals the future request order.
+
+        REPLAY pass (self._char_ops is not None): pop the precomputed
+        result for this pair from the batch the engine delivered. A
+        None element is the per-pair engine-failure fallback: a single
+        REPLACE covering the whole line. A position overrun (impossible
+        when the walk is deterministic -- the defensive branch) also
+        falls back to a full REPLACE.
+
+        LEGACY synchronous mode (neither field set: compare() called
+        directly without a preceding collect, e.g. tests): ONE
+        synchronous BATCHED diff_proc(DIF_CHARS) call for this single
+        pair. Falls back to the Python char_diff only when the native
         API is unavailable (strict comparison, no flags).
 
         Returns: list of (tag, a_start, a_end, b_start, b_end) tuples
-        where tag is 'equal'/'delete'/'insert'/'replace' and offsets are
-        character positions into line_a / line_b. Same format as
+        where tag is 'equal'/'delete'/'insert'/'replace' and offsets
+        are character positions into line_a / line_b. Same format as
         difflib.SequenceMatcher.get_opcodes() operating on characters.
         """
-        # Early bail-out for very long lines: skip the native call
-        # entirely and return a single REPLACE. The Pascal DoDiffChars
-        # would do the same inside diff_proc(DIF_CHARS) (its Tokenize
-        # pre-allocates N tokens where N = byte length, which for
-        # 100KB+ lines causes massive heap allocation that leads to
-        # EAccessViolation when repeated across many line pairs).
-        # Checking here avoids the Python→C→Pascal→C→Python round-trip
-        # and the heap churn entirely.
-        if len(line_a) > 100000 or len(line_b) > 100000:
+        # The long-line guard is evaluated FIRST in every mode (same
+        # condition, same strings -> same outcome in collect and
+        # replay, so the record/pop alignment is preserved).
+        if (len(line_a) > self._CHAR_GUARD_LEN or
+                len(line_b) > self._CHAR_GUARD_LEN):
+            if self._char_pairs_pending is not None:
+                # collect pass: DO NOT record the pair (the replay pass
+                # will take this same branch instead of popping).
+                return []
             return [('replace', 0, len(line_a), 0, len(line_b))]
 
+        # COLLECT pass: record, no engine call.
+        collect = self._char_pairs_pending
+        if collect is not None:
+            collect.append((line_a, line_b))
+            return []
+
+        # REPLAY pass: pop the precomputed result.
+        ops = self._char_ops
+        if ops is not None:
+            pos = self._char_ops_pos
+            if pos >= len(ops):
+                # Defensive: the walk requested one pair more than the
+                # collect pass recorded (a determinism break -- should
+                # never happen). Fall back instead of crashing; the
+                # remaining pops keep their positions.
+                return [('replace', 0, len(line_a), 0, len(line_b))]
+            self._char_ops_pos = pos + 1
+            pair_ops = ops[pos]
+            if pair_ops is None:
+                # Engine reported this pair as failed: full REPLACE.
+                return [('replace', 0, len(line_a), 0, len(line_b))]
+            return pair_ops
+
+        # LEGACY synchronous mode: one single-pair batched call.
         # No profiling sections here: the CALLER times this call with a
-        # perf_counter pair (a ~60ns read — ~1% observer effect on the
+        # perf_counter pair (a ~60ns read -- ~1% observer effect on the
         # ~10us engine call) and books one batched Profiler.mark() per
         # chunk of pairs. The old per-pair sections cost more than the
         # pairing itself on 1M-line files and made the report lie.
         if _HAS_NATIVE_DIFF:
             result = _ct.diff_proc(
                 _ct.DIF_CHARS,
-                line_a,
-                line_b,
-                0,                   # algo: unused for DIF_CHARS
-                self.ignore_flags,   # bitmask of DIFF_IGN_* (Differ.ignore_flags)
+                [(line_a, line_b)],    # one-pair batch
+                None,                  # param2: unused for DIF_CHARS
+                0,                     # algo: unused for DIF_CHARS
+                self.ignore_flags,     # bitmask of DIFF_IGN_*
             )
-            if result is None:
-                # Defensive: should never happen — fall back to a single
-                # REPLACE covering everything.
-                result = [('replace', 0, len(line_a), 0, len(line_b))]
-            return result
+            if result and result[0] is not None:
+                return result[0]
+            # Defensive: whole-call None (engine error) or an empty /
+            # per-pair None result -- fall back to a single REPLACE
+            # covering everything (same degraded output the replay
+            # mode's None-element fallback paints).
+            return [('replace', 0, len(line_a), 0, len(line_b))]
         else:
             # Native API not available — fall back to Python char_diff.
             return char_diff(line_a, line_b)
 
-    def compare(self, a_text, b_text, opcodes=None):
+    def collect_char_pairs(self, a_text, b_text, opcodes):
+        """COLLECT pass of the two-phase native compare (phase 2, step 1).
+
+        Splits the two raw texts into line lists (cached on the Differ
+        for the following replay pass -- compare() takes them over
+        instead of splitting again), then drives the EXACT pairing walk
+        the replay/paint pass will run later: every opcode of the
+        replace family goes through _replace_block_chunks ->
+        _positional_pairs_events / _find_best_pairs_events, whose
+        _char_diff calls RECORD their pairs (collect mode) instead of
+        touching the engine. The yielded event lists are drained and
+        discarded -- only the pair order matters, and it is identical
+        to the replay pass's request order because both passes run the
+        same code on the same inputs (the walk is deterministic).
+
+        Returns the collected pairs as a list of (line_a, line_b)
+        string tuples, in walk order. The caller (Command.
+        _on_native_diff_done) sends the whole list to the engine in ONE
+        batched asynchronous diff_proc(DIF_CHARS) call.
+
+        Only 'replace' opcodes are walked: every other tag (equal /
+        delete / insert / ignore) produces no char diff -- their events
+        are pure line-level bookkeeping generated (again) by the
+        replay pass's compare() loop.
+
+        The pairing walk's per-chunk Profiler sections are suppressed
+        while collecting (the collect cost lands in the caller's
+        'compare:collect_pairs' section instead, so the
+        positional/find_best rows keep reporting ONLY the paint-pass
+        walk, one row per producer, calls=1 per chunk as before).
+        """
+        # Fresh state: a previous compare's leftovers (an abandoned
+        # replay pass) must never leak into this collect pass.
+        self._char_ops = None
+        self._char_ops_pos = 0
+        self._lines_a = split_lines_safe(a_text)
+        self._lines_b = split_lines_safe(b_text)
+        pairs = []
+        self._char_pairs_pending = pairs
+        try:
+            for tag, i1, i2, j1, j2 in opcodes:
+                if tag == 'replace' and self.withdetail:
+                    # Drain the chunk generator: drives the pairing
+                    # (and records the pairs); the yielded event lists
+                    # are throwaway.
+                    for _evs in self._replace_block_chunks(
+                            self._lines_a, i1, i2, self._lines_b, j1, j2):
+                        pass
+        finally:
+            self._char_pairs_pending = None
+        return pairs
+
+    def drop_cached_state(self):
+        """Drop the two-phase transient state: the cached line lists
+        (kept between the collect and replay passes) and any replay
+        bookkeeping. Called after a compare finishes AND on every
+        abandonment path where no replay pass will follow (cancelled /
+        stale / closed-tab / engine-failure), so the Differ never holds
+        text between compares -- the same invariant compare() keeps.
+        """
+        self._lines_a = None
+        self._lines_b = None
+        self._char_ops = None
+        self._char_ops_pos = 0
+        self._char_pairs_pending = None
+
+    def compare(self, a_text, b_text, opcodes=None, char_ops=None):
         """Generator that yields diff events for side-by-side display.
 
         Pure translation of the engine's opcodes into paint events —
@@ -465,6 +708,12 @@ class Differ:
                 returns (verified by grep — __init__.py reads only
                 self.diff.diffmap after the compare loop, never
                 self.diff.a_text / self.diff.b_text).
+                TWO-PHASE EXCEPTION: after a collect_char_pairs() pass,
+                the line lists are already cached on the Differ and
+                a_text/b_text are passed as None — the cached lists are
+                taken over (no second split) and dropped at the end of
+                the generator, preserving the no-text-between-compares
+                invariant.
             opcodes: precomputed line-level opcodes for a_text/b_text —
                 the result the engine's background thread delivered to
                 Command._on_native_diff_done (the diff_proc callback
@@ -473,6 +722,17 @@ class Differ:
                 the given opcodes directly. None (default) runs the
                 engine synchronously here, on the caller's thread,
                 while the generator is being consumed.
+            char_ops: precomputed BATCHED char-level results — the
+                per-pair opcode list the engine's background thread
+                delivered to Command._on_char_diff_done (the BATCHED
+                diff_proc(DIF_CHARS) callback; element k belongs to
+                the k-th pair the COLLECT pass recorded, and the walk
+                requests them in that same order). When given (any
+                list, including []), _char_diff runs in REPLAY mode:
+                no engine call happens while painting — each pair pops
+                its ready result. None (default) keeps the legacy
+                per-pair synchronous behavior (collect/replay modes
+                inactive).
 
         NOTE: _realign_opcodes (the VS Code-style post-pass in
         differ_python.py) is NOT applied to native opcodes. Native engines
@@ -500,6 +760,17 @@ class Differ:
         # bottleneck. Only sections that close before a yield remain
         # (compare:algorithm, per-chunk compare:positional_pairs /
         # compare:find_best_pairs).
+
+        # REPLAY-mode setup: the batched char results the engine
+        # delivered. Assignment (not an if-guard) so a compare() call
+        # without char_ops (legacy synchronous mode) ALWAYS deactivates
+        # any replay state left by an abandoned previous pass -- a
+        # stale _char_ops would make _char_diff pop stale results
+        # instead of calling the engine. Reset again at the natural end
+        # of the generator; drop_cached_state() covers the abandonment
+        # paths.
+        self._char_ops = char_ops
+        self._char_ops_pos = 0
 
         self.diffmap = []
         if opcodes is None:
@@ -562,8 +833,15 @@ class Differ:
         # after the compare finishes. Between compares, the Differ holds
         # zero text bytes — only config + diffmap.
         #
-        # SEQUENTIAL SPLIT — drop each raw text the instant its line
-        # list is built. split_lines_safe returns INDEPENDENT string
+        # TWO-PHASE REPLAY PASS: the COLLECT pass already split the
+        # texts and cached the line lists on the Differ — take them over
+        # (a_text/b_text are None here) instead of splitting again: the
+        # split costs ~3.3s on a 1M-line compare, real work that would
+        # otherwise run twice. Ownership moves here: the cache fields
+        # are cleared, and the lists die with the generator's locals.
+        #
+        # SEQUENTIAL SPLIT (legacy path) — drop each raw text the instant
+        # its line list is built. split_lines_safe returns INDEPENDENT string
         # objects per line (CPython string slices are COPIES of the
         # char data, not views into the source str's buffer), so a_lines
         # owns its own char data and a_text is redundant the moment
@@ -579,12 +857,20 @@ class Differ:
         # consumer's section SELF time. The Python differ splits in
         # refresh_compare under the SAME tag, so the row is comparable
         # across algorithms.
-        Profiler.start('compare:split_lines')
-        a_lines = split_lines_safe(a_text)
-        del a_text
-        b_lines = split_lines_safe(b_text)
-        del b_text
-        Profiler.stop('compare:split_lines')
+        if self._lines_a is not None:
+            # replay pass: cached by collect_char_pairs()
+            a_lines = self._lines_a
+            self._lines_a = None
+            b_lines = self._lines_b
+            self._lines_b = None
+            del a_text, b_text
+        else:
+            Profiler.start('compare:split_lines')
+            a_lines = split_lines_safe(a_text)
+            del a_text
+            b_lines = split_lines_safe(b_text)
+            del b_text
+            Profiler.stop('compare:split_lines')
 
         # Event production for REPLACE blocks is instrumented per chunk
         # ('compare:positional_pairs' / 'compare:find_best_pairs' open
@@ -664,6 +950,19 @@ class Differ:
                       len(a_lines), len(b_lines),
                       len(self.diffmap)))
 
+        # End of the walk: drop the two-phase transient state so the
+        # Differ holds no text / no engine results between compares
+        # (the line lists were taken over as locals above and die with
+        # this frame; _char_ops is the engine's result list, released
+        # here). Abandonment paths (an exception in the paint consumer
+        # that kills this generator early) are covered by
+        # drop_cached_state() in the Command callbacks, and the next
+        # collect pass re-initializes everything anyway.
+        self._char_ops = None
+        self._char_ops_pos = 0
+        self._lines_a = None
+        self._lines_b = None
+
     # Profiling row the char-level engine calls are marked under (one
     # row for the whole _char_diff call: the wrapper's own cost is a
     # fraction of a microsecond and not worth a second row).
@@ -686,12 +985,20 @@ class Differ:
 
         Profiling: engine calls are timed with perf_counter (a ~60ns
         read — ~1% observer effect on a ~10us engine call) and booked
-        ONCE per chunk via Profiler.mark(). No per-pair sections: the
-        old design's 800k char_diff + 800k char_diff:native_engine
-        sections per 1M-line compare cost more than the pairing itself
-        and made the report lie.
+        ONCE per chunk via Profiler.mark() — but ONLY in the legacy
+        synchronous mode (neither collecting nor replaying): in the
+        two-phase flow the engine time is booked by the async section
+        pair around the BATCHED diff_proc(DIF_CHARS) job
+        (char_diff:native_engine, calls=1), so per-pair timing here
+        would pollute that row with record/pop costs. No per-pair
+        sections: the old design's 800k char_diff +
+        800k char_diff:native_engine sections per 1M-line compare cost
+        more than the pairing itself and made the report lie.
         """
-        prof_on = Profiler.enabled
+        # Legacy synchronous mode only: time the per-pair engine calls.
+        prof_on = (Profiler.enabled and
+                   self._char_pairs_pending is None and
+                   self._char_ops is None)
         row = self._CHAR_ROW
         char_diff_call = self._char_diff
         append = out.append
@@ -780,31 +1087,42 @@ class Differ:
 
         # ---- da != db: the two modes diverge here ----
         if self.beautify_alignment and da != db:
-            # anchor + prefix/suffix scoring + threshold + staggering.
+            # anchor + prefix/suffix scoring + threshold and staggering.
             # Produced into ONE list (beautify is opt-in; the recursive
             # scorer makes chunking invasive). Char diffs inside are
-            # perf_counter-timed and booked as batched marks.
-            Profiler.start('compare:find_best_pairs')
+            # perf_counter-timed and booked as batched marks (legacy
+            # mode only). The producing section is suppressed during
+            # the COLLECT pass: the collect pass's whole cost lands in
+            # the caller's 'compare:collect_pairs' section, so these
+            # rows keep reporting ONLY the paint-pass walk.
+            _collecting = self._char_pairs_pending is not None
+            if not _collecting:
+                Profiler.start('compare:find_best_pairs')
             evs = []
             self._find_best_pairs_events(evs, a, alo, ahi, b, blo, bhi)
-            Profiler.stop('compare:find_best_pairs')
+            if not _collecting:
+                Profiler.stop('compare:find_best_pairs')
             yield evs
             return
 
         # Shared fast path (both modes): positional pairing for the
         # common line count, chunked; then leftovers on the longer side
         # as plain added/deleted lines against a gap at the bottom of
-        # the shorter side's block.
+        # the shorter side's block. Section suppression during the
+        # COLLECT pass, same rationale as the beautify branch above.
+        _collecting = self._char_pairs_pending is not None
         common = min(da, db)
         k = 0
         while k < common:
             n = self._REPLACE_CHUNK
             if common - k < n:
                 n = common - k
-            Profiler.start('compare:positional_pairs')
+            if not _collecting:
+                Profiler.start('compare:positional_pairs')
             evs = []
             self._positional_pairs_events(evs, a, alo + k, b, blo + k, n)
-            Profiler.stop('compare:positional_pairs')
+            if not _collecting:
+                Profiler.stop('compare:positional_pairs')
             yield evs
             k += n
 
@@ -856,6 +1174,10 @@ class Differ:
         Profiling: both searches and the char diffs are perf_counter-
         timed and booked as batched marks (calls = 1 per invocation) —
         no sections, so recursion depth adds zero instrumentation cost.
+        The SEARCH marks run in every mode (the search itself runs in
+        every pass); the CHAR-DIFF timing runs only in the legacy
+        synchronous mode (in the two-phase flow the engine time is
+        booked by the async pair around the batched DIF_CHARS job).
         """
         da, db = ahi - alo, bhi - blo
         if da == 0:
@@ -876,6 +1198,10 @@ class Differ:
         # Use a dict-based approach for O(N+M) instead of O(N*M):
         # build a map of unique lines in a[alo:ahi], then scan b[blo:bhi].
         prof_on = Profiler.enabled
+        # char-diff timing: legacy synchronous mode only (see docstring)
+        _time_engine = (prof_on and
+                        self._char_pairs_pending is None and
+                        self._char_ops is None)
         if prof_on:
             _t0 = time.perf_counter()
         sub_a_counts = Counter(a[alo:ahi])
@@ -1001,7 +1327,7 @@ class Differ:
         if a_line == b_line:
             out.append((ALIGN, best_i, best_j))
         else:
-            if prof_on:
+            if _time_engine:
                 _t0 = time.perf_counter()
                 ops = self._char_diff(a_line, b_line)
                 dt = time.perf_counter() - _t0

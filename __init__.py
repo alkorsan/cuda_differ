@@ -928,13 +928,17 @@ class _CompareJob:
     """Context for one compare of one compare tab.
 
     refresh_compare fills the job while setting the compare up. With the
-    native algorithms the line-level diff runs in the engine's
-    background thread: refresh_compare returns after starting it, and the
-    engine's completion callback (_on_native_diff_done, marshalled to
-    the main thread) uses the job to finish the compare -- paint the
-    events, set the bookmarks, repaint the overview. With the Python
-    algorithms the paint phase runs inline in refresh_compare and the job
-    is just a carrier for the same data.
+    native algorithms the compare runs as TWO background engine jobs:
+    the line-level diff (job_handle) runs first, and when its opcodes
+    arrive (_on_native_diff_done, marshalled to the main thread), the
+    BATCHED char-level diff (char_job_handle) runs the collected line
+    pairs; the char batch's callback (_on_char_diff_done) finishes the
+    compare -- paint the events, set the bookmarks, repaint the
+    overview. The session's job slot stays taken for BOTH phases (a
+    refresh arriving mid-compare is dropped; the cancel commands find
+    the job and cancel whichever engine job is still running). With the
+    Python algorithms the paint phase runs inline in refresh_compare
+    and the job is just a carrier for the same data.
 
     The snapshot fields (a_text/b_text, lines_a/lines_b) are the texts
     the engine was kicked off with. While a background compare runs,
@@ -968,7 +972,10 @@ class _CompareJob:
         'profiling_enabled_here',   # profiling enabled by this compare
         'cprofile',                 # (pr, s) while the cProfile layer runs
         'profiler_async_token',     # start_async_pair token (engine wait)
-        'job_handle',       # engine job handle for the background compare (0 = none)
+        'job_handle',       # engine job handle for the background LINE compare (0 = none)
+        'char_job_handle',  # engine job handle for the background batched CHAR compare (0 = none)
+        'char_profiler_token',      # start_async_pair token (char batch wait)
+        'char_pairs_count', # number of pairs sent to the char batch (engine-failure fallback sizing)
         'editor_lock',      # whole-compare lock/RO state (see class docstring)
         'stale',            # job dropped (tab closed / app exiting)
         'in_flight',        # background engine call was started
@@ -1001,6 +1008,9 @@ class _CompareJob:
         self.cprofile = None
         self.profiler_async_token = None
         self.job_handle = 0
+        self.char_job_handle = 0
+        self.char_profiler_token = None
+        self.char_pairs_count = 0
         self.editor_lock = None
         self.stale = False
         self.in_flight = False
@@ -2386,16 +2396,25 @@ class Command:
         """Cancel one in-flight background compare job: mark it stale (so
         its completion callback, if the engine delivers one after all,
         turns into a no-op -- see _CompareJob.stale in
-        _on_native_diff_done), release the whole-compare editor lock /
-        read-only state the job's kick-off acquired (the editors must
-        become editable again the moment the compare is gone), and tell
-        the engine to stop cooperatively via diff_proc(DIF_CANCEL) if a
-        background call was actually started. No-op for a Python-
-        algorithm job, which never gets a job_handle. Does not touch
-        the session's job slot -- callers clear session.job themselves
+        _on_native_diff_done / _on_char_diff_done), release the
+        whole-compare editor lock / read-only state the job's kick-off
+        acquired (the editors must become editable again the moment the
+        compare is gone), and tell the engine to stop cooperatively via
+        diff_proc(DIF_CANCEL) for whichever engine job is still running
+        -- the LINE-level compare (job_handle), the BATCHED char-level
+        compare (char_job_handle), or both. No-op for a Python-
+        algorithm job, which never gets a handle. Does not touch the
+        session's job slot -- callers clear session.job themselves
         (close / save / cancel command / exit each handle it
         differently but identically safe)."""
         job.stale = True
+        # Drop the Differ's two-phase transient state (cached line
+        # lists / replay bookkeeping): a cancelled compare never reaches
+        # its replay pass, so the Differ must not hold the texts.
+        if job.session is not None:
+            diff = self._session_diff(job.session)
+            if isinstance(diff, dfn.Differ):
+                diff.drop_cached_state()
         # Close the engine-wait profiling pair: a cancelled compare's
         # completion callback never fires, so this is the ONLY place the
         # pair is closed for cancels (tab close / app exit / save /
@@ -2403,6 +2422,10 @@ class Command:
         # newer kick-off's reset) already handled it.
         Profiler.stop_async_pair(job.profiler_async_token)
         job.profiler_async_token = None
+        # Same for the CHAR batch's wait pair (two-phase compares: the
+        # line phase may already be done when the cancel arrives).
+        Profiler.stop_async_pair(job.char_profiler_token)
+        job.char_profiler_token = None
         # A cancelled compare's epilogue never runs: disable the
         # cProfile layer without printing (an enabled Profile would
         # keep tracing the main thread).
@@ -2412,6 +2435,12 @@ class Command:
         if job.job_handle:
             dfn.cancel_async_line_diff(job.job_handle)
             job.job_handle = 0
+        if job.char_job_handle:
+            # Cancel the background BATCHED char compare exactly the
+            # same way (DIF_CANCEL finds DIF_CHARS and DIF_TEXTS jobs
+            # alike; the engine re-checks the flag between pairs).
+            dfn.cancel_async_char_diff(job.char_job_handle)
+            job.char_job_handle = 0
 
     def cancel_compare(self):
         """Command: cancel the in-flight background compare for the
@@ -2606,23 +2635,31 @@ class Command:
         the no-arg menu command and other manual entry points default
         to True.
 
-        With the native algorithms, the line-level diff runs in a
-        background thread (the callback form of cudatext.diff_proc):
-        this method does the whole setup -- reads the texts, clears
-        the old markers, prepares the overview and the Differ --
-        starts the engine call, locks both halves (EDACTION_LOCK busy
-        placeholder + PROP_RO read-only) for the whole run when
-        LOCK_EDITORS_WHILE_COMPARING is on, and returns at once so
-        the UI stays responsive. The engine call returns a job
-        handle, which the job keeps so it can be cancelled
-        (diff_proc DIF_CANCEL) when the result will never be consumed
-        (tab closed / app exiting). When the compare finishes, it
-        calls back on the main thread and _on_native_diff_done
-        finishes the compare: it paints the events
-        (_paint_compare_events), sets the bookmarks, repaints the
-        overview, shows the timing epilogue, and only then releases
-        the editor lock / read-only state. Python algorithms run the
-        paint phase inline, synchronously."""
+        With the native algorithms, the compare runs as TWO
+        background engine jobs (the callback form of cudatext.
+        diff_proc): this method does the whole setup -- reads the
+        texts, clears the old markers, prepares the overview and the
+        Differ -- starts the LINE-level engine call, locks both
+        halves (EDACTION_LOCK busy placeholder + PROP_RO read-only)
+        for the whole run when LOCK_EDITORS_WHILE_COMPARING is on,
+        and returns at once so the UI stays responsive. The engine
+        call returns a job handle, which the job keeps so it can be
+        cancelled (diff_proc DIF_CANCEL) when the result will never
+        be consumed (tab closed / app exiting). When the line compare
+        finishes, it calls back on the main thread and
+        _on_native_diff_done starts PHASE 2: it walks the opcodes
+        once collecting every line pair that needs a char-level diff
+        (no engine call), then ONE background BATCHED
+        diff_proc(DIF_CHARS) job runs them all -- also cancelable
+        (the job keeps that handle too; the cancel commands stop
+        whichever engine job is still running). When the char batch
+        finishes, _on_char_diff_done finishes the compare: it paints
+        the events (_paint_compare_events, popping each pair's
+        precomputed char opcodes -- no engine call while painting),
+        sets the bookmarks, repaints the overview, shows the timing
+        epilogue, and only then releases the editor lock / read-only
+        state. Python algorithms run the paint phase inline,
+        synchronously."""
         if ed is None:
             ed = ct.ed
         if show_dialog is None:
@@ -2966,10 +3003,12 @@ class Command:
                     job.profiler_async_token = _async_pair
                     session.job = job
                     # Editors are locked + read-only for the whole engine
-                    # run (kick-off -> fully-rendered result / cancel):
-                    # the paint lock shows the 'busy' placeholder in both
-                    # halves and PROP_RO blocks typing. Released in
-                    # _on_native_diff_done / _cancel_job.
+                    # run (kick-off -> fully-rendered result / cancel,
+                    # covering BOTH engine jobs -- the line compare and
+                    # the char batch): the paint lock shows the 'busy'
+                    # placeholder in both halves and PROP_RO blocks
+                    # typing. Released in _on_char_diff_done /
+                    # _finish_native_compare / _cancel_job.
                     self._lock_compare_editors(job)
                     # The timing/profiling epilogue runs in the
                     # completion callback, not in the finally below.
@@ -3010,14 +3049,19 @@ class Command:
                                        tab_id,
                                        _cprof)
 
-    def _paint_compare_events(self, job, opcodes=None):
+    def _paint_compare_events(self, job, opcodes=None, char_ops=None):
         """Consume the Differ's event generator and paint every event
         into both editor halves.
 
         Shared by both compare modes: the synchronous mode (Python
-        algorithms) calls it directly from refresh_compare; the background
-        mode calls it from _on_native_diff_done, passing the opcodes the
-        engine produced on its background thread.
+        algorithms) calls it directly from refresh_compare; the native
+        background mode calls it from _finish_native_compare (reached
+        from _on_native_diff_done or the char batch's _on_char_diff_done),
+        passing the opcodes the engine produced on its background thread
+        and char_ops -- the precomputed BATCHED char-level results the
+        char phase delivered (REPLAY mode: the Differ's generator pops
+        each pair's ready opcodes instead of calling the engine). None
+        keeps the legacy behavior (per-pair synchronous engine calls).
 
         Locking: this method takes NO lock of its own. When the whole-
         compare lock is held (job.editor_lock -- the background mode's
@@ -3100,8 +3144,14 @@ class Command:
         # JOB'S SESSION's -- each compare tab paints from its own records.
         diff = self._session_diff(job.session)
         if isinstance(diff, dfn.Differ):
+            # char_ops: the precomputed BATCHED char results (REPLAY
+            # mode -- no engine call during painting; the Differ pops
+            # each pair's ready opcodes). In the two-phase flow the
+            # Differ holds the cached line lists from the collect pass
+            # and job.a_text / job.b_text are None (dropped after the
+            # collect split).
             compare_iter = diff.compare(job.a_text, job.b_text,
-                                        opcodes=opcodes)
+                                        opcodes=opcodes, char_ops=char_ops)
             # RELEASE the job's refs to the raw texts now that the
             # generator has its own (param) refs. The native generator
             # splits the texts into line lists inside compare() and then
@@ -3113,7 +3163,9 @@ class Command:
             # call, the strings' refcount actually hits 0 and they are
             # freed instead of lingering through the whole paint loop.
             # (Python path already `del`d its texts in refresh_compare
-            # right after the split_lines_safe call.)
+            # right after the split_lines_safe call. Two-phase flow: the
+            # refs were already dropped after the collect pass -- these
+            # assignments are idempotent no-ops there.)
             job.a_text = None
             job.b_text = None
         else:
@@ -3513,9 +3565,19 @@ class Command:
 
         Profiler.stop('refresh')
 
+    def _free_job_slot(self, job):
+        """Free the session's job slot when this job finishes (or is
+        definitively abandoned inside a callback): a new refresh can
+        start right after. Idempotent -- the session keeps at most one
+        job, and only when it IS this job does the clear happen. The
+        cancel commands (close / save / exit / cancel) clear the slot
+        themselves BEFORE _cancel_job, so they never rely on this."""
+        if job.session is not None and job.session.job is job:
+            job.session.job = None
+
     def _on_native_diff_done(self, job, opcodes):
         """diff_proc completion callback for a background line-level
-        compare (native algorithms).
+        compare (native algorithms) -- PHASE 1 of the two-phase flow.
 
         The engine invokes this on the main thread when its background
         thread finishes, passing one argument: the opcode list -- the
@@ -3527,36 +3589,60 @@ class Command:
         (the engine drops the result instead), so normally only completed
         compares arrive here.
 
-        The job is validated against the live state before painting:
-        when the compare tab was closed, CudaText is exiting, or the
-        configured algorithm switched to a Python one, the result is
-        discarded (the Python case re-runs the refresh with the new
-        algorithm). The engine's own texts cannot have drifted: while
-        the engine ran, LOCK_EDITORS_WHILE_COMPARING kept both halves
-        read-only, and a refresh arriving mid-run was dropped at the top
-        of refresh_compare -- so what the engine produced is what the
-        editors still hold, and it is painted as-is.
+        The job is validated against the live state first: when the
+        compare tab was closed, CudaText is exiting, or the configured
+        algorithm switched to a Python one, the result is discarded (the
+        Python case re-runs the refresh with the new algorithm). The
+        engine's own texts cannot have drifted: while the engine ran,
+        LOCK_EDITORS_WHILE_COMPARING kept both halves read-only, and a
+        refresh arriving mid-run was dropped at the top of
+        refresh_compare -- so what the engine produced is what the
+        editors still hold.
 
-        Whatever the outcome, the kick-off editor lock / read-only state
-        is released in a finally block (idempotent -- _cancel_job already
+        Then the CHAR PHASE decision (when details are on):
+        - The Differ walks the opcodes ONCE in collect mode
+          (Differ.collect_char_pairs: the exact same pairing walk the
+          paint pass will run, recording every line pair that needs a
+          char-level diff -- no engine call). The raw text snapshots
+          are dropped after the split.
+        - With at least one collected pair, ONE background batched
+          diff_proc(DIF_CHARS) job runs them all (dfn.
+          start_async_char_diff); the completion callback
+          (_on_char_diff_done, marshalled to the main thread) paints
+          with the precomputed per-pair opcodes. This method RETURNS at
+          kick-off with the session's job slot STILL TAKEN (the compare
+          is still running -- the cancel commands must find the job to
+          stop the char batch), the editor lock still held, and the
+          timing/profiling epilogue deferred to the char callback.
+        - Zero pairs (withdetail off, or nothing changed inside the
+          replace blocks): paint immediately -- no char phase.
+        - Engine refused to start the background batch: ONE synchronous
+          batched diff_proc(DIF_CHARS) call (blocking fallback, still
+          batched), then paint.
+
+        Whatever the non-deferred outcome, the kick-off editor lock /
+        read-only state, the job slot and the cProfile layer are
+        released in a finally block (idempotent -- _cancel_job already
         released cancelled jobs): the halves become editable again only
         here, after the result is fully rendered.
         """
-        # This job is finished -- free the session's job slot first of all.
-        if job.session is not None and job.session.job is job:
-            job.session.job = None
-
         # Close the engine-wait profiling pair FIRST, before anything
         # else: its elapsed (kick-off -> now) is booked to
         # line_diff:native_engine and deducted from 'refresh' BEFORE the
-        # paint sections below open, and it must close on EVERY outcome
+        # sections below open, and it must close on EVERY outcome
         # (stale / exiting / closed tab / algo-switch re-run / engine
-        # error / normal paint), not just the happy path. Token-guarded:
-        # after a cancel already closed it (or a newer kick-off's reset
-        # wiped the token) this is a no-op, so a late callback cannot
-        # double-count the engine wait.
+        # error / normal paint / char-phase deferral), not just the
+        # happy path. Token-guarded: after a cancel already closed it
+        # (or a newer kick-off's reset wiped the token) this is a no-op,
+        # so a late callback cannot double-count the engine wait.
         Profiler.stop_async_pair(job.profiler_async_token)
         job.profiler_async_token = None
+
+        # True when the compare continues into the background char
+        # batch: the finally below must then NOT release the editor
+        # lock / free the slot / kill the cProfile layer -- all of that
+        # moves to _on_char_diff_done.
+        _deferred = False
 
         try:
             if job.stale:
@@ -3568,12 +3654,15 @@ class Command:
                 return
 
             try:
-                if not isinstance(self._session_diff(job.session), dfn.Differ):
+                diff = self._session_diff(job.session)
+                if not isinstance(diff, dfn.Differ):
                     # Algorithm switched to a Python one while the engine
                     # was running: the session's Differ cannot paint native
-                    # opcodes. Release this job's lock BEFORE the re-run
-                    # so the new kick-off's lock does not stack on it,
-                    # then re-run the refresh with the new algorithm.
+                    # opcodes. Release this job's lock (and slot -- the
+                    # re-run's guard needs it free) BEFORE the re-run so
+                    # the new kick-off's lock does not stack on it, then
+                    # re-run the refresh with the new algorithm.
+                    self._free_job_slot(job)
                     self._release_compare_editors(job)
                     self.refresh_compare(job.ed, show_dialog=job.show_dialog)
                     return
@@ -3587,41 +3676,232 @@ class Command:
                         ('replace', 0, len(split_lines_safe(job.a_text)),
                          0, len(split_lines_safe(job.b_text)))]
 
-                # Paint the result. The timing epilogue (status-bar message
-                # + profiling report) covers the WHOLE compare, from
-                # kick-off (job.compare_start) to paint done -- the wall
-                # time the user actually waited.
-                try:
-                    self._paint_compare_events(job, opcodes)
-                finally:
-                    self._compare_epilogue(job.compare_start,
-                                           job.profiling_enabled_here,
-                                           job.tab_id,
-                                           job.cprofile)
-                    job.cprofile = None
+                # ---- char phase decision ----
+                if diff.withdetail:
+                    # COLLECT pass: walk the opcodes once, recording
+                    # every line pair that needs a char-level diff.
+                    # Also splits the texts into line lists (cached on
+                    # the Differ for the paint pass); the raw text
+                    # snapshots are dropped right after.
+                    Profiler.start('compare:collect_pairs')
+                    pairs = diff.collect_char_pairs(
+                        job.a_text, job.b_text, opcodes)
+                    job.a_text = None
+                    job.b_text = None
+                    Profiler.stop('compare:collect_pairs')
+
+                    if pairs:
+                        job.char_pairs_count = len(pairs)
+                        # Profile the char-batch wait as an async pair:
+                        # inner row 'char_diff:native_engine' (the same
+                        # row the per-pair engine calls used to feed --
+                        # now calls=1, the true engine wall time), outer
+                        # row 'compare:char_phase'. Token-guarded; closed
+                        # in _on_char_diff_done / _cancel_job.
+                        _async_pair = Profiler.start_async_pair(
+                            'compare:char_phase', 'char_diff:native_engine')
+                        # functools.partial carries the job AND the line
+                        # opcodes to the char callback (the Differ holds
+                        # the cached line lists).
+                        cb = functools.partial(self._on_char_diff_done,
+                                               job, opcodes)
+                        handle = dfn.start_async_char_diff(
+                            pairs, diff.ignore_flags, cb)
+                        if handle:
+                            job.char_job_handle = handle
+                            job.char_profiler_token = _async_pair
+                            # session.job STAYS: the compare is still
+                            # running (a refresh arriving now is dropped;
+                            # the cancel commands cancel the char batch).
+                            # Freed in _on_char_diff_done.
+                            _deferred = True
+                            return
+                        # Engine refused to start the background batch:
+                        # close the async pair (pure bookkeeping hygiene,
+                        # same as the line-phase refusal path) and fall
+                        # back to the SYNCHRONOUS batched call -- ONE
+                        # blocking call for all pairs (still batched, no
+                        # per-pair round-trips), then paint inline.
+                        Profiler.stop_async_pair(_async_pair)
+                        msg('diff_proc failed to start the background '
+                            'char compare', level=1)
+                        char_ops = dfn.sync_char_diff(
+                            pairs, diff.ignore_flags)
+                        if char_ops is None:
+                            # Engine failed the batch as well: paint
+                            # every pair as a full REPLACE (the replay
+                            # mode's None-element fallback) -- no engine
+                            # calls, deterministic degraded output.
+                            char_ops = [None] * len(pairs)
+                        self._finish_native_compare(job, opcodes, char_ops)
+                        return
+                    # Zero pairs collected: nothing to char-diff (the
+                    # paint walk takes the same empty branch) -- fall
+                    # through to the immediate paint below.
+
+                # withdetail off, or nothing to char-diff: paint now
+                # (char_ops=[] -- the replay mode never pops).
+                self._finish_native_compare(job, opcodes, [])
+                return
             finally:
-                # Compare finished and everything is rendered: make the
-                # halves editable again / drop the busy placeholder.
-                # Idempotent, so the stale/exiting/closed/re-run paths
-                # above (and _cancel_job for cancelled jobs) are all
-                # covered by this single call.
-                self._release_compare_editors(job)
-                # Safety net for the early-return paths above (stale /
-                # exiting / closed tab / algorithm-switch re-run): they
-                # skip the epilogue, so disable an abandoned cProfile
-                # run here -- an enabled Profile keeps tracing the main
-                # thread until something replaces it. No-op when the
-                # epilogue already stopped it (job.cprofile is None by
-                # then) or when the cProfile layer is off.
-                cancel_profiling(job.cprofile)
-                job.cprofile = None
+                if not _deferred:
+                    # Non-deferred outcomes only: the compare is fully
+                    # done (or was abandoned). _finish_native_compare
+                    # already did this for the paint paths (idempotent
+                    # re-release here); the stale / exiting / closed /
+                    # algo-switch / exception paths release HERE.
+                    self._free_job_slot(job)
+                    self._release_compare_editors(job)
+                    # Safety net for the early-return paths above (stale /
+                    # exiting / closed tab / algorithm-switch re-run): they
+                    # skip the epilogue, so disable an abandoned cProfile
+                    # run here -- an enabled Profile keeps tracing the main
+                    # thread until something replaces it. No-op when the
+                    # epilogue already stopped it (job.cprofile is None by
+                    # then) or when the cProfile layer is off.
+                    cancel_profiling(job.cprofile)
+                    job.cprofile = None
         except Exception:
             # Never let an exception escape into the engine's callback
             # dispatcher: print the traceback and leave the tab in its
             # cleared state -- the next refresh (manual or automatic)
-            # re-applies the markers.
+            # re-applies the markers. The finally above freed the slot
+            # and released the lock (the exception path is
+            # non-deferred), so the tab is NOT stuck 'comparing'.
             import traceback
             traceback.print_exc()
+
+    def _on_char_diff_done(self, job, opcodes, results):
+        """diff_proc completion callback for the background BATCHED
+        char-level compare (native algorithms) -- PHASE 2 of the
+        two-phase flow.
+
+        The engine invokes this on the main thread when the batch
+        finishes, passing one argument: the per-pair opcode list -- one
+        opcode list per input pair, in the collect pass's record order
+        -- or None when the batch failed. The callback arrives through
+        the functools.partial(self._on_char_diff_done, job, opcodes)
+        created in _on_native_diff_done, so the job context AND the
+        line-level opcodes travel with it. A batch cancelled through
+        diff_proc(DIF_CANCEL) never reaches this callback (the engine
+        drops the result), so normally only completed batches arrive
+        here.
+
+        Validation mirrors _on_native_diff_done: stale (cancelled),
+        exiting, closed tab, or an algorithm switch to a Python Differ
+        (re-runs the refresh) discard the result. On a whole-batch
+        engine failure (results is None) every pair paints as a full
+        REPLACE (the replay mode's None-element fallback -- the same
+        degraded-but-sane output the line phase's error fallback
+        produces).
+
+        The paint itself runs in _finish_native_compare: it walks the
+        line opcodes in REPLAY mode (Differ.compare with char_ops),
+        popping each pair's precomputed opcodes -- no engine call while
+        painting. The timing epilogue (status-bar message + profiling
+        report) covers the WHOLE compare, from kick-off
+        (job.compare_start) to paint done -- the wall time the user
+        waited. The editor lock / read-only state taken at kick-off is
+        released in the finally, after the result is fully rendered;
+        the session's job slot is freed so the next refresh can start.
+        """
+        # Close the char-batch wait pair FIRST (every outcome -- the
+        # paint sections below must not absorb the engine wait).
+        # Token-guarded: after a cancel already closed it this is a
+        # no-op, so a late callback cannot double-count.
+        Profiler.stop_async_pair(job.char_profiler_token)
+        job.char_profiler_token = None
+        # The batch is finished (or its result arrived): no longer
+        # cancelable -- DIF_CANCEL would find nothing. Clearing here
+        # also makes _cancel_job's char branch a no-op for a late
+        # cancel racing the completion.
+        job.char_job_handle = 0
+
+        try:
+            if job.stale:
+                return
+            if self._app_exiting:
+                return
+            if not self._is_compare_tab(job.tab_id):
+                return
+
+            diff = self._session_diff(job.session)
+            if not isinstance(diff, dfn.Differ):
+                # Algorithm switched to a Python one while the char
+                # batch was running (same re-run as the line phase).
+                self._free_job_slot(job)
+                self._release_compare_editors(job)
+                self.refresh_compare(job.ed, show_dialog=job.show_dialog)
+                return
+
+            if results is None:
+                # Whole-batch engine failure: per-pair full-REPLACE
+                # fallback (see docstring).
+                results = [None] * job.char_pairs_count
+
+            self._finish_native_compare(job, opcodes, results)
+        except Exception:
+            # Never let an exception escape into the engine's callback
+            # dispatcher (same contract as _on_native_diff_done): print
+            # the traceback; the finally below released the lock and
+            # freed the slot so the tab is not stuck 'comparing'.
+            import traceback
+            traceback.print_exc()
+        finally:
+            # EVERY outcome releases (idempotent: the paint path inside
+            # _finish_native_compare released already when it finished;
+            # the stale / exiting / closed paths were released by
+            # _cancel_job; the exception paths need it HERE).
+            self._free_job_slot(job)
+            self._release_compare_editors(job)
+            cancel_profiling(job.cprofile)
+            job.cprofile = None
+
+    def _finish_native_compare(self, job, opcodes, char_ops):
+        """Finish a native compare after BOTH phases have their
+        results: paint the events (the Differ walks the line opcodes in
+        REPLAY mode, popping each pair's precomputed char opcodes --
+        no engine call while painting), run the timing/profiling
+        epilogue, and release the editor lock / read-only state taken
+        at kick-off.
+
+        Frees the session's job slot FIRST (a refresh fired by an event
+        arriving right after the paint must not be dropped), then keeps
+        everything else in try/finally so an exception mid-paint still
+        runs the epilogue and re-enables editing.
+        """
+        # The compare is finishing: the slot must be free BEFORE the
+        # paint loop starts processing events, so a refresh triggered
+        # from inside the paint's editor updates (wrap sync, caret
+        # events queued behind EDACTION_UNLOCK repaints) is queued, not
+        # dropped. Idempotent (the char callback's finally re-frees).
+        self._free_job_slot(job)
+        try:
+            try:
+                self._paint_compare_events(job, opcodes, char_ops)
+            finally:
+                # Timing epilogue (status-bar message + profiling
+                # report) covers the WHOLE compare: kick-off ->
+                # paint done, the wall time the user waited.
+                self._compare_epilogue(job.compare_start,
+                                       job.profiling_enabled_here,
+                                       job.tab_id,
+                                       job.cprofile)
+                job.cprofile = None
+        finally:
+            # Compare finished and everything is rendered: make the
+            # halves editable again / drop the busy placeholder.
+            # Idempotent -- the callback's finally re-releases.
+            self._release_compare_editors(job)
+            # Belt-and-braces: compare() clears the Differ's two-phase
+            # transient state at the natural end of its walk; an
+            # exception mid-paint leaves a suspended generator holding
+            # the cached line lists + replay bookkeeping -- drop them
+            # here so the Differ never holds text between compares.
+            if job.session is not None:
+                diff = self._session_diff(job.session)
+                if isinstance(diff, dfn.Differ):
+                    diff.drop_cached_state()
 
     def _compare_epilogue(self, compare_start, profiling_enabled_here,
                           tab_id=None, cprofile=None):
