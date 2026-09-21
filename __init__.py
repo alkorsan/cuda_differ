@@ -3019,11 +3019,12 @@ class Command:
         color_ignored_gap = job.color_ignored_gap
         show_dialog = job.show_dialog
         # The for loop below consumes events from diff.compare() (a
-        # generator) and paints each event. Profiling the loop as a whole
-        # captures both compare time (inside the generator) and paint time
-        # (inside the loop body). The paint:* sub-sections break down the
-        # paint time by operation type. The compare:* sub-sections (from
-        # differ.py) break down the compare time by algorithm phase.
+        # generator) and paints each event. One section wraps the whole
+        # loop: its SELF time is the honest per-event dispatch+collection
+        # cost (the generator's production time is booked separately by
+        # the differ's per-chunk 'compare:event_generation' sections and
+        # batched 'char_diff:*' marks — no per-event sections anywhere,
+        # see profiling.py's docstring).
         #
         # Bookmarks are NOT set immediately in the loop. Instead, they
         # are collected into pending_bkm_a / pending_bkm_b lists and
@@ -3087,163 +3088,34 @@ class Command:
             compare_iter = diff.compare(job.lines_a, job.lines_b)
             job.lines_a = None
             job.lines_b = None
+        # Colors are read ONCE here, not per event (the loop below runs
+        # millions of times on big files; the old code did a cfg.get per
+        # event).
+        color_deleted = self.cfg.get('color_deleted')
+        color_added = self.cfg.get('color_added')
+        color_changed = self.cfg.get('color_changed')
+        # Branch order = event frequency on big files (ALIGN for every
+        # matched line dominates, then the char/line/decor events of
+        # changed pairs, then del/add, then gaps) — the ladder is
+        # behavior-neutral (ids are mutually exclusive) but the hot ids
+        # are matched after the fewest comparisons.
+        #
+        # Per-event Profiler sections are GONE (they were the biggest
+        # fake cost in the old report: ~4M start/stop pairs charged
+        # ~2-4us each to whichever section was open, and the consumer's
+        # work between two next() calls was booked into the SUSPENDED
+        # generator's section). All dispatch+collection time now lands
+        # honestly in this section's self time; the generator's own
+        # production time is visible in the per-chunk
+        # 'compare:event_generation' rows + the batched 'char_diff:*'
+        # marks (see differ_native/differ_python).
         for d in compare_iter:
             diff_id, y = d[0], d[1]
-            if diff_id == df.A_LINE_DEL:
-                n_diff_events += 1
-                pending_bkm_a.append((y, NKIND_DELETED))
-                if micromap_on:
-                    Profiler.start('paint:micromap')
-                    pending_mm_a[y] = self.cfg.get('color_deleted')
-                    Profiler.stop('paint:micromap')
-                if overview is not None:
-                    overview.add_line_state('a', y, self.cfg.get('color_deleted'))
-            elif diff_id == df.B_LINE_ADD:
-                n_diff_events += 1
-                pending_bkm_b.append((y, NKIND_ADDED))
-                if micromap_on:
-                    Profiler.start('paint:micromap')
-                    pending_mm_b[y] = self.cfg.get('color_added')
-                    Profiler.stop('paint:micromap')
-                if overview is not None:
-                    overview.add_line_state('b', y, self.cfg.get('color_added'))
-            elif diff_id == df.A_LINE_CHANGE:
-                n_diff_events += 1
-                pending_bkm_a.append((y, NKIND_CHANGED))
-                if micromap_on:
-                    Profiler.start('paint:micromap')
-                    pending_mm_a[y] = self.cfg.get('color_changed')
-                    Profiler.stop('paint:micromap')
-                if overview is not None:
-                    overview.add_line_state('a', y, self.cfg.get('color_changed'))
-            elif diff_id == df.B_LINE_CHANGE:
-                n_diff_events += 1
-                pending_bkm_b.append((y, NKIND_CHANGED))
-                if micromap_on:
-                    Profiler.start('paint:micromap')
-                    pending_mm_b[y] = self.cfg.get('color_changed')
-                    Profiler.stop('paint:micromap')
-                if overview is not None:
-                    overview.add_line_state('b', y, self.cfg.get('color_changed'))
-            elif diff_id == df.A_GAP:
-                a_line_after, b_start, b_end = d[1], d[2], d[3]
-                if wrap_on:
-                    Profiler.start('paint:wrap_calc')
-                    total_visual = self._sum_visual_rows(
-                        wrap_counts_b, b_start, b_end)
-                    Profiler.stop('paint:wrap_calc')
-                    Profiler.start('paint:gap')
-                    self._add_raw_gap(a_ed, a_line_after - 1,
-                                      total_visual * line_h_a, color_gaps)
-                    Profiler.stop('paint:gap')
-                    if overview is not None:
-                        # Gap appears BEFORE a_line_after (between lines
-                        # a_line_after-1 and a_line_after)
-                        overview.add_gap('a', a_line_after, total_visual)
-                else:
-                    Profiler.start('paint:gap')
-                    self.set_gap(a_ed, a_line_after, b_end - b_start)
-                    Profiler.stop('paint:gap')
-                    if overview is not None:
-                        overview.add_gap('a', a_line_after, b_end - b_start)
-            elif diff_id == df.B_GAP:
-                b_line_after, a_start, a_end = d[1], d[2], d[3]
-                if wrap_on:
-                    Profiler.start('paint:wrap_calc')
-                    total_visual = self._sum_visual_rows(
-                        wrap_counts_a, a_start, a_end)
-                    Profiler.stop('paint:wrap_calc')
-                    Profiler.start('paint:gap')
-                    self._add_raw_gap(b_ed, b_line_after - 1,
-                                      total_visual * line_h_b, color_gaps)
-                    Profiler.stop('paint:gap')
-                    if overview is not None:
-                        overview.add_gap('b', b_line_after, total_visual)
-                else:
-                    Profiler.start('paint:gap')
-                    self.set_gap(b_ed, b_line_after, a_end - a_start)
-                    Profiler.stop('paint:gap')
-                    if overview is not None:
-                        overview.add_gap('b', b_line_after, a_end - a_start)
-            elif diff_id == df.A_GAP_IGN:
-                # Compensating gap for a suppressed all-blank hunk
-                # (DIFF_IGN_BLANK_LINES): same geometry as A_GAP but
-                # painted with the ignored-gap color and carrying the
-                # dedicated IGN_GAP_TAG, so ignored regions look
-                # distinct from regular alignment gaps. Pure visual
-                # alignment — not a difference, so no n_diff_events.
-                a_line_after, b_start, b_end = d[1], d[2], d[3]
-                if wrap_on:
-                    Profiler.start('paint:wrap_calc')
-                    total_visual = self._sum_visual_rows(
-                        wrap_counts_b, b_start, b_end)
-                    Profiler.stop('paint:wrap_calc')
-                    Profiler.start('paint:gap')
-                    self._add_raw_gap(a_ed, a_line_after - 1,
-                                      total_visual * line_h_a,
-                                      color_ignored_gap, tag=IGN_GAP_TAG)
-                    Profiler.stop('paint:gap')
-                    if overview is not None:
-                        overview.add_gap('a', a_line_after, total_visual,
-                                         ignored=True)
-                else:
-                    Profiler.start('paint:gap')
-                    self.set_gap(a_ed, a_line_after, b_end - b_start,
-                                 color=color_ignored_gap, tag=IGN_GAP_TAG)
-                    Profiler.stop('paint:gap')
-                    if overview is not None:
-                        overview.add_gap('a', a_line_after, b_end - b_start,
-                                         ignored=True)
-            elif diff_id == df.B_GAP_IGN:
-                b_line_after, a_start, a_end = d[1], d[2], d[3]
-                if wrap_on:
-                    Profiler.start('paint:wrap_calc')
-                    total_visual = self._sum_visual_rows(
-                        wrap_counts_a, a_start, a_end)
-                    Profiler.stop('paint:wrap_calc')
-                    Profiler.start('paint:gap')
-                    self._add_raw_gap(b_ed, b_line_after - 1,
-                                      total_visual * line_h_b,
-                                      color_ignored_gap, tag=IGN_GAP_TAG)
-                    Profiler.stop('paint:gap')
-                    if overview is not None:
-                        overview.add_gap('b', b_line_after, total_visual,
-                                         ignored=True)
-                else:
-                    Profiler.start('paint:gap')
-                    self.set_gap(b_ed, b_line_after, a_end - a_start,
-                                 color=color_ignored_gap, tag=IGN_GAP_TAG)
-                    Profiler.stop('paint:gap')
-                    if overview is not None:
-                        overview.add_gap('b', b_line_after, a_end - a_start,
-                                         ignored=True)
-            elif diff_id == df.A_LINE_IGN:
-                # Line of a suppressed all-blank hunk: painted with
-                # the ignored color, but NOT a difference — no
-                # bookmark, no diffmap entry, not counted in
-                # n_diff_events (a file differing only in blank
-                # lines still reports "No differences found").
-                if micromap_on:
-                    Profiler.start('paint:micromap')
-                    pending_mm_a[y] = color_ignored
-                    Profiler.stop('paint:micromap')
-                if overview is not None:
-                    overview.add_line_state('a', y, color_ignored)
-            elif diff_id == df.B_LINE_IGN:
-                if micromap_on:
-                    Profiler.start('paint:micromap')
-                    pending_mm_b[y] = color_ignored
-                    Profiler.stop('paint:micromap')
-                if overview is not None:
-                    overview.add_line_state('b', y, color_ignored)
-            elif diff_id == df.ALIGN:
+            if diff_id == df.ALIGN:
                 if wrap_on:
                     a_line, b_line = d[1], d[2]
-                    Profiler.start('paint:wrap_calc')
                     va = self._visual_rows(wrap_counts_a, a_line)
                     vb = self._visual_rows(wrap_counts_b, b_line)
-                    Profiler.stop('paint:wrap_calc')
-                    Profiler.start('paint:gap')
                     if va > vb:
                         diff_rows = va - vb
                         self._add_raw_gap(b_ed, b_line,
@@ -3262,39 +3134,146 @@ class Command:
                             # Same: gap is after a_line, so record
                             # as after_line = a_line + 1.
                             overview.add_gap('a', a_line + 1, diff_rows)
-                    Profiler.stop('paint:gap')
             elif diff_id == df.A_SYMBOL_DEL:
                 n_diff_events += 1
-                Profiler.start('paint:attr')
                 pending_ch_a.setdefault(y, []).append(
-                    (d[2], d[3], self.cfg.get('color_deleted')))
-                Profiler.stop('paint:attr')
+                    (d[2], d[3], color_deleted))
                 if overview is not None:
-                    overview.add_line_state('a', y, self.cfg.get('color_deleted'))
+                    overview.add_line_state('a', y, color_deleted)
             elif diff_id == df.B_SYMBOL_ADD:
                 n_diff_events += 1
-                Profiler.start('paint:attr')
                 pending_ch_b.setdefault(y, []).append(
-                    (d[2], d[3], self.cfg.get('color_added')))
-                Profiler.stop('paint:attr')
+                    (d[2], d[3], color_added))
                 if overview is not None:
-                    overview.add_line_state('b', y, self.cfg.get('color_added'))
-            elif diff_id == df.A_DECOR_YELLOW:
+                    overview.add_line_state('b', y, color_added)
+            elif diff_id == df.A_LINE_CHANGE:
                 n_diff_events += 1
+                pending_bkm_a.append((y, NKIND_CHANGED))
+                if micromap_on:
+                    pending_mm_a[y] = color_changed
                 if overview is not None:
-                    overview.add_line_state('a', y, self.cfg.get('color_changed'))
-            elif diff_id == df.B_DECOR_YELLOW:
+                    overview.add_line_state('a', y, color_changed)
+            elif diff_id == df.B_LINE_CHANGE:
                 n_diff_events += 1
+                pending_bkm_b.append((y, NKIND_CHANGED))
+                if micromap_on:
+                    pending_mm_b[y] = color_changed
                 if overview is not None:
-                    overview.add_line_state('b', y, self.cfg.get('color_changed'))
+                    overview.add_line_state('b', y, color_changed)
             elif diff_id == df.A_DECOR_RED:
                 n_diff_events += 1
                 if overview is not None:
-                    overview.add_line_state('a', y, self.cfg.get('color_deleted'))
+                    overview.add_line_state('a', y, color_deleted)
+            elif diff_id == df.A_DECOR_YELLOW:
+                n_diff_events += 1
+                if overview is not None:
+                    overview.add_line_state('a', y, color_changed)
             elif diff_id == df.B_DECOR_GREEN:
                 n_diff_events += 1
                 if overview is not None:
-                    overview.add_line_state('b', y, self.cfg.get('color_added'))
+                    overview.add_line_state('b', y, color_added)
+            elif diff_id == df.B_DECOR_YELLOW:
+                n_diff_events += 1
+                if overview is not None:
+                    overview.add_line_state('b', y, color_changed)
+            elif diff_id == df.A_LINE_DEL:
+                n_diff_events += 1
+                pending_bkm_a.append((y, NKIND_DELETED))
+                if micromap_on:
+                    pending_mm_a[y] = color_deleted
+                if overview is not None:
+                    overview.add_line_state('a', y, color_deleted)
+            elif diff_id == df.B_LINE_ADD:
+                n_diff_events += 1
+                pending_bkm_b.append((y, NKIND_ADDED))
+                if micromap_on:
+                    pending_mm_b[y] = color_added
+                if overview is not None:
+                    overview.add_line_state('b', y, color_added)
+            elif diff_id == df.A_GAP:
+                a_line_after, b_start, b_end = d[1], d[2], d[3]
+                if wrap_on:
+                    total_visual = self._sum_visual_rows(
+                        wrap_counts_b, b_start, b_end)
+                    self._add_raw_gap(a_ed, a_line_after - 1,
+                                      total_visual * line_h_a, color_gaps)
+                    if overview is not None:
+                        # Gap appears BEFORE a_line_after (between lines
+                        # a_line_after-1 and a_line_after)
+                        overview.add_gap('a', a_line_after, total_visual)
+                else:
+                    self.set_gap(a_ed, a_line_after, b_end - b_start)
+                    if overview is not None:
+                        overview.add_gap('a', a_line_after, b_end - b_start)
+            elif diff_id == df.B_GAP:
+                b_line_after, a_start, a_end = d[1], d[2], d[3]
+                if wrap_on:
+                    total_visual = self._sum_visual_rows(
+                        wrap_counts_a, a_start, a_end)
+                    self._add_raw_gap(b_ed, b_line_after - 1,
+                                      total_visual * line_h_b, color_gaps)
+                    if overview is not None:
+                        overview.add_gap('b', b_line_after, total_visual)
+                else:
+                    self.set_gap(b_ed, b_line_after, a_end - a_start)
+                    if overview is not None:
+                        overview.add_gap('b', b_line_after, a_end - a_start)
+            elif diff_id == df.A_GAP_IGN:
+                # Compensating gap for a suppressed all-blank hunk
+                # (DIFF_IGN_BLANK_LINES): same geometry as A_GAP but
+                # painted with the ignored-gap color and carrying the
+                # dedicated IGN_GAP_TAG, so ignored regions look
+                # distinct from regular alignment gaps. Pure visual
+                # alignment — not a difference, so no n_diff_events.
+                a_line_after, b_start, b_end = d[1], d[2], d[3]
+                if wrap_on:
+                    total_visual = self._sum_visual_rows(
+                        wrap_counts_b, b_start, b_end)
+                    self._add_raw_gap(a_ed, a_line_after - 1,
+                                      total_visual * line_h_a,
+                                      color_ignored_gap, tag=IGN_GAP_TAG)
+                    if overview is not None:
+                        overview.add_gap('a', a_line_after, total_visual,
+                                         ignored=True)
+                else:
+                    self.set_gap(a_ed, a_line_after, b_end - b_start,
+                                 color=color_ignored_gap, tag=IGN_GAP_TAG)
+                    if overview is not None:
+                        overview.add_gap('a', a_line_after, b_end - b_start,
+                                         ignored=True)
+            elif diff_id == df.B_GAP_IGN:
+                b_line_after, a_start, a_end = d[1], d[2], d[3]
+                if wrap_on:
+                    total_visual = self._sum_visual_rows(
+                        wrap_counts_a, a_start, a_end)
+                    self._add_raw_gap(b_ed, b_line_after - 1,
+                                      total_visual * line_h_b,
+                                      color_ignored_gap, tag=IGN_GAP_TAG)
+                    if overview is not None:
+                        overview.add_gap('b', b_line_after, total_visual,
+                                         ignored=True)
+                else:
+                    self.set_gap(b_ed, b_line_after, a_end - a_start,
+                                 color=color_ignored_gap, tag=IGN_GAP_TAG)
+                    if overview is not None:
+                        overview.add_gap('b', b_line_after, a_end - a_start,
+                                         ignored=True)
+            elif diff_id == df.A_LINE_IGN:
+                # Line of a suppressed all-blank hunk: painted with the
+                # ignored color, but NOT a difference — no bookmark, no
+                # diffmap entry, not counted in n_diff_events (a file
+                # differing only in blank lines still reports "No
+                # differences found").
+                if micromap_on:
+                    pending_mm_a[y] = color_ignored
+                if overview is not None:
+                    overview.add_line_state('a', y, color_ignored)
+            elif diff_id == df.B_LINE_IGN:
+                if micromap_on:
+                    pending_mm_b[y] = color_ignored
+                if overview is not None:
+                    overview.add_line_state('b', y, color_ignored)
+
         Profiler.stop('refresh:compare_and_paint')
 
         if n_diff_events == 0:

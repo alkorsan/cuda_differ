@@ -597,13 +597,33 @@ Advanced section:
 - differ.advanced.enable_profiling: Enable profiling
   Enable profiling to trace where compare time is consumed.
   When enabled, prints a detailed timing report to the console after
-  each compare, breaking down time spent in the diff algorithm, opcode
-  realignment, event generation, char-level diffing (native vs Python),
-  and UI painting (bookmarks, gaps, attributes). The report
-  header also names what was compared: per side the original file's
-  path, or -- for untitled tabs -- the original tab's title. Use for
-  debugging performance issues only -- adds small overhead (~1-2us per
-  timing point).
+  each compare. The report is sorted by SELF time (time inside a
+  row EXCLUDING its nested rows), so the real bottleneck is at the
+  top. Rows you will see:
+  - line_diff:native_engine -- the background line-level engine
+    (kick-off to completion callback).
+  - compare:algorithm -- the synchronous engine call / the engine
+    wait wrapper.
+  - char_diff:native_engine (or :python_engine) -- the char-level
+    diff engine calls, timed per pair with perf_counter and booked
+    in batches: 'calls' is the number of line PAIRS, 'max' the
+    slowest single call.
+  - compare:event_generation -- building the paint events for
+    REPLACE-block chunks (pairing + char diffs + event lists):
+    'calls' is the number of produced chunks.
+  - refresh:compare_and_paint -- the consumer loop: event dispatch,
+    marker/bookmark/overview data collection (its self time is the
+    honest per-event pipeline cost).
+  - refresh:*, paint:bookmark, paint:marker_window, paint:overview --
+    the other refresh phases.
+  The report header names what was compared (per side: the original
+  file's path, or the tab title for untitled tabs), and a final line
+  ESTIMATES the profiler's own overhead (instrumentation instances
+  x micro-benchmarked per-op cost), so the observer effect is visible
+  instead of hiding inside the rows. Overhead is ~0.4s on a 1M-line /
+  200k-difference compare (the old per-event-section profiler added
+  seconds and misattributed them -- see history 2026.09.21 part 2).
+  Use for debugging performance issues only.
   Default: off.
 
 Micromap section:
