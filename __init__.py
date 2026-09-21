@@ -4,6 +4,7 @@ import re
 import json
 import time
 import typing as tp
+from bisect import bisect_left
 
 import cudatext as ct
 import cudatext_cmd as ct_cmd
@@ -39,6 +40,23 @@ NKIND_CHANGED = 26
 GAP_WIDTH = 5000
 DEFAULT_SYNC_SCROLL = '1'
 U_PREFIX = 'untitled:'
+
+# Marker windowing: lines above/below the viewport that stay colored in
+# the editors. The compare no longer adds ALL diff markers to the editors
+# — every ed.attr(MARKERS_ADD) call costs a sorted-list insert AND an
+# Ed.Update inside CudaText (applying ~200k markers was the multi-second
+# 'paint:attr' phase), and CudaText's micromap painter walks ALL of
+# Ed.Attribs on EVERY editor repaint, so a fully-marked 1M-line compare
+# paid 100-200 ms per paint — exactly the "slider/text lag 100-200 ms
+# behind the mouse on million-line files" bug (deleting the markers with
+# ed.attr(MARKERS_DELETE_ALL) made scrolling instant, which pinned the
+# cost on the marker volume). Instead, only the markers inside the
+# viewport +/- this margin are applied (batched via MARKERS_ADD_MANY,
+# one Ed.Update per batch), and on_scroll re-applies the window when
+# scrolling leaves it. 1500 lines ≈ 15 screens of look-ahead: arrow-key /
+# ▲/▼ / wheel scrolling never re-applies mid-gesture, and a re-apply
+# itself adds only ~2-4k markers (a few ms).
+MARKER_WINDOW_MARGIN = 1500
 
 # Hotkeys for compare tabs, dispatched by Command.on_key. The plugin
 # subscribes to the lazy on_key~ event AT RUNTIME with a key-code filter
@@ -1029,6 +1047,9 @@ class _TabSession:
         'overview_timer', 'suppress_change',
         'saved', 'dirty',
         'scrollstyle_orig',
+        'marks_micromap_a', 'marks_micromap_b',
+        'marks_chars_a', 'marks_chars_b',
+        'mark_window_a', 'mark_window_b',
     )
 
     def __init__(self, tab_id, state_key=''):
@@ -1049,6 +1070,21 @@ class _TabSession:
         # removal and scrollbar hiding are per-tab, so this never leaks
         # into another compare tab's editors.
         self.scrollstyle_orig = None
+        # --- Windowed diff markers (see MARKER_WINDOW_MARGIN) ---
+        # Per side: the compare's collected marker data as parallel
+        # SORTED arrays (micromap: (lines, per-line colors); chars:
+        # (lines, per-line [(x, len, color)] lists)) or None when that
+        # side has nothing colorable. None also means "invalidated"
+        # (markers cleared / user edited): _maintain_marker_window
+        # skips until the next compare stores fresh arrays.
+        self.marks_micromap_a = None
+        self.marks_micromap_b = None
+        self.marks_chars_a = None
+        self.marks_chars_b = None
+        # Per side: (lo, hi) line range the markers currently in the
+        # editor cover, or None when no window is applied.
+        self.mark_window_a = None
+        self.mark_window_b = None
 
 
 class Command:
@@ -1830,6 +1866,12 @@ class Command:
                 self.scroll.on_scroll(ed_self)
             if overview is not None:
                 overview.track_paint()
+            # Keep the diff-marker window centered on the viewport that
+            # just painted (no-op of a few prop reads while the viewport
+            # is still inside the applied window; re-applies the window
+            # when scrolling left it). Runs for overview-driven scrolls
+            # too — that is exactly when the position changes the most.
+            self._maintain_marker_window(session, ed_self)
             # Trailing repaint 150ms after the last scroll event.
             if not session.overview_timer:
                 session.overview_timer = True
@@ -1862,6 +1904,10 @@ class Command:
           secondary/right) so on_save_pre later syncs ONLY that half back
           to its original tab -- clean halves and their originals are
           never touched by save.
+        - Dropping the session's collected marker-window data: edits
+          shift line numbers, so re-applying from the collected arrays
+          would paint wrong positions (the markers already in the editor
+          shift with the text; the next compare rebuilds everything).
         - Persisting the 'unsaved' state so it survives restarts.
 
         Uses on_change (not on_change_slow) because on_change_slow has a
@@ -1881,6 +1927,12 @@ class Command:
         session = self._session_for(tab_id)
         if session is None:
             return
+        # Edits shift line numbers, so the session's collected marker
+        # data (and its windows) would paint wrong positions — drop it.
+        # The markers already applied in the editor shift with the text
+        # (ATSynEdit moves them on editing) and stay visible exactly as
+        # long as they always did; the next compare rebuilds everything.
+        self._reset_marker_windows(session)
         if session.suppress_change > 0:
             session.suppress_change -= 1
             # Skip color change and state write for this spurious event.
@@ -2699,6 +2751,9 @@ class Command:
                 Profiler.start('refresh:clear')
                 self.clear(a_ed)
                 self.clear(b_ed)
+                # The collected marker data belongs to the OLD compare;
+                # drop it so on_scroll cannot re-apply cleared markers.
+                self._reset_marker_windows(session)
                 Profiler.stop('refresh:clear')
                 # Clear THIS tab's diff records (the session's Differ --
                 # another tab's diffmap is never touched).
@@ -2722,6 +2777,10 @@ class Command:
             Profiler.start('refresh:clear')
             self.clear(a_ed)
             self.clear(b_ed)
+            # Old compare's marker data is invalid the moment its markers
+            # are cleared; the paint phase stores fresh arrays and applies
+            # fresh windows when the compare finishes.
+            self._reset_marker_windows(session)
             Profiler.stop('refresh:clear')
 
             # config() was already called above (before the profiling check).
@@ -2978,6 +3037,16 @@ class Command:
         # when micromap is enabled.
         pending_bkm_a = []  # list of (line, nkind) for a_ed
         pending_bkm_b = []  # list of (line, nkind) for b_ed
+        # Marker data COLLECTED here and applied WINDOWED (viewport +/-
+        # MARKER_WINDOW_MARGIN lines) by _store_and_apply_marker_windows
+        # after the loop — see MARKER_WINDOW_MARGIN for why the markers
+        # must not all be added to the editors. micromap marks: one color
+        # per diff/ignored line (map_only=1); char marks: the changed
+        # character runs inside modified lines (map_only=0).
+        pending_mm_a = {}  # {line: color} micromap marks for a_ed
+        pending_mm_b = {}  # {line: color} micromap marks for b_ed
+        pending_ch_a = {}  # {line: [(x, len, color), ...]} char marks
+        pending_ch_b = {}  # {line: [(x, len, color), ...]}
         # Count of events that actually colorize something (line
         # marks, char highlights, line decors). Gaps and ALIGN events
         # are pure visual alignment and don't count. When this stays
@@ -3025,8 +3094,7 @@ class Command:
                 pending_bkm_a.append((y, NKIND_DELETED))
                 if micromap_on:
                     Profiler.start('paint:micromap')
-                    self.set_attr(a_ed, y=y, bg=self.cfg.get('color_deleted'),
-                                 mptag=1, map_only=1)
+                    pending_mm_a[y] = self.cfg.get('color_deleted')
                     Profiler.stop('paint:micromap')
                 if overview is not None:
                     overview.add_line_state('a', y, self.cfg.get('color_deleted'))
@@ -3035,8 +3103,7 @@ class Command:
                 pending_bkm_b.append((y, NKIND_ADDED))
                 if micromap_on:
                     Profiler.start('paint:micromap')
-                    self.set_attr(b_ed, y=y, bg=self.cfg.get('color_added'),
-                                 mptag=1, map_only=1)
+                    pending_mm_b[y] = self.cfg.get('color_added')
                     Profiler.stop('paint:micromap')
                 if overview is not None:
                     overview.add_line_state('b', y, self.cfg.get('color_added'))
@@ -3045,8 +3112,7 @@ class Command:
                 pending_bkm_a.append((y, NKIND_CHANGED))
                 if micromap_on:
                     Profiler.start('paint:micromap')
-                    self.set_attr(a_ed, y=y, bg=self.cfg.get('color_changed'),
-                                 mptag=1, map_only=1)
+                    pending_mm_a[y] = self.cfg.get('color_changed')
                     Profiler.stop('paint:micromap')
                 if overview is not None:
                     overview.add_line_state('a', y, self.cfg.get('color_changed'))
@@ -3055,8 +3121,7 @@ class Command:
                 pending_bkm_b.append((y, NKIND_CHANGED))
                 if micromap_on:
                     Profiler.start('paint:micromap')
-                    self.set_attr(b_ed, y=y, bg=self.cfg.get('color_changed'),
-                                 mptag=1, map_only=1)
+                    pending_mm_b[y] = self.cfg.get('color_changed')
                     Profiler.stop('paint:micromap')
                 if overview is not None:
                     overview.add_line_state('b', y, self.cfg.get('color_changed'))
@@ -3160,16 +3225,14 @@ class Command:
                 # lines still reports "No differences found").
                 if micromap_on:
                     Profiler.start('paint:micromap')
-                    self.set_attr(a_ed, y=y, bg=color_ignored,
-                                 mptag=1, map_only=1)
+                    pending_mm_a[y] = color_ignored
                     Profiler.stop('paint:micromap')
                 if overview is not None:
                     overview.add_line_state('a', y, color_ignored)
             elif diff_id == df.B_LINE_IGN:
                 if micromap_on:
                     Profiler.start('paint:micromap')
-                    self.set_attr(b_ed, y=y, bg=color_ignored,
-                                 mptag=1, map_only=1)
+                    pending_mm_b[y] = color_ignored
                     Profiler.stop('paint:micromap')
                 if overview is not None:
                     overview.add_line_state('b', y, color_ignored)
@@ -3203,14 +3266,16 @@ class Command:
             elif diff_id == df.A_SYMBOL_DEL:
                 n_diff_events += 1
                 Profiler.start('paint:attr')
-                self.set_attr(a_ed, d[2], y, d[3], self.cfg.get('color_deleted'))
+                pending_ch_a.setdefault(y, []).append(
+                    (d[2], d[3], self.cfg.get('color_deleted')))
                 Profiler.stop('paint:attr')
                 if overview is not None:
                     overview.add_line_state('a', y, self.cfg.get('color_deleted'))
             elif diff_id == df.B_SYMBOL_ADD:
                 n_diff_events += 1
                 Profiler.start('paint:attr')
-                self.set_attr(b_ed, d[2], y, d[3], self.cfg.get('color_added'))
+                pending_ch_b.setdefault(y, []).append(
+                    (d[2], d[3], self.cfg.get('color_added')))
                 Profiler.stop('paint:attr')
                 if overview is not None:
                     overview.add_line_state('b', y, self.cfg.get('color_added'))
@@ -3269,6 +3334,18 @@ class Command:
                           nkind=nk, text='', auto_del=True,
                           show=False, tag=DIFF_TAG)
         Profiler.stop('paint:bookmark')
+
+        # Apply the collected markers WINDOWED around the editors'
+        # current viewports (see MARKER_WINDOW_MARGIN): this replaces the
+        # old per-event set_attr calls that added EVERY marker at once —
+        # the multi-second 'paint:attr' phase and, worse, the 100-200 ms
+        # per-repaint cost that made scrolling million-line compares
+        # crawl. on_scroll keeps the windows centered via
+        # _maintain_marker_window.
+        Profiler.start('paint:marker_window')
+        self._store_and_apply_marker_windows(
+            job, pending_mm_a, pending_mm_b, pending_ch_a, pending_ch_b)
+        Profiler.stop('paint:marker_window')
 
         # BOOKMARK2_APPEND doesn't repaint on its own. When the halves
         # are NOT already locked for the whole compare (job.editor_lock
@@ -3503,33 +3580,192 @@ class Command:
             names.append((label, name))
         return names
 
-    def set_attr(self, e, x=0, y=0, nlen=0, bg=0, mptag=-1, map_only=0):
-        """Add a colored attribute (background highlight) on editor e.
+    def _store_and_apply_marker_windows(self, job, mm_a, mm_b, ch_a, ch_b):
+        """Store the compare's collected marker data on the session and
+        apply the initial marker windows around the editors' current
+        viewports.
 
-        Used for char-level text highlights (e.g., highlighting the
-        changed characters within a modified line). The overview panel
-        is handled separately by PaintboxOverview, not by this method.
+        The paint loop COLLECTS markers (micromap line marks + char-run
+        highlights) instead of adding them to the editors one by one:
+        every single ed.attr(MARKERS_ADD) call costs a sorted-list insert
+        (O(n) memmove) AND an Ed.Update inside CudaText, so applying
+        100-200k markers per compare was the multi-second 'paint:attr'
+        phase -- and keeping them all in the editor made every later
+        repaint walk them (CudaText's micromap painter iterates ALL of
+        Ed.Attribs per paint), which is what made scrolling a
+        million-line compare lag 100-200 ms per step behind the mouse.
 
-        Args:
-            e:        Editor instance.
-            x:        Column (0-based). Default 0 (start of line).
-            y:        Line number (0-based). Required.
-            nlen:     Number of characters to highlight. Default 0.
-            bg:       Background color (int, e.g. 0xFF0000 for red).
-            mptag:    Micromap column tag. -1 = don't show on micromap
-                      (default). 1..127 = show on micromap column with
-                      that tag. Not used for the overview panel.
-            map_only: 0 = text area only (default), 1 = micromap only,
-                      2 = both text area and micromap.
+        Instead the data is stored per side as parallel SORTED arrays and
+        only the markers inside the current window (viewport +/-
+        MARKER_WINDOW_MARGIN lines) are added, in at most two batch
+        ed.attr(MARKERS_ADD_MANY) calls per editor (one Ed.Update each).
+        _maintain_marker_window (wired into on_scroll) re-applies the
+        window when scrolling leaves it: a re-apply is cheap because it
+        adds at most a few thousand markers, and every editor repaint is
+        then bounded by the window size instead of the file's diff
+        count — scrolling big files becomes as instant as on small
+        files, exactly like the editors' own scrollbars.
         """
-        e.attr(ct.MARKERS_ADD, DIFF_TAG,
-               x,
-               y,
-               nlen,
-               color_bg=bg,
-               show_on_map=mptag,
-               map_only=map_only
-               )
+        session = job.session
+        session.marks_micromap_a = self._marks_to_arrays(mm_a)
+        session.marks_micromap_b = self._marks_to_arrays(mm_b)
+        session.marks_chars_a = self._marks_to_arrays(ch_a)
+        session.marks_chars_b = self._marks_to_arrays(ch_b)
+        session.mark_window_a = None
+        session.mark_window_b = None
+        self._apply_marker_window(session, job.a_ed, 'a')
+        self._apply_marker_window(session, job.b_ed, 'b')
+
+    @staticmethod
+    def _marks_to_arrays(marks):
+        """Convert one collected marker dict to (sorted_lines, values)
+        parallel arrays — values are the per-line color for micromap
+        marks, or the per-line [(x, len, color)] lists for char marks.
+        None for an empty dict. Sorted lines let the window extraction
+        use binary search + slice instead of walking all collected
+        lines on every re-apply."""
+        if not marks:
+            return None
+        lines = sorted(marks)
+        return (lines, [marks[k] for k in lines])
+
+    def _apply_marker_window(self, session, ed, side):
+        """(Re)apply one editor side's diff markers for the window around
+        its current viewport: delete all DIFF_TAG markers of the editor,
+        then batch-add the micromap line marks and the char-run
+        highlights with lines inside [top - margin, top + page + margin).
+
+        Sets the side's session window BEFORE touching the editor: the
+        attr calls end with an Ed.Update invalidation, and the resulting
+        paint fires on_scroll -> _maintain_marker_window, which must see
+        the finished window or it would pointlessly re-apply again."""
+        mm = session.marks_micromap_a if side == 'a' else session.marks_micromap_b
+        ch = session.marks_chars_a if side == 'a' else session.marks_chars_b
+        if mm is None and ch is None:
+            # Nothing colorable was collected for this side: drop any
+            # markers left by an earlier compare, keep no window (the
+            # maintain hook skips sides without collected data).
+            ed.attr(ct.MARKERS_DELETE_BY_TAG, DIFF_TAG)
+            if side == 'a':
+                session.mark_window_a = None
+            else:
+                session.mark_window_b = None
+            return
+        top = ed.get_prop(ct.PROP_LINE_TOP)
+        if not isinstance(top, int) or top < 0:
+            top = 0
+        page = self._visible_page_lines(ed)
+        lo = max(0, top - MARKER_WINDOW_MARGIN)
+        hi = top + page + MARKER_WINDOW_MARGIN
+        if side == 'a':
+            session.mark_window_a = (lo, hi)
+        else:
+            session.mark_window_b = (lo, hi)
+        # Delete-then-add instead of incremental updates: the window is
+        # only re-applied when scrolling left it, so the full refresh is
+        # the rare path and it can never leave stale edge markers
+        # behind (MARKERS_ADD_MANY cannot express range deletion).
+        ed.attr(ct.MARKERS_DELETE_BY_TAG, DIFF_TAG)
+        if mm is not None:
+            lines, colors = mm
+            i1 = bisect_left(lines, lo)
+            i2 = bisect_left(lines, hi)
+            if i2 > i1:
+                # len must be >= 1 per item (a 0 len terminates the
+                # whole ADD_MANY batch); for micromap-only markers the
+                # length is irrelevant to the micromap painting.
+                ed.attr(ct.MARKERS_ADD_MANY, DIFF_TAG,
+                        x=[0] * (i2 - i1),
+                        y=lines[i1:i2],
+                        len=[1] * (i2 - i1),
+                        color_bg=colors[i1:i2],
+                        show_on_map=1,
+                        map_only=1)
+        if ch is not None:
+            lines, items = ch
+            i1 = bisect_left(lines, lo)
+            i2 = bisect_left(lines, hi)
+            if i2 > i1:
+                xs = []
+                ys = []
+                lens = []
+                colors = []
+                for line, row_items in zip(lines[i1:i2], items[i1:i2]):
+                    for item_x, item_len, item_color in row_items:
+                        if item_x >= 0 and item_len > 0:
+                            # ADD_MANY stops at the first x<0 / y<0 /
+                            # len=0 item, so unusable entries are dropped
+                            # instead of truncating the batch.
+                            xs.append(item_x)
+                            ys.append(line)
+                            lens.append(item_len)
+                            colors.append(item_color)
+                if xs:
+                    ed.attr(ct.MARKERS_ADD_MANY, DIFF_TAG,
+                            x=xs, y=ys, len=lens, color_bg=colors,
+                            show_on_map=-1, map_only=0)
+
+    @staticmethod
+    def _visible_page_lines(ed):
+        """Visible page height in whole lines (for the marker window's
+        bottom edge). PROP_SCROLL_VERT_INFO carries both the page in
+        pixels (smooth_page) and the row height (char_size); PROP_CELL_SIZE
+        is the fallback. Returns a small default when neither is usable
+        — the exact page hardly matters under the +/- MARKER_WINDOW_MARGIN
+        padding, it only needs an order-of-magnitude."""
+        scroll_info = ed.get_prop(ct.PROP_SCROLL_VERT_INFO)
+        char_h = scroll_info.get('char_size', 0) if scroll_info else 0
+        page_px = scroll_info.get('smooth_page', 0) if scroll_info else 0
+        if char_h <= 0:
+            cell = ed.get_prop(ct.PROP_CELL_SIZE)
+            char_h = cell[1] if cell else 0
+        if char_h > 0 and page_px > 0:
+            return int(page_px // char_h) + 1
+        return 100
+
+    def _maintain_marker_window(self, session, ed):
+        """Keep editor ed's marker window centered on its viewport.
+
+        Called from on_scroll (which CudaText fires at the END of every
+        editor viewport paint, so it also doubles as the scroll-settled
+        signal): when the viewport left the applied window, re-apply the
+        window around the new position; otherwise this is a no-op of a
+        few cheap prop reads. Sides without collected marker data are
+        skipped entirely (markers cleared / tab being re-compared / this
+        side had no differences)."""
+        h_primary = ed.get_prop(ct.PROP_HANDLE_PRIMARY)
+        h_self = ed.get_prop(ct.PROP_HANDLE_SELF)
+        side = 'a' if h_self == h_primary else 'b'
+        mm = session.marks_micromap_a if side == 'a' else session.marks_micromap_b
+        ch = session.marks_chars_a if side == 'a' else session.marks_chars_b
+        if mm is None and ch is None:
+            return
+        window = session.mark_window_a if side == 'a' else session.mark_window_b
+        if window is None:
+            self._apply_marker_window(session, ed, side)
+            return
+        top = ed.get_prop(ct.PROP_LINE_TOP)
+        if not isinstance(top, int) or top < 0:
+            return
+        lo, hi = window
+        if lo <= top and top + self._visible_page_lines(ed) <= hi:
+            return
+        self._apply_marker_window(session, ed, side)
+
+    def _reset_marker_windows(self, session):
+        """Drop the session's collected marker data and window state.
+        Called when the collected data is invalidated: refresh start
+        (clear() removes the markers, the old data must not re-apply
+        them) and user edits (edits shift line numbers, so the collected
+        arrays would paint wrong positions; the markers already in the
+        editor stay shifted until the next compare rebuilds them —
+        same staleness contract as the old always-all markers)."""
+        session.marks_micromap_a = None
+        session.marks_micromap_b = None
+        session.marks_chars_a = None
+        session.marks_chars_b = None
+        session.mark_window_a = None
+        session.mark_window_b = None
 
     def set_gap(self, e, row, n=1, color=None, tag=None):
         """Add a gap of n line-heights after 'row' on editor e. Used to
