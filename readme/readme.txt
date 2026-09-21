@@ -612,6 +612,10 @@ Advanced section:
     diff engine calls, timed per pair with perf_counter and booked
     in batches: 'calls' is the number of line PAIRS, 'max' the
     slowest single call.
+  - compare:split_lines -- splitting the raw texts into line lists
+    (in the native differ this happens inside compare(); the Python
+    differ splits in refresh_compare under the same tag). On a
+    1M-line / 50MB compare this is ~3.3s of real work.
   - compare:positional_pairs -- building the paint events for
     REPLACE-block chunks in the positional pairing mode (the
     algo-faithful default and the beautify fast path):
@@ -621,6 +625,10 @@ Advanced section:
     when beautify_alignment produced unequal-count blocks):
     'calls' is the number of such blocks. One row per producer, so
     the report always shows WHICH pairing mode the time went to.
+  - refresh:wrapinfo_api -- the ed.get_wrapinfo() calls (one per
+    editor, wrap on): the single most expensive editor API of a
+    wrapped big-file refresh (~4.9s on 1M lines). Nests under
+    refresh:wrap_counts.
   - refresh:compare_and_paint -- the consumer loop: event dispatch,
     marker/bookmark/overview data collection (its self time is the
     honest per-event pipeline cost).
@@ -631,21 +639,31 @@ Advanced section:
     category, and booked with one mark after the loop; 'calls' is
     the number of timed operations, 'max' the slowest single one.
     A row appears only when its sites actually ran (paint:micromap
-    needs the micromap on, paint:wrap_calc needs wrapping on).
+    needs the micromap on, paint:wrap_calc needs wrapping on, and
+    paint:gap only runs for insert/delete hunks and wrap-height
+    mismatches -- a compare of two files with equal line counts and
+    equal wrap counts has ~none, so 'paint:gap 0.0ms 1 call' is
+    CORRECT, not a profiling bug).
   - refresh:*, paint:bookmark, paint:marker_window, paint:overview --
     the other refresh phases.
   The report header names what was compared (per side: the original
-  file's path, or the tab title for untitled tabs), and a final line
-  ESTIMATES the profiler's own overhead (instrumentation instances
-  x micro-benchmarked per-op cost), so the observer effect is visible
-  instead of hiding inside the rows. Overhead is ~0.4s on a 1M-line /
-  200k-difference compare (the old per-event-section profiler added
-  seconds and misattributed them -- see history 2026.09.21 part 2).
-  The cProfile report attributes every Python function call on the
-  main thread: use it to find the hot function, then set
-  ENABLE_CPROFILE=False in profiling.py and re-compare for clean
-  section numbers (while cProfile traces, every call pays ~1-2us and
-  the section report's rows are inflated).
+  file's path, or the tab title for untitled tabs), and a final
+  block ESTIMATES the profiler's own overhead with ALL THREE cost
+  components (start/stop sections + mark() bookings + the call-site
+  perf_counter pairs, each with its micro-benchmarked per-op cost),
+  so the observer effect is visible instead of hiding inside the
+  rows (~0.4s clean on a 1M-line / 200k-difference compare; the old
+  per-event-section profiler added seconds and misattributed them
+  -- see history 2026.09.21 part 2).
+  When the cProfile layer ran in the same compare, the section
+  report prints a WARNING BANNER: while cProfile traces, every
+  Python call pays ~1-2us, so rows with millions of cheap calls
+  (paint:attr etc.) are inflated 2-3x in that run. The cProfile
+  report attributes every Python function call on the main thread:
+  use it to find the hot function, then set ENABLE_CPROFILE=False
+  in profiling.py and re-compare for clean section numbers. The
+  tracing is always disabled before the section report prints, so
+  the overhead estimate's per-op costs are measured clean.
   Use for debugging performance issues only.
   Default: off.
 

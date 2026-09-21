@@ -37,9 +37,15 @@ the profiler itself. The rewrite:
    section (see differ_native.compare / differ_python.compare).
 
 5. The report micro-benchmarks the machinery at print time and prints
-   an ESTIMATED OVERHEAD line (instances x measured per-op cost), so
-   the observer effect is visible in the report instead of hiding
-   inside the rows' self times.
+   an ESTIMATED OVERHEAD line with ALL THREE cost components:
+   start/stop sections, mark() bookings, and the call-site timing ops
+   (every timed item pays a perf_counter pair + accumulation -- the
+   biggest component on big files; the old estimate ignored it, and
+   also counted the benchmark's own 3x20000 ops into the totals).
+   The benchmark snapshots/restores the counters, so the printed
+   counts are the RUN's counts. When the cProfile layer ran during the
+   compare, report(cprofile_was_on=True) prints an inflation warning
+   banner -- a tracing profiler inflates every cheap-call row 2-3x.
 
 Row semantics:
   total = wall time including nested children/marks
@@ -102,10 +108,17 @@ class Profiler:
     # _rows: name -> _Row.
     # _section_ops / _mark_ops: instrumentation instance counts, used by
     #   the report's estimated-overhead line.
+    # _timed_ops: total number of TIMED OPERATIONS (sum of every mark's
+    #   'calls' argument) -- each one pays a perf_counter pair plus the
+    #   caller-side accumulation (dict get + adds), so this count is the
+    #   multiplier for the largest overhead component, the call-site
+    #   timing pattern. The old estimate ignored it completely and
+    #   therefore under-reported the observer effect.
     _stack = []
     _rows = {}
     _section_ops = 0
     _mark_ops = 0
+    _timed_ops = 0
     _async_pending = {}
     _async_serial = 0
 
@@ -176,6 +189,7 @@ class Profiler:
         if cls._stack:
             cls._stack[-1].child_dt += dt
         cls._mark_ops += 1
+        cls._timed_ops += calls
 
     # ------------------------------------------------------------------
     # Context-manager form (rare, non-hot sections only)
@@ -259,14 +273,23 @@ class Profiler:
         cls._async_pending = {}
         cls._section_ops = 0
         cls._mark_ops = 0
+        cls._timed_ops = 0
 
     @classmethod
-    def report(cls, files=None):
+    def report(cls, files=None, cprofile_was_on=False):
         """Print the timing report (stdout), sorted by SELF time
         descending -- the real bottleneck at the top, wrappers sink.
 
         'files': optional sequence of (label, name) pairs naming what
-        was compared; printed under the title."""
+        was compared; printed under the title.
+
+        'cprofile_was_on': True when the cProfile LAYER ran during this
+        compare (start_profiling was active). MUST be passed then: every
+        Python call was traced (~1-2us each) while the sections were
+        being timed, so rows dominated by millions of cheap calls
+        (paint:attr, paint:wrap_calc, char_diff:*) are inflated 2-3x.
+        The report prints a warning banner instead of letting the
+        inflated numbers pass silently as truth."""
         if not cls._rows:
             return
         outermost_name = None
@@ -285,6 +308,13 @@ class Profiler:
             print('Compared files:')
             for label, name in files:
                 print('  {:<5s}: {}'.format(str(label), name))
+        if cprofile_was_on:
+            print('  !! cProfile layer was ON during this run: it traces every')
+            print('  !! Python call (~1-2us each), so rows with millions of')
+            print('  !! cheap calls (paint:attr etc.) are INFLATED 2-3x here.')
+            print('  !! For clean section numbers set ENABLE_CPROFILE=False in')
+            print('  !! profiling.py and re-run; use this run for the')
+            print('  !! function-level report printed after this one.')
         print('=' * 100)
         print('  {:<40s} {:>10s} {:>10s} {:>9s} {:>10s} {:>6s}'.format(
             'section', 'self', 'total', 'calls', 'max', '%'))
@@ -305,28 +335,86 @@ class Profiler:
             print('  Untracked time (outside any section): {:.1f}ms ({:.1f}%)'.format(
                 (grand_total - sum_self) * 1000.0, 100.0 - _sum_pct))
         # Observer effect, measured and shown instead of hidden.
-        ov_ms = cls._estimated_overhead_ms()
-        if ov_ms is not None:
-            print('  Estimated profiler overhead: ~{:.1f}ms '
-                  '({} sections + {} marks, micro-benchmarked)'.format(
-                      ov_ms, cls._section_ops, cls._mark_ops))
+        # per_site_us defaults to 0.0 so the notes below can print it
+        # even when nothing was instrumented (ov is None).
+        per_site_us = 0.0
+        ov = cls._estimated_overhead_ms()
+        if ov is not None:
+            est_ms, per_sec_us, per_mark_us, per_site_us = ov
+            print('  Estimated profiler overhead: ~{:.1f}ms ='.format(est_ms))
+            print('      {} sections x {:.2f}us (start/stop pairs) +'.format(
+                cls._section_ops, per_sec_us))
+            print('      {} mark() calls x {:.2f}us (batched bookings) +'.format(
+                cls._mark_ops, per_mark_us))
+            print('      {} timed operations x {:.2f}us (call-site'
+                  ' perf_counter pairs + accumulation)'.format(
+                      cls._timed_ops, per_site_us))
+            if cprofile_was_on:
+                print('      (clean per-op costs; the cProfile tracing that')
+                print('       inflated the rows above is NOT included)')
         print('=' * 100)
         print('Note: self  = time here EXCLUDING nested children/marks'
               ' (the real cost).')
         print('      total = time INCLUDING children.')
-        print('      Hot loops (char_diff etc.) are timed by perf_counter'
-              ' and booked in batches (calls = total items).')
+        print('      Rows ending in :native_engine / batched rows'
+              ' (char_diff:*, paint:attr, paint:gap, paint:wrap_calc,')
+        print('      paint:micromap): calls = TIMED ITEMS, not section'
+              ' instances; each item')
+        print(('      carries ~{:.2f}us of instrumentation (see overhead'
+               ' line above).').format(per_site_us))
+        print('Row families:')
+        print('  refresh:*   phases of one refresh (text fetch, line split,')
+        print('              wrap info, clear) + the whole-tree root')
+        print('  compare:*   event GENERATION: line split, per-block pairing')
+        print('              (positional_pairs / find_best_pairs), engine walk;')
+        print('              compare:algorithm wraps line_diff:native_engine')
+        print('              (wall time incl. the background wait)')
+        print('  char_diff:* char-level engine calls, booked per chunk')
+        print('  paint:*     CONSUMER work: per-operation categories')
+        print('              (attr/micromap/gap/wrap_calc) + flushes')
+        print('              (bookmark, marker_window, overview)')
+        print('Zero-time rows are honest: paint:gap only runs for')
+        print('  insert/delete hunks and wrap-height mismatches -- a compare')
+        print('  with equal line counts and equal wrap counts has ~none')
+        print('  (calls shows how many ran). refresh:compare_and_paint SELF =')
+        print('  the residual per-event dispatch: generator resume + branch')
+        print('  ladder + pending dict/list collection (incl.')
+        print('  overview.add_line_state, deliberately uninstrumented: its')
+        print('  per-call work is sub-us, timing it would cost more than')
+        print('  the work itself).')
         print('=' * 100 + '\n')
 
     @classmethod
     def _estimated_overhead_ms(cls):
-        """Micro-benchmark the section/mark machinery now and estimate
-        the total instrumentation cost of the profiled run. Returns
-        None when nothing was instrumented."""
-        if cls._section_ops == 0 and cls._mark_ops == 0:
+        """Micro-benchmark the instrumentation NOW and estimate its total
+        cost for the profiled run. Returns (est_ms, per_section_us,
+        per_mark_us, per_callsite_us) or None when nothing ran.
+
+        Three components, because the instrumentation has three costs:
+          * start/stop section pairs -- phase sections + one per pairing
+            chunk (200k on a 1M-line compare);
+          * mark() invocations -- one per batched booking;
+          * CALL-SITE timing ops -- every timed operation pays a
+            perf_counter pair plus the caller-side accumulation (the
+            _end() closure in __init__ / the inline accumulators in the
+            differs). On a 1M-line compare this is MILLIONS of ops and
+            the single biggest component -- the old estimate ignored it
+            entirely and under-reported the observer effect.
+
+        The benchmark snapshots the three counters first: its own
+        3 x 20000 ops must not pollute the counts (the old code counted
+        them and printed e.g. '220022 sections' for a real
+        200022-section run). Callers should also make sure cProfile is
+        disabled before calling this -- a tracing profiler would
+        triple the measured per-op costs."""
+        if (cls._section_ops == 0 and cls._mark_ops == 0
+                and cls._timed_ops == 0):
             return None
         n = 20000
-        saved = cls.enabled
+        saved_enabled = cls.enabled
+        saved_section_ops = cls._section_ops
+        saved_mark_ops = cls._mark_ops
+        saved_timed_ops = cls._timed_ops
         cls.enabled = True
         cls._stack.clear()
         try:
@@ -339,15 +427,46 @@ class Profiler:
             for _ in range(n):
                 cls.mark('::ovm', 1e-9, 1, 1e-9)
             per_mark = (time.perf_counter() - t0) / n
+            # Call-site pattern, mimicking the real hot-loop shape:
+            #   _t0 = perf_counter(); <work>; _end(cat, _t0) where _end
+            #   does a perf_counter read + dict get + list accumulate.
+            # The representative 'work' is a no-op assignment, so the
+            # measured loop cost IS the instrumentation overhead.
+            site_stats = {}
+
+            def _end_bench(cat, t0_):
+                dt = time.perf_counter() - t0_
+                rec = site_stats.get(cat)
+                if rec is None:
+                    site_stats[cat] = [dt, 1, dt]
+                else:
+                    rec[0] += dt
+                    rec[1] += 1
+                    if dt > rec[2]:
+                        rec[2] = dt
+
+            t0 = time.perf_counter()
+            for _ in range(n):
+                _t0 = time.perf_counter()
+                _w = 0
+                _end_bench('::ovs', _t0)
+            per_callsite = (time.perf_counter() - t0) / n
         finally:
             cls._rows.pop('::ov', None)
             cls._rows.pop('::ovm', None)
             cls._stack.clear()
-            cls.enabled = saved
+            cls.enabled = saved_enabled
+            cls._section_ops = saved_section_ops
+            cls._mark_ops = saved_mark_ops
+            cls._timed_ops = saved_timed_ops
         est = (cls._section_ops * per_section +
-               cls._mark_ops * per_mark) * 1000.0
+               cls._mark_ops * per_mark +
+               cls._timed_ops * per_callsite) * 1000.0
         # never report a negative estimate
-        return est if est >= 0.0 else 0.0
+        if est < 0.0:
+            est = 0.0
+        return (est, per_section * 1e6, per_mark * 1e6,
+                per_callsite * 1e6)
 
     @classmethod
     def is_enabled(cls):
@@ -405,8 +524,11 @@ def is_profiling_enabled():
     return Profiler.is_enabled()
 
 
-def profiling_report(files=None):
-    Profiler.report(files)
+def profiling_report(files=None, cprofile_was_on=False):
+    """Print the section report. 'cprofile_was_on' MUST be True when the
+    cProfile layer ran during the compare -- the report then prints the
+    inflation warning banner (see Profiler.report)."""
+    Profiler.report(files, cprofile_was_on)
 
 
 def reset_profiling():

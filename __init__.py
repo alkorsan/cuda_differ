@@ -2826,8 +2826,11 @@ class Command:
             if not isinstance(diff, dfn.Differ):
                 # Python differ: consumes line lists directly (the
                 # pure-Python matchers take sequences), so the split
-                # is genuinely needed here.
-                Profiler.start('refresh:split_lines_safe')
+                # is genuinely needed here. Same tag as the native
+                # differ's split (differ_native.compare), so the
+                # 'compare:split_lines' row is comparable across
+                # algorithms.
+                Profiler.start('compare:split_lines')
                 # SEQUENTIAL SPLIT — release each raw text the instant
                 # its line list is built. split_lines_safe returns
                 # INDEPENDENT string objects per line (CPython string
@@ -2846,7 +2849,7 @@ class Command:
                 del a_text_all
                 lines_b = split_lines_safe(b_text_all)
                 del b_text_all
-                Profiler.stop('refresh:split_lines_safe')
+                Profiler.stop('compare:split_lines')
 
             self.scroll.tab_id.add(tab_id)
             self.scroll.toggle(self.cfg.get('sync_scroll'))
@@ -3636,9 +3639,14 @@ class Command:
         _compared_names_for_report.
 
         'cprofile' is the (pr, s) pair refresh_compare started when the
-        cProfile layer is on (see profiling.py): printed here (sorted by
-        SELF time -- which function eats the time) and disabled, so the
-        app runs at full speed again from here on. None when off."""
+        cProfile layer is on (see profiling.py): its TRACING is disabled
+        first (so the section report's micro-benchmark measures clean
+        per-op costs and its printing is not traced), then the report is
+        printed (sorted by SELF time -- which function eats the time),
+        so the app runs at full speed again from here on. None when off.
+        While it was on, every Python call was traced (~1-2us each), so
+        the SECTION report printed before it carries the inflation
+        warning banner (profiling_report(cprofile_was_on=True))."""
         _compare_elapsed = time.perf_counter() - compare_start
         if _compare_elapsed < 1.0:
             ct.msg_status(_('Differ: compared in {:.0f}ms').format(
@@ -3657,8 +3665,22 @@ class Command:
         # crashed), also on big files. The header names the compared
         # files: per side the original's PATH when it is a file on disk,
         # otherwise the original tab's title.
+        #
+        # The cProfile TRACING is stopped FIRST: the section report
+        # micro-benchmarks the instrumentation while it prints, and a
+        # tracing profiler would triple the measured per-op costs (and
+        # trace the report's own printing). All profiled data is already
+        # collected in 'pr' -- disabling loses nothing; stop_profiling
+        # below re-disables it (idempotent) and prints the report.
+        if cprofile is not None:
+            cprofile[0].disable()
         if profiling_enabled_here:
-            profiling_report(files=self._compared_names_for_report(tab_id))
+            # cprofile_was_on: the rows were timed while every Python
+            # call was traced -- the report prints the inflation banner
+            # so the numbers cannot pass as clean truth.
+            profiling_report(
+                files=self._compared_names_for_report(tab_id),
+                cprofile_was_on=cprofile is not None)
             enable_profiling(False)
         # cProfile layer: function-level report, sorted by SELF time
         # (tottime). Switch the call below to sort_key='cumulative' for
@@ -3966,8 +3988,14 @@ class Command:
         # change automatically, but not always -- EDACTION_UPDATE with
         # param1="1" forces it.
         ed.action(ct.EDACTION_UPDATE, "1")
+        # get_wrapinfo is profiled as its own sub-row: on a 1M-line
+        # compare the two calls (one per editor) cost ~4.9s -- the
+        # single most expensive editor API of the whole refresh. Without
+        # this row that cost hides inside refresh:wrap_counts' self and
+        # looks like unexplained Python work.
         try:
-            info = ed.get_wrapinfo()
+            with Profiler.section('refresh:wrapinfo_api'):
+                info = ed.get_wrapinfo()
         except Exception:
             return counts
         if not info:
