@@ -314,8 +314,9 @@ class Differ:
 
     This class is self-contained: it does not import from differ_python.
     Code that overlaps with differ_python.Differ (event constants,
-    _replace_block, _find_best_pairs, _char_diff_pair, etc.) is
-    duplicated intentionally to allow independent evolution.
+    _replace_block_chunks, _find_best_pairs_events,
+    _char_diff_pair_events, etc.) is duplicated intentionally to allow
+    independent evolution.
 
     compare() function return tuples for paint text:
     id can be:
@@ -410,18 +411,19 @@ class Differ:
         if len(line_a) > 100000 or len(line_b) > 100000:
             return [('replace', 0, len(line_a), 0, len(line_b))]
 
+        # No profiling sections here: the CALLER times this call with a
+        # perf_counter pair (a ~60ns read — ~1% observer effect on the
+        # ~10us engine call) and books one batched Profiler.mark() per
+        # chunk of pairs. The old per-pair sections cost more than the
+        # pairing itself on 1M-line files and made the report lie.
         if _HAS_NATIVE_DIFF:
-            Profiler.start('char_diff:native_engine')
-            try:
-                result = _ct.diff_proc(
-                    _ct.DIF_CHARS,
-                    line_a,
-                    line_b,
-                    0,                   # algo: unused for DIF_CHARS
-                    self.ignore_flags,   # bitmask of DIFF_IGN_* (Differ.ignore_flags)
-                )
-            finally:
-                Profiler.stop('char_diff:native_engine')
+            result = _ct.diff_proc(
+                _ct.DIF_CHARS,
+                line_a,
+                line_b,
+                0,                   # algo: unused for DIF_CHARS
+                self.ignore_flags,   # bitmask of DIFF_IGN_* (Differ.ignore_flags)
+            )
             if result is None:
                 # Defensive: should never happen — fall back to a single
                 # REPLACE covering everything.
@@ -429,11 +431,7 @@ class Differ:
             return result
         else:
             # Native API not available — fall back to Python char_diff.
-            Profiler.start('char_diff:python_engine')
-            try:
-                return char_diff(line_a, line_b)
-            finally:
-                Profiler.stop('char_diff:python_engine')
+            return char_diff(line_a, line_b)
 
     def compare(self, a_text, b_text, opcodes=None):
         """Generator that yields diff events for side-by-side display.
@@ -442,7 +440,8 @@ class Differ:
         nothing is added, removed or re-paired here.
 
         The alignment mode (beautify_alignment) only affects how
-        unequal-count REPLACE blocks are laid out — see _replace_block.
+        unequal-count REPLACE blocks are laid out — see
+        _replace_block_chunks.
 
         Runs the native diff algorithm on the two raw texts, then walks
         the opcodes and yields events (A_LINE_DEL, B_LINE_ADD, A_GAP,
@@ -492,7 +491,14 @@ class Differ:
         # (or closed).
         _bm_start = time.perf_counter() if _BENCHMARK else None
 
-        Profiler.start('compare')
+        # NOTE: no 'compare' wrapper section any more. A section open
+        # across this generator's yields would also be open while the
+        # CONSUMER works between two next() calls (the generator is
+        # suspended inside it), so all consumer-side time would be
+        # booked into the generator's section -- the flaw that made the
+        # old report show replace_block:positional_pair as a fake ~20s
+        # bottleneck. Only sections that close before a yield remain
+        # (compare:algorithm, per-chunk compare:event_generation).
 
         self.diffmap = []
         if opcodes is None:
@@ -548,8 +554,9 @@ class Differ:
 
         # Build the line lists LOCALLY for painting — split_lines_safe is
         # O(N) per call, so we split once here and pass the lists to
-        # _replace_block / _plain_replace_simple. Both a_text/b_text and
-        # a_lines/b_lines are locals inside this generator: they go out
+        # _replace_block_chunks / _plain_replace_chunks. Both
+        # a_text/b_text and a_lines/b_lines are locals inside this
+        # generator: they go out
         # of scope when compare() returns, so they are garbage-collected
         # after the compare finishes. Between compares, the Differ holds
         # zero text bytes — only config + diffmap.
@@ -570,7 +577,11 @@ class Differ:
         b_lines = split_lines_safe(b_text)
         del b_text
 
-        Profiler.start('compare:event_generation')
+        # Event production for REPLACE blocks is instrumented per chunk
+        # ('compare:event_generation' opens AFTER the chunk list is built
+        # and closed BEFORE it is yielded); equal/delete/insert/ignore
+        # production is trivial tuple loops and stays uninstrumented — its
+        # cost lands in the consumer's section, which is where it runs.
         for tag, i1, i2, j1, j2 in opcodes:
             if tag not in ('equal', 'ignore'):
                 # 'ignore' hunks are suppressed differences, not diff
@@ -596,12 +607,18 @@ class Differ:
                 for y in range(j1, j2):
                     yield (B_LINE_ADD, y)
             elif tag == 'replace':
+                # Each REPLACE block's events are BUILT into lists (one
+                # list per bounded chunk of pairs) and yielded only after
+                # the producing section closed: no Profiler section is
+                # ever open across a yield. See the NOTE above.
                 if self.withdetail:
-                    yield from self._replace_block(a_lines, i1, i2,
-                                                   b_lines, j1, j2)
+                    for evlist in self._replace_block_chunks(
+                            a_lines, i1, i2, b_lines, j1, j2):
+                        yield from evlist
                 else:
-                    yield from self._plain_replace_simple(a_lines, i1, i2,
-                                                          b_lines, j1, j2)
+                    for evlist in self._plain_replace_chunks(
+                            a_lines, i1, i2, b_lines, j1, j2):
+                        yield from evlist
             elif tag == 'ignore':
                 # Suppressed all-blank hunk (DIFF_IGN_BLANK_LINES) —
                 # a WinMerge-style "ignored difference". NOT counted as
@@ -626,9 +643,6 @@ class Differ:
                     yield (A_LINE_IGN, y)
                 for y in range(j1, j2):
                     yield (B_LINE_IGN, y)
-        Profiler.stop('compare:event_generation')
-
-        Profiler.stop('compare')
 
         if _bm_start is not None:
             _bm_elapsed = time.perf_counter() - _bm_start
@@ -639,82 +653,101 @@ class Differ:
                       len(a_lines), len(b_lines),
                       len(self.diffmap)))
 
-    def _positional_pairs(self, a, alo, b, blo, count):
+    # Profiling row the char-level engine calls are marked under (one
+    # row for the whole _char_diff call: the wrapper's own cost is a
+    # fraction of a microsecond and not worth a second row).
+    _CHAR_ROW = ('char_diff:native_engine' if _HAS_NATIVE_DIFF
+                 else 'char_diff:python_engine')
+
+    # Pair chunk for huge REPLACE blocks: events are produced (and
+    # profiled) per chunk, so neither the event list nor the open
+    # 'compare:event_generation' frame grows with the block size.
+    _REPLACE_CHUNK = 512
+
+    def _positional_pairs_events(self, out, a, alo, b, blo, count):
         """Pair the k-th A line with the k-th B line, top-down, for
-        `count` pairs. For identical lines yield ALIGN only; for
-        different lines run the native char diff and yield its paint
-        events, then ALIGN. No heuristics — this is the sdiff/WinMerge
-        alignment, also used by the OLD beautify mode when line counts
-        are equal (the old code did exactly this in that case).
+        `count` pairs, APPENDING each pair's events to `out` (a builder,
+        not a generator — no Profiler section is ever open across a
+        yield). For identical lines append ALIGN only; for different
+        lines run the char diff and append its paint events, then ALIGN.
+        No heuristics — this is the sdiff/WinMerge alignment, also used
+        by the beautify mode when line counts are equal.
+
+        Profiling: engine calls are timed with perf_counter (a ~60ns
+        read — ~1% observer effect on a ~10us engine call) and booked
+        ONCE per chunk via Profiler.mark(). No per-pair sections: the
+        old design's 800k char_diff + 800k char_diff:native_engine
+        sections per 1M-line compare cost more than the pairing itself
+        and made the report lie.
         """
+        prof_on = Profiler.enabled
+        row = self._CHAR_ROW
+        char_diff_call = self._char_diff
+        append = out.append
+        if prof_on:
+            eng_dt = 0.0
+            eng_n = 0
+            eng_max = 0.0
         for k in range(count):
             ai, bj = alo + k, blo + k
             if a[ai] == b[bj]:
-                yield (ALIGN, ai, bj)
+                append((ALIGN, ai, bj))
             else:
-                # char_diff wraps the whole _char_diff() method call.
-                # Its children are char_diff:native_engine or
-                # char_diff:python_engine (the actual engine invocation
-                # inside _char_diff). self = overhead of the method
-                # (length check, result validation); total = self + engine.
-                Profiler.start('char_diff')
-                ops = self._char_diff(a[ai], b[bj])
-                Profiler.stop('char_diff')
-                yield from self._char_diff_pair(ai, bj, ops)
-                yield (ALIGN, ai, bj)
+                if prof_on:
+                    t0 = time.perf_counter()
+                    ops = char_diff_call(a[ai], b[bj])
+                    dt = time.perf_counter() - t0
+                    eng_dt += dt
+                    eng_n += 1
+                    if dt > eng_max:
+                        eng_max = dt
+                else:
+                    ops = char_diff_call(a[ai], b[bj])
+                self._char_diff_pair_events(out, ai, bj, ops)
+                append((ALIGN, ai, bj))
+        if prof_on and eng_n:
+            Profiler.mark(row, eng_dt, eng_n, eng_max)
 
-    def _replace_block(self, a, alo, ahi, b, blo, bhi):
-        """Process a 'replace' opcode: a[alo:ahi] is replaced by b[blo:bhi].
-        
-        Aligns lines within a REPLACE block for visual display.
+    def _replace_block_chunks(self, a, alo, ahi, b, blo, bhi):
+        """Process a 'replace' opcode: a[alo:ahi] is replaced by
+        b[blo:bhi]. GENERATOR OF EVENT LISTS: yields the block's paint
+        events as one or more lists, in exactly the order the old
+        generator-based version yielded them. The producing section
+        ('compare:event_generation') opens after a list starts and
+        closes before the list is yielded — never open across a yield
+        (see compare()'s NOTE). Event lists are bounded by
+        _REPLACE_CHUNK pairs, so huge blocks (two entirely different
+        1M-line files come as ONE replace opcode) do not materialize
+        their whole event stream at once.
 
         Two rendering modes, selected by self.beautify_alignment:
 
         beautify_alignment = True ('beautified' alignment)
-            Unequal line counts use _find_best_pairs(): anchor on the
-            longest unique exact match or the best prefix/suffix-similar
-            pair, char-diff it, recurse on both sides. Lines with < 3
-            chars of similarity are shown as separate delete+add.
-            VS Code-like; re-arranges the engine's output.
-    
-            Fast path (da == db): positional pairing — pair 1st line of A with
-            1st line of B, 2nd with 2nd, etc. For each pair, if lines are
-            identical yield ALIGN; otherwise run char_diff and yield the
-            char-level changes. This is the common case and avoids the O(N*M)
-            prefix/suffix search.
-    
-            Slow path (da != db): _find_best_pairs — find the best-matching
-            line pair by (1) exact unique match (longest wins), then (2) common
-            prefix/suffix length scoring. Recurse on the parts before and after
-            the best pair. This aligns similar-but-not-equal lines (e.g.
-            'def foo(self):' with 'def bar(self):') so char_diff highlights
-            only the differing characters.
-    
-            Note: the line-level diff algorithm (cudadiffmyers.pas for
-            DIFF_ALGO_MYERS, cudadiffhistogram.pas for DIFF_ALGO_HISTOGRAM)
-            already found ALL exactly-equal lines and emitted them as
-            separate EQUAL opcodes. So this function does NOT re-run a
-            line-level diff — the exact-match search in _find_best_pairs
-            only finds matches that the engine missed (rare; can happen
-            with the Eggert TOO_EXPENSIVE heuristic under DIFF_ALGO_MYERS,
-            or with HistogramDiff's max_chain_length fallback). The main
-            value of _find_best_pairs is the prefix/suffix scoring for
-            similar-but-not-equal lines, which neither engine does.
-            
-        beautify_alignment = False (algo-faithful, default)
-            Render exactly the way the algorithm dictate
-            for example if native myers is used it will render
-            the way WinMerge / GNU diffutils side-by-side
-            (sdiff) output does: pair the first min(da, db) lines
-            top-down by position (char-diff each pair via the native
-            engine), and show leftover lines on the longer side as plain
-            added/deleted lines against a gap at the bottom of the
-            shorter side. Nothing is re-paired or re-ordered.
+            Unequal line counts use _find_best_pairs_events(): anchor on
+            the longest unique exact match or the best prefix/suffix-
+            similar pair, char-diff it, recurse on both sides. Lines
+            with < 3 chars of similarity are shown as separate
+            delete+add. VS Code-like; re-arranges the engine's output.
 
-        Equal line counts (da == db) are positional in BOTH modes, so the modes
-        diverge only in the da != db branch below.
+            Fast path (da == db): positional pairing (same as the
+            algo-faithful mode) — the common case; avoids the O(N*M)
+            prefix/suffix search.
+
+            Slow path (da != db): _find_best_pairs_events — see its
+            docstring.
+
+        beautify_alignment = False (algo-faithful, default)
+            Render exactly the way the algorithm dictates: pair the
+            first min(da, db) lines top-down by position (char-diff each
+            pair via the engine), and show leftover lines on the longer
+            side as plain added/deleted lines against a gap at the
+            bottom of the shorter side. Nothing is re-paired or
+            re-ordered — the way WinMerge / GNU diffutils side-by-side
+            (sdiff) output does.
+
+        Equal line counts (da == db) are positional in BOTH modes, so
+        the modes diverge only in the da != db branch.
         """
-        Profiler.start('replace_block')
         da, db = ahi - alo, bhi - blo
 
         # Defensive only — a 'replace' opcode from the engine always has
@@ -722,123 +755,116 @@ class Differ:
         # opcodes in compare()). These branches contain no heuristics;
         # they just render a degenerate opcode faithfully.
         if da == 0 and db == 0:
-            Profiler.stop('replace_block')
             return
         if da == 0:
-            Profiler.start('replace_block:insert_only')
-            yield (A_GAP, alo, blo, bhi)
-            for y in range(blo, bhi):
-                yield (B_LINE_ADD, y)
-            Profiler.stop('replace_block:insert_only')
-            Profiler.stop('replace_block')
+            yield [(A_GAP, alo, blo, bhi)] + \
+                  [(B_LINE_ADD, y) for y in range(blo, bhi)]
             return
         if db == 0:
-            Profiler.start('replace_block:delete_only')
-            yield (B_GAP, blo, alo, ahi)
-            for y in range(alo, ahi):
-                yield (A_LINE_DEL, y)
-            Profiler.stop('replace_block:delete_only')
-            Profiler.stop('replace_block')
-            return
-
-        # Fast path: when both sides have the same number of lines, use
-        # positional pairing directly. This avoids the overhead of running
-        # a line-level Myers diff + _realign_opcodes on every REPLACE
-        # block. For large files (e.g. 33k-line HTML), most REPLACE blocks
-        # have da == db, so this keeps performance at ~30s instead of ~80s.
-        # The prefix/suffix search (_find_best_pairs) is only needed when
-        # da != db, because that's when positional pairing might misalign
-        # similar lines.
-        if da == db:
-            # Shared fast path — positional pairing (both modes).
-            Profiler.start('replace_block:positional_pair')
-            yield from self._positional_pairs(a, alo, b, blo, da)
-            Profiler.stop('replace_block:positional_pair')
-            Profiler.stop('replace_block')
+            yield [(B_GAP, blo, alo, ahi)] + \
+                  [(A_LINE_DEL, y) for y in range(alo, ahi)]
             return
 
         # ---- da != db: the two modes diverge here ----
-        if self.beautify_alignment:
+        if self.beautify_alignment and da != db:
             # anchor + prefix/suffix scoring + threshold + staggering.
-            # Different line counts (da != db): use _find_best_pairs which
-            # finds the best-matching pair by exact unique match (longest
-            # wins) or prefix/suffix length scoring, then recurses.
-            yield from self._find_best_pairs(a, alo, ahi, b, blo, bhi)
-        else:
-            # positional top-down pairing; leftovers on
-            # the longer side are plain added/deleted lines against a gap
-            # at the bottom of the shorter side's block (same convention
-            # as _plain_replace_simple).
-            Profiler.start('replace_block:positional_pair')
-            common = min(da, db)
-            yield from self._positional_pairs(a, alo, b, blo, common)
-            if da > common:
-                yield (B_GAP, bhi, alo + common, ahi)
-                for y in range(alo + common, ahi):
-                    yield (A_LINE_DEL, y)
-            elif db > common:
-                yield (A_GAP, ahi, blo + common, bhi)
-                for y in range(blo + common, bhi):
-                    yield (B_LINE_ADD, y)
-            Profiler.stop('replace_block:positional_pair')
+            # Produced into ONE list (beautify is opt-in; the recursive
+            # scorer makes chunking invasive). Char diffs inside are
+            # perf_counter-timed and booked as batched marks.
+            Profiler.start('compare:event_generation')
+            evs = []
+            self._find_best_pairs_events(evs, a, alo, ahi, b, blo, bhi)
+            Profiler.stop('compare:event_generation')
+            yield evs
+            return
 
-        Profiler.stop('replace_block')
+        # Shared fast path (both modes): positional pairing for the
+        # common line count, chunked; then leftovers on the longer side
+        # as plain added/deleted lines against a gap at the bottom of
+        # the shorter side's block.
+        common = min(da, db)
+        k = 0
+        while k < common:
+            n = self._REPLACE_CHUNK
+            if common - k < n:
+                n = common - k
+            Profiler.start('compare:event_generation')
+            evs = []
+            self._positional_pairs_events(evs, a, alo + k, b, blo + k, n)
+            Profiler.stop('compare:event_generation')
+            yield evs
+            k += n
 
-    def _find_best_pairs(self, a, alo, ahi, b, blo, bhi):
-        """Find the best line alignment within a sub-REPLACE block.
+        chunk = self._REPLACE_CHUNK
+        if da > common:
+            # Leftover A lines, against a gap at the bottom of B's block.
+            y = alo + common
+            first = True
+            while y < ahi:
+                y2 = y + chunk if ahi - y > chunk else ahi
+                evs = []
+                if first:
+                    evs.append((B_GAP, bhi, alo + common, ahi))
+                    first = False
+                for yy in range(y, y2):
+                    evs.append((A_LINE_DEL, yy))
+                yield evs
+                y = y2
+        elif db > common:
+            # Leftover B lines, against a gap at the bottom of A's block.
+            y = blo + common
+            first = True
+            while y < bhi:
+                y2 = y + chunk if bhi - y > chunk else bhi
+                evs = []
+                if first:
+                    evs.append((A_GAP, ahi, blo + common, bhi))
+                    first = False
+                for yy in range(y, y2):
+                    evs.append((B_LINE_ADD, yy))
+                yield evs
+                y = y2
 
-        ONLY USED WHEN self.beautify_alignment is True (the
-        'beautified' alignment mode).
+    def _find_best_pairs_events(self, out, a, alo, ahi, b, blo, bhi):
+        """(beautify mode) Find the best line alignment within a
+        sub-REPLACE block, APPENDING events to `out`.
 
-        Finds the best-matching line pair using two strategies:
-        1. Exact unique match: build a dict of unique lines in a[alo:ahi],
-           scan b[blo:bhi] for matches, pick the LONGEST match as anchor.
-           O(N+M) via Counter-based uniqueness check.
-        2. If no exact match: prefix/suffix length scoring. For each (i,j)
-           pair, compute common prefix length + common suffix length.
-           Score = prefix*100 + suffix. Pick the highest-scoring pair.
-           O(N*M) per block but each comparison is O(line_length).
+        Strategies (same as the old generator version):
+        1. Exact unique match: build a dict of unique lines in
+           a[alo:ahi], scan b[blo:bhi] for matches, pick the LONGEST
+           match as anchor. O(N+M) via Counter-based uniqueness check.
+        2. If no exact match: prefix/suffix length scoring, O(N*M) per
+           block (each comparison O(line_length)).
 
-        After finding the best pair, do char_diff on it, then recurse on
-        the parts before and after. A minimum prefix threshold (>= 3 chars)
+        After finding the best pair, char-diff it, then recurse on the
+        parts before and after. A minimum prefix threshold (>= 3 chars)
         prevents pairing completely unrelated lines.
 
-        The line-level diff (cudadiffmyers.pas for DIFF_ALGO_MYERS,
-        cudadiffhistogram.pas for DIFF_ALGO_HISTOGRAM) already found all exactly-equal
-        lines, so the exact-match search here mainly catches rare cases
-        where the TOO_EXPENSIVE heuristic produced a suboptimal REPLACE.
-        The main value is the prefix/suffix scoring for similar-but-not-
-        equal lines, which the line-level diff does not do.
+        Profiling: both searches and the char diffs are perf_counter-
+        timed and booked as batched marks (calls = 1 per invocation) —
+        no sections, so recursion depth adds zero instrumentation cost.
         """
         da, db = ahi - alo, bhi - blo
         if da == 0:
             if db > 0:
-                yield (A_GAP, alo, blo, bhi)
+                out.append((A_GAP, alo, blo, bhi))
                 for y in range(blo, bhi):
-                    yield (B_LINE_ADD, y)
+                    out.append((B_LINE_ADD, y))
             return
         if db == 0:
             if da > 0:
-                yield (B_GAP, blo, alo, ahi)
+                out.append((B_GAP, blo, alo, ahi))
                 for y in range(alo, ahi):
-                    yield (A_LINE_DEL, y)
+                    out.append((A_LINE_DEL, y))
             return
 
         # Find the best-matching pair by char-level similarity.
-        # Strategy: find ALL unique exact matches first, then pick the
-        # LONGEST one as the anchor (longer lines are more specific and
-        # better anchors — 'def on_change_slow(self, ed_self):' is a
-        # better anchor than 'else:'). If no unique exact match, fall
-        # back to prefix/suffix length scoring.
-        best_score = -1
-        best_prefix = 0
-        best_i, best_j = alo, blo
-        max_prefix_any = 0
-
         # First pass: find all unique exact matches and pick the longest.
         # Use a dict-based approach for O(N+M) instead of O(N*M):
         # build a map of unique lines in a[alo:ahi], then scan b[blo:bhi].
-        Profiler.start('find_best_pairs:exact_match_search')
+        prof_on = Profiler.enabled
+        if prof_on:
+            _t0 = time.perf_counter()
         sub_a_counts = Counter(a[alo:ahi])
         sub_b_counts = Counter(b[blo:bhi])
         best_exact_len = 0
@@ -860,7 +886,14 @@ class Differ:
                     best_exact_len = len(line)
                     best_exact_i = sub_a_unique[line]
                     best_exact_j = j
-        Profiler.stop('find_best_pairs:exact_match_search')
+        if prof_on:
+            Profiler.mark('find_best_pairs:exact_match_search',
+                          time.perf_counter() - _t0)
+
+        best_score = -1
+        best_prefix = 0
+        best_i, best_j = alo, blo
+        max_prefix_any = 0
 
         if best_exact_i >= 0:
             # Use the longest unique exact match as anchor
@@ -869,22 +902,12 @@ class Differ:
             best_prefix = 1000000
             max_prefix_any = 1000000
         else:
-            # No unique exact match — use prefix/suffix length scoring.
-            # No size guard: the prefix/suffix metric is O(line_length)
-            # per pair, and the exact-match pass above already handled
-            # unique lines. For large blocks without unique matches,
-            # this is O(N*M) but each pair comparison is fast (just
-            # scanning from both ends of the lines).
-            #
-            # THIS IS THE LIKELY BOTTLENECK for large files with many
-            # REPLACE blocks where da != db. Each pair comparison scans
-            # the prefix AND suffix character-by-character. For a block
-            # with 1000 lines on each side, that's 1M comparisons, each
-            # potentially scanning hundreds of chars. And this is
-            # RECURSIVE — after finding the best pair, it recurses on
-            # both sides, so the total work can be O(N*M*D) where D is
-            # the number of differences.
-            Profiler.start('find_best_pairs:prefix_suffix_search')
+            # No unique exact match — prefix/suffix length scoring.
+            # NOTE: O(N*M) and RECURSIVE (see the old generator's
+            # docstring) — the reason beautify_alignment is off by
+            # default on large files.
+            if prof_on:
+                _t0 = time.perf_counter()
             for j in range(blo, bhi):
                 bj_line = b[j]
                 for i in range(alo, ahi):
@@ -913,22 +936,15 @@ class Differ:
                     if score > best_score:
                         best_score, best_i, best_j = score, i, j
                         best_prefix = prefix
-            Profiler.stop('find_best_pairs:prefix_suffix_search')
+            if prof_on:
+                Profiler.mark('find_best_pairs:prefix_suffix_search',
+                              time.perf_counter() - _t0)
 
         # Minimum similarity threshold: only pair lines if the BEST pair
-        # shares a meaningful common prefix (>= 3 chars). This matches VS
-        # Code's behavior — VS Code does NOT pair completely different
-        # lines (like 'dsds' vs '\n' or 'ff' vs 'ss'); it shows them
-        # as separate delete + add. Without this threshold, the diff
-        # looks confusing because unrelated lines get marked as "changed"
-        # (orange/yellow) instead of separate red+green.
-        # The threshold of 3 means: '"""Register' (9 common chars) pairs,
-        # but 'dsds' vs '\n' (0 common chars) does NOT pair.
-        # Exception: if the block is 1xN or Nx1 (one side has a single
-        # line), pair positionally ONLY if the opposing first line is
-        # non-trivial (has >= 3 non-whitespace chars). This matches VS
-        # Code: it pairs 'dsds' with 'ggg' (both non-trivial) but shows
-        # 'dsds' as deleted when the opposing side starts with '\n'.
+        # shares a meaningful common prefix (>= 3 chars) — VS Code's
+        # behavior; unrelated lines show as separate delete + add.
+        # Exception: 1xN/Nx1 blocks pair positionally when the opposing
+        # first line is non-trivial (>= 3 non-whitespace chars).
         if best_prefix < 3 and best_prefix != 1000000:
             if da == 1 or db == 1:
                 # Single-line block: check if the opposing first line
@@ -947,87 +963,110 @@ class Differ:
                 else:
                     # Trivial opposing line: show as delete + add
                     for i in range(alo, ahi):
-                        yield (B_GAP, blo, i, i + 1)
-                        yield (A_LINE_DEL, i)
+                        out.append((B_GAP, blo, i, i + 1))
+                        out.append((A_LINE_DEL, i))
                     for j in range(blo, bhi):
-                        yield (A_GAP, ahi, j, j + 1)
-                        yield (B_LINE_ADD, j)
+                        out.append((A_GAP, ahi, j, j + 1))
+                        out.append((B_LINE_ADD, j))
                     return
             else:
                 # Multi-line block with no good match: show all as
                 # separate delete + add
                 for i in range(alo, ahi):
-                    yield (B_GAP, blo, i, i + 1)
-                    yield (A_LINE_DEL, i)
+                    out.append((B_GAP, blo, i, i + 1))
+                    out.append((A_LINE_DEL, i))
                 for j in range(blo, bhi):
-                    yield (A_GAP, ahi, j, j + 1)
-                    yield (B_LINE_ADD, j)
+                    out.append((A_GAP, ahi, j, j + 1))
+                    out.append((B_LINE_ADD, j))
                 return
 
         # Recurse on the part before the best pair
-        yield from self._find_best_pairs(a, alo, best_i, b, blo, best_j)
+        self._find_best_pairs_events(out, a, alo, best_i, b, blo, best_j)
 
         # Process the best pair itself
         a_line, b_line = a[best_i], b[best_j]
         if a_line == b_line:
-            yield (ALIGN, best_i, best_j)
+            out.append((ALIGN, best_i, best_j))
         else:
-            Profiler.start('char_diff')
-            ops = self._char_diff(a_line, b_line)
-            Profiler.stop('char_diff')
-            yield from self._char_diff_pair(best_i, best_j, ops)
-            yield (ALIGN, best_i, best_j)
+            if prof_on:
+                _t0 = time.perf_counter()
+                ops = self._char_diff(a_line, b_line)
+                dt = time.perf_counter() - _t0
+                Profiler.mark(self._CHAR_ROW, dt, 1, dt)
+            else:
+                ops = self._char_diff(a_line, b_line)
+            self._char_diff_pair_events(out, best_i, best_j, ops)
+            out.append((ALIGN, best_i, best_j))
 
         # Recurse on the part after the best pair
-        yield from self._find_best_pairs(a, best_i + 1, ahi,
-                                          b, best_j + 1, bhi)
+        self._find_best_pairs_events(out, a, best_i + 1, ahi,
+                                     b, best_j + 1, bhi)
 
-    def _char_diff_pair(self, ai, bj, ops):
-        """Yield character-level diff events for a single line pair,
-        given the char-level opcodes from native engine char_diff().
-        Shared by BOTH alignment modes
-        Pure glue — no decisions made here.
+    def _char_diff_pair_events(self, out, ai, bj, ops):
+        """Append character-level diff events for a single line pair,
+        given the char-level opcodes from the engine's char_diff().
+        Shared by BOTH alignment modes. Pure glue — no decisions here.
 
-        The line is marked as A_LINE_CHANGE / B_LINE_CHANGE (yellow/red/
-        green decor based on whether char-level deletes or inserts were
-        found), and the specific character ranges that differ are emitted
-        as A_SYMBOL_DEL / B_SYMBOL_ADD events so the wrapper can highlight
-        them inline.
+        The line is marked as A_LINE_CHANGE / B_LINE_CHANGE and the
+        specific character ranges that differ are emitted as
+        A_SYMBOL_DEL / B_SYMBOL_ADD events so the wrapper can highlight
+        them inline. Same event order as the old generator version.
         """
         deca, decb = 0, 0
+        append = out.append
         for tag, a_start, a_end, b_start, b_end in ops:
             la, lb = a_end - a_start, b_end - b_start
             if tag == 'delete':
                 deca += 1
-                yield (A_SYMBOL_DEL, ai, a_start, la)
+                append((A_SYMBOL_DEL, ai, a_start, la))
             elif tag == 'insert':
                 decb += 1
-                yield (B_SYMBOL_ADD, bj, b_start, lb)
+                append((B_SYMBOL_ADD, bj, b_start, lb))
             elif tag == 'replace':
                 deca += 1
                 decb += 1
-                yield (A_SYMBOL_DEL, ai, a_start, la)
-                yield (B_SYMBOL_ADD, bj, b_start, lb)
-        yield (A_LINE_CHANGE, ai)
-        yield (B_LINE_CHANGE, bj)
-        yield (A_DECOR_YELLOW, ai) if deca == 0 else (A_DECOR_RED, ai)
-        yield (B_DECOR_YELLOW, bj) if decb == 0 else (B_DECOR_GREEN, bj)
+                append((A_SYMBOL_DEL, ai, a_start, la))
+                append((B_SYMBOL_ADD, bj, b_start, lb))
+        append((A_LINE_CHANGE, ai))
+        append((B_LINE_CHANGE, bj))
+        append((A_DECOR_YELLOW, ai) if deca == 0 else (A_DECOR_RED, ai))
+        append((B_DECOR_YELLOW, bj) if decb == 0 else (B_DECOR_GREEN, bj))
 
-    def _plain_replace_simple(self, a, alo, ahi, b, blo, bhi):
-        """Non-detailed replace (withdetail=False). Pairs lines by position
-        and marks all as changed (A_LINE_CHANGE/B_LINE_CHANGE) with yellow decor
-        (no char-level highlights)."""
+    def _plain_replace_chunks(self, a, alo, ahi, b, blo, bhi):
+        """Non-detailed replace (withdetail=False). Pairs lines by
+        position and marks all as changed (A_LINE_CHANGE/B_LINE_CHANGE)
+        with yellow decor (no char-level highlights). Generator of event
+        lists with bounded size; same event order as the old
+        _plain_replace_simple generator.
+        """
         da, db = ahi - alo, bhi - blo
         common = min(da, db)
+        flush_at = self._REPLACE_CHUNK * 4
+        evs = []
+        append = evs.append
         for k in range(common):
-            yield (ALIGN, alo + k, blo + k)
+            append((ALIGN, alo + k, blo + k))
+            if len(evs) >= flush_at:
+                yield evs
+                evs = []
+                append = evs.append
         if da > db:
-            yield (B_GAP, bhi, alo + common, ahi)
+            append((B_GAP, bhi, alo + common, ahi))
         elif db > da:
-            yield (A_GAP, ahi, blo + common, bhi)
+            append((A_GAP, ahi, blo + common, bhi))
         for y in range(alo, ahi):
-            yield (A_LINE_CHANGE, y)
-            yield (A_DECOR_YELLOW, y)
+            append((A_LINE_CHANGE, y))
+            append((A_DECOR_YELLOW, y))
+            if len(evs) >= flush_at:
+                yield evs
+                evs = []
+                append = evs.append
         for y in range(blo, bhi):
-            yield (B_LINE_CHANGE, y)
-            yield (B_DECOR_YELLOW, y)
+            append((B_LINE_CHANGE, y))
+            append((B_DECOR_YELLOW, y))
+            if len(evs) >= flush_at:
+                yield evs
+                evs = []
+                append = evs.append
+        if evs:
+            yield evs
