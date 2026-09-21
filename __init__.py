@@ -14,7 +14,9 @@ import cudax_lib as ctx
 from . import differ_native as dfn
 from . import differ_python as dfp
 from .overview import PaintboxOverview
-from .profiling import Profiler, enable_profiling, profiling_report, reset_profiling
+from .profiling import (Profiler, enable_profiling, profiling_report,
+                        reset_profiling, start_profiling, stop_profiling,
+                        cancel_profiling, ENABLE_CPROFILE)
 from .utils import split_lines_safe, ScrollSplittedTab
 from difflib import unified_diff
 from cudax_lib import get_translation
@@ -964,6 +966,7 @@ class _CompareJob:
         'show_dialog',
         'compare_start',            # kick-off perf_counter()
         'profiling_enabled_here',   # profiling enabled by this compare
+        'cprofile',                 # (pr, s) while the cProfile layer runs
         'profiler_async_token',     # start_async_pair token (engine wait)
         'job_handle',       # engine job handle for the background compare (0 = none)
         'editor_lock',      # whole-compare lock/RO state (see class docstring)
@@ -995,6 +998,7 @@ class _CompareJob:
         self.show_dialog = False
         self.compare_start = 0.0
         self.profiling_enabled_here = False
+        self.cprofile = None
         self.profiler_async_token = None
         self.job_handle = 0
         self.editor_lock = None
@@ -2399,6 +2403,11 @@ class Command:
         # newer kick-off's reset) already handled it.
         Profiler.stop_async_pair(job.profiler_async_token)
         job.profiler_async_token = None
+        # A cancelled compare's epilogue never runs: disable the
+        # cProfile layer without printing (an enabled Profile would
+        # keep tracing the main thread).
+        cancel_profiling(job.cprofile)
+        job.cprofile = None
         self._release_compare_editors(job)
         if job.job_handle:
             dfn.cancel_async_line_diff(job.job_handle)
@@ -2681,8 +2690,21 @@ class Command:
         # Cleared when the compare continues in the background --
         # the epilogue then runs in _on_native_diff_done instead.
         _epilogue = True
+        # cProfile layer (see profiling.py): function-level attribution
+        # for the WHOLE refresh -- which FUNCTION eats the time, the
+        # question the section report cannot answer. Started only when
+        # the section profiler is on (the same 'enable_profiling'
+        # config switch) AND ENABLE_CPROFILE in profiling.py; stopped +
+        # printed by _compare_epilogue (sync: this method's finally;
+        # background: _on_native_diff_done), cancelled without printing
+        # on every abandonment path (engine-refused below, _cancel_job).
+        # cProfile traces every Python call, so profiled compares run
+        # 2-3x slower while it is on -- a diagnostic, not the norm.
+        _cprof = None
         try:
             Profiler.start('refresh')
+            if ENABLE_CPROFILE and Profiler.is_enabled():
+                _cprof = start_profiling()
 
             a_ed = ct.Editor(ed.get_prop(ct.PROP_HANDLE_PRIMARY))
             b_ed = ct.Editor(ed.get_prop(ct.PROP_HANDLE_SECONDARY))
@@ -2901,6 +2923,7 @@ class Command:
             job.show_dialog = show_dialog
             job.compare_start = _compare_start
             job.profiling_enabled_here = _profiling_enabled_here
+            job.cprofile = _cprof
             if isinstance(diff, dfn.Differ):
                 job.a_text = a_text_all
                 job.b_text = b_text_all
@@ -2958,6 +2981,10 @@ class Command:
                 # failed start attempt; no report prints on this path, so
                 # the rows are pure bookkeeping hygiene).
                 Profiler.stop_async_pair(_async_pair)
+                # No epilogue runs on this path: turn the cProfile layer
+                # off silently (it only captured the setup anyway).
+                cancel_profiling(_cprof)
+                _cprof = None
                 msg('diff_proc failed to start the background compare', level=1)
                 _epilogue = False
                 Profiler.stop('refresh')
@@ -2977,7 +3004,8 @@ class Command:
             if _epilogue:
                 self._compare_epilogue(_compare_start,
                                        _profiling_enabled_here,
-                                       tab_id)
+                                       tab_id,
+                                       _cprof)
 
     def _paint_compare_events(self, job, opcodes=None):
         """Consume the Differ's event generator and paint every event
@@ -3022,9 +3050,10 @@ class Command:
         # generator) and paints each event. One section wraps the whole
         # loop: its SELF time is the honest per-event dispatch+collection
         # cost (the generator's production time is booked separately by
-        # the differ's per-chunk 'compare:event_generation' sections and
-        # batched 'char_diff:*' marks — no per-event sections anywhere,
-        # see profiling.py's docstring).
+        # the differ's per-chunk 'compare:positional_pairs' /
+        # 'compare:find_best_pairs' sections and batched 'char_diff:*'
+        # marks — no per-event sections anywhere, see profiling.py's
+        # docstring).
         #
         # Bookmarks are NOT set immediately in the loop. Instead, they
         # are collected into pending_bkm_a / pending_bkm_b lists and
@@ -3100,26 +3129,59 @@ class Command:
         # behavior-neutral (ids are mutually exclusive) but the hot ids
         # are matched after the fewest comparisons.
         #
-        # Per-event Profiler sections are GONE (they were the biggest
+        # Per-event Profiler SECTIONS stay gone (they were the biggest
         # fake cost in the old report: ~4M start/stop pairs charged
         # ~2-4us each to whichever section was open, and the consumer's
         # work between two next() calls was booked into the SUSPENDED
-        # generator's section). All dispatch+collection time now lands
+        # generator's section). All dispatch+collection time lands
         # honestly in this section's self time; the generator's own
         # production time is visible in the per-chunk
-        # 'compare:event_generation' rows + the batched 'char_diff:*'
-        # marks (see differ_native/differ_python).
+        # 'compare:positional_pairs' / 'compare:find_best_pairs' rows +
+        # the batched 'char_diff:*' marks (see differ_native /
+        # differ_python).
+        #
+        # The per-OPERATION rows the old report had (paint:gap /
+        # paint:wrap_calc / paint:attr / paint:micromap) are RESTORED
+        # as batched marks: each guarded site below times its single
+        # operation with a perf_counter pair (~120ns) and _end()
+        # accumulates it per category; after the loop each category is
+        # booked with ONE Profiler.mark() (calls = timed operations,
+        # max = slowest single op). Same row names as the old report —
+        # honest numbers now: no frame-stack push/pop per event and no
+        # attribution lies. Zero cost when profiling is off.
+        prof_on = Profiler.enabled
+        if prof_on:
+            _stats = {}  # category -> [total dt, calls, max dt]
+
+            def _end(cat, t0):
+                dt = time.perf_counter() - t0
+                rec = _stats.get(cat)
+                if rec is None:
+                    _stats[cat] = [dt, 1, dt]
+                else:
+                    rec[0] += dt
+                    rec[1] += 1
+                    if dt > rec[2]:
+                        rec[2] = dt
         for d in compare_iter:
             diff_id, y = d[0], d[1]
             if diff_id == df.ALIGN:
                 if wrap_on:
                     a_line, b_line = d[1], d[2]
+                    if prof_on:
+                        _t0 = time.perf_counter()
                     va = self._visual_rows(wrap_counts_a, a_line)
                     vb = self._visual_rows(wrap_counts_b, b_line)
+                    if prof_on:
+                        _end('paint:wrap_calc', _t0)
                     if va > vb:
                         diff_rows = va - vb
+                        if prof_on:
+                            _t0 = time.perf_counter()
                         self._add_raw_gap(b_ed, b_line,
                                           diff_rows * line_h_b, color_gaps)
+                        if prof_on:
+                            _end('paint:gap', _t0)
                         if overview is not None:
                             # _add_raw_gap inserts AFTER b_line (between
                             # b_line and b_line+1), so record as
@@ -3128,36 +3190,56 @@ class Command:
                             overview.add_gap('b', b_line + 1, diff_rows)
                     elif vb > va:
                         diff_rows = vb - va
+                        if prof_on:
+                            _t0 = time.perf_counter()
                         self._add_raw_gap(a_ed, a_line,
                                           diff_rows * line_h_a, color_gaps)
+                        if prof_on:
+                            _end('paint:gap', _t0)
                         if overview is not None:
                             # Same: gap is after a_line, so record
                             # as after_line = a_line + 1.
                             overview.add_gap('a', a_line + 1, diff_rows)
             elif diff_id == df.A_SYMBOL_DEL:
                 n_diff_events += 1
+                if prof_on:
+                    _t0 = time.perf_counter()
                 pending_ch_a.setdefault(y, []).append(
                     (d[2], d[3], color_deleted))
+                if prof_on:
+                    _end('paint:attr', _t0)
                 if overview is not None:
                     overview.add_line_state('a', y, color_deleted)
             elif diff_id == df.B_SYMBOL_ADD:
                 n_diff_events += 1
+                if prof_on:
+                    _t0 = time.perf_counter()
                 pending_ch_b.setdefault(y, []).append(
                     (d[2], d[3], color_added))
+                if prof_on:
+                    _end('paint:attr', _t0)
                 if overview is not None:
                     overview.add_line_state('b', y, color_added)
             elif diff_id == df.A_LINE_CHANGE:
                 n_diff_events += 1
                 pending_bkm_a.append((y, NKIND_CHANGED))
                 if micromap_on:
+                    if prof_on:
+                        _t0 = time.perf_counter()
                     pending_mm_a[y] = color_changed
+                    if prof_on:
+                        _end('paint:micromap', _t0)
                 if overview is not None:
                     overview.add_line_state('a', y, color_changed)
             elif diff_id == df.B_LINE_CHANGE:
                 n_diff_events += 1
                 pending_bkm_b.append((y, NKIND_CHANGED))
                 if micromap_on:
+                    if prof_on:
+                        _t0 = time.perf_counter()
                     pending_mm_b[y] = color_changed
+                    if prof_on:
+                        _end('paint:micromap', _t0)
                 if overview is not None:
                     overview.add_line_state('b', y, color_changed)
             elif diff_id == df.A_DECOR_RED:
@@ -3180,42 +3262,72 @@ class Command:
                 n_diff_events += 1
                 pending_bkm_a.append((y, NKIND_DELETED))
                 if micromap_on:
+                    if prof_on:
+                        _t0 = time.perf_counter()
                     pending_mm_a[y] = color_deleted
+                    if prof_on:
+                        _end('paint:micromap', _t0)
                 if overview is not None:
                     overview.add_line_state('a', y, color_deleted)
             elif diff_id == df.B_LINE_ADD:
                 n_diff_events += 1
                 pending_bkm_b.append((y, NKIND_ADDED))
                 if micromap_on:
+                    if prof_on:
+                        _t0 = time.perf_counter()
                     pending_mm_b[y] = color_added
+                    if prof_on:
+                        _end('paint:micromap', _t0)
                 if overview is not None:
                     overview.add_line_state('b', y, color_added)
             elif diff_id == df.A_GAP:
                 a_line_after, b_start, b_end = d[1], d[2], d[3]
                 if wrap_on:
+                    if prof_on:
+                        _t0 = time.perf_counter()
                     total_visual = self._sum_visual_rows(
                         wrap_counts_b, b_start, b_end)
+                    if prof_on:
+                        _end('paint:wrap_calc', _t0)
+                        _t0 = time.perf_counter()
                     self._add_raw_gap(a_ed, a_line_after - 1,
                                       total_visual * line_h_a, color_gaps)
+                    if prof_on:
+                        _end('paint:gap', _t0)
                     if overview is not None:
                         # Gap appears BEFORE a_line_after (between lines
                         # a_line_after-1 and a_line_after)
                         overview.add_gap('a', a_line_after, total_visual)
                 else:
+                    if prof_on:
+                        _t0 = time.perf_counter()
                     self.set_gap(a_ed, a_line_after, b_end - b_start)
+                    if prof_on:
+                        _end('paint:gap', _t0)
                     if overview is not None:
                         overview.add_gap('a', a_line_after, b_end - b_start)
             elif diff_id == df.B_GAP:
                 b_line_after, a_start, a_end = d[1], d[2], d[3]
                 if wrap_on:
+                    if prof_on:
+                        _t0 = time.perf_counter()
                     total_visual = self._sum_visual_rows(
                         wrap_counts_a, a_start, a_end)
+                    if prof_on:
+                        _end('paint:wrap_calc', _t0)
+                        _t0 = time.perf_counter()
                     self._add_raw_gap(b_ed, b_line_after - 1,
                                       total_visual * line_h_b, color_gaps)
+                    if prof_on:
+                        _end('paint:gap', _t0)
                     if overview is not None:
                         overview.add_gap('b', b_line_after, total_visual)
                 else:
+                    if prof_on:
+                        _t0 = time.perf_counter()
                     self.set_gap(b_ed, b_line_after, a_end - a_start)
+                    if prof_on:
+                        _end('paint:gap', _t0)
                     if overview is not None:
                         overview.add_gap('b', b_line_after, a_end - a_start)
             elif diff_id == df.A_GAP_IGN:
@@ -3227,34 +3339,56 @@ class Command:
                 # alignment — not a difference, so no n_diff_events.
                 a_line_after, b_start, b_end = d[1], d[2], d[3]
                 if wrap_on:
+                    if prof_on:
+                        _t0 = time.perf_counter()
                     total_visual = self._sum_visual_rows(
                         wrap_counts_b, b_start, b_end)
+                    if prof_on:
+                        _end('paint:wrap_calc', _t0)
+                        _t0 = time.perf_counter()
                     self._add_raw_gap(a_ed, a_line_after - 1,
                                       total_visual * line_h_a,
                                       color_ignored_gap, tag=IGN_GAP_TAG)
+                    if prof_on:
+                        _end('paint:gap', _t0)
                     if overview is not None:
                         overview.add_gap('a', a_line_after, total_visual,
                                          ignored=True)
                 else:
+                    if prof_on:
+                        _t0 = time.perf_counter()
                     self.set_gap(a_ed, a_line_after, b_end - b_start,
                                  color=color_ignored_gap, tag=IGN_GAP_TAG)
+                    if prof_on:
+                        _end('paint:gap', _t0)
                     if overview is not None:
                         overview.add_gap('a', a_line_after, b_end - b_start,
                                          ignored=True)
             elif diff_id == df.B_GAP_IGN:
                 b_line_after, a_start, a_end = d[1], d[2], d[3]
                 if wrap_on:
+                    if prof_on:
+                        _t0 = time.perf_counter()
                     total_visual = self._sum_visual_rows(
                         wrap_counts_a, a_start, a_end)
+                    if prof_on:
+                        _end('paint:wrap_calc', _t0)
+                        _t0 = time.perf_counter()
                     self._add_raw_gap(b_ed, b_line_after - 1,
                                       total_visual * line_h_b,
                                       color_ignored_gap, tag=IGN_GAP_TAG)
+                    if prof_on:
+                        _end('paint:gap', _t0)
                     if overview is not None:
                         overview.add_gap('b', b_line_after, total_visual,
                                          ignored=True)
                 else:
+                    if prof_on:
+                        _t0 = time.perf_counter()
                     self.set_gap(b_ed, b_line_after, a_end - a_start,
                                  color=color_ignored_gap, tag=IGN_GAP_TAG)
+                    if prof_on:
+                        _end('paint:gap', _t0)
                     if overview is not None:
                         overview.add_gap('b', b_line_after, a_end - a_start,
                                          ignored=True)
@@ -3265,15 +3399,29 @@ class Command:
                 # differing only in blank lines still reports "No
                 # differences found").
                 if micromap_on:
+                    if prof_on:
+                        _t0 = time.perf_counter()
                     pending_mm_a[y] = color_ignored
+                    if prof_on:
+                        _end('paint:micromap', _t0)
                 if overview is not None:
                     overview.add_line_state('a', y, color_ignored)
             elif diff_id == df.B_LINE_IGN:
                 if micromap_on:
+                    if prof_on:
+                        _t0 = time.perf_counter()
                     pending_mm_b[y] = color_ignored
+                    if prof_on:
+                        _end('paint:micromap', _t0)
                 if overview is not None:
                     overview.add_line_state('b', y, color_ignored)
 
+        # Book the per-operation paint rows collected inside the loop,
+        # while 'refresh:compare_and_paint' is still open, so they nest
+        # under it (its self time excludes them — they are its children).
+        if prof_on:
+            for _cat, _rec in _stats.items():
+                Profiler.mark(_cat, _rec[0], _rec[1], _rec[2])
         Profiler.stop('refresh:compare_and_paint')
 
         if n_diff_events == 0:
@@ -3445,7 +3593,9 @@ class Command:
                 finally:
                     self._compare_epilogue(job.compare_start,
                                            job.profiling_enabled_here,
-                                           job.tab_id)
+                                           job.tab_id,
+                                           job.cprofile)
+                    job.cprofile = None
             finally:
                 # Compare finished and everything is rendered: make the
                 # halves editable again / drop the busy placeholder.
@@ -3453,6 +3603,15 @@ class Command:
                 # above (and _cancel_job for cancelled jobs) are all
                 # covered by this single call.
                 self._release_compare_editors(job)
+                # Safety net for the early-return paths above (stale /
+                # exiting / closed tab / algorithm-switch re-run): they
+                # skip the epilogue, so disable an abandoned cProfile
+                # run here -- an enabled Profile keeps tracing the main
+                # thread until something replaces it. No-op when the
+                # epilogue already stopped it (job.cprofile is None by
+                # then) or when the cProfile layer is off.
+                cancel_profiling(job.cprofile)
+                job.cprofile = None
         except Exception:
             # Never let an exception escape into the engine's callback
             # dispatcher: print the traceback and leave the tab in its
@@ -3461,7 +3620,8 @@ class Command:
             import traceback
             traceback.print_exc()
 
-    def _compare_epilogue(self, compare_start, profiling_enabled_here, tab_id=None):
+    def _compare_epilogue(self, compare_start, profiling_enabled_here,
+                          tab_id=None, cprofile=None):
         """Show the total compare time on the status bar and print the
         profiling report. Runs for the synchronous mode (from
         refresh_compare's finally) and for the background mode (from
@@ -3473,7 +3633,12 @@ class Command:
         profiling report header names what it compares -- per side the
         original file's PATH when it is a file on disk, otherwise the
         original tab's title (untitled tabs have no path). See
-        _compared_names_for_report."""
+        _compared_names_for_report.
+
+        'cprofile' is the (pr, s) pair refresh_compare started when the
+        cProfile layer is on (see profiling.py): printed here (sorted by
+        SELF time -- which function eats the time) and disabled, so the
+        app runs at full speed again from here on. None when off."""
         _compare_elapsed = time.perf_counter() - compare_start
         if _compare_elapsed < 1.0:
             ct.msg_status(_('Differ: compared in {:.0f}ms').format(
@@ -3495,6 +3660,13 @@ class Command:
         if profiling_enabled_here:
             profiling_report(files=self._compared_names_for_report(tab_id))
             enable_profiling(False)
+        # cProfile layer: function-level report, sorted by SELF time
+        # (tottime). Switch the call below to sort_key='cumulative' for
+        # the call-tree view, or raise max_lines for a longer table.
+        if cprofile is not None:
+            stop_profiling(cprofile[0], cprofile[1],
+                           sort_key='time', max_lines=30,
+                           title='cProfile: refresh_compare')
 
     def _compared_names_for_report(self, tab_id):
         """Return [('Left', name), ('Right', name)] describing what the

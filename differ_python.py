@@ -454,7 +454,7 @@ class Differ:
         # old report show replace_block:positional_pair as a fake giant
         # bottleneck. Only sections that close before a yield remain
         # (compare:algorithm, compare:realign_opcodes, per-chunk
-        # compare:event_generation).
+        # compare:positional_pairs / compare:find_best_pairs).
 
         self.diffmap = []
         Profiler.start('compare:algorithm')
@@ -502,8 +502,10 @@ class Differ:
         Profiler.stop('compare:realign_opcodes')
 
         # Event production for REPLACE blocks is instrumented per chunk
-        # ('compare:event_generation' opens after the chunk list starts
-        # and closes BEFORE it is yielded); equal/delete/insert production
+        # ('compare:positional_pairs' / 'compare:find_best_pairs' open
+        # after the chunk list starts and close BEFORE it is yielded —
+        # one row per producer, so the report shows WHICH of the two
+        # pairing modes a block used); equal/delete/insert production
         # is trivial tuple loops and stays uninstrumented — its cost lands
         # in the consumer's section, which is where it runs.
         for tag, i1, i2, j1, j2 in opcodes:
@@ -557,7 +559,7 @@ class Differ:
 
     # Pair chunk for huge REPLACE blocks: events are produced (and
     # profiled) per chunk, so neither the event list nor the open
-    # 'compare:event_generation' frame grows with the block size.
+    # 'compare:positional_pairs' frame grows with the block size.
     _REPLACE_CHUNK = 512
 
     def _positional_pairs_events(self, out, a, alo, b, blo, count):
@@ -609,12 +611,14 @@ class Differ:
         b[blo:bhi]. GENERATOR OF EVENT LISTS: yields the block's paint
         events as one or more lists, in exactly the order the old
         generator-based version yielded them. The producing section
-        ('compare:event_generation') opens after a list starts and
-        closes before the list is yielded — never open across a yield
-        (see compare()'s NOTE). Event lists are bounded by
-        _REPLACE_CHUNK pairs, so huge blocks (two entirely different
-        1M-line files come as ONE replace opcode) do not materialize
-        their whole event stream at once.
+        ('compare:find_best_pairs' for the beautify path,
+        'compare:positional_pairs' for the positional path — one row per
+        producer so the report shows which mode a block used) opens
+        after a list starts and closes before the list is yielded —
+        never open across a yield (see compare()'s NOTE). Event lists
+        are bounded by _REPLACE_CHUNK pairs, so huge blocks (two
+        entirely different 1M-line files come as ONE replace opcode)
+        do not materialize their whole event stream at once.
 
         Two rendering modes, selected by self.beautify_alignment:
 
@@ -668,10 +672,10 @@ class Differ:
             # Produced into ONE list (beautify is opt-in; the recursive
             # scorer makes chunking invasive). Char diffs inside are
             # perf_counter-timed and booked as batched marks.
-            Profiler.start('compare:event_generation')
+            Profiler.start('compare:find_best_pairs')
             evs = []
             self._find_best_pairs_events(evs, a, alo, ahi, b, blo, bhi)
-            Profiler.stop('compare:event_generation')
+            Profiler.stop('compare:find_best_pairs')
             yield evs
             return
 
@@ -685,10 +689,10 @@ class Differ:
             n = self._REPLACE_CHUNK
             if common - k < n:
                 n = common - k
-            Profiler.start('compare:event_generation')
+            Profiler.start('compare:positional_pairs')
             evs = []
             self._positional_pairs_events(evs, a, alo + k, b, blo + k, n)
-            Profiler.stop('compare:event_generation')
+            Profiler.stop('compare:positional_pairs')
             yield evs
             k += n
 

@@ -596,8 +596,12 @@ Advanced section:
   Default: 3.
 - differ.advanced.enable_profiling: Enable profiling
   Enable profiling to trace where compare time is consumed.
-  When enabled, prints a detailed timing report to the console after
-  each compare. The report is sorted by SELF time (time inside a
+  When enabled, prints TWO reports to the console after each
+  compare: the section report (which PHASE eats the time) and, when
+  the cProfile layer is on (ENABLE_CPROFILE in the plugin's
+  profiling.py, currently True), a cProfile report (which FUNCTION
+  eats the time), sorted by self time.
+  The section report is sorted by SELF time (time inside a
   row EXCLUDING its nested rows), so the real bottleneck is at the
   top. Rows you will see:
   - line_diff:native_engine -- the background line-level engine
@@ -608,12 +612,26 @@ Advanced section:
     diff engine calls, timed per pair with perf_counter and booked
     in batches: 'calls' is the number of line PAIRS, 'max' the
     slowest single call.
-  - compare:event_generation -- building the paint events for
-    REPLACE-block chunks (pairing + char diffs + event lists):
+  - compare:positional_pairs -- building the paint events for
+    REPLACE-block chunks in the positional pairing mode (the
+    algo-faithful default and the beautify fast path):
     'calls' is the number of produced chunks.
+  - compare:find_best_pairs -- the same event production in the
+    beautify mode's anchor / prefix-suffix pairing (present only
+    when beautify_alignment produced unequal-count blocks):
+    'calls' is the number of such blocks. One row per producer, so
+    the report always shows WHICH pairing mode the time went to.
   - refresh:compare_and_paint -- the consumer loop: event dispatch,
     marker/bookmark/overview data collection (its self time is the
     honest per-event pipeline cost).
+  - paint:attr / paint:gap / paint:micromap / paint:wrap_calc --
+    per-operation paint costs, as BATCHED marks: each gap
+    insertion, wrap computation, char-run collection and micromap
+    line paint is timed with a perf_counter pair, accumulated per
+    category, and booked with one mark after the loop; 'calls' is
+    the number of timed operations, 'max' the slowest single one.
+    A row appears only when its sites actually ran (paint:micromap
+    needs the micromap on, paint:wrap_calc needs wrapping on).
   - refresh:*, paint:bookmark, paint:marker_window, paint:overview --
     the other refresh phases.
   The report header names what was compared (per side: the original
@@ -623,6 +641,11 @@ Advanced section:
   instead of hiding inside the rows. Overhead is ~0.4s on a 1M-line /
   200k-difference compare (the old per-event-section profiler added
   seconds and misattributed them -- see history 2026.09.21 part 2).
+  The cProfile report attributes every Python function call on the
+  main thread: use it to find the hot function, then set
+  ENABLE_CPROFILE=False in profiling.py and re-compare for clean
+  section numbers (while cProfile traces, every call pays ~1-2us and
+  the section report's rows are inflated).
   Use for debugging performance issues only.
   Default: off.
 
