@@ -61,9 +61,11 @@ Usage:
     Profiler.stop()
     Profiler.report(files=[('Left', '/a.py'), ('Right', '/b.py')])
 
-Module-level wrappers start_profiling/stop_profiling/enable_profiling/
-is_profiling_enabled/profiling_report/reset_profiling are kept: the
-plugin's __init__.py imports them.
+Module-level wrappers enable_profiling/is_profiling_enabled/
+profiling_report/reset_profiling are kept: the plugin's __init__.py
+imports them. start_profiling/stop_profiling are the cProfile LAYER
+(see the bottom of this file): function-level attribution for one
+whole refresh_compare, printed alongside the section report.
 """
 
 import time
@@ -395,14 +397,6 @@ class _NullSection:
 # Module-level convenience wrappers (the API __init__.py imports).
 # --------------------------------------------------------------------------
 
-def start_profiling(name='section'):
-    Profiler.start(name)
-
-
-def stop_profiling(name=None):
-    Profiler.stop(name)
-
-
 def enable_profiling(enabled=True):
     Profiler.set_enabled(enabled)
 
@@ -417,3 +411,98 @@ def profiling_report(files=None):
 
 def reset_profiling():
     Profiler.reset()
+
+
+# --------------------------------------------------------------------------
+# cProfile layer: function-level attribution for one whole
+# refresh_compare.
+#
+# The section Profiler above answers "which PHASE eats the time"; this
+# layer answers "which FUNCTION eats the time" -- the question the
+# section report cannot resolve (e.g. what inside the consumer loop or
+# the pairing costs: _add_raw_gap? set_gap? setdefault/append? the
+# generator's next()?). It is the same tool the section report is:
+# a diagnostic you switch on, read, and switch off.
+#
+# Overheads interact: cProfile traces every Python call on the thread
+# (~1-2us per call), so while this layer runs the SECTION report's rows
+# are inflated (profiled compares also run 2-3x slower overall). Use
+# this layer to find the hot function, then turn it off
+# (ENABLE_CPROFILE = False) and read the section report for clean
+# phase attribution. Both layers are gated by the SAME config switch
+# (differ.advanced.enable_profiling) -- this constant only adds the
+# second layer on top.
+#
+# The names start_profiling/stop_profiling replace the legacy thin
+# aliases of Profiler.start/stop that used to live here (nothing
+# imported them -- the Profiler class is used directly for sections).
+# --------------------------------------------------------------------------
+
+# Master switch for the cProfile layer. True: every profiled compare
+# also runs under cProfile and prints the function-level report after
+# the section report. False: only the (cheap) section Profiler runs.
+ENABLE_CPROFILE = True
+
+
+def start_profiling():
+    """Initializes and enables the profiler, and creates an IO stream."""
+    import cProfile
+    import io
+    pr = cProfile.Profile()
+    pr.enable()
+    s = io.StringIO()
+    return pr, s
+
+
+def stop_profiling(pr, s, sort_key='cumulative', max_lines=20, title='Profile Results'):
+    """
+    Disables the profiler, processes the stats, and prints them.
+    Accepts pr (cProfile.Profile) and s (io.StringIO) objects.
+    """
+    import pstats
+
+    # pr and s are guaranteed to be non-None if stop_profiling is called when ENABLE_PROFILING is True.
+
+    try:
+        pr.disable()
+    except ValueError:
+        # This can happen if an exception occurred in the profiled code before pr.enable() finished,
+        # or if the profiler was stopped manually beforehand (which is now avoided).
+        print(f"ERROR: Profiler for {title} was not properly enabled/disabled.")
+        return
+
+    # Get the stats object
+    try:
+        # Map human-readable sort_key to pstats.SortKey
+        # default is sort by cumulative time (time spent in function + all sub-functions)
+        sort_map = {
+            'cumulative': pstats.SortKey.CUMULATIVE,
+            'time': pstats.SortKey.TIME,
+        }
+        sortby = sort_map.get(sort_key.lower(), pstats.SortKey.CUMULATIVE)
+
+        ps = pstats.Stats(pr, stream=s).sort_stats(sortby)
+
+        # Print the stats to the in-memory stream 's'
+        ps.print_stats(max_lines)
+
+        # Print the captured output to the console/log
+        print(f"\n--- {title} ---")
+        print(s.getvalue())
+    except Exception as e:
+        print(f"ERROR: Error processing profiling results for {title}: {e}")
+
+
+def cancel_profiling(pr):
+    """Disable an abandoned cProfile run WITHOUT printing (the compare
+    was cancelled / the tab closed / the engine refused to start): an
+    enabled Profile keeps tracing the main thread until something else
+    replaces it, so every abandonment path must turn it off. No-op for
+    None and for an already-disabled Profile (after a normal epilogue
+    stopped the same pr, this is a harmless second disable)."""
+    if pr is None:
+        return
+    try:
+        pr.disable()
+    except ValueError:
+        pass
