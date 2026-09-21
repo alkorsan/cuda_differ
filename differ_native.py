@@ -573,10 +573,18 @@ class Differ:
         # + b_lines-being-built). On a 33k-line / 10MB file that's a
         # ~3.5MB reduction in the OVERALL peak memory during compare —
         # the peak the user actually sees when the diff runs.
+        # Profiled as its own section: on a 1M-line / 50MB compare this
+        # split costs ~3.3s (two full-text passes + 2M line-string
+        # allocations) — real work that used to vanish into the
+        # consumer's section SELF time. The Python differ splits in
+        # refresh_compare under the SAME tag, so the row is comparable
+        # across algorithms.
+        Profiler.start('compare:split_lines')
         a_lines = split_lines_safe(a_text)
         del a_text
         b_lines = split_lines_safe(b_text)
         del b_text
+        Profiler.stop('compare:split_lines')
 
         # Event production for REPLACE blocks is instrumented per chunk
         # ('compare:positional_pairs' / 'compare:find_best_pairs' open
