@@ -6,6 +6,7 @@ import time
 import typing as tp
 from bisect import bisect_left
 from collections import Counter
+from itertools import chain
 from operator import itemgetter
 
 import cudatext as ct
@@ -55,6 +56,30 @@ NKIND_CHANGED = 26
 GAP_WIDTH = 5000
 DEFAULT_SYNC_SCROLL = '1'
 U_PREFIX = 'untitled:'
+
+
+def _chunk_events(ev_iter, chunk=4096):
+    """Batch a FLAT event generator (the pure-Python Differ's compare())
+    into bounded event lists.
+
+    The paint loop consumes BOTH differs through one path:
+    itertools.chain.from_iterable over a list-yielding iterator (the
+    native Differ already yields lists -- compare_lists; this wrapper
+    adapts the flat generator to the same shape). Bounded lists keep
+    the adaptation's memory constant, and nothing is added between
+    the source's yields, so the per-event cost stays the source
+    generator's own."""
+    buf = []
+    append = buf.append
+    for d in ev_iter:
+        append(d)
+        if len(buf) >= chunk:
+            yield buf
+            buf = []
+            append = buf.append
+    if buf:
+        yield buf
+
 
 # Marker windowing: lines above/below the viewport that stay colored in
 # the editors. The compare no longer adds ALL diff markers to the editors
@@ -977,6 +1002,7 @@ class _CompareJob:
         'lines_a', 'lines_b',       # python: line lists
         'overview',         # PaintboxOverview or None
         'micromap_on', 'wrap_on',
+        'align_gap_events',         # ALIGN events matter (a line wraps to 2+ rows)
         'wrap_counts_a', 'wrap_counts_b',
         'line_h_a', 'line_h_b',
         'color_gaps', 'color_ignored', 'color_ignored_gap',
@@ -1008,6 +1034,7 @@ class _CompareJob:
         self.overview = None
         self.micromap_on = False
         self.wrap_on = False
+        self.align_gap_events = True
         self.wrap_counts_a = None
         self.wrap_counts_b = None
         self.line_h_a = 0
@@ -2960,6 +2987,20 @@ class Command:
                 wrap_counts_b = None
                 line_h_a = 0
                 line_h_b = 0
+            # ALIGN events drive exactly ONE thing: the compensating
+            # gaps for matched pairs that wrap to DIFFERENT visual
+            # heights (the dispatch loop's ALIGN branch). When no line
+            # on either side wraps to 2+ visual rows, that branch is a
+            # NO-OP for every ALIGN event -- so the paint pass can skip
+            # producing, dispatching and timing ~1M ALIGN events on a
+            # 1M-line compare (compare_lists's align_gap_events=False).
+            # max() is one C-speed pass (~20ms per 1M lines, in this
+            # method's own time, outside the wrap_counts section);
+            # empty count lists (empty editors) count as no wrapping.
+            align_gap_events = bool(
+                wrap_on and
+                ((wrap_counts_a and max(wrap_counts_a) > 1) or
+                 (wrap_counts_b and max(wrap_counts_b) > 1)))
             color_gaps = self.cfg.get('color_gaps')
             # Ignored-difference colors (WinMerge-style suppressed blank
             # lines + their compensating gaps) -- see 'ignored_color' /
@@ -2984,6 +3025,7 @@ class Command:
             job.overview = overview
             job.micromap_on = micromap_on
             job.wrap_on = wrap_on
+            job.align_gap_events = align_gap_events
             job.wrap_counts_a = wrap_counts_a
             job.wrap_counts_b = wrap_counts_b
             job.line_h_a = line_h_a
@@ -3081,8 +3123,9 @@ class Command:
                                        _cprof)
 
     def _paint_compare_events(self, job, opcodes=None, char_ops=None):
-        """Consume the Differ's event generator and paint every event
-        into both editor halves.
+        """Consume the Differ's events (flattened from bounded lists by
+        chain.from_iterable -- see the compare_iter setup below) and
+        paint every event into both editor halves.
 
         Shared by both compare modes: the synchronous mode (Python
         algorithms) calls it directly from refresh_compare; the native
@@ -3116,6 +3159,14 @@ class Command:
         micromap_on = job.micromap_on
         overview = job.overview
         wrap_on = job.wrap_on
+        # ALIGN events matter only when some line wraps to 2+ visual
+        # rows (set by refresh_compare from the wrap counts). Gates the
+        # ALIGN branch below (the Python Differ still yields ALIGN
+        # events -- skipping the no-op branch body is the equivalent
+        # of the native walk's align_gap_events=False suppression) and
+        # is passed to compare_lists so the native walk can skip
+        # producing them altogether.
+        align_gaps = job.align_gap_events
         wrap_counts_a = job.wrap_counts_a
         wrap_counts_b = job.wrap_counts_b
         line_h_a = job.line_h_a
@@ -3124,8 +3175,9 @@ class Command:
         color_ignored = job.color_ignored
         color_ignored_gap = job.color_ignored_gap
         show_dialog = job.show_dialog
-        # The for loop below consumes events from diff.compare() (a
-        # generator) and paints each event. One section wraps the whole
+        # The for loop below consumes events (flattened at C speed by
+        # chain.from_iterable -- see the compare_iter setup below) and
+        # paints each event. One section wraps the whole
         # loop: its SELF time is the honest per-event dispatch+collection
         # cost (the generator's production time is booked separately by
         # the differ's per-chunk 'compare:positional_pairs' /
@@ -3181,26 +3233,44 @@ class Command:
             # Differ holds the cached line lists from the collect pass
             # and job.a_text / job.b_text are None (dropped after the
             # collect split).
-            compare_iter = diff.compare(job.a_text, job.b_text,
-                                        opcodes=opcodes, char_ops=char_ops)
+            #
+            # LIST PROTOCOL: the native walk yields bounded EVENT
+            # LISTS (compare_lists) and chain.from_iterable flattens
+            # them at C speed -- a 5.8M-event compare drops from 5.8M
+            # Python generator resumes (each a frame switch that
+            # cProfile traces as a function call) to a few hundred
+            # list yields. align_gap_events=False (no line wraps to
+            # 2+ rows, see refresh_compare) additionally skips the
+            # ~1M ALIGN events whose consumer branch would be a
+            # no-op.
+            compare_iter = chain.from_iterable(diff.compare_lists(
+                job.a_text, job.b_text,
+                opcodes=opcodes, char_ops=char_ops,
+                align_gap_events=job.align_gap_events))
             # RELEASE the job's refs to the raw texts now that the
             # generator has its own (param) refs. The native generator
-            # splits the texts into line lists inside compare() and then
-            # `del`s its own param refs, so by the time the first event
-            # is yielded, the only remaining refs to the raw texts are
-            # the JOB's fields. Drop them here, BEFORE the for loop
-            # starts driving the generator, so that when the generator's
-            # `del a_text, b_text` executes during the first `next()`
-            # call, the strings' refcount actually hits 0 and they are
-            # freed instead of lingering through the whole paint loop.
-            # (Python path already `del`d its texts in refresh_compare
-            # right after the split_lines_safe call. Two-phase flow: the
-            # refs were already dropped after the collect pass -- these
-            # assignments are idempotent no-ops there.)
+            # splits the texts into line lists inside compare_lists()
+            # and then `del`s its own param refs, so by the time the
+            # first event is yielded, the only remaining refs to the
+            # raw texts are the JOB's fields. Drop them here, BEFORE
+            # the for loop starts driving the generator, so that when
+            # the generator's `del a_text, b_text` executes during the
+            # first `next()` call, the strings' refcount actually hits 0
+            # and they are freed instead of lingering through the whole
+            # paint loop. (Python path already `del`d its texts in
+            # refresh_compare right after the split_lines_safe call.
+            # Two-phase flow: the refs were already dropped after the
+            # collect pass -- these assignments are idempotent no-ops
+            # there.)
             job.a_text = None
             job.b_text = None
         else:
-            compare_iter = diff.compare(job.lines_a, job.lines_b)
+            # Pure-Python Differ: flat per-event generator, batched
+            # into bounded lists by _chunk_events so the consumption
+            # path below is the SAME chain.from_iterable for both
+            # differs.
+            compare_iter = chain.from_iterable(
+                _chunk_events(diff.compare(job.lines_a, job.lines_b)))
             job.lines_a = None
             job.lines_b = None
         # Colors are read ONCE here, not per event (the loop below runs
@@ -3229,15 +3299,17 @@ class Command:
         # The per-OPERATION rows the old report had (paint:gap /
         # paint:wrap_calc / paint:attr / paint:micromap) are RESTORED
         # as batched marks: each guarded site below times its single
-        # operation with a perf_counter pair (~120ns) and _end()
-        # accumulates it per category; after the loop each category is
-        # booked with ONE Profiler.mark() (calls = timed operations,
-        # max = slowest single op). Same row names as the old report —
-        # honest numbers now: no frame-stack push/pop per event and no
-        # attribution lies. Zero cost when profiling is off.
+        # operation with a perf_counter pair (~120ns) and _end() (cold
+        # categories) or inline locals (the hot paint:attr /
+        # paint:wrap_calc sites -- see below) accumulates it per
+        # category; after the loop each category is booked with ONE
+        # Profiler.mark() (calls = timed operations, max = slowest
+        # single op). Same row names as the old report — honest numbers
+        # now: no frame-stack push/pop per event and no attribution
+        # lies. Zero cost when profiling is off.
         prof_on = Profiler.enabled
         if prof_on:
-            _stats = {}  # category -> [total dt, calls, max dt]
+            _stats = {}  # COLD categories -> [total dt, calls, max dt]
 
             def _end(cat, t0):
                 dt = _perf() - t0
@@ -3249,6 +3321,21 @@ class Command:
                         rec[2] = dt
                 except KeyError:
                     _stats[cat] = [dt, 1, dt]
+
+            # HOT categories -- paint:attr (~1.6M timed ops) and
+            # paint:wrap_calc (up to 1M on wrapping compares) -- do NOT
+            # go through _end: the closure call (a function call + a
+            # dict lookup, x2.6M per 1M-line compare, and EACH one a
+            # traced call under the cProfile layer) collapses into
+            # three inline ops on these preallocated locals. Booked
+            # with the same one Profiler.mark() per category after the
+            # loop, so the rows are indistinguishable from before.
+            _attr_dt = 0.0
+            _attr_n = 0
+            _attr_max = 0.0
+            _wc_dt = 0.0
+            _wc_n = 0
+            _wc_max = 0.0
         # Hot-loop bindings: the loop below runs millions of iterations
         # on big files, so everything it touches more than once per
         # event is pre-resolved here.
@@ -3275,7 +3362,7 @@ class Command:
         for d in compare_iter:
             diff_id, y = d[0], d[1]
             if diff_id == df.ALIGN:
-                if wrap_on:
+                if wrap_on and align_gaps:
                     a_line, b_line = d[1], d[2]
                     if prof_on:
                         _t0 = _perf()
@@ -3286,7 +3373,11 @@ class Command:
                     vb = (wrap_counts_b[b_line]
                           if 0 <= b_line < wcb_n else 1)
                     if prof_on:
-                        _end('paint:wrap_calc', _t0)
+                        _dt = _perf() - _t0
+                        _wc_dt += _dt
+                        _wc_n += 1
+                        if _dt > _wc_max:
+                            _wc_max = _dt
                     if va > vb:
                         diff_rows = va - vb
                         if prof_on:
@@ -3324,7 +3415,11 @@ class Command:
                 else:
                     _lst.append(_tup)
                 if prof_on:
-                    _end('paint:attr', _t0)
+                    _dt = _perf() - _t0
+                    _attr_dt += _dt
+                    _attr_n += 1
+                    if _dt > _attr_max:
+                        _attr_max = _dt
                 if ov_states_a is not None:
                     ov_states_a[y] = color_deleted
             elif diff_id == df.B_SYMBOL_ADD:
@@ -3338,7 +3433,11 @@ class Command:
                 else:
                     _lst.append(_tup)
                 if prof_on:
-                    _end('paint:attr', _t0)
+                    _dt = _perf() - _t0
+                    _attr_dt += _dt
+                    _attr_n += 1
+                    if _dt > _attr_max:
+                        _attr_max = _dt
                 if ov_states_b is not None:
                     ov_states_b[y] = color_added
             elif diff_id == df.A_LINE_CHANGE:
@@ -3409,7 +3508,11 @@ class Command:
                     total_visual = self._sum_visual_rows(
                         wrap_counts_b, b_start, b_end)
                     if prof_on:
-                        _end('paint:wrap_calc', _t0)
+                        _dt = _perf() - _t0
+                        _wc_dt += _dt
+                        _wc_n += 1
+                        if _dt > _wc_max:
+                            _wc_max = _dt
                         _t0 = _perf()
                     self._add_raw_gap(a_ed, a_line_after - 1,
                                       total_visual * line_h_a, color_gaps)
@@ -3435,7 +3538,11 @@ class Command:
                     total_visual = self._sum_visual_rows(
                         wrap_counts_a, a_start, a_end)
                     if prof_on:
-                        _end('paint:wrap_calc', _t0)
+                        _dt = _perf() - _t0
+                        _wc_dt += _dt
+                        _wc_n += 1
+                        if _dt > _wc_max:
+                            _wc_max = _dt
                         _t0 = _perf()
                     self._add_raw_gap(b_ed, b_line_after - 1,
                                       total_visual * line_h_b, color_gaps)
@@ -3465,7 +3572,11 @@ class Command:
                     total_visual = self._sum_visual_rows(
                         wrap_counts_b, b_start, b_end)
                     if prof_on:
-                        _end('paint:wrap_calc', _t0)
+                        _dt = _perf() - _t0
+                        _wc_dt += _dt
+                        _wc_n += 1
+                        if _dt > _wc_max:
+                            _wc_max = _dt
                         _t0 = _perf()
                     self._add_raw_gap(a_ed, a_line_after - 1,
                                       total_visual * line_h_a,
@@ -3493,7 +3604,11 @@ class Command:
                     total_visual = self._sum_visual_rows(
                         wrap_counts_a, a_start, a_end)
                     if prof_on:
-                        _end('paint:wrap_calc', _t0)
+                        _dt = _perf() - _t0
+                        _wc_dt += _dt
+                        _wc_n += 1
+                        if _dt > _wc_max:
+                            _wc_max = _dt
                         _t0 = _perf()
                     self._add_raw_gap(b_ed, b_line_after - 1,
                                       total_visual * line_h_b,
@@ -3541,6 +3656,10 @@ class Command:
         # while 'refresh:compare_and_paint' is still open, so they nest
         # under it (its self time excludes them — they are its children).
         if prof_on:
+            if _attr_n:
+                Profiler.mark('paint:attr', _attr_dt, _attr_n, _attr_max)
+            if _wc_n:
+                Profiler.mark('paint:wrap_calc', _wc_dt, _wc_n, _wc_max)
             for _cat, _rec in _stats.items():
                 Profiler.mark(_cat, _rec[0], _rec[1], _rec[2])
         Profiler.stop('refresh:compare_and_paint')
@@ -3642,9 +3761,14 @@ class Command:
             # visual heights. Without this, each line is counted as 1
             # visual row, causing desync when wrapping is on (lines
             # that wrap to 2+ rows have more visual height than 1).
-            if wrap_on:
+            if wrap_on and job.align_gap_events:
                 overview.set_wrap_counts(wrap_counts_a, wrap_counts_b)
             else:
+                # Wrap off, or all wrap counts are 1 (nothing actually
+                # wraps -- the same condition that cleared
+                # align_gaps): None selects the IDENTICAL one-row-per-
+                # line layout without building the 1M-entry prefix-sum
+                # list per side.
                 overview.set_wrap_counts(None, None)
             overview.repaint_static()
             Profiler.stop('paint:overview')
@@ -4366,7 +4490,16 @@ class Command:
             return counts
         if not info:
             return counts
-        # FAST path: the API contract is a list of {'line': <int>}
+        # FAST path: wrapinfo carries ONE ENTRY PER VISUAL ROW and every
+        # line occupies at least one row, so len(info) == line_count
+        # means every line has EXACTLY one visual row -- the [1]*n
+        # default IS the final answer. Skips the Counter pass below
+        # (~0.5s per 1M-row editor with the cProfile layer on) and is
+        # precisely the no-wrapping case the ALIGN-suppression check
+        # in refresh_compare then detects via max(counts) == 1.
+        if len(info) == line_count:
+            return counts
+        # Counter path: the API contract is a list of {'line': <int>}
         # dicts, one entry per VISUAL row (a line wrapping to 2 rows
         # appears twice). Counter over map(itemgetter) is a single
         # C-speed pass; the interpreted per-row loop it replaces cost
