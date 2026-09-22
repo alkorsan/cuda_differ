@@ -621,10 +621,29 @@ def cancel_profiling(pr):
     enabled Profile keeps tracing the main thread until something else
     replaces it, so every abandonment path must turn it off. No-op for
     None and for an already-disabled Profile (after a normal epilogue
-    stopped the same pr, this is a harmless second disable)."""
+    stopped the same pr, this is a harmless second disable).
+
+    Accepts EITHER the bare cProfile.Profile OR the (pr, s) pair that
+    start_profiling() returns: every caller stores the PAIR (job
+    attribute 'cprofile', refresh_compare's _cprof). Passing the pair
+    used to raise "'tuple' object has no attribute 'disable'", which
+    aborted _cancel_job BEFORE DIF_CANCEL reached the engine -- the
+    cancel command then had no effect and the background batch ran to
+    its natural end."""
     if pr is None:
         return
+    if isinstance(pr, (tuple, list)):
+        # start_profiling() returns (pr, s); unpack to the Profile.
+        # An empty sequence degrades to the None no-op above.
+        pr = pr[0] if pr else None
+        if pr is None:
+            return
     try:
         pr.disable()
     except ValueError:
+        # Already disabled by the epilogue's stop: harmless.
+        pass
+    except AttributeError:
+        # Not a Profile at all (wrong object stored): profiling
+        # cleanup must never break the cancel path around it.
         pass
