@@ -654,8 +654,19 @@ class Differ:
         self._char_ops_pos = 0
         self._skip_align = False  # collect emits no events; never leak a
         # stale ALIGN-suppression flag into the following walk.
+        # The split is profiled under the SAME tag the legacy
+        # compare_lists path uses ('compare:split_lines'): in the
+        # two-phase flow the split runs HERE, and before this row was
+        # added its cost (~2x 70-380ms per 50MB side, depending on the
+        # terminator mix -- see utils.split_lines_safe's fast paths)
+        # silently inflated 'compare:collect_pairs' SELF, making the
+        # row look like slow pair-recording when half of it was line
+        # splitting. Same-tag instrumentation keeps the row comparable
+        # across the sync / collect / replay code paths.
+        Profiler.start('compare:split_lines')
         self._lines_a = split_lines_safe(a_text)
         self._lines_b = split_lines_safe(b_text)
+        Profiler.stop('compare:split_lines')
         pairs = []
         self._char_pairs_pending = pairs
         try:
