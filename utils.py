@@ -71,6 +71,41 @@ def split_lines_safe(text: str) -> tp.List[str]:
     """
     if not text:
         return []
+
+    # ---- fast path 1: pure-LF text (no CR at all) ----
+    # str.split's last element is '' iff the text ends with the
+    # separator: that phantom is the "nothing after the final
+    # terminator", not a line -- drop it, then re-attach the terminator
+    # every remaining piece DID have. Byte-identical to the regex walk
+    # below for every CR-free input (test_split_lines_fast.py).
+    if '\r' not in text:
+        parts = text.split('\n')
+        if parts[-1] == '':
+            parts.pop()
+            return [p + '\n' for p in parts]
+        # no trailing terminator: every piece but the last owns one
+        if len(parts) == 1:
+            return [text]
+        return [p + '\n' for p in parts[:-1]] + [parts[-1]]
+
+    # ---- fast path 2: CRLF-only text ----
+    # Safe only when NO lone CR and NO lone LF exists (every '\r' starts
+    # a '\r\n' and every '\n' ends one): splitting on '\r\n' then finds
+    # exactly the terminator boundaries. Three C-speed count() scans
+    # decide; mixed-terminator texts fall through to the regex walk.
+    n_cr = text.count('\r')
+    if n_cr:
+        n_lf = text.count('\n')
+        if n_cr == n_lf and n_cr == text.count('\r\n'):
+            parts = text.split('\r\n')
+            if parts[-1] == '':
+                parts.pop()
+                return [p + '\r\n' for p in parts]
+            if len(parts) == 1:
+                return [text]
+            return [p + '\r\n' for p in parts[:-1]] + [parts[-1]]
+
+    # ---- general path: mixed terminators, regex walk ----
     lines = []
     pos = 0
     for m in _LINE_SPLIT_RE.finditer(text):

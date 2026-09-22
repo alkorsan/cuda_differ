@@ -5,11 +5,24 @@ import json
 import time
 import typing as tp
 from bisect import bisect_left
+from collections import Counter
+from operator import itemgetter
 
 import cudatext as ct
 import cudatext_cmd as ct_cmd
 import cudatext_keys as ct_keys
 import cudax_lib as ctx
+
+# Direct C-API entry point for the bookmark flush (see the paint loop's
+# paint:bookmark section): Editor.bookmark is a thin positional
+# pass-through to this function, and the flush makes one call per
+# changed line -- 1.6M calls on a 1M-line compare. Unavailable in test
+# sandboxes (fake cudatext, no compiled module) -> None -> the flush
+# falls back to the Editor wrapper method.
+try:
+    from cudatext_api import ed_bookmark as _ed_bookmark_api
+except Exception:
+    _ed_bookmark_api = None
 
 from . import differ_native as dfn
 from . import differ_python as dfp
@@ -3227,30 +3240,57 @@ class Command:
             _stats = {}  # category -> [total dt, calls, max dt]
 
             def _end(cat, t0):
-                dt = time.perf_counter() - t0
-                rec = _stats.get(cat)
-                if rec is None:
-                    _stats[cat] = [dt, 1, dt]
-                else:
+                dt = _perf() - t0
+                try:
+                    rec = _stats[cat]
                     rec[0] += dt
                     rec[1] += 1
                     if dt > rec[2]:
                         rec[2] = dt
+                except KeyError:
+                    _stats[cat] = [dt, 1, dt]
+        # Hot-loop bindings: the loop below runs millions of iterations
+        # on big files, so everything it touches more than once per
+        # event is pre-resolved here.
+        _perf = time.perf_counter
+        # The overview's line-state dicts, taken directly (add_line_state
+        # is a trivial dict STORE behind a method call + a string
+        # compare -- 4.8M calls on a 1M-line compare): the loop writes
+        # the same keys the method would, so the painted overview is
+        # byte-identical. add_line_state itself stays for any other
+        # caller.
+        ov_states_a = overview.line_states_a if overview is not None else None
+        ov_states_b = overview.line_states_b if overview is not None else None
+        # Visual-row lookup lengths: wrap_counts_a/b are LISTS whenever
+        # wrap_on (refresh_compare: _get_wrap_counts always returns a
+        # list, possibly empty) -- the inlined _visual_rows below turns
+        # 2 method calls per ALIGN event into plain list indexing.
+        wca_n = len(wrap_counts_a) if wrap_counts_a is not None else 0
+        wcb_n = len(wrap_counts_b) if wrap_counts_b is not None else 0
+        # Per-event pending-dict accessors (setdefault(y, []) allocates
+        # the empty list EVERY call, even for the ~99% of calls where
+        # the key already exists -- get + None check skips that).
+        _ch_a_get = pending_ch_a.get
+        _ch_b_get = pending_ch_b.get
         for d in compare_iter:
             diff_id, y = d[0], d[1]
             if diff_id == df.ALIGN:
                 if wrap_on:
                     a_line, b_line = d[1], d[2]
                     if prof_on:
-                        _t0 = time.perf_counter()
-                    va = self._visual_rows(wrap_counts_a, a_line)
-                    vb = self._visual_rows(wrap_counts_b, b_line)
+                        _t0 = _perf()
+                    # inlined _visual_rows: wrap_counts_* are lists
+                    # whenever wrap_on (see bindings above)
+                    va = (wrap_counts_a[a_line]
+                          if 0 <= a_line < wca_n else 1)
+                    vb = (wrap_counts_b[b_line]
+                          if 0 <= b_line < wcb_n else 1)
                     if prof_on:
                         _end('paint:wrap_calc', _t0)
                     if va > vb:
                         diff_rows = va - vb
                         if prof_on:
-                            _t0 = time.perf_counter()
+                            _t0 = _perf()
                         self._add_raw_gap(b_ed, b_line,
                                           diff_rows * line_h_b, color_gaps)
                         if prof_on:
@@ -3264,7 +3304,7 @@ class Command:
                     elif vb > va:
                         diff_rows = vb - va
                         if prof_on:
-                            _t0 = time.perf_counter()
+                            _t0 = _perf()
                         self._add_raw_gap(a_ed, a_line,
                                           diff_rows * line_h_a, color_gaps)
                         if prof_on:
@@ -3276,93 +3316,101 @@ class Command:
             elif diff_id == df.A_SYMBOL_DEL:
                 n_diff_events += 1
                 if prof_on:
-                    _t0 = time.perf_counter()
-                pending_ch_a.setdefault(y, []).append(
-                    (d[2], d[3], color_deleted))
+                    _t0 = _perf()
+                _tup = (d[2], d[3], color_deleted)
+                _lst = _ch_a_get(y)
+                if _lst is None:
+                    pending_ch_a[y] = [_tup]
+                else:
+                    _lst.append(_tup)
                 if prof_on:
                     _end('paint:attr', _t0)
-                if overview is not None:
-                    overview.add_line_state('a', y, color_deleted)
+                if ov_states_a is not None:
+                    ov_states_a[y] = color_deleted
             elif diff_id == df.B_SYMBOL_ADD:
                 n_diff_events += 1
                 if prof_on:
-                    _t0 = time.perf_counter()
-                pending_ch_b.setdefault(y, []).append(
-                    (d[2], d[3], color_added))
+                    _t0 = _perf()
+                _tup = (d[2], d[3], color_added)
+                _lst = _ch_b_get(y)
+                if _lst is None:
+                    pending_ch_b[y] = [_tup]
+                else:
+                    _lst.append(_tup)
                 if prof_on:
                     _end('paint:attr', _t0)
-                if overview is not None:
-                    overview.add_line_state('b', y, color_added)
+                if ov_states_b is not None:
+                    ov_states_b[y] = color_added
             elif diff_id == df.A_LINE_CHANGE:
                 n_diff_events += 1
                 pending_bkm_a.append((y, NKIND_CHANGED))
                 if micromap_on:
                     if prof_on:
-                        _t0 = time.perf_counter()
+                        _t0 = _perf()
                     pending_mm_a[y] = color_changed
                     if prof_on:
                         _end('paint:micromap', _t0)
-                if overview is not None:
-                    overview.add_line_state('a', y, color_changed)
+                if ov_states_a is not None:
+                    ov_states_a[y] = color_changed
             elif diff_id == df.B_LINE_CHANGE:
                 n_diff_events += 1
                 pending_bkm_b.append((y, NKIND_CHANGED))
                 if micromap_on:
                     if prof_on:
-                        _t0 = time.perf_counter()
+                        _t0 = _perf()
                     pending_mm_b[y] = color_changed
                     if prof_on:
                         _end('paint:micromap', _t0)
-                if overview is not None:
-                    overview.add_line_state('b', y, color_changed)
+                if ov_states_b is not None:
+                    ov_states_b[y] = color_changed
             elif diff_id == df.A_DECOR_RED:
                 n_diff_events += 1
-                if overview is not None:
-                    overview.add_line_state('a', y, color_deleted)
+                if ov_states_a is not None:
+                    ov_states_a[y] = color_deleted
             elif diff_id == df.A_DECOR_YELLOW:
                 n_diff_events += 1
-                if overview is not None:
-                    overview.add_line_state('a', y, color_changed)
+                if ov_states_a is not None:
+                    ov_states_a[y] = color_changed
             elif diff_id == df.B_DECOR_GREEN:
                 n_diff_events += 1
-                if overview is not None:
-                    overview.add_line_state('b', y, color_added)
+                if ov_states_b is not None:
+                    ov_states_b[y] = color_added
             elif diff_id == df.B_DECOR_YELLOW:
                 n_diff_events += 1
-                if overview is not None:
-                    overview.add_line_state('b', y, color_changed)
+                if ov_states_b is not None:
+                    ov_states_b[y] = color_changed
             elif diff_id == df.A_LINE_DEL:
                 n_diff_events += 1
                 pending_bkm_a.append((y, NKIND_DELETED))
                 if micromap_on:
                     if prof_on:
-                        _t0 = time.perf_counter()
+                        _t0 = _perf()
                     pending_mm_a[y] = color_deleted
                     if prof_on:
                         _end('paint:micromap', _t0)
-                if overview is not None:
-                    overview.add_line_state('a', y, color_deleted)
+                if ov_states_a is not None:
+                    ov_states_a[y] = color_deleted
             elif diff_id == df.B_LINE_ADD:
                 n_diff_events += 1
                 pending_bkm_b.append((y, NKIND_ADDED))
                 if micromap_on:
                     if prof_on:
-                        _t0 = time.perf_counter()
+                        _t0 = _perf()
                     pending_mm_b[y] = color_added
                     if prof_on:
                         _end('paint:micromap', _t0)
-                if overview is not None:
-                    overview.add_line_state('b', y, color_added)
+                if ov_states_b is not None:
+                    ov_states_b[y] = color_added
             elif diff_id == df.A_GAP:
                 a_line_after, b_start, b_end = d[1], d[2], d[3]
                 if wrap_on:
                     if prof_on:
-                        _t0 = time.perf_counter()
+                        _t0 = _perf()
                     total_visual = self._sum_visual_rows(
                         wrap_counts_b, b_start, b_end)
                     if prof_on:
                         _end('paint:wrap_calc', _t0)
-                        _t0 = time.perf_counter()
+                        _t0 = _perf()
                     self._add_raw_gap(a_ed, a_line_after - 1,
                                       total_visual * line_h_a, color_gaps)
                     if prof_on:
@@ -3373,7 +3421,7 @@ class Command:
                         overview.add_gap('a', a_line_after, total_visual)
                 else:
                     if prof_on:
-                        _t0 = time.perf_counter()
+                        _t0 = _perf()
                     self.set_gap(a_ed, a_line_after, b_end - b_start)
                     if prof_on:
                         _end('paint:gap', _t0)
@@ -3383,12 +3431,12 @@ class Command:
                 b_line_after, a_start, a_end = d[1], d[2], d[3]
                 if wrap_on:
                     if prof_on:
-                        _t0 = time.perf_counter()
+                        _t0 = _perf()
                     total_visual = self._sum_visual_rows(
                         wrap_counts_a, a_start, a_end)
                     if prof_on:
                         _end('paint:wrap_calc', _t0)
-                        _t0 = time.perf_counter()
+                        _t0 = _perf()
                     self._add_raw_gap(b_ed, b_line_after - 1,
                                       total_visual * line_h_b, color_gaps)
                     if prof_on:
@@ -3397,7 +3445,7 @@ class Command:
                         overview.add_gap('b', b_line_after, total_visual)
                 else:
                     if prof_on:
-                        _t0 = time.perf_counter()
+                        _t0 = _perf()
                     self.set_gap(b_ed, b_line_after, a_end - a_start)
                     if prof_on:
                         _end('paint:gap', _t0)
@@ -3413,12 +3461,12 @@ class Command:
                 a_line_after, b_start, b_end = d[1], d[2], d[3]
                 if wrap_on:
                     if prof_on:
-                        _t0 = time.perf_counter()
+                        _t0 = _perf()
                     total_visual = self._sum_visual_rows(
                         wrap_counts_b, b_start, b_end)
                     if prof_on:
                         _end('paint:wrap_calc', _t0)
-                        _t0 = time.perf_counter()
+                        _t0 = _perf()
                     self._add_raw_gap(a_ed, a_line_after - 1,
                                       total_visual * line_h_a,
                                       color_ignored_gap, tag=IGN_GAP_TAG)
@@ -3429,7 +3477,7 @@ class Command:
                                          ignored=True)
                 else:
                     if prof_on:
-                        _t0 = time.perf_counter()
+                        _t0 = _perf()
                     self.set_gap(a_ed, a_line_after, b_end - b_start,
                                  color=color_ignored_gap, tag=IGN_GAP_TAG)
                     if prof_on:
@@ -3441,12 +3489,12 @@ class Command:
                 b_line_after, a_start, a_end = d[1], d[2], d[3]
                 if wrap_on:
                     if prof_on:
-                        _t0 = time.perf_counter()
+                        _t0 = _perf()
                     total_visual = self._sum_visual_rows(
                         wrap_counts_a, a_start, a_end)
                     if prof_on:
                         _end('paint:wrap_calc', _t0)
-                        _t0 = time.perf_counter()
+                        _t0 = _perf()
                     self._add_raw_gap(b_ed, b_line_after - 1,
                                       total_visual * line_h_b,
                                       color_ignored_gap, tag=IGN_GAP_TAG)
@@ -3457,7 +3505,7 @@ class Command:
                                          ignored=True)
                 else:
                     if prof_on:
-                        _t0 = time.perf_counter()
+                        _t0 = _perf()
                     self.set_gap(b_ed, b_line_after, a_end - a_start,
                                  color=color_ignored_gap, tag=IGN_GAP_TAG)
                     if prof_on:
@@ -3473,21 +3521,21 @@ class Command:
                 # differences found").
                 if micromap_on:
                     if prof_on:
-                        _t0 = time.perf_counter()
+                        _t0 = _perf()
                     pending_mm_a[y] = color_ignored
                     if prof_on:
                         _end('paint:micromap', _t0)
-                if overview is not None:
-                    overview.add_line_state('a', y, color_ignored)
+                if ov_states_a is not None:
+                    ov_states_a[y] = color_ignored
             elif diff_id == df.B_LINE_IGN:
                 if micromap_on:
                     if prof_on:
-                        _t0 = time.perf_counter()
+                        _t0 = _perf()
                     pending_mm_b[y] = color_ignored
                     if prof_on:
                         _end('paint:micromap', _t0)
-                if overview is not None:
-                    overview.add_line_state('b', y, color_ignored)
+                if ov_states_b is not None:
+                    ov_states_b[y] = color_ignored
 
         # Book the per-operation paint rows collected inside the loop,
         # while 'refresh:compare_and_paint' is still open, so they nest
@@ -3525,14 +3573,34 @@ class Command:
         Profiler.start('paint:bookmark')
         pending_bkm_a.sort()
         pending_bkm_b.sort()
-        for row, nk in pending_bkm_a:
-            a_ed.bookmark(ct.BOOKMARK2_APPEND, row,
-                          nkind=nk, text='', auto_del=True,
-                          show=False, tag=DIFF_TAG)
-        for row, nk in pending_bkm_b:
-            b_ed.bookmark(ct.BOOKMARK2_APPEND, row,
-                          nkind=nk, text='', auto_del=True,
-                          show=False, tag=DIFF_TAG)
+        # Direct C-API when available: Editor.bookmark is a thin
+        # positional pass-through to cudatext_api.ed_bookmark, and this
+        # flush makes one call per changed line (1.6M on a 1M-line
+        # compare -- the wrapper layer alone was ~0.5s there). The
+        # fallback keeps the Editor wrapper (test sandboxes fake the
+        # editor without an .h handle; hosts without a reachable
+        # cudatext_api module).
+        _bkm = _ed_bookmark_api
+        h_a = getattr(a_ed, 'h', None)
+        h_b = getattr(b_ed, 'h', None)
+        if _bkm is not None and h_a is not None:
+            for row, nk in pending_bkm_a:
+                _bkm(h_a, ct.BOOKMARK2_APPEND, row, nk, -1, '',
+                     True, False, DIFF_TAG)
+        else:
+            for row, nk in pending_bkm_a:
+                a_ed.bookmark(ct.BOOKMARK2_APPEND, row,
+                              nkind=nk, text='', auto_del=True,
+                              show=False, tag=DIFF_TAG)
+        if _bkm is not None and h_b is not None:
+            for row, nk in pending_bkm_b:
+                _bkm(h_b, ct.BOOKMARK2_APPEND, row, nk, -1, '',
+                     True, False, DIFF_TAG)
+        else:
+            for row, nk in pending_bkm_b:
+                b_ed.bookmark(ct.BOOKMARK2_APPEND, row,
+                              nkind=nk, text='', auto_del=True,
+                              show=False, tag=DIFF_TAG)
         Profiler.stop('paint:bookmark')
 
         # Apply the collected markers WINDOWED around the editors'
@@ -4298,6 +4366,28 @@ class Command:
             return counts
         if not info:
             return counts
+        # FAST path: the API contract is a list of {'line': <int>}
+        # dicts, one entry per VISUAL row (a line wrapping to 2 rows
+        # appears twice). Counter over map(itemgetter) is a single
+        # C-speed pass; the interpreted per-row loop it replaces cost
+        # ~2.5s (cProfile-on) for two 1M-row editors. ANY deviation from
+        # the contract (non-dict row, missing 'line' key) raises and
+        # falls back to the original tolerant loop, whose skip
+        # semantics are preserved verbatim below.
+        try:
+            rows = Counter(map(itemgetter('line'), info))
+        except (TypeError, KeyError):
+            rows = None
+        if rows is not None:
+            if rows:
+                for line, n in rows.items():
+                    # out-of-range / negative lines are skipped, exactly
+                    # like the tolerant loop; n is always > 0 in a Counter.
+                    if 0 <= line < line_count:
+                        counts[line] = n
+            return counts
+        # Tolerant fallback (original loop): non-dict rows skipped,
+        # missing 'line' treated as -1 -> skipped by the bounds check.
         temp = [0] * line_count
         for item in info:
             if isinstance(item, dict):

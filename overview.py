@@ -193,6 +193,7 @@ Architecture:
 
 import time
 from itertools import accumulate
+from operator import itemgetter
 
 import cudatext as ct
 import cudatext_cmd as ct_cmd
@@ -1072,10 +1073,12 @@ class PaintboxOverview:
         if cum is None or gap_map is None:
             cum, _total, gap_map = self._prefix_sums(side)
 
-        def line_rows(i):
-            if wrap is not None and 0 <= i < len(wrap) and wrap[i] > 0:
-                return wrap[i]
-            return 1
+        # Inlined line_rows() (was one FUNCTION CALL per state line --
+        # 1.6M calls on a 1M-line compare): line >= 0 is guaranteed by
+        # the range filter below, so the wrap lookup is a plain index.
+        # wrap[i] > 0 -> i rows, else 1 -- same as the original method.
+        wl = len(wrap) if wrap is not None else 0
+        wrap_hot = wrap if wl else None
 
         # Line runs: consecutive same-colored lines merge while they are
         # visually adjacent (line == prev+1 AND no gap before this line).
@@ -1084,7 +1087,13 @@ class PaintboxOverview:
         for line, color in sorted(states.items()):
             if line < 0 or line >= n:
                 continue
-            end_row = cum[line] + line_rows(line)
+            if wrap_hot is not None and line < wl:
+                rows = wrap[line]
+                if rows < 1:
+                    rows = 1
+            else:
+                rows = 1
+            end_row = cum[line] + rows
             if (runs and line == prev_line + 1
                     and line not in gap_map
                     and runs[-1][2] == color):
@@ -1121,9 +1130,10 @@ class PaintboxOverview:
         # Merge both ascending streams by start row; a gap before line i
         # ends where line i starts, so ties cannot happen between a run
         # and a gap. The sort is stable, keeping a gap's split portions
-        # in their emitted (ignored, then regular) order.
+        # in their emitted (ignored, then regular) order. itemgetter(0)
+        # extracts the same key the lambda did, at C speed.
         segments = gap_segs + [tuple(r) for r in runs]
-        segments.sort(key=lambda seg: seg[0])
+        segments.sort(key=itemgetter(0))
         return segments
 
     def _paint_side_segments(self, c, side, x_start, x_end, y0, track_h):
