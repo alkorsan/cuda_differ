@@ -1006,10 +1006,20 @@ class Differ:
             eng_dt = 0.0
             eng_n = 0
             eng_max = 0.0
+        # COLLECT pass: every event appended to `out` here is drained and
+        # DISCARDED by collect_char_pairs (only the pair RECORD order
+        # matters), so building the ALIGN / A_LINE_CHANGE / B_LINE_CHANGE
+        # tuples per pair is dead work -- ~2 tuple allocations + a method
+        # call per pair on 1M-line compares. The pairing DECISIONS and the
+        # _char_diff record calls run exactly as before (the record order
+        # stays identical); only the discarded writes are skipped. The
+        # replay pass (not collecting) still emits the full event set.
+        collecting = self._char_pairs_pending is not None
         for k in range(count):
             ai, bj = alo + k, blo + k
             if a[ai] == b[bj]:
-                append((ALIGN, ai, bj))
+                if not collecting:
+                    append((ALIGN, ai, bj))
             else:
                 if prof_on:
                     t0 = time.perf_counter()
@@ -1021,8 +1031,9 @@ class Differ:
                         eng_max = dt
                 else:
                     ops = char_diff_call(a[ai], b[bj])
-                self._char_diff_pair_events(out, ai, bj, ops)
-                append((ALIGN, ai, bj))
+                if not collecting:
+                    self._char_diff_pair_events(out, ai, bj, ops)
+                    append((ALIGN, ai, bj))
         if prof_on and eng_n:
             Profiler.mark(row, eng_dt, eng_n, eng_max)
 
@@ -1325,7 +1336,8 @@ class Differ:
         # Process the best pair itself
         a_line, b_line = a[best_i], b[best_j]
         if a_line == b_line:
-            out.append((ALIGN, best_i, best_j))
+            if self._char_pairs_pending is None:
+                out.append((ALIGN, best_i, best_j))
         else:
             if _time_engine:
                 _t0 = time.perf_counter()
@@ -1334,8 +1346,13 @@ class Differ:
                 Profiler.mark(self._CHAR_ROW, dt, 1, dt)
             else:
                 ops = self._char_diff(a_line, b_line)
-            self._char_diff_pair_events(out, best_i, best_j, ops)
-            out.append((ALIGN, best_i, best_j))
+            # COLLECT pass: the pair events are drained and discarded by
+            # collect_char_pairs (same dead-write skip as
+            # _positional_pairs_events) -- the record call above already
+            # did the work that matters.
+            if self._char_pairs_pending is None:
+                self._char_diff_pair_events(out, best_i, best_j, ops)
+                out.append((ALIGN, best_i, best_j))
 
         # Recurse on the part after the best pair
         self._find_best_pairs_events(out, a, best_i + 1, ahi,
