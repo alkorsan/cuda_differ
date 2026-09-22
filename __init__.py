@@ -81,6 +81,53 @@ def _chunk_events(ev_iter, chunk=4096):
         yield buf
 
 
+def _timed_produce(list_iter):
+    """Yield the source's event LISTS unchanged, with each fetch wrapped
+    in a 'compare:produce' section -- the PRODUCTION/DISPATCH split of
+    the paint loop.
+
+    Why this exists: 'refresh:compare_and_paint' wraps the whole
+    consumption loop, and its SELF time used to mix two different
+    jobs -- the walk's event PRODUCTION (generator/walk time: opcode
+    iteration, tuple construction, replay pops) and the consumer's
+    DISPATCH (branch ladder + pending-list collection). Both are real
+    work, but they have different fixes (production belongs to the
+    differ, dispatch to the consumer), so a report that merges them
+    answers neither question. This wrapper measures each fetch -- the
+    stretch during which the walk actually RUNS -- as its own section,
+    and the dispatch between two fetches stays in the enclosing
+    section's self.
+
+    Discipline (see profiling.py, point 4 / compare_lists's NOTE): the
+    produce section opens and closes AROUND THE FETCH ONLY, never
+    across the yield. While the consumer dispatches a list, this
+    generator is suspended at 'yield evs' with NO section open, so the
+    dispatch time cannot be booked into 'compare:produce'. The walk's
+    own per-chunk sections (compare:positional_pairs /
+    compare:find_best_pairs) open during the fetch and therefore nest
+    UNDER produce: the tree reads
+
+        refresh:compare_and_paint
+            compare:produce            (per event-list fetch)
+                compare:positional_pairs / find_best_pairs (walk chunks)
+            paint:attr / paint:gap / paint:micromap / wrap_calc (marks)
+            <SELF = pure dispatch: branch ladder + collection>
+
+    'produce' SELF = the walk's non-chunked work: trivial-tag loops
+    (equal/delete/insert), the replay pops, generator machinery.
+
+    Only used while the section profiler is enabled (the consumer
+    bypasses it otherwise -- chain.from_iterable straight over the
+    source, zero added calls on the clean path)."""
+    while True:
+        Profiler.start('compare:produce')
+        evs = next(list_iter, None)
+        Profiler.stop('compare:produce')
+        if evs is None:
+            return
+        yield evs
+
+
 # Marker windowing: lines above/below the viewport that stay colored in
 # the editors. The compare no longer adds ALL diff markers to the editors
 # — every ed.attr(MARKERS_ADD) call costs a sorted-list insert AND an
@@ -2420,17 +2467,31 @@ class Command:
         if not state:
             return
         job.editor_lock = None  # idempotency guard: release exactly once
-        for half, e in (('a', job.a_ed), ('b', job.b_ed)):
-            if half not in state:
-                continue
-            try:
-                e.set_prop(ct.PROP_RO, state[half])
-            except Exception:
-                pass
-            try:
-                e.action(ct.EDACTION_UNLOCK)
-            except Exception:
-                pass  # dead handle: the tab is already gone
+        # Profiled as its own row: EDACTION_UNLOCK triggers the one
+        # big final repaint of both halves (under the whole-compare
+        # paint lock every attr/gap/bookmark invalidation was deferred
+        # -- the unlock flushes it all in one pass). In the normal
+        # completion path this runs AFTER 'refresh' has closed (its
+        # row appears as a sibling top-level row, still inside the
+        # compare's wall time); on the cancel paths it nests under
+        # whatever section is open. Without the row this repaint cost
+        # is invisible -- it looked like time 'outside' the profiled
+        # tree entirely.
+        Profiler.start('refresh:release_editors')
+        try:
+            for half, e in (('a', job.a_ed), ('b', job.b_ed)):
+                if half not in state:
+                    continue
+                try:
+                    e.set_prop(ct.PROP_RO, state[half])
+                except Exception:
+                    pass
+                try:
+                    e.action(ct.EDACTION_UNLOCK)
+                except Exception:
+                    pass  # dead handle: the tab is already gone
+        finally:
+            Profiler.stop('refresh:release_editors')
 
     def _cancel_job(self, job):
         """Cancel one in-flight background compare job: mark it stale (so
@@ -3243,10 +3304,21 @@ class Command:
             # 2+ rows, see refresh_compare) additionally skips the
             # ~1M ALIGN events whose consumer branch would be a
             # no-op.
-            compare_iter = chain.from_iterable(diff.compare_lists(
+            #
+            # PROFILING: with the section profiler on, _timed_produce
+            # wraps each fetch in a 'compare:produce' section so the
+            # report separates the walk's PRODUCTION time from the
+            # consumer's DISPATCH time (which stays in
+            # refresh:compare_and_paint's self). Bypassed when
+            # profiling is off -- chain straight over the source, no
+            # added calls on the clean path.
+            _lists = diff.compare_lists(
                 job.a_text, job.b_text,
                 opcodes=opcodes, char_ops=char_ops,
-                align_gap_events=job.align_gap_events))
+                align_gap_events=job.align_gap_events)
+            if Profiler.enabled:
+                _lists = _timed_produce(_lists)
+            compare_iter = chain.from_iterable(_lists)
             # RELEASE the job's refs to the raw texts now that the
             # generator has its own (param) refs. The native generator
             # splits the texts into line lists inside compare_lists()
@@ -3268,9 +3340,14 @@ class Command:
             # Pure-Python Differ: flat per-event generator, batched
             # into bounded lists by _chunk_events so the consumption
             # path below is the SAME chain.from_iterable for both
-            # differs.
-            compare_iter = chain.from_iterable(
-                _chunk_events(diff.compare(job.lines_a, job.lines_b)))
+            # differs. _timed_produce (profiling on) wraps the fetches
+            # in 'compare:produce' sections -- same split as the
+            # native path above.
+            _lists = _chunk_events(
+                diff.compare(job.lines_a, job.lines_b))
+            if Profiler.enabled:
+                _lists = _timed_produce(_lists)
+            compare_iter = chain.from_iterable(_lists)
             job.lines_a = None
             job.lines_b = None
         # Colors are read ONCE here, not per event (the loop below runs
@@ -3307,7 +3384,20 @@ class Command:
         # single op). Same row names as the old report — honest numbers
         # now: no frame-stack push/pop per event and no attribution
         # lies. Zero cost when profiling is off.
-        prof_on = Profiler.enabled
+        # Per-op timing (the _perf pairs + _end/inline accumulators that
+        # feed the paint:attr / paint:gap / paint:micromap /
+        # paint:wrap_calc rows) runs ONLY when the cProfile layer is
+        # OFF. Under cProfile every _perf()/_end() call is itself a
+        # TRACED call (~1-2us each; a 1M-line compare times millions of
+        # ops = seconds of pure observer effect), and the resulting
+        # rows are inflated 2-3x anyway (profiling.report's banner says
+        # so). With both layers on, the per-op rows are simply absent:
+        # their time stays in refresh:compare_and_paint's SELF, where
+        # it runs -- and 'compare:produce' (section-based, cheap, kept
+        # under cProfile) still separates production from dispatch.
+        # job.cprofile is the (pr, s) pair refresh_compare started, or
+        # None when the layer is off.
+        prof_on = Profiler.enabled and job.cprofile is None
         if prof_on:
             _stats = {}  # COLD categories -> [total dt, calls, max dt]
 
@@ -4476,8 +4566,15 @@ class Command:
         # Force CudaText to refresh its internal WrapInfo structure before
         # we query it. After text changes CudaText usually detects the
         # change automatically, but not always -- EDACTION_UPDATE with
-        # param1="1" forces it.
-        ed.action(ct.EDACTION_UPDATE, "1")
+        # param1="1" forces it. Profiled as its own row: this editor
+        # action is NOT cheap -- it forces the wrap recalculation AND a
+        # repaint (on Windows EDACTION_UPDATE maps to Ed.Repaint,
+        # SYNCHRONOUS), so on a 1M-line compare this two-line action
+        # can cost real time that otherwise hides inside
+        # refresh:wrap_counts' self and looks like unexplained Python
+        # work.
+        with Profiler.section('refresh:wrapinfo_update'):
+            ed.action(ct.EDACTION_UPDATE, "1")
         # get_wrapinfo is profiled as its own sub-row: on a 1M-line
         # compare the two calls (one per editor) cost ~4.9s -- the
         # single most expensive editor API of the whole refresh. Without
