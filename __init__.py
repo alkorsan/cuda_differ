@@ -2415,22 +2415,14 @@ class Command:
             diff = self._session_diff(job.session)
             if isinstance(diff, dfn.Differ):
                 diff.drop_cached_state()
-        # Close the engine-wait profiling pair: a cancelled compare's
-        # completion callback never fires, so this is the ONLY place the
-        # pair is closed for cancels (tab close / app exit / save /
-        # cancel commands). Token-guarded no-op when the callback (or a
-        # newer kick-off's reset) already handled it.
-        Profiler.stop_async_pair(job.profiler_async_token)
-        job.profiler_async_token = None
-        # Same for the CHAR batch's wait pair (two-phase compares: the
-        # line phase may already be done when the cancel arrives).
-        Profiler.stop_async_pair(job.char_profiler_token)
-        job.char_profiler_token = None
-        # A cancelled compare's epilogue never runs: disable the
-        # cProfile layer without printing (an enabled Profile would
-        # keep tracing the main thread).
-        cancel_profiling(job.cprofile)
-        job.cprofile = None
+        # CRITICAL PATH FIRST: the engine must learn about the cancel
+        # (DIF_CANCEL) and the editors must become editable again no
+        # matter what the diagnostic-only profiling cleanup below does.
+        # Before this ordering, a raise in that cleanup (the (pr, s)
+        # tuple bug: cancel_profiling received job.cprofile's PAIR, not
+        # the Profile) skipped DIF_CANCEL entirely -- the 'cancel
+        # compare' command had no effect and the background batch ran
+        # to its natural end.
         self._release_compare_editors(job)
         if job.job_handle:
             dfn.cancel_async_line_diff(job.job_handle)
@@ -2441,6 +2433,32 @@ class Command:
             # alike; the engine re-checks the flag between pairs).
             dfn.cancel_async_char_diff(job.char_job_handle)
             job.char_job_handle = 0
+        # Best-effort diagnostic cleanup (token-guarded no-ops after a
+        # late callback already closed them): a raise here must never
+        # abort the cancel -- the engine jobs and the editors are
+        # already handled above.
+        try:
+            # Close the engine-wait profiling pair: a cancelled
+            # compare's completion callback never fires, so this is the
+            # ONLY place the pair is closed for cancels (tab close /
+            # app exit / save / cancel commands). Token-guarded no-op
+            # when the callback (or a newer kick-off's reset) already
+            # handled it.
+            Profiler.stop_async_pair(job.profiler_async_token)
+            # Same for the CHAR batch's wait pair (two-phase compares:
+            # the line phase may already be done when the cancel
+            # arrives).
+            Profiler.stop_async_pair(job.char_profiler_token)
+            # A cancelled compare's epilogue never runs: disable the
+            # cProfile layer without printing (an enabled Profile would
+            # keep tracing the main thread).
+            cancel_profiling(job.cprofile)
+        except Exception:
+            import traceback
+            traceback.print_exc()
+        job.profiler_async_token = None
+        job.char_profiler_token = None
+        job.cprofile = None
 
     def cancel_compare(self):
         """Command: cancel the in-flight background compare for the
