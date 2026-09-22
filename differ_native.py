@@ -509,6 +509,13 @@ class Differ:
         # cleared by drop_cached_state() on the abandonment paths.
         self._lines_a = None
         self._lines_b = None
+        # ALIGN-event suppression flag of the CURRENT walk (set by
+        # compare_lists from its align_gap_events parameter; False =
+        # historical full stream). The walk's producers read it to
+        # skip emitting ALIGN tuples the consumer would ignore anyway
+        # (see compare_lists's docstring). Reset at the walk's end and
+        # on every abandonment path, like the fields above.
+        self._skip_align = False
 
     # Very-long-line guard (chars, not bytes): a pair with either side
     # over this limit skips the engine entirely and renders as a
@@ -645,6 +652,8 @@ class Differ:
         # replay pass) must never leak into this collect pass.
         self._char_ops = None
         self._char_ops_pos = 0
+        self._skip_align = False  # collect emits no events; never leak a
+        # stale ALIGN-suppression flag into the following walk.
         self._lines_a = split_lines_safe(a_text)
         self._lines_b = split_lines_safe(b_text)
         pairs = []
@@ -675,12 +684,39 @@ class Differ:
         self._char_ops = None
         self._char_ops_pos = 0
         self._char_pairs_pending = None
+        self._skip_align = False
 
-    def compare(self, a_text, b_text, opcodes=None, char_ops=None):
-        """Generator that yields diff events for side-by-side display.
+    def compare(self, a_text, b_text, opcodes=None, char_ops=None,
+                align_gap_events=True):
+        """Generator that yields diff events for side-by-side display,
+        ONE EVENT PER YIELD -- the flat public protocol every existing
+        consumer and test uses.
 
-        Pure translation of the engine's opcodes into paint events —
-        nothing is added, removed or re-paired here.
+        Thin flattening wrapper over compare_lists() (the same walk,
+        yielding the same events as bounded LISTS): `yield from` over
+        each list reproduces the flat stream the monolithic generator
+        produced, in the same order. See compare_lists for the full
+        documentation (engine modes, text ownership, the two-phase
+        collect/replay state machine).
+
+        align_gap_events: False makes the walk skip the per-line ALIGN
+        events (they exist only for the consumer's wrap-gap
+        compensation -- see compare_lists); the flat stream then simply
+        contains no ALIGN tuples while every other event stays
+        identical. Default True keeps the historical stream.
+        """
+        for evlist in self.compare_lists(
+                a_text, b_text, opcodes=opcodes, char_ops=char_ops,
+                align_gap_events=align_gap_events):
+            yield from evlist
+
+    def compare_lists(self, a_text, b_text, opcodes=None, char_ops=None,
+                      align_gap_events=True):
+        """Generator that yields LISTS of diff events (bounded by
+        _TAG_CHUNK / _REPLACE_CHUNK entries) for side-by-side display;
+        the flat per-event protocol is compare(), which flattens these
+        lists. Pure translation of the engine's opcodes into paint
+        events — nothing is added, removed or re-paired here.
 
         The alignment mode (beautify_alignment) only affects how
         unequal-count REPLACE blocks are laid out — see
@@ -733,6 +769,20 @@ class Differ:
                 its ready result. None (default) keeps the legacy
                 per-pair synchronous behavior (collect/replay modes
                 inactive).
+            align_gap_events: True (default) emits the historical full
+                stream, ALIGN events included. False skips every ALIGN
+                event: they exist ONLY so the paint consumer can add
+                compensating gaps for matched pairs that wrap to
+                different visual heights; when the consumer already
+                knows no line wraps to 2+ visual rows
+                (Command.refresh_compare's wrap-count check), each
+                ALIGN would be consumed as a NO-OP -- producing,
+                dispatching and timing ~1M of them on a 1M-line
+                compare is pure overhead. The replay pop positions do
+                not change (pops advance on CHANGED pairs only;
+                ALIGN skipping touches equal pairs and the post-pair
+                ALIGN appends, never the pops), so the collect/replay
+                alignment invariant is unaffected.
 
         NOTE: _realign_opcodes (the VS Code-style post-pass in
         differ_python.py) is NOT applied to native opcodes. Native engines
@@ -771,6 +821,10 @@ class Differ:
         # paths.
         self._char_ops = char_ops
         self._char_ops_pos = 0
+        # ALIGN suppression flag of THIS walk (see the docstring's
+        # align_gap_events paragraph). Reset at the walk's end below,
+        # like the replay fields.
+        self._skip_align = not align_gap_events
 
         self.diffmap = []
         if opcodes is None:
@@ -879,30 +933,59 @@ class Differ:
         # pairing modes a block used); equal/delete/insert/ignore
         # production is trivial tuple loops and stays uninstrumented — its
         # cost lands in the consumer's section, which is where it runs.
+        #
+        # This generator yields LISTS (one per bounded chunk; compare()
+        # flattens them for the flat protocol). The trivial tags build
+        # their lists here with the same _TAG_CHUNK bound, so a 1M-line
+        # 'equal' opcode streams its ALIGNs in bounded pieces instead of
+        # materializing them all at once.
+        skip_align = self._skip_align
         for tag, i1, i2, j1, j2 in opcodes:
             if tag not in ('equal', 'ignore'):
                 # 'ignore' hunks are suppressed differences, not diff
                 # blocks: jump()/copy()/select_current() must skip them.
                 self.diffmap.append([i1, i2, j1, j2])
             if tag == 'equal':
-                # Yield ALIGN for each matched pair so the wrapper can add
-                # compensating gaps when wrap is on.
-                for k in range(i2 - i1):
-                    yield (ALIGN, i1 + k, j1 + k)
+                # ALIGN for each matched pair so the wrapper can add
+                # compensating gaps when wrap is on. Skipped ENTIRELY
+                # when the consumer suppressed ALIGN events
+                # (skip_align): the events would be consumed as no-ops
+                # there (no wrap-height mismatch is possible).
+                if not skip_align:
+                    for k0 in range(i1, i2, self._TAG_CHUNK):
+                        k2 = k0 + self._TAG_CHUNK
+                        if k2 > i2:
+                            k2 = i2
+                        yield [(ALIGN, k, j1 + (k - i1))
+                               for k in range(k0, k2)]
             elif tag == 'delete':
                 # Lines i1..i2-1 in A are deleted; gap in B after line j1-1.
                 # (j1 == j2 for 'delete'.) The gap compensates for A lines
                 # [i1, i2).
-                yield (B_GAP, j1, i1, i2)
+                evs = [(B_GAP, j1, i1, i2)]
+                append = evs.append
                 for y in range(i1, i2):
-                    yield (A_LINE_DEL, y)
+                    append((A_LINE_DEL, y))
+                    if len(evs) >= self._TAG_CHUNK:
+                        yield evs
+                        evs = []
+                        append = evs.append
+                if evs:
+                    yield evs
             elif tag == 'insert':
                 # Lines j1..j2-1 in B are inserted; gap in A after line i1-1.
                 # (i1 == i2 for 'insert'.) The gap compensates for B lines
                 # [j1, j2).
-                yield (A_GAP, i1, j1, j2)
+                evs = [(A_GAP, i1, j1, j2)]
+                append = evs.append
                 for y in range(j1, j2):
-                    yield (B_LINE_ADD, y)
+                    append((B_LINE_ADD, y))
+                    if len(evs) >= self._TAG_CHUNK:
+                        yield evs
+                        evs = []
+                        append = evs.append
+                if evs:
+                    yield evs
             elif tag == 'replace':
                 # Each REPLACE block's events are BUILT into lists (one
                 # list per bounded chunk of pairs) and yielded only after
@@ -911,11 +994,11 @@ class Differ:
                 if self.withdetail:
                     for evlist in self._replace_block_chunks(
                             a_lines, i1, i2, b_lines, j1, j2):
-                        yield from evlist
+                        yield evlist
                 else:
                     for evlist in self._plain_replace_chunks(
                             a_lines, i1, i2, b_lines, j1, j2):
-                        yield from evlist
+                        yield evlist
             elif tag == 'ignore':
                 # Suppressed all-blank hunk (DIFF_IGN_BLANK_LINES) —
                 # a WinMerge-style "ignored difference". NOT counted as
@@ -925,21 +1008,38 @@ class Differ:
                 # ignored gap so lines below stay aligned.
                 da = i2 - i1
                 db = j2 - j1
+                evs = []
+                append = evs.append
                 if da > db:
                     # Side A has extra blank lines: gap in B before line
                     # j2 (after B's hunk lines), compensating A's extra
                     # lines [i1 + db, i2).
-                    yield (B_GAP_IGN, j2, i1 + db, i2)
+                    append((B_GAP_IGN, j2, i1 + db, i2))
                 elif db > da:
                     # Side B has extra blank lines: gap in A before line
                     # i2, compensating B's extra lines [j1 + da, j2).
-                    yield (A_GAP_IGN, i2, j1 + da, j2)
-                for k in range(min(da, db)):
-                    yield (ALIGN, i1 + k, j1 + k)
+                    append((A_GAP_IGN, i2, j1 + da, j2))
+                if not skip_align:
+                    for k in range(da if da < db else db):
+                        append((ALIGN, i1 + k, j1 + k))
+                        if len(evs) >= self._TAG_CHUNK:
+                            yield evs
+                            evs = []
+                            append = evs.append
                 for y in range(i1, i2):
-                    yield (A_LINE_IGN, y)
+                    append((A_LINE_IGN, y))
+                    if len(evs) >= self._TAG_CHUNK:
+                        yield evs
+                        evs = []
+                        append = evs.append
                 for y in range(j1, j2):
-                    yield (B_LINE_IGN, y)
+                    append((B_LINE_IGN, y))
+                    if len(evs) >= self._TAG_CHUNK:
+                        yield evs
+                        evs = []
+                        append = evs.append
+                if evs:
+                    yield evs
 
         if _bm_start is not None:
             _bm_elapsed = time.perf_counter() - _bm_start
@@ -962,6 +1062,7 @@ class Differ:
         self._char_ops_pos = 0
         self._lines_a = None
         self._lines_b = None
+        self._skip_align = False
 
     # Profiling row the char-level engine calls are marked under (one
     # row for the whole _char_diff call: the wrapper's own cost is a
@@ -973,6 +1074,12 @@ class Differ:
     # profiled) per chunk, so neither the event list nor the open
     # 'compare:positional_pairs' frame grows with the block size.
     _REPLACE_CHUNK = 512
+    # Event-list bound for the non-REPLACE tags (equal / delete /
+    # insert / ignore) in compare_lists(): a 1M-line 'equal' opcode
+    # would otherwise materialize its whole ALIGN stream at once. Same
+    # role as _REPLACE_CHUNK; one list stays well under a few hundred
+    # KB even for 4-tuple events.
+    _TAG_CHUNK = 4096
 
     def _positional_pairs_events(self, out, a, alo, b, blo, count):
         """Pair the k-th A line with the k-th B line, top-down, for
@@ -1023,40 +1130,72 @@ class Differ:
         # branches: the long-line guard REPLACES the pop (no position
         # advance, same fallback list), a None element or a position
         # overrun degrades to a full-line REPLACE, and the pop position
-        # advances per pair exactly as _char_diff does. COLLECT and
-        # LEGACY modes keep the original loop below (unchanged).
+        # advances per pair exactly as _char_diff does. COLLECT mode
+        # runs the lean record-only loop below; the LEGACY synchronous
+        # mode keeps the original loop below (engine calls + event
+        # emission).
         replay_ops = self._char_ops if not collecting else None
         if replay_ops is not None:
             guard = self._CHAR_GUARD_LEN
             ops_len = len(replay_ops)
             pair_events = self._char_diff_pair_events
+            emit_align = not self._skip_align
+            # Pop position kept in a LOCAL for the whole loop: ONE
+            # attribute write-back at the end instead of two attribute
+            # accesses per changed pair (~1.6M attribute ops on a
+            # 1M-line compare). pair_events never touches the field,
+            # and the guard/overrun/None fallbacks below advance the
+            # position exactly like _char_diff's replay branches do.
+            pos = self._char_ops_pos
             for k in range(count):
                 ai, bj = alo + k, blo + k
                 la = a[ai]
                 lb = b[bj]
                 if la == lb:
-                    append((ALIGN, ai, bj))
+                    if emit_align:
+                        append((ALIGN, ai, bj))
                     continue
                 if len(la) > guard or len(lb) > guard:
                     ops = [('replace', 0, len(la), 0, len(lb))]
+                elif pos >= ops_len:
+                    ops = [('replace', 0, len(la), 0, len(lb))]
                 else:
-                    pos = self._char_ops_pos
-                    if pos >= ops_len:
+                    pair_ops = replay_ops[pos]
+                    pos += 1
+                    if pair_ops is None:
                         ops = [('replace', 0, len(la), 0, len(lb))]
                     else:
-                        self._char_ops_pos = pos + 1
-                        pair_ops = replay_ops[pos]
-                        if pair_ops is None:
-                            ops = [('replace', 0, len(la), 0, len(lb))]
-                        else:
-                            ops = pair_ops
+                        ops = pair_ops
                 pair_events(out, ai, bj, ops)
-                append((ALIGN, ai, bj))
+                if emit_align:
+                    append((ALIGN, ai, bj))
+            self._char_ops_pos = pos
             return
+        # COLLECT pass, lean loop: the only output that survives
+        # collect_char_pairs is the pair RECORD ORDER (every event
+        # append below would be drained and discarded). Inlining
+        # _char_diff's collect branch (guard check -> record) removes
+        # one method call per changed pair (~800k on a 1M-line
+        # compare); the guard/negation order mirrors _char_diff
+        # EXACTLY, so the recorded pairs -- and their order -- are
+        # identical to what the old record loop produced.
+        collect = self._char_pairs_pending
+        if collect is not None:
+            guard = self._CHAR_GUARD_LEN
+            collect_append = collect.append
+            for k in range(count):
+                la = a[alo + k]
+                lb = b[blo + k]
+                if (la != lb and len(la) <= guard
+                        and len(lb) <= guard):
+                    collect_append((la, lb))
+            return
+        # LEGACY synchronous mode (collect finished, no replay data).
+        emit_align = not self._skip_align
         for k in range(count):
             ai, bj = alo + k, blo + k
             if a[ai] == b[bj]:
-                if not collecting:
+                if emit_align:
                     append((ALIGN, ai, bj))
             else:
                 if prof_on:
@@ -1069,8 +1208,8 @@ class Differ:
                         eng_max = dt
                 else:
                     ops = char_diff_call(a[ai], b[bj])
-                if not collecting:
-                    self._char_diff_pair_events(out, ai, bj, ops)
+                self._char_diff_pair_events(out, ai, bj, ops)
+                if emit_align:
                     append((ALIGN, ai, bj))
         if prof_on and eng_n:
             Profiler.mark(row, eng_dt, eng_n, eng_max)
@@ -1160,7 +1299,10 @@ class Differ:
         # the shorter side's block. Section suppression during the
         # COLLECT pass, same rationale as the beautify branch above.
         _collecting = self._char_pairs_pending is not None
-        common = min(da, db)
+        # inline min(da, db): one builtin call per opcode per walk
+        # (~400k calls on a 1M-line compare, each a traced call under
+        # the cProfile layer)
+        common = da if da < db else db
         k = 0
         while k < common:
             n = self._REPLACE_CHUNK
@@ -1374,7 +1516,7 @@ class Differ:
         # Process the best pair itself
         a_line, b_line = a[best_i], b[best_j]
         if a_line == b_line:
-            if self._char_pairs_pending is None:
+            if self._char_pairs_pending is None and not self._skip_align:
                 out.append((ALIGN, best_i, best_j))
         else:
             if _time_engine:
@@ -1390,7 +1532,8 @@ class Differ:
             # did the work that matters.
             if self._char_pairs_pending is None:
                 self._char_diff_pair_events(out, best_i, best_j, ops)
-                out.append((ALIGN, best_i, best_j))
+                if not self._skip_align:
+                    out.append((ALIGN, best_i, best_j))
 
         # Recurse on the part after the best pair
         self._find_best_pairs_events(out, a, best_i + 1, ahi,
@@ -1434,12 +1577,14 @@ class Differ:
         _plain_replace_simple generator.
         """
         da, db = ahi - alo, bhi - blo
-        common = min(da, db)
+        common = da if da < db else db
         flush_at = self._REPLACE_CHUNK * 4
         evs = []
         append = evs.append
+        emit_align = not self._skip_align
         for k in range(common):
-            append((ALIGN, alo + k, blo + k))
+            if emit_align:
+                append((ALIGN, alo + k, blo + k))
             if len(evs) >= flush_at:
                 yield evs
                 evs = []
