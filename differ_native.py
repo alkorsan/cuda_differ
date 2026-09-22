@@ -1015,6 +1015,44 @@ class Differ:
         # stays identical); only the discarded writes are skipped. The
         # replay pass (not collecting) still emits the full event set.
         collecting = self._char_pairs_pending is not None
+        # REPLAY fast path: _char_ops bound + not collecting means the
+        # per-pair engine result is a positional POP. Inlined here so
+        # the 800k _char_diff calls (a method call + the 3-mode branch
+        # switch per pair on a 1M-line compare) collapse into direct
+        # list ops. The logic is an EXACT copy of _char_diff's replay
+        # branches: the long-line guard REPLACES the pop (no position
+        # advance, same fallback list), a None element or a position
+        # overrun degrades to a full-line REPLACE, and the pop position
+        # advances per pair exactly as _char_diff does. COLLECT and
+        # LEGACY modes keep the original loop below (unchanged).
+        replay_ops = self._char_ops if not collecting else None
+        if replay_ops is not None:
+            guard = self._CHAR_GUARD_LEN
+            ops_len = len(replay_ops)
+            pair_events = self._char_diff_pair_events
+            for k in range(count):
+                ai, bj = alo + k, blo + k
+                la = a[ai]
+                lb = b[bj]
+                if la == lb:
+                    append((ALIGN, ai, bj))
+                    continue
+                if len(la) > guard or len(lb) > guard:
+                    ops = [('replace', 0, len(la), 0, len(lb))]
+                else:
+                    pos = self._char_ops_pos
+                    if pos >= ops_len:
+                        ops = [('replace', 0, len(la), 0, len(lb))]
+                    else:
+                        self._char_ops_pos = pos + 1
+                        pair_ops = replay_ops[pos]
+                        if pair_ops is None:
+                            ops = [('replace', 0, len(la), 0, len(lb))]
+                        else:
+                            ops = pair_ops
+                pair_events(out, ai, bj, ops)
+                append((ALIGN, ai, bj))
+            return
         for k in range(count):
             ai, bj = alo + k, blo + k
             if a[ai] == b[bj]:
