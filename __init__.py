@@ -26,6 +26,18 @@ try:
 except Exception:
     _ed_bookmark_api = None
 
+# Direct C-API entry point for the FLAT wrap-counts query (see
+# _get_wrap_counts): one call returning a single bytes object (int32
+# array: [version, line_count, counts...]) instead of get_wrapinfo's
+# one-dict-per-visual-row (~0.5s per million-row editor) + the Counter
+# pass (~0.5s more). Only this build's host exposes it; None on older
+# hosts and in test sandboxes -> _get_wrap_counts falls back to the
+# legacy get_wrapinfo path (EDACTION_UPDATE + Counter).
+try:
+    from cudatext_api import ed_get_wrap_counts as _ed_get_wrap_counts_api
+except Exception:
+    _ed_get_wrap_counts_api = None
+
 from . import differ_native as dfn
 from . import differ_python as dfp
 from .overview import PaintboxOverview
@@ -4216,12 +4228,12 @@ class Command:
                             'char compare', level=1)
                         char_ops = dfn.sync_char_diff(
                             pairs, diff.ignore_flags)
-                        if char_ops is None:
-                            # Engine failed the batch as well: paint
-                            # every pair as a full REPLACE (the replay
-                            # mode's None-element fallback) -- no engine
-                            # calls, deterministic degraded output.
-                            char_ops = [None] * len(pairs)
+                        # bytes (flat host) / list (legacy host) / None
+                        # (engine error): normalize into the replay-
+                        # consumable form -- None becomes the [None]*n
+                        # per-pair full-REPLACE fallback.
+                        char_ops = dfn.normalize_char_results(
+                            char_ops, len(pairs))
                         self._finish_native_compare(job, opcodes, char_ops)
                         return
                     # Zero pairs collected: nothing to char-diff (the
@@ -4269,7 +4281,10 @@ class Command:
         The engine invokes this on the main thread when the batch
         finishes, passing one argument: the per-pair opcode list -- one
         opcode list per input pair, in the collect pass's record order
-        -- or None when the batch failed. The callback arrives through
+        -- ONE bytes object when the host honored the DIFF_CHARS_FLAT
+        bit the kick-off requested (the flat int32 protocol; decoded
+        below into FlatCharOps), or None when the batch failed. The
+        callback arrives through
         the functools.partial(self._on_char_diff_done, job, opcodes)
         created in _on_native_diff_done, so the job context AND the
         line-level opcodes travel with it. A batch cancelled through
@@ -4328,6 +4343,15 @@ class Command:
                 # Whole-batch engine failure: per-pair full-REPLACE
                 # fallback (see docstring).
                 results = [None] * job.char_pairs_count
+            elif not isinstance(results, list):
+                # FLAT protocol: the host honored the DIFF_CHARS_FLAT bit
+                # (requested by start_async_char_diff) and delivered ONE
+                # bytes object; decode it zero-copy (FlatCharOps: the
+                # replay walk then reads the flat int32 array directly).
+                # A plain list (older host that ignored the bit) passes
+                # through normalize_char_results unchanged.
+                results = dfn.normalize_char_results(
+                    results, job.char_pairs_count)
 
             self._finish_native_compare(job, opcodes, results)
         except Exception:
@@ -4773,10 +4797,71 @@ class Command:
         Used to size inter-line gaps correctly when word-wrap is on: a gap
         that compensates for N missing logical lines must actually be
         (sum of those lines' visual rows) * line_height pixels tall,
-        otherwise the two compare sides drift apart visually."""
+        otherwise the two compare sides drift apart visually.
+
+        TWO implementations, selected by what this build's host exposes:
+
+        FLAT path (this build's ed_get_wrap_counts): ONE direct C-API
+        call returning a single bytes object -- [version=1, line_count,
+        one int32 count per line] (see PyHelper_GetWrapCountsFlat in
+        formmain_py_api.inc). The Pascal side runs the SAME per-line
+        count get_wrapinfo's dicts fed the old Counter pass, but with
+        zero Python objects (get_wrapinfo builds ONE DICT PER VISUAL
+        ROW: ~0.5s per million-row editor; the Counter pass then costs
+        ~0.5s more -- together ~1s of the ~1.8s the whole wrap phase
+        used to cost per editor). It also SKIPS the EDACTION_UPDATE
+        forced repaint the legacy path needed: the editor recalculates
+        its wrap info itself on every text change (set_text_all does
+        WrapInfo.Clear + UpdateWrapInfo; the edit APIs call
+        UpdateWrapInfo per change), and the Pascal side detects a stale
+        structure by coverage (rows not reaching the last line) and
+        recomputes WITHOUT repainting -- the forced repaint cost ~0.9s
+        per million-line editor and painted the editors a second time
+        mid-compare for nothing. Booked under the SAME
+        'refresh:wrapinfo_api' row as the legacy call so the reports
+        stay comparable; the wrapinfo_update / wrapinfo_count rows
+        simply disappear from the flat path.
+
+        LEGACY path (older hosts, test sandboxes): EDACTION_UPDATE
+        forced refresh, get_wrapinfo dict list, Counter pass -- the
+        pre-flat code, kept verbatim as the fallback."""
         line_count = ed.get_line_count()
         if line_count <= 0:
             return []
+        # FLAT path: direct C-API when this build's host exposes it
+        # (module-level _ed_get_wrap_counts_api; None in sandboxes/old
+        # hosts). The Editor wrapper (get_wrap_counts) is not used
+        # because per-editor method lookup on the hot refresh path is
+        # exactly the wrapper cost the bookmark flush dropped too.
+        wrap_api = _ed_get_wrap_counts_api
+        if wrap_api is not None:
+            h = getattr(ed, 'h', None)
+            if h is not None:
+                with Profiler.section('refresh:wrapinfo_api'):
+                    try:
+                        buf = wrap_api(h)
+                    except Exception:
+                        buf = None
+                if isinstance(buf, (bytes, bytearray)):
+                    try:
+                        mv = memoryview(buf).cast('i')
+                        if (mv[0] == 1 and mv[1] == line_count
+                                and len(mv) == 2 + line_count):
+                            # tolist(): one C-speed pass building the
+                            # per-line int list every consumer already
+                            # indexes (list speed; ~30-60ms per 1M
+                            # lines). Booked in this method's own time:
+                            # the row above covers the API round-trip.
+                            return mv[2:].tolist()
+                    except Exception:
+                        pass
+                # Malformed buffer / line-count mismatch (a text change
+                # between calls?) -> fall through to the legacy path,
+                # which forces the refresh first. Should never happen:
+                # the editors are locked read-only for the whole
+                # compare at this point.
+        # LEGACY path (unchanged): counts default to one visual row per
+        # line; the Counter pass below overwrites the wrapped ones.
         counts = [1] * line_count
         # Force CudaText to refresh its internal WrapInfo structure before
         # we query it. After text changes CudaText usually detects the

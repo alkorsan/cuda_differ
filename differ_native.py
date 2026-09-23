@@ -33,6 +33,19 @@ TWO-PHASE ASYNCHRONOUS DESIGN (both engine jobs run off the UI thread):
   for each pair (same walk order -> same pop order), so no engine call
   happens during painting.
 
+  FLAT RESULT PROTOCOL (hosts that support it): the batch is requested
+  with the DIFF_CHARS_FLAT bit of diff_proc's algo parameter, so the
+  engine delivers the whole result as ONE bytes object (int32 array:
+  [version, pair_count, total_ops, starts[pair_count+1] (CSR), then 5
+  int32 per opcode: tag(0-4), i1, i2, j1, j2]) instead of 1.6M opcode
+  tuples built under the GIL -- seconds of main-thread time replaced
+  by one memcpy. normalize_char_results() wraps that bytes object in
+  FlatCharOps (zero-copy memoryview decode), and the replay fast paths
+  walk the flat array directly (no per-opcode tuples materialized at
+  all). Hosts without the bit return the old list-of-lists protocol,
+  which normalize_char_results passes through unchanged -- both shapes
+  feed the same walk, so plugin and host versions mix freely.
+
   Why batched: the old design made ONE diff_proc(DIF_CHARS) call PER
   pair -- ~800k API round-trips (argument parsing, string marshalling,
   result building) on a 1M-line compare, which dominated the runtime
@@ -282,10 +295,138 @@ def cancel_async_line_diff(job):
     return bool(_ct.diff_proc(_ct.DIF_CANCEL, job))
 
 
+# Algo-parameter bit requesting the FLAT DIF_CHARS result protocol from
+# hosts that support it (cudatext.DIFF_CHARS_FLAT == 1 << 16, mirrored
+# here so the plugin works against cudatext.py files of any vintage).
+# Old hosts ignore the bit for DIF_CHARS (algo was never used there) and
+# return the list-of-lists protocol; the result-shape detection in
+# normalize_char_results handles whichever shape comes back, so plugin
+# and host versions mix freely in both directions.
+_CHARS_FLAT_ALGO = 1 << 16
+
+# Opcode tag values of the flat protocol (Pascal DIFF_TAG_*): the flat
+# buffer carries tags as these ints; only 1/2/3 ever produce paint
+# events (the walk ignores 'equal' and 'ignore' opcodes exactly like
+# the tuple protocol's string compares).
+_FLAT_TAG_DELETE = 1
+_FLAT_TAG_INSERT = 2
+_FLAT_TAG_REPLACE = 3
+
+# Tag names for the compatibility materialization path (__getitem__):
+# flat code -> the protocol's tag string. Index by the int code.
+_FLAT_TAG_NAMES = ('equal', 'delete', 'insert', 'replace', 'ignore')
+
+
+class FlatCharOps:
+    """Zero-copy decoded view of a FLAT DIF_CHARS batch result (the
+    bytes object the engine delivers when the batch was requested with
+    the DIFF_CHARS_FLAT bit; see the module docstring for the layout).
+
+    The buffer is an int32 array (native byte order -- producer and
+    consumer are the same process):
+      [0] format version (checked: 1)
+      [1] N = pair count
+      [2] T = total opcode count
+      [3 .. 3+N] starts: N+1 cumulative opcode-start indices (CSR)
+      then 5 int32 per opcode: tag(0-4), i1, i2, j1, j2
+
+    Sequence protocol compatible with the replay machinery:
+      len(obj)        -> pair count (the replay 'overrun' bound)
+      obj[k]          -> pair k's opcodes materialized as a list of
+                         (tag, i1, i2, j1, j2) tuples with STRING tags
+                         (the cold/compat path: _char_diff's replay
+                         branch and the beautify walk; the hot positional
+                         replay fast path instead reads .flat/.starts
+                         directly and materializes nothing)
+
+    The memoryview slices keep the underlying bytes object alive, so
+    the view stays valid for as long as this object does."""
+
+    __slots__ = ('flat', 'starts', 'n_pairs')
+
+    def __init__(self, buf):
+        mv = memoryview(buf).cast('i')
+        version = mv[0]
+        if version != 1:
+            raise ValueError(
+                'flat char-ops buffer: unknown format version %r' % (
+                    version,))
+        n = mv[1]
+        if n < 0 or len(mv) < 4 + n:
+            raise ValueError(
+                'flat char-ops buffer: truncated header (pairs=%r, '
+                'ints=%d)' % (n, len(mv)))
+        self.n_pairs = n
+        # zero-copy slices; each indexing read creates the int lazily
+        self.starts = mv[3:4 + n]
+        self.flat = mv[4 + n:]
+        if len(self.flat) < mv[2] * 5:
+            raise ValueError('flat char-ops buffer: truncated opcodes')
+
+    def __len__(self):
+        return self.n_pairs
+
+    def __getitem__(self, k):
+        """Materialize pair k's opcodes as (tag, i1, i2, j1, j2) tuples
+        with string tags -- the exact list the tuple protocol delivered
+        for that pair. Cold path (compat consumers); the hot replay
+        loops walk .flat/.starts directly instead."""
+        if k < 0:
+            k += self.n_pairs
+        if not 0 <= k < self.n_pairs:
+            raise IndexError('FlatCharOps index %r out of range' % (k,))
+        s0 = self.starts[k] * 5
+        s1 = self.starts[k + 1] * 5
+        flat = self.flat
+        names = _FLAT_TAG_NAMES
+        out = []
+        append = out.append
+        p = s0
+        while p < s1:
+            tag = flat[p]
+            if 0 <= tag <= 4:
+                tag = names[tag]
+            # tags outside 0..4 pass through as ints: the consumers'
+            # string compares simply never match them, same defensive
+            # stance as the list protocol's unknown-tag elements
+            append((tag, flat[p + 1], flat[p + 2],
+                    flat[p + 3], flat[p + 4]))
+            p += 5
+        return out
+
+
+def normalize_char_results(results, pair_count):
+    """Normalize the DIF_CHARS batch result delivered by the engine into
+    the replay-consumable form, whatever protocol the host used:
+
+      bytes/bytearray -> FlatCharOps (flat protocol, zero-copy decode)
+      list            -> the list itself (tuple protocol: per-pair opcode
+                         lists; elements may be None for the
+                         engine-failure fallback)
+      None            -> [None] * pair_count (whole-batch failure: every
+                         pair paints as a full REPLACE)
+
+    A malformed flat buffer (unknown version / truncated) raises inside
+    FlatCharOps -- the caller treats that like an engine error. Returns
+    the normalized object; pair_count only feeds the None branch."""
+    if results is None:
+        return [None] * pair_count
+    if isinstance(results, (bytes, bytearray)):
+        return FlatCharOps(results)
+    return results
+
+
 def start_async_char_diff(pairs, flags, callback):
     """Start a BATCHED char-level compare of ALL line pairs in ONE
     background engine job: the asynchronous form of
     cudatext.diff_proc(DIF_CHARS) (the `callback` argument).
+
+    The DIFF_CHARS_FLAT bit is OR-ed into the algo parameter: hosts that
+    support it deliver the batch as ONE flat bytes object (see
+    FlatCharOps), hosts that don't ignore the bit for DIF_CHARS and
+    deliver the list-of-lists protocol; the completion callback
+    normalizes either shape (normalize_char_results), so this call is
+    safe against every host/plugin version combination.
 
     'pairs' is the list of (text1, text2) string tuples collected by
     Differ.collect_char_pairs() -- the whole batch is marshalled into
@@ -300,7 +441,9 @@ def start_async_char_diff(pairs, flags, callback):
     'results' is a list with ONE opcode list per input pair, in the
     same order as 'pairs' (element k describes pairs[k][0] vs
     pairs[k][1], in the same (tag, i1, i2, j1, j2) format
-    start_async_line_diff's callback delivers for whole texts), or None
+    start_async_line_diff's callback delivers for whole texts), the
+    flat bytes object when the host honored the DIFF_CHARS_FLAT bit
+    (normalize_char_results decodes it), or None
     when the engine failed. Returns 0 when the background compare
     could not be started (caller falls back to the synchronous batched
     form, sync_char_diff).
@@ -315,7 +458,7 @@ def start_async_char_diff(pairs, flags, callback):
     if not _HAS_NATIVE_DIFF or not pairs:
         return 0
     result = _ct.diff_proc(
-        _ct.DIF_CHARS, pairs, None, 0, flags, callback)
+        _ct.DIF_CHARS, pairs, None, _CHARS_FLAT_ALGO, flags, callback)
     if isinstance(result, int) and result > 0:
         return result
     return 0
@@ -347,14 +490,20 @@ def sync_char_diff(pairs, flags):
     it blocks the main thread for the whole batch time -- acceptable
     only as an emergency path, never the normal flow.
 
-    Returns the per-pair opcode list (same format as
-    start_async_char_diff's callback argument), or None on engine
-    error (the caller then paints every pair as a full REPLACE via the
-    replay mode's None-element fallback).
+    Requests the flat protocol like the async form (DIFF_CHARS_FLAT in
+    the algo parameter): hosts that support it return ONE bytes object
+    (normalize_char_results decodes it), older hosts ignore the bit and
+    return the list-of-lists protocol.
+
+    Returns the raw result -- the per-pair opcode list, the flat bytes
+    object, or None on engine error (the caller normalizes it and, for
+    None, paints every pair as a full REPLACE via the replay mode's
+    None-element fallback).
     """
     if not _HAS_NATIVE_DIFF or not pairs:
         return None
-    return _ct.diff_proc(_ct.DIF_CHARS, pairs, None, 0, flags)
+    return _ct.diff_proc(
+        _ct.DIF_CHARS, pairs, None, _CHARS_FLAT_ALGO, flags)
 
 
 def algo_id(algorithm_name):
@@ -608,7 +757,14 @@ class Differ:
             collect.append((line_a, line_b))
             return []
 
-        # REPLAY pass: pop the precomputed result.
+        # REPLAY pass: pop the precomputed result. With the FLAT
+        # protocol, ops is a FlatCharOps and this pop MATERIALIZES the
+        # pair's opcode list (tuples with string tags) via __getitem__
+        # -- the cold/compat path used by the beautify walk and any
+        # non-inlined consumer; the hot positional replay loop walks
+        # the flat array directly instead (see _positional_pairs_
+        # events). Pop-position semantics are identical for both
+        # shapes: the advance happens here, on the POP, exactly once.
         ops = self._char_ops
         if ops is not None:
             pos = self._char_ops_pos
@@ -1191,6 +1347,64 @@ class Differ:
             # below advance the position exactly like _char_diff's
             # replay branches do.
             pos = self._char_ops_pos
+            # FLAT protocol fast path: the engine delivered the batch
+            # as one bytes object (FlatCharOps, see normalize_char_
+            # results). Walk the CSR starts + flat int array directly:
+            # NO per-opcode tuple is ever materialized (the tuple path
+            # below pops ready-made lists of tuples). The guard /
+            # overrun fallbacks and the pop-position advance are an
+            # EXACT copy of the tuple path's (guard and overrun
+            # degrade to the full-line REPLACE without advancing; a
+            # popped pair walks exactly its starts[k]..starts[k+1]
+            # opcode range). Tag compares are int == (the protocol's
+            # 0..4 codes) instead of string ==: the emitted events are
+            # identical to the tuple path's -- equivalence is
+            # test-enforced (test_flat_char_protocol.py).
+            replay_flat = (replay_ops.flat
+                           if type(replay_ops) is FlatCharOps else None)
+            if replay_flat is not None:
+                starts = replay_ops.starts
+                for k in range(count):
+                    ai, bj = alo + k, blo + k
+                    la = a[ai]
+                    lb = b[bj]
+                    if la == lb:
+                        if emit_align:
+                            append((ALIGN, ai, bj))
+                        continue
+                    if (len(la) > guard or len(lb) > guard
+                            or pos >= ops_len):
+                        # full-line REPLACE (guard / overrun), no pop
+                        append((A_SYMBOL_DEL, ai, 0, len(la)))
+                        append((B_SYMBOL_ADD, bj, 0, len(lb)))
+                        append((PAIR_CHANGED, ai, bj, 1, 1))
+                        continue
+                    p = starts[pos] * 5
+                    p_end = starts[pos + 1] * 5
+                    pos += 1
+                    deca = 0
+                    decb = 0
+                    while p < p_end:
+                        tag = replay_flat[p]
+                        if tag == _FLAT_TAG_REPLACE:
+                            deca += 1
+                            decb += 1
+                            append((A_SYMBOL_DEL, ai, replay_flat[p + 1],
+                                    replay_flat[p + 2] - replay_flat[p + 1]))
+                            append((B_SYMBOL_ADD, bj, replay_flat[p + 3],
+                                    replay_flat[p + 4] - replay_flat[p + 3]))
+                        elif tag == _FLAT_TAG_DELETE:
+                            deca += 1
+                            append((A_SYMBOL_DEL, ai, replay_flat[p + 1],
+                                    replay_flat[p + 2] - replay_flat[p + 1]))
+                        elif tag == _FLAT_TAG_INSERT:
+                            decb += 1
+                            append((B_SYMBOL_ADD, bj, replay_flat[p + 3],
+                                    replay_flat[p + 4] - replay_flat[p + 3]))
+                        p += 5
+                    append((PAIR_CHANGED, ai, bj, deca, decb))
+                self._char_ops_pos = pos
+                return
             for k in range(count):
                 ai, bj = alo + k, blo + k
                 la = a[ai]
