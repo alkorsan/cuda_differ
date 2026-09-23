@@ -22,12 +22,64 @@ Architecture:
   - Uses a two-bitmap optimization (see _ensure_static_bitmap / paint):
     * Static bitmap: a separate persistent bitmap (via bitmap_proc) that
       stores the colored diff segments, the scroll buttons and the
-      separator line. Only repainted on compare/resize via
-      repaint_static().
+      separator line. Rebuilt via repaint_static() after a compare, and
+      after a RESIZE — both happen in the BACKGROUND (see the next
+      section), never synchronously on the main thread.
     * Dynamic: on each paint(), copy the static bitmap to the image's
       embedded bitmap via CANVAS_BITMAP, then draw the slider and
       grabber on top. This is cheap (one bitmap copy + a few
       CANVAS_RECT / CANVAS_LINE calls).
+
+  - CREATED EMPTY, FILLED WHEN THE COMPARE FINISHES:
+    The overview panel is created (docked) BEFORE the compare texts are
+    loaded into the two editor halves — the set_files flow. Docking the
+    panel changes the editors' width; doing that AFTER the text was
+    loaded would force CudaText to re-wrap the whole text of both halves
+    (very visible on big files). With the panel docked first, the text
+    wraps exactly once, at its final width. Until the compare finishes
+    the panel shows the DEFAULT look: the theme's editor background
+    (EdTextBg) plus the ▲/▼ buttons and the separator — no diff map.
+    refresh_compare also (re)creates the overview when it is missing
+    (Recompare on a restored tab, overview option toggled on, ...), so
+    an overview always exists whenever a compare paints its events.
+
+  - BACKGROUND STATIC PAINTING (the "resize freeze" fix):
+    The expensive half of a static repaint is pure Python: the prefix
+    sums, the run coalescing and the WinMerge pixel-dedup walk over up
+    to 1.6M segments per side — seconds on million-line compares, and
+    NONE of it needs CudaText. The overview now runs that half on a
+    daemon WORKER THREAD and keeps every CudaText API call on the MAIN
+    thread (CudaText is single-threaded; its API must never be called
+    from a secondary thread — this is a hard CudaText rule):
+      * repaint_static(), and the size-mismatch path of
+        _ensure_static_bitmap() (a resize), only publish a REQUEST
+        (token, data-generation, w, h) into a condition-variable slot
+        and return AT ONCE — the UI never waits. While the rebuild is
+        in flight, paint() keeps blitting the OLD static bitmap (over a
+        background-colored fill when the sizes transiently differ), so
+        resizes feel instant and the fresh map lands when ready.
+      * the worker thread (_worker_loop) computes the final PIXEL RECT
+        list — plain Python tuples (color, x0, x1, y0, y1) — with zero
+        CudaText API calls. Its hot loops check an abort condition
+        (newer request issued / shutdown) every ABORT_CHECK_MASK
+        segments, so a resize storm or a tab close stops a stale
+        multi-second compute within milliseconds. The request slot
+        always holds only the NEWEST request: anything superseded is
+        dropped by the token checks.
+      * a repeating APPLY timer (APPLY_TIMER_MS, main thread — timer
+        callbacks are the standard way CudaText plugins get scheduled
+        main-thread execution) polls the result slot, and when a result
+        is ready creates the new static bitmap, replays the precomputed
+        rects (a few hundred canvas calls, bounded by the panel's pixel
+        height), swaps the bitmap in, frees the old one and repaints.
+        The timer stops itself when nothing is in flight.
+      * stale results can never be applied: every result carries the
+        token and the data-generation of the request it answered;
+        clear_data() bumps the generation, so anything computed against
+        replaced data (a new compare started) is dropped. Concurrent
+        data mutation during a compute only raises inside the worker
+        (CPython raises on dicts resized during iteration), where it is
+        caught and discarded — never a crash, never garbage on screen.
 
   - PANEL LAYOUT (like a usual scrollbar):
       +----------------+
@@ -93,19 +145,35 @@ Architecture:
         `nPrevEndY != bottom_coord` rule), so the number of actual
         canvas calls is bounded by the panel's pixel HEIGHT, not by the
         number of diffs — 200k diffs still paint at most ~600 rects per
-        side.
+        side. The whole pixel-dedup walk runs on the worker thread; only
+        the surviving rects cross back to the main thread.
 
-  - PROPORTIONAL SLIDER HEIGHT:
-    Like real scrollbars in browsers/editors, the slider grows/shrinks
-    based on the visible-page vs total-content ratio. CudaText reports:
+  - END-OF-TRACK SCROLL MAPPING (the "slider at the end" fix):
+    A native scrollbar maps the thumb's TRAVEL RANGE — the track MINUS
+    the thumb — onto the scrollable range (content height minus page).
+    The overview does exactly that. CudaText reports:
       smooth_max     = total content height (pixels, INCLUDES page)
       smooth_page    = visible viewport height (pixels)
       smooth_pos     = current scroll position (pixels)
-    So slider_height = track_h * smooth_page / smooth_max, clamped to a
-    30px minimum so the slider stays grabbable. The slider_top formula
-    `py_top = track_y0 + track_h * smooth_pos / smooth_max` is
-    mathematically consistent: when smooth_pos reaches its max
-    (smooth_max - smooth_page), py_top lands flush at the track bottom.
+      smooth_pos_last = maximum scroll position (the END of the text)
+    so:
+      thumb_h  = clamp(track_h * smooth_page / smooth_max, 30px, track_h)
+      usable   = track_h - thumb_h          (pixels the thumb-top travels)
+      pos_last = smooth_pos_last
+      forward:  thumb_top = track_y0 + usable * smooth_pos / pos_last
+      inverse:  pos       = pos_last * (thumb_top - track_y0) / usable
+    Both directions are exact inverses, so dragging the slider flush to
+    the BOTTOM of the track writes smooth_pos_last — the very end of the
+    text — and the thumb lands flush at the track bottom when the editor
+    is scrolled to its end, exactly like the scrollbars of usual editors
+    and browsers. (The old code mapped pos/max onto the FULL track
+    height; that is only equivalent while the thumb keeps its
+    proportional size. With the 30px minimum-thumb clamp on big files —
+    a 600px track over a 100k-line file has a ~3px proportional thumb
+    clamped up to 30px — the inverse mapping peaked at
+    smooth_max*(track-30)/track, which left the text tens of screens
+    above the end when the slider was at the bottom, and the user had to
+    scroll the rest manually.)
 
   - LIVE SLIDER DRAG (the native-scrollbar pipeline):
     A native scrollbar never lets the thumb wait for the text: the
@@ -115,35 +183,35 @@ Architecture:
     exactly, with two decoupled streams per RAW mouse move:
 
     1) THUMB: the slider bitmap is repainted at the mouse-derived
-    position (_thumb_preview_y -- the position being DRIVEN to, not the
-    round-tripped editor position) and the message queue is pumped
-    (app_proc(PROC_IDLE)) so its WM_PAINT is delivered right away --
-    but ONLY while the editors are clean. The pump (ProcessMessages)
-    delivers EVERYTHING pending: pumping right after invalidating the
-    editors would deliver both editors' full viewport paints
-    SYNCHRONOUSLY inside the mouse handler -- 100-200 ms per move on
-    million-line compares, the "slider waits to follow the mouse" bug.
-    Pumping while clean delivers only the tiny overview repaint (~1ms).
-    The pump also dispatches pending INPUT messages: mouse MOVES are
-    dropped while pumping (breaking the move→pump→move recursion; the
-    newest position arrives with the next event); UP / EXIT / DOWN are
-    always processed — a release dispatched during a pump must never be
-    swallowed, or the drag and the ▲/▼ auto-repeat would survive the
-    released button (the "mouse is not released" bug).
+       position (_thumb_preview_y -- the position being DRIVEN to, not the
+       round-tripped editor position) and the message queue is pumped
+       (app_proc(PROC_IDLE)) so its WM_PAINT is delivered right away --
+       but ONLY while the editors are clean. The pump (ProcessMessages)
+       delivers EVERYTHING pending: pumping right after invalidating the
+       editors would deliver both editors' full viewport paints
+       SYNCHRONOUSLY inside the mouse handler -- 100-200 ms per move on
+       million-line compares, the "slider waits to follow the mouse" bug.
+       Pumping while clean delivers only the tiny overview repaint (~1ms).
+       The pump also dispatches pending INPUT messages: mouse MOVES are
+       dropped while pumping (breaking the move→pump→move recursion; the
+       newest position arrives with the next event); UP / EXIT / DOWN are
+       always processed — a release dispatched during a pump must never be
+       swallowed, or the drag and the ▲/▼ auto-repeat would survive the
+       released button (the "mouse is not released" bug).
 
     2) TEXT: the scroll position is written to both editors
-    (set_prop + the async cmd_RepaintEditor invalidate) at a bounded
-    rate — at most every OVERVIEW_TRACK_INTERVAL AND only after the
-    editors have PAINTED the previous apply (_editors_dirty cleared by
-    note_scroll_painted: TATSynEdit fires on_scroll at the END of every
-    viewport paint, a free completion signal wired in from
-    __init__.py's on_scroll). At most ONE apply is ever pending, and
-    the editors' paints are always delivered by the natural
-    message-loop drain between mouse handlers — never synchronously
-    inside a handler. Identical consecutive writes are skipped, and a
-    deferred one-shot timer applies the pending newest position when
-    the mouse stops (WM_TIMER starvation), so the thumb always lands
-    exactly under the cursor.
+       (set_prop + the async cmd_RepaintEditor invalidate) at a bounded
+       rate — at most every OVERVIEW_TRACK_INTERVAL AND only after the
+       editors have PAINTED the previous apply (_editors_dirty cleared by
+       note_scroll_painted: TATSynEdit fires on_scroll at the END of every
+       viewport paint, a free completion signal wired in from
+       __init__.py's on_scroll). At most ONE apply is ever pending, and
+       the editors' paints are always delivered by the natural
+       message-loop drain between mouse handlers — never synchronously
+       inside a handler. Identical consecutive writes are skipped, and a
+       deferred one-shot timer applies the pending newest position when
+       the mouse stops (WM_TIMER starvation), so the thumb always lands
+       exactly under the cursor.
 
     Net effect: the thumb is glued to the mouse at the input rate; the
     text follows at the editors' paint rate — on huge files that is
@@ -191,6 +259,7 @@ Architecture:
   See: https://github.com/CudaText-addons/cuda_differ/issues/29
 """
 
+import threading
 import time
 from itertools import accumulate
 
@@ -253,6 +322,22 @@ OVERVIEW_APPLY_STALL = 0.25
 # The cache is also refreshed by repaint_static(), so resizes are picked
 # up immediately on compare/resize and within this TTL otherwise.
 OVERVIEW_SIZE_TTL = 0.20
+
+# Repeating-timer interval (ms) that polls the background worker's
+# result slot and applies finished static-bitmap rebuilds ON THE MAIN
+# THREAD (CudaText API is main-thread-only; the worker computes pure
+# Python and never calls the API). While a rebuild is in flight the UI
+# stays fully interactive; the timer stops itself when nothing is
+# pending, so an idle overview costs nothing.
+APPLY_TIMER_MS = 40
+
+# The worker's hot loops check the abort condition (newer request
+# issued / shutdown) every (ABORT_CHECK_MASK + 1) iterations — often
+# enough that a resize storm or a tab close stops a stale multi-second
+# million-segment compute within milliseconds, rarely enough that the
+# check's cost is invisible (one or two attribute reads per 4096
+# segments).
+ABORT_CHECK_MASK = 0xFFF
 
 # Width of the grey vertical separator line at the very left of the
 # overview panel (full panel height, buttons included). Separates the
@@ -478,6 +563,11 @@ class PaintboxOverview:
 
     The overview shows a gap-aware mini-map of both editors side by side.
     Created once per compare tab, destroyed when the tab closes.
+
+    The heavy static painting (diff segments -> pixel rects) runs on a
+    background daemon worker thread; every CudaText API call stays on
+    the main thread (see the module docstring, BACKGROUND STATIC
+    PAINTING).
     """
 
     def __init__(self):
@@ -488,10 +578,10 @@ class PaintboxOverview:
         self.h_canvas = None    # image's embedded bitmap canvas handle
         self._ctl_index = None  # control index in the dialog
         self._owns_dlg = False  # True if we created a separate dialog
-        # Static bitmap (persistent — only repainted on compare/resize).
-        # Stores the colored diff segments, the scroll buttons and the
-        # separator line so they don't need to be repainted on every
-        # scroll. See paint() for how it's used.
+        # Static bitmap (persistent — rebuilt after a compare or a
+        # resize, in the BACKGROUND). Stores the colored diff segments,
+        # the scroll buttons and the separator line so they don't need
+        # to be repainted on every scroll. See paint() for how it's used.
         self._h_static_bmp = None
         self._h_static_cnv = None
         self._static_w = 0
@@ -624,6 +714,43 @@ class PaintboxOverview:
         # when the file is much taller than the viewport.
         self._slider_min_height = 30
 
+        # --- Background static painting (see the module docstring,
+        #     BACKGROUND STATIC PAINTING) -----------------------------
+        # Async painting on/off: True while the daemon worker thread can
+        # run; flipped False only if thread creation fails (then every
+        # static repaint uses the synchronous fallback path).
+        self._async_enabled = True
+        # The single daemon worker thread (lazily started by the first
+        # _request_async_paint; sleeps on _worker_cond when idle).
+        self._worker = None
+        # Condition guarding the request/result slots and the shutdown
+        # flag (the ONLY state shared with the worker thread).
+        self._worker_cond = threading.Condition()
+        # True after destroy(): the worker exits instead of publishing.
+        self._worker_shutdown = False
+        # Pending request slot: (token, gen, w, h) — REPLACED (never
+        # queued) by each new request, so only the newest rebuild runs.
+        self._req = None
+        # (w, h, gen) of the newest issued request — dedups identical
+        # rebuild requests that would race (e.g. paint() noticing the
+        # same size mismatch while that rebuild is already in flight).
+        self._last_req = None
+        # Published result slot: (token, gen, w, h, rects_a, rects_b) —
+        # written by the worker (pure-Python rect lists, no handles),
+        # consumed by the apply timer on the main thread.
+        self._result = None
+        # Monotonic counters: every issued rebuild bumps _token; every
+        # consumed result sets _applied_token to its token; every data
+        # mutation (clear_data / destroy) bumps _data_gen. A result is
+        # only applied when its token is still the newest AND its
+        # data-generation still matches — stale results are dropped.
+        self._token = 0
+        self._applied_token = 0
+        self._data_gen = 0
+        # True while the APPLY_TIMER_MS repeating timer is armed (the
+        # apply timer polls the result slot and stops itself when idle).
+        self._apply_timer_on = False
+
     def is_created(self):
         """Return True if the overview dialog has been created."""
         return self.h_dlg is not None
@@ -646,6 +773,17 @@ class PaintboxOverview:
         "PROP_HANDLE_PARENT is enough for docked micromap, PROP_HANDLE_PARENT2
         is not needed anymore."
 
+        The panel is created EMPTY and painted at once with the DEFAULT
+        look — the theme's editor background (EdTextBg), the ▲/▼ buttons
+        and the separator. The set_files flow calls this BEFORE the
+        compare texts are loaded (docking the panel changes the editors'
+        width — doing it after the text is loaded would re-wrap both
+        halves), and the colored diff map is filled in only when the
+        compare finishes (repaint_static after the paint loop).
+        refresh_compare also calls this when the overview is missing
+        (Recompare, restored tabs, the option toggled on), so an overview
+        always exists by the time a compare paints its events.
+
         Args:
             a_ed: left editor (primary)
             b_ed: right editor (secondary)
@@ -659,6 +797,17 @@ class PaintboxOverview:
         h_parent = a_ed.get_prop(ct.PROP_HANDLE_PARENT)
         if not h_parent:
             h_parent = 0
+
+        # Default background from the current UI theme, so the dialog's
+        # own color and the FIRST paint (end of this method) already
+        # match the editor background; set_colors() refines everything
+        # (diff colors, slider colors) at the compare start.
+        try:
+            ui = ct.app_proc(ct.PROC_THEME_UI_DICT_GET, '')
+            self.color_bg = ui.get('EdTextBg', {}).get('color', 0xFFFFFF)
+        except Exception:
+            pass
+        self.color_btn_bg = self.color_bg
 
         # Create a separate dialog for the overview
         self.h_dlg = ct.dlg_proc(0, ct.DLG_CREATE)
@@ -695,12 +844,24 @@ class PaintboxOverview:
         self.h_bitmap = ct.image_proc(self.h_image, ct.IMAGE_GET_BITMAP)
         self.h_canvas = ct.bitmap_proc(self.h_bitmap, ct.BITMAP_GET_CANVAS)
 
-        # Dock to the RIGHT side of the editor's parent-of-parent form
+        # Dock to the RIGHT side of the editor's parent form
         ct.dlg_proc(self.h_dlg, ct.DLG_SHOW_NONMODAL)
         ct.dlg_proc(self.h_dlg, ct.DLG_DOCK, prop='R', index=h_parent)
 
+        # First paint right away: the panel shows the DEFAULT background
+        # (+ the ▲/▼ buttons + the separator) from the very first moment
+        # it appears; the colored diff map arrives only when a compare
+        # finishes. Cheap: with no data collected yet the static paint is
+        # just the background fill + buttons + separator (the empty
+        # overview is also rebuilt in the background like any other).
+        self.paint()
+
     def destroy(self):
-        """Undock and free the overview dialog and static bitmap."""
+        """Undock and free the overview dialog, the static bitmap and
+        the background painting machinery."""
+        # Stop the worker thread and the apply timer FIRST (they must
+        # never touch the dialog/bitmap handles freed below).
+        self._shutdown_async_paint()
         self._stop_button_repeat()
         self._driving = False
         self._dragging = False
@@ -741,23 +902,49 @@ class PaintboxOverview:
         """Create or resize the persistent static bitmap to match (w, h).
 
         The static bitmap stores the colored diff segments, the scroll
-        buttons and the separator line (the expensive part). It's only
-        repainted here when the size changes or when repaint_static() is
-        called after a fresh compare.
+        buttons and the separator line (the expensive part).
 
-        Once created, the static bitmap is reused on every paint() call
-        — paint() just copies it to the image's embedded bitmap and draws
-        the slider on top, which is very fast.
+        A SIZE CHANGE never rebuilds synchronously with the background
+        machinery — that synchronous rebuild was the "resizing CudaText
+        freezes everything until the overview is redrawn" bug: a resize
+        makes paint() notice the new size, and the old code then ran the
+        multi-second segment walk on the MAIN thread, once per resize
+        step. Instead the mismatch only requests a background rebuild
+        (_request_async_paint — deduped, superseding) and paint() keeps
+        blitting the old (stale-sized) bitmap over a background-colored
+        fill until the fresh one lands.
+
+        When no bitmap exists at all (first paint after create()), the
+        CHEAP empty static (background + buttons + separator — no
+        segments) is painted synchronously so the panel shows the
+        default background immediately; the real segments arrive via the
+        background request issued right after.
+
+        The synchronous fallback (threading unavailable) rebuilds the
+        full bitmap here, like the old code did.
         """
         if self._h_static_bmp is not None:
             if self._static_w == w and self._static_h == h:
                 return  # still valid, reuse
+            if self._async_enabled:
+                # ASYNC: request a background rebuild; keep showing the
+                # old bitmap (paint() fills the exposed area itself).
+                self._request_async_paint(w, h)
+                return
+            # sync fallback: rebuild right here
             self._free_static_bitmap()
         self._h_static_bmp = ct.bitmap_proc(0, ct.BITMAP_CREATE, w, h)
         self._h_static_cnv = ct.bitmap_proc(self._h_static_bmp, ct.BITMAP_GET_CANVAS)
         self._static_w = w
         self._static_h = h
-        self._paint_static(self._h_static_cnv, w, h)
+        if self._async_enabled:
+            # First bitmap: the cheap EMPTY static at once (background +
+            # buttons + separator — no segments), then the real segments
+            # via the background request.
+            self._paint_static_empty(self._h_static_cnv, w, h)
+            self._request_async_paint(w, h)
+        else:
+            self._paint_static(self._h_static_cnv, w, h)
 
     def set_colors(self, color_bg, color_deleted, color_added, color_changed,
                    color_gap, color_ignored_gap=None):
@@ -848,9 +1035,18 @@ class PaintboxOverview:
                                                SLIDER_LINE_LUM_DIFF)
 
     def set_line_counts(self, a_count, b_count):
-        """Set the total line counts for both editors (without gaps)."""
+        """Set the total line counts for both editors (without gaps).
+
+        Also bumps the data generation: line counts are installed right
+        before repaint_static() at the end of a compare, so any still-
+        pending background rebuild computed against the OLD layout is
+        invalidated (its result is dropped by the apply timer), and the
+        repaint_static() that follows is never deduplicated away behind
+        an older request with the same size.
+        """
         self.a_line_count = a_count
         self.b_line_count = b_count
+        self._data_gen += 1
 
     def set_wrap_counts(self, wrap_a, wrap_b):
         """Set per-line visual row counts for wrap-aware height computation.
@@ -859,9 +1055,13 @@ class PaintboxOverview:
             wrap_a: list where wrap_a[i] = visual rows for line i in a_ed,
                     or None if wrapping is off (each line = 1 row).
             wrap_b: same for b_ed.
+
+        Also bumps the data generation (same rationale as
+        set_line_counts: installed right before repaint_static()).
         """
         self.wrap_counts_a = wrap_a
         self.wrap_counts_b = wrap_b
+        self._data_gen += 1
 
     def add_line_state(self, side, line, color):
         """Record that a line has a specific color (deleted/added/changed).
@@ -894,11 +1094,20 @@ class PaintboxOverview:
 
     def clear_data(self):
         """Clear all collected line states and gaps. Called before a
-        fresh compare."""
+        fresh compare.
+
+        Also bumps the data generation (_data_gen): any background
+        static rebuild still computing against the OLD data becomes
+        stale — its result is dropped by the apply timer's generation
+        check. (The worker iterating a dict that this clear() empties
+        just raises RuntimeError inside the worker, where it is caught
+        and discarded; the generation check covers the silent cases.)
+        """
         self.line_states_a.clear()
         self.line_states_b.clear()
         self.gaps_a.clear()
         self.gaps_b.clear()
+        self._data_gen += 1
 
     # ------------------------------------------------------------------
     # Layout helpers
@@ -939,42 +1148,13 @@ class PaintboxOverview:
 
     # ------------------------------------------------------------------
     # Static painting (WinMerge "Location Pane" model)
+    #
+    # Split into a pure-Python COMPUTE half (safe to run on the worker
+    # thread: _prefix_sums -> _build_segments -> _compute_side_rects ->
+    # _compute_static_rects) and a CudaText-API DRAW half that only
+    # replays the precomputed rect lists (_paint_rects /
+    # _paint_static_from_rects — main thread only).
     # ------------------------------------------------------------------
-
-    def _paint_static(self, c, w, h):
-        """Paint the static part (background, diff segments, buttons,
-        separator) on the given canvas. Only runs on compare/resize.
-
-        The heavy work is the per-side segment painting
-        (_paint_side_segments), which uses the WinMerge Location Pane
-        approach: lines are converted to pixel segments once (prefix
-        sums), consecutive same-colored lines are coalesced into runs,
-        and every segment that would collapse onto already-painted pixels
-        is skipped — so the canvas call count is bounded by the panel's
-        pixel height, not by the file's line/diff count.
-
-        Args:
-            c: canvas handle (static bitmap canvas)
-            w: width in pixels
-            h: height in pixels
-        """
-        # Clear background
-        ct.canvas_proc(c, ct.CANVAS_SET_BRUSH, color=self.color_bg, style=ct.BRUSH_SOLID)
-        ct.canvas_proc(c, ct.CANVAS_RECT_FILL, x=0, y=0, x2=w, y2=h)
-
-        # Map area: between the buttons, right of the separator line.
-        track_y0, track_h = self._track_rect(h)
-        x_start = SEP_LINE_WIDTH
-        half_w = (w - SEP_LINE_WIDTH) // 2
-        if track_h > 0:
-            self._paint_side_segments(c, 'a', x_start, x_start + half_w,
-                                      track_y0, track_h)
-            self._paint_side_segments(c, 'b', x_start + half_w, w,
-                                      track_y0, track_h)
-
-        # ▲/▼ buttons and the separator line on top
-        self._paint_buttons(c, w, h)
-        self._paint_separator(c, w, h)
 
     def _prefix_sums(self, side):
         """One-pass conversion of a side's line/gap layout to visual rows.
@@ -994,7 +1174,7 @@ class PaintboxOverview:
         Built with itertools.accumulate (C speed) — a 1M-line side is
         one pass instead of the per-line Python loops the old code ran
         (separate O(n) walks in _compute_visual_height, _get_scale and
-        the paint loop itself).
+        the paint loop itself). Pure Python — safe on the worker thread.
         """
         if side == 'a':
             n, gaps, wrap = self.a_line_count, self.gaps_a, self.wrap_counts_a
@@ -1050,12 +1230,14 @@ class PaintboxOverview:
         total = cum[n] + trailing
         return cum, total, gap_map
 
-    def _build_segments(self, side, cum=None, gap_map=None):
+    def _build_segments(self, side, cum=None, gap_map=None, abort=None):
         """Build the colored segments of one side, in visual order.
 
         Returns a list of (start_row, end_row, color) entries (run
         entries are 3-element lists, gap entries 3-element tuples —
-        unpacking treats them identically):
+        unpacking treats them identically), or None when the `abort`
+        callback fired (background rebuild superseded/shut down):
+
           - line runs: consecutive lines with the same color, merged
             when they are visually adjacent (no gap between them) —
             one rect instead of per-line rects;
@@ -1066,6 +1248,11 @@ class PaintboxOverview:
 
         cum / gap_map may be passed in (from a _prefix_sums call the
         caller already made) or computed here when omitted.
+
+        `abort` (worker thread only) is checked every
+        ABORT_CHECK_MASK+1 entries of the line-run loop — a newer
+        request or a shutdown stops a multi-second million-entry walk
+        within milliseconds.
 
         v7: on big compares this walk replaced ~3.7s of the 4.85s
         paint:overview row (cProfile _build_segments self, 1.6M state
@@ -1120,7 +1307,11 @@ class PaintboxOverview:
         has_gaps = bool(gap_map)
         prev_line = -2
         last = None  # the run being extended (runs[-1], kept local)
+        _i = 0
         for line, color in items:
+            _i += 1
+            if abort is not None and (_i & ABORT_CHECK_MASK) == 0 and abort():
+                return None
             if line < 0 or line >= n:
                 continue
             if wrap_hot is not None and line < wl:
@@ -1189,44 +1380,49 @@ class PaintboxOverview:
             gi += 1
         return segments
 
-    def _paint_side_segments(self, c, side, x_start, x_end, y0, track_h):
-        """Paint one side's colored segments into the track area.
+    def _compute_side_rects(self, side, x0, x1, y0, track_h, abort=None):
+        """Compute one side's static PIXEL RECT list (pure Python —
+        NO CudaText API, safe on the worker thread).
 
-        The WinMerge Location Pane draw loop: convert each segment to
-        pixels once, then SKIP every segment whose end pixel equals the
-        previous segment's end pixel — it would only repaint pixels that
-        are already covered ("we cannot write to half a pixel"). A
-        segment that collapses to zero height is bumped to 1 pixel so
-        the first sub-pixel diff of a region stays visible. The number
-        of CANVAS_RECT_FILL calls is therefore bounded by the track
-        height in pixels, not by the line/diff count.
+        _prefix_sums + _build_segments + the WinMerge draw loop:
+        convert each segment to pixels once, then SKIP every segment
+        whose end pixel equals the previous segment's end pixel — it
+        would only repaint pixels that are already covered ("we cannot
+        write to half a pixel"). A segment that collapses to zero height
+        is bumped to 1 pixel so the first sub-pixel diff of a region
+        stays visible. The output list holds only the SURVIVING rects —
+        (color, x0, x1, py0, py1) tuples — so its length is bounded by
+        the track height in pixels, not by the line/diff count: 200k
+        diffs still produce at most ~600 rects per side, and replaying
+        them on the main thread is a few hundred canvas calls.
 
-        v7: the end pixel is computed FIRST and the start pixel only
-        for surviving segments — the vast majority of the 1.6M
+        v7 note: the end pixel is computed FIRST and the start pixel
+        only for surviving segments — the vast majority of the 1.6M
         segments per side collapse onto already-covered pixels and
-        never needed ps. Two sub-sections (paint:overview:build /
-        paint:overview:draw, 2 instances each per repaint) split the
-        old single paint:overview row so the report shows how much is
-        segment CONSTRUCTION (states -> runs) and how much is pixel
-        mapping/drawing.
+        never needed ps.
+
+        `abort` (worker thread only) is polled every
+        ABORT_CHECK_MASK+1 segments; returns None when aborted.
+        Returns [] when the side has no paintable content.
         """
-        # _prefix_sums + _build_segments: the segment CONSTRUCTION half.
-        Profiler.start('paint:overview:build')
         cum, total, gap_map = self._prefix_sums(side)
-        segments = self._build_segments(side, cum, gap_map) \
-            if total > 0 and track_h > 0 else None
-        Profiler.stop('paint:overview:build')
         if total <= 0 or track_h <= 0:
-            return
+            return []
+        segments = self._build_segments(side, cum, gap_map, abort)
+        if segments is None:
+            return None
         if not segments:
-            return
+            return []
         scale = track_h / total
 
-        # the pixel-mapping + drawing half
-        Profiler.start('paint:overview:draw')
+        rects = []
+        rects_append = rects.append
         prev_end = -1     # raw end pixel of the previous segment (WinMerge's nPrevEndY)
-        last_color = None
+        _i = 0
         for start_row, end_row, color in segments:
+            _i += 1
+            if abort is not None and (_i & ABORT_CHECK_MASK) == 0 and abort():
+                return None
             raw_pe = y0 + int(end_row * scale)
             if raw_pe == prev_end:
                 # Collapses onto pixels the previous segment already
@@ -1236,14 +1432,118 @@ class PaintboxOverview:
             pe = raw_pe
             if pe <= ps:
                 pe = ps + 1  # sub-pixel segment: draw at least one pixel
+            rects_append((color, x0, x1, ps, pe))
+            prev_end = raw_pe
+        return rects
+
+    def _compute_static_rects(self, token, w, h):
+        """Compute BOTH sides' static rect lists for a background
+        rebuild (worker thread; pure Python only — see the module
+        docstring, BACKGROUND STATIC PAINTING).
+
+        Returns (rects_a, rects_b) — lists of (color, x0, x1, py0, py1)
+        tuples ready for _paint_rects on the main thread — or None when
+        the rebuild was aborted (a newer request superseded this token,
+        or shutdown): the caller drops the compute, the newer request
+        runs next.
+        """
+        def _aborted():
+            return self._worker_shutdown or self._token != token
+
+        track_y0, track_h = self._track_rect(h)
+        if track_h <= 0:
+            return [], []
+        x_start = SEP_LINE_WIDTH
+        half_w = (w - SEP_LINE_WIDTH) // 2
+        rects_a = self._compute_side_rects(
+            'a', x_start, x_start + half_w, track_y0, track_h, _aborted)
+        if rects_a is None:
+            return None
+        rects_b = self._compute_side_rects(
+            'b', x_start + half_w, w, track_y0, track_h, _aborted)
+        if rects_b is None:
+            return None
+        return rects_a, rects_b
+
+    def _paint_rects(self, c, rects):
+        """Replay a precomputed rect list onto a canvas (MAIN thread —
+        CudaText API). One CANVAS_SET_BRUSH per color change + one
+        CANVAS_RECT_FILL per rect; the WinMerge dedup that ran in the
+        compute half already bounded the list by the panel's pixel
+        height, so this costs at most a few hundred canvas calls."""
+        last_color = None
+        for color, x0, x1, y0, y1 in rects:
             if color != last_color:
                 ct.canvas_proc(c, ct.CANVAS_SET_BRUSH, color=color,
                                style=ct.BRUSH_SOLID)
                 last_color = color
             ct.canvas_proc(c, ct.CANVAS_RECT_FILL,
-                           x=x_start, y=ps, x2=x_end, y2=pe)
-            prev_end = raw_pe
-        Profiler.stop('paint:overview:draw')
+                           x=x0, y=y0, x2=x1, y2=y1)
+
+    def _paint_static(self, c, w, h):
+        """Full SYNCHRONOUS static paint (background, diff segments,
+        buttons, separator) — the fallback path used only when the
+        background worker cannot run (thread creation failed). The
+        normal path computes the rects on the worker thread and applies
+        them via _paint_static_from_rects from the apply timer."""
+        # Clear background
+        ct.canvas_proc(c, ct.CANVAS_SET_BRUSH, color=self.color_bg, style=ct.BRUSH_SOLID)
+        ct.canvas_proc(c, ct.CANVAS_RECT_FILL, x=0, y=0, x2=w, y2=h)
+
+        # Map area: between the buttons, right of the separator line.
+        track_y0, track_h = self._track_rect(h)
+        x_start = SEP_LINE_WIDTH
+        half_w = (w - SEP_LINE_WIDTH) // 2
+        if track_h > 0:
+            Profiler.start('paint:overview:build')
+            rects_a = self._compute_side_rects(
+                'a', x_start, x_start + half_w, track_y0, track_h)
+            rects_b = self._compute_side_rects(
+                'b', x_start + half_w, w, track_y0, track_h)
+            Profiler.stop('paint:overview:build')
+            Profiler.start('paint:overview:draw')
+            if rects_a:
+                self._paint_rects(c, rects_a)
+            if rects_b:
+                self._paint_rects(c, rects_b)
+            Profiler.stop('paint:overview:draw')
+
+        # ▲/▼ buttons and the separator line on top
+        self._paint_buttons(c, w, h)
+        self._paint_separator(c, w, h)
+
+    def _paint_static_empty(self, c, w, h):
+        """Paint the EMPTY static: background, ▲/▼ buttons, separator —
+        no diff segments (MAIN thread — CudaText API). Used for the
+        first paint of a freshly created overview (the panel shows the
+        default background immediately; the compare fills the map in
+        when it finishes) — with no data collected the full static paint
+        degenerates to exactly this, so running it synchronously is
+        cheap by construction."""
+        ct.canvas_proc(c, ct.CANVAS_SET_BRUSH, color=self.color_bg,
+                       style=ct.BRUSH_SOLID)
+        ct.canvas_proc(c, ct.CANVAS_RECT_FILL, x=0, y=0, x2=w, y2=h)
+        self._paint_buttons(c, w, h)
+        self._paint_separator(c, w, h)
+
+    def _paint_static_from_rects(self, c, w, h, rects_a, rects_b):
+        """Paint the static bitmap from the worker's PRECOMPUTED rect
+        lists (MAIN thread — CudaText API): background fill, both sides'
+        surviving rects (bounded by the panel's pixel height thanks to
+        the WinMerge dedup that ran on the worker thread), the ▲/▼
+        buttons and the separator. This is the cheap API half of the old
+        _paint_static; the expensive Python half ran off the main
+        thread, which is what keeps resizes and compare epilogues from
+        freezing the UI on million-line files."""
+        ct.canvas_proc(c, ct.CANVAS_SET_BRUSH, color=self.color_bg,
+                       style=ct.BRUSH_SOLID)
+        ct.canvas_proc(c, ct.CANVAS_RECT_FILL, x=0, y=0, x2=w, y2=h)
+        if rects_a:
+            self._paint_rects(c, rects_a)
+        if rects_b:
+            self._paint_rects(c, rects_b)
+        self._paint_buttons(c, w, h)
+        self._paint_separator(c, w, h)
 
     def _paint_buttons(self, c, w, h):
         """Paint the ▲/▼ scroll button boxes at the top and bottom of
@@ -1309,12 +1609,247 @@ class PaintboxOverview:
         ct.canvas_proc(c, ct.CANVAS_RECT_FILL,
                        x=0, y=0, x2=SEP_LINE_WIDTH, y2=h)
 
+    # ------------------------------------------------------------------
+    # Background static painting machinery
+    # (see the module docstring, BACKGROUND STATIC PAINTING)
+    #
+    # HARD RULE: CudaText is single-threaded — its API (dlg_proc /
+    # canvas_proc / bitmap_proc / timer_proc / editor calls) may ONLY
+    # run on the main thread. The worker thread computes PURE Python
+    # only (prefix sums, segment coalescing, pixel mapping) and hands
+    # plain tuple lists back; the main thread does every API call.
+    # ------------------------------------------------------------------
+
+    def _request_async_paint(self, w, h):
+        """Ask the background worker to rebuild the static bitmap at
+        (w, h) — the async path of repaint_static() and of
+        _ensure_static_bitmap()'s size-mismatch branch.
+
+        Publishes (token, data-generation, w, h) into the request slot
+        (REPLACING any older request, so only the newest rebuild ever
+        runs) and makes sure the worker thread and the main-thread
+        apply timer are running. Returns at once: the UI never waits
+        for the compute. While the rebuild is in flight, paint() keeps
+        blitting the OLD static bitmap.
+
+        Identical rebuild requests (same size AND same data generation)
+        that are already pending or in flight are skipped — this is
+        what keeps the per-paint size check cheap during resize storms.
+        """
+        if self.h_canvas is None or not self._async_enabled:
+            return
+        gen = self._data_gen
+        with self._worker_cond:
+            if self._applied_token < self._token and \
+                    self._last_req == (w, h, gen):
+                # The identical rebuild is already pending / in flight.
+                return
+            self._token += 1
+            token = self._token
+            self._req = (token, gen, w, h)
+            self._last_req = (w, h, gen)
+            self._worker_cond.notify_all()
+        self._start_apply_timer()
+        self._start_worker()
+
+    def _start_worker(self):
+        """Start the daemon worker thread if it is not running (main
+        thread only). On the exotic failure of thread creation the
+        overview permanently falls back to the synchronous static
+        paint."""
+        if self._worker is not None and self._worker.is_alive():
+            return
+        try:
+            self._worker = threading.Thread(
+                target=self._worker_loop,
+                name='cuda_differ_overview',
+                daemon=True)
+            self._worker.start()
+        except Exception:
+            # Threads unavailable: no background painting — every
+            # static rebuild runs synchronously from now on.
+            self._async_enabled = False
+            with self._worker_cond:
+                self._req = None
+                self._result = None
+            self._applied_token = self._token
+            self._stop_apply_timer()
+
+    def _worker_loop(self):
+        """The daemon worker thread body.
+
+        Waits for a request, computes the static bitmap's PIXEL RECT
+        lists with PURE Python only (NO CudaText API — CudaText is
+        single-threaded and its API must never be called from here),
+        publishes the result into the result slot, and loops.
+
+        A newer request that arrived while computing is picked up on the
+        next pass (the request slot always holds only the newest one);
+        the hot loops abort early via the token check when superseded,
+        so a resize storm never burns multi-second stale computes.
+        Never touches timers, dialogs, canvases or editor objects.
+        """
+        while True:
+            with self._worker_cond:
+                while self._req is None and not self._worker_shutdown:
+                    self._worker_cond.wait(timeout=0.5)
+                if self._worker_shutdown:
+                    return
+                req = self._req
+                self._req = None
+            token, gen, w, h = req
+            try:
+                out = self._compute_static_rects(token, w, h)
+            except Exception:
+                # The overview data was replaced under us (a new
+                # compare's clear_data / paint loop mutated the dicts
+                # while this compute was iterating them — CPython raises
+                # on dicts resized during iteration). The token /
+                # generation checks guarantee nothing stale is applied
+                # anyway; just drop the compute.
+                out = None
+            if out is None:
+                continue  # aborted / superseded / failed: take the newest request
+            with self._worker_cond:
+                if self._worker_shutdown or self._token != token:
+                    continue  # superseded / shut down: drop the result
+                self._result = (token, gen, w, h, out[0], out[1])
+
+    def _apply_async_tick(self, tag=''):
+        """Repeating APPLY_TIMER_MS timer callback (MAIN thread): apply
+        finished background static rebuilds.
+
+        Consumes the worker's published result, validates it (still the
+        newest request; data generation unchanged; control size
+        unchanged) and then builds the new static bitmap ON THE MAIN
+        THREAD (bitmap_proc / canvas_proc are CudaText API — main
+        thread only): background + the precomputed rects + buttons +
+        separator, swaps it in place of the old bitmap, frees the old
+        one and repaints (paint() blits the new static + draws the
+        slider). The canvas work is bounded by the panel's pixel height
+        (the WinMerge dedup ran on the worker), so the tick costs at
+        most a few ms.
+
+        The timer stops itself when nothing is in flight (no result to
+        consume and every issued token applied) — an idle overview
+        costs nothing.
+        """
+        if self.h_canvas is None:
+            self._stop_apply_timer()
+            return
+        with self._worker_cond:
+            res = self._result
+            self._result = None
+        if res is not None:
+            token, gen, w, h, rects_a, rects_b = res
+            if token != self._token or gen != self._data_gen:
+                # Stale: a newer request superseded it, or the overview
+                # data was replaced (clear_data bumps the generation).
+                if token == self._token:
+                    # Data changed but nothing newer was requested: this
+                    # token is consumed (the next repaint_static issues
+                    # a fresh request with the new data generation).
+                    self._applied_token = token
+            else:
+                w_now, h_now = self._get_size()
+                if w_now > 0 and h_now > 0 and (w_now != w or h_now != h):
+                    # The control was resized while the worker computed:
+                    # this result is outdated — recompute at the fresh
+                    # size (the new request supersedes via its token).
+                    self._applied_token = token
+                    self._request_async_paint(w_now, h_now)
+                else:
+                    self._applied_token = token
+                    self._swap_static_bitmap(w, h, rects_a, rects_b)
+                    self.paint()
+        # Stop the timer when nothing is in flight.
+        if self._apply_timer_on:
+            with self._worker_cond:
+                idle = (self._result is None and
+                        self._applied_token >= self._token)
+            if idle:
+                self._stop_apply_timer()
+
+    def _start_apply_timer(self):
+        """Arm the repeating apply timer (idempotent — guarded by the
+        _apply_timer_on flag; all timer calls are main-thread only)."""
+        if self._apply_timer_on:
+            return
+        self._apply_timer_on = True
+        ct.timer_proc(ct.TIMER_START, self._apply_async_tick, APPLY_TIMER_MS)
+
+    def _stop_apply_timer(self):
+        """Disarm the repeating apply timer (idempotent)."""
+        if not self._apply_timer_on:
+            return
+        self._apply_timer_on = False
+        ct.timer_proc(ct.TIMER_STOP, self._apply_async_tick, APPLY_TIMER_MS)
+
+    def _swap_static_bitmap(self, w, h, rects_a, rects_b):
+        """Create the new static bitmap from the worker's precomputed
+        rects and swap it in (MAIN thread — CudaText API only here).
+
+        The old bitmap is freed AFTER the new one is fully painted: the
+        on-screen image bitmap holds a COPY of the old pixels
+        (CANVAS_BITMAP blits pixel data, it does not reference the
+        source), so freeing the source is safe; keeping the old bitmap
+        alive until the swap also means paint() could always blit
+        something meaningful while the rebuild was in flight."""
+        old_bmp = self._h_static_bmp
+        try:
+            self._h_static_bmp = ct.bitmap_proc(0, ct.BITMAP_CREATE, w, h)
+            self._h_static_cnv = ct.bitmap_proc(
+                self._h_static_bmp, ct.BITMAP_GET_CANVAS)
+            self._static_w = w
+            self._static_h = h
+            self._paint_static_from_rects(
+                self._h_static_cnv, w, h, rects_a, rects_b)
+        finally:
+            if old_bmp is not None and old_bmp != self._h_static_bmp:
+                try:
+                    ct.bitmap_proc(old_bmp, ct.BITMAP_FREE)
+                except Exception:
+                    pass
+
+    def _shutdown_async_paint(self):
+        """Stop the background painting machinery (destroy path): wake
+        and shut down the worker, drop any pending request and result,
+        stop the apply timer.
+
+        The worker checks the shutdown flag in its hot loops, so it
+        unwinds within milliseconds of a running compute; the join is
+        only a short politeness wait (the thread is a daemon, so even a
+        stuck worker cannot block app exit)."""
+        with self._worker_cond:
+            self._worker_shutdown = True
+            self._req = None
+            self._result = None
+            self._worker_cond.notify_all()
+        self._stop_apply_timer()
+        t = self._worker
+        if t is not None and t.is_alive():
+            try:
+                t.join(timeout=0.25)
+            except Exception:
+                pass
+        # Invalidate anything the worker could still publish.
+        self._data_gen += 1
+
     def repaint_static(self):
         """Force a full repaint of the static bitmap. Called after a
         fresh compare or when colors change.
 
-        Frees the old static bitmap and creates a new one with fresh
-        content, then calls paint() to display it with the dynamic part.
+        With the background painting machinery (the normal path) this
+        only PUBLISHES a rebuild request and returns AT ONCE: the
+        worker thread recomputes the segment -> pixel rects off the
+        main thread, and the apply timer swaps the fresh static bitmap
+        in when it is ready. Until then paint() keeps showing the OLD
+        static bitmap, so the panel never goes blank and the UI never
+        waits — on million-line compares the multi-second segment walk
+        no longer freezes the compare epilogue or a resize.
+
+        The synchronous fallback (threading unavailable) rebuilds the
+        bitmap right here, like the old code did.
         """
         if self.h_canvas is None:
             return
@@ -1325,21 +1860,35 @@ class PaintboxOverview:
         # up to OVERVIEW_SIZE_TTL, and a stale entry right after a resize
         # would blit a mismatched static bitmap.
         self._size_cache = (w, h, time.monotonic())
-        self._free_static_bitmap()
-        self._ensure_static_bitmap(w, h)
-        self.paint()
+        if self._async_enabled:
+            # ASYNC: request the rebuild, keep showing the old bitmap
+            # until the fresh one lands (the apply timer swaps it in).
+            self._request_async_paint(w, h)
+            self.paint()
+        else:
+            self._free_static_bitmap()
+            self._ensure_static_bitmap(w, h)
+            self.paint()
 
     def paint(self):
         """Repaint the overview using the static/dynamic bitmap approach.
 
         The static bitmap (diff segments + buttons + separator) is
-        reused — it's only repainted when the diff changes (via
-        repaint_static). On scroll, this method just:
+        reused — it's only rebuilt (in the background) when the diff
+        changes (via repaint_static) or the control size changes. On
+        scroll, this method just:
         1. Ensures the static bitmap exists and matches current size.
         2. Resizes the image's embedded bitmap to match (if needed).
         3. Copies the static bitmap to the image's embedded bitmap via
            CANVAS_BITMAP (fast — one bitmap copy).
         4. Draws the dynamic part (slider + grabber) on top.
+
+        While a background rebuild is in flight the static bitmap can
+        be sized for the PREVIOUS control size: the destination is
+        first filled with the background color so the area the stale
+        bitmap cannot reach shows the default background instead of
+        garbage, then the stale bitmap is blitted (its bottom/right is
+        simply clipped) — the transient frame costs one rect fill.
 
         This avoids the expensive segment loop on every scroll. The
         image control's embedded bitmap handles resize/minimize/restore
@@ -1353,13 +1902,24 @@ class PaintboxOverview:
         if w <= 0 or h <= 0:
             return
 
-        # Ensure static bitmap exists and matches current size
+        # Ensure a static bitmap exists (creating it is cheap: the empty
+        # background + buttons + separator; a size mismatch only requests
+        # a background rebuild — never a synchronous segment walk).
         self._ensure_static_bitmap(w, h)
 
         # Resize the image's embedded bitmap to match the control size.
         # The image control starts with a 0x0 bitmap; we must resize it
         # before painting on it, otherwise nothing shows (checkerboard pattern).
         ct.bitmap_proc(self.h_bitmap, ct.BITMAP_SET_SIZE, w, h)
+
+        # Clear the destination first when the static bitmap is
+        # stale-sized (background rebuild in flight after a resize).
+        if self._h_static_bmp is not None and \
+                (self._static_w != w or self._static_h != h):
+            ct.canvas_proc(self.h_canvas, ct.CANVAS_SET_BRUSH,
+                           color=self.color_bg, style=ct.BRUSH_SOLID)
+            ct.canvas_proc(self.h_canvas, ct.CANVAS_RECT_FILL,
+                           x=0, y=0, x2=w, y2=h)
 
         # Copy static bitmap to the image's embedded bitmap.
         # CudaText API change (recent versions): CANVAS_BITMAP now takes
@@ -1374,27 +1934,89 @@ class PaintboxOverview:
         # Draw dynamic part (slider) on top
         self._paint_dynamic(w, h)
 
+    # ------------------------------------------------------------------
+    # Scroll mapping helpers (END-OF-TRACK SCROLL MAPPING — see the
+    # module docstring). Pure math: no CudaText API, no state changes.
+    # ------------------------------------------------------------------
+
+    def _slider_metrics(self, track_h, smooth_max, smooth_page):
+        """(thumb_height, usable_travel) for a track height and the
+        editor's smooth-scroll geometry.
+
+        The thumb is proportional to page/max (like every real
+        scrollbar), clamped to [_slider_min_height, track_h] so it stays
+        grabbable on big files; the USABLE travel is what remains of the
+        track — the pixel range the thumb's TOP moves over, mapped
+        linearly onto the scrollable range [0, smooth_pos_last] by
+        _paint_dynamic / _pixel_to_smooth_pos / _preview_y_for_pos.
+        """
+        min_h = self._slider_min_height
+        if smooth_max > 0 and smooth_page > 0:
+            thumb_h = int(track_h * smooth_page / smooth_max + 0.5)
+            thumb_h = max(min_h, min(track_h, thumb_h))
+        else:
+            thumb_h = min(min_h, track_h)
+        return thumb_h, max(0, track_h - thumb_h)
+
+    def _cached_scroll_info(self):
+        """(smooth_max, smooth_page, pos_last) from the cached truth
+        read, reading PROP_SCROLL_VERT_INFO from a_ed once when the
+        caches are cold.
+
+        pos_last is the editor's MAXIMUM smooth scroll position — the
+        value that shows the very end of the text. Returns None when no
+        usable truth is available yet (no editor, no scroll info).
+        """
+        if self._smooth_max > 0:
+            return (self._smooth_max, self._smooth_page,
+                    max(0, self._smooth_pos_last))
+        if self.a_ed is None:
+            return None
+        scroll_info = self.a_ed.get_prop(ct.PROP_SCROLL_VERT_INFO)
+        if not scroll_info:
+            return None
+        smooth_max = scroll_info.get('smooth_max', 0)
+        smooth_page = scroll_info.get('smooth_page', 0)
+        pos_last = scroll_info.get('smooth_pos_last')
+        if pos_last is None:
+            pos_last = max(0, smooth_max - smooth_page) if smooth_max > 0 else 0
+        if smooth_max <= 0:
+            return None
+        self._smooth_max = smooth_max
+        self._smooth_page = smooth_page
+        self._smooth_pos_last = pos_last
+        return smooth_max, smooth_page, pos_last
+
     def _paint_dynamic(self, w, h):
         """Draw the dynamic part: the scrollbar slider.
 
-        Uses pure pixel-based mapping (no line/gap calculations):
+        Uses the END-OF-TRACK pixel mapping (no line/gap calculations):
         - Get the editor's total content height (smooth_max), current
-          scroll position (smooth_pos), and visible page (smooth_page)
-          from PROP_SCROLL_VERT_INFO.
+          scroll position (smooth_pos), visible page (smooth_page) and
+          maximum position (smooth_pos_last = smooth_pos_last) from
+          PROP_SCROLL_VERT_INFO.
         - Map to the track area between the ▲/▼ buttons:
-            slider_height = track_h * smooth_page / smooth_max
-                            (proportional, clamped to min 30px so it
-                            stays grabbable, and to the track height)
-            slider_top    = track_y0 + track_h * smooth_pos / smooth_max
+            thumb_h  = track_h * smooth_page / smooth_max
+                       (proportional, clamped to min 30px so it stays
+                       grabbable, and to the track height)
+            usable   = track_h - thumb_h  (the thumb's travel range)
+            thumb_top = track_y0 + usable * smooth_pos / smooth_pos_last
         - Draw via _paint_slider_solid: one CANVAS_RECT call (pen border
           + solid brush fill) + the grabber lines — no transparency
           blending, so zero overhead per paint.
 
-        The slider_top formula is mathematically consistent: when
-        smooth_pos reaches its max (smooth_max - smooth_page),
-        py_top = track_y0 + track_h - slider_height, so the slider lands
-        flush at the bottom of the track. No special-casing needed for
-        the bottom edge.
+        The thumb_top formula is the exact inverse of
+        _pixel_to_smooth_pos: when smooth_pos reaches its max
+        (smooth_pos_last — the end of the text), thumb_top lands flush
+        at the track bottom, and dragging the thumb flush to the track
+        bottom writes smooth_pos_last — the text shows its very end,
+        like the scrollbars of usual editors and browsers. (Mapping the
+        position onto the FULL track height instead — the old code —
+        only agrees with the inverse while the thumb keeps its
+        proportional size; with the 30px minimum clamp active on big
+        files the two mappings disagreed by (min_thumb - proportional)
+        pixels of track, which left the text far from the end when the
+        slider was at the bottom.)
 
         While the overview is DRIVING the scroll (slider drag / track
         jump / ▲/▼ repeat) _thumb_preview_y is set: the thumb is drawn
@@ -1418,26 +2040,15 @@ class PaintboxOverview:
 
         track_y0, track_h = self._track_rect(h)
 
-        # --- Compute proportional slider height (like a real scrollbar) ---
-        # smooth_max is the total content height in pixels (includes the
-        # page size, per CudaText API docs). smooth_page is the visible
-        # viewport height. slider_height proportional to page/total,
-        # clamped to [min_height, track_h] so the slider always fits the
-        # track and stays grabbable. Both values use round-half-up so
-        # the slider lands EXACTLY flush at the track bottom when the
-        # scroll position reaches its max (plain int() truncation would
-        # leave a 1px gap: int(t*p/m) + int(t*p/m) != t).
-        min_h = self._slider_min_height
         if self._thumb_preview_y is not None and self._smooth_max > 0:
             # Driving: page/max/height don't change mid-interaction --
             # reuse the geometry from the last truth read (no get_prop).
             smooth_max = self._smooth_max
             smooth_page = self._smooth_page
-            if smooth_page > 0:
-                py_height = int(track_h * smooth_page / smooth_max + 0.5)
-                py_height = max(min_h, min(track_h, py_height))
-            else:
-                py_height = min(min_h, track_h)
+            pos_last = max(0, self._smooth_pos_last)
+            thumb_h, usable = self._slider_metrics(
+                track_h, smooth_max, smooth_page)
+            py_height = thumb_h
             # Thumb glued to the driven position (already track-clamped
             # by the callers; clamp again for safety).
             py_top = self._thumb_preview_y
@@ -1452,26 +2063,33 @@ class PaintboxOverview:
             smooth_pos = scroll_info.get('smooth_pos', 0)
             smooth_max = scroll_info.get('smooth_max', 1)
             smooth_page = scroll_info.get('smooth_page', 0)
+            pos_last = scroll_info.get('smooth_pos_last')
+            if pos_last is None:
+                pos_last = max(0, smooth_max - smooth_page) \
+                    if smooth_max > 0 else 0
 
             if smooth_max <= 0:
                 smooth_max = 1
 
-            if smooth_page > 0:
-                py_height = int(track_h * smooth_page / smooth_max + 0.5)
-                py_height = max(min_h, min(track_h, py_height))
-            else:
-                # No page info (e.g., very early init) — fall back to min.
-                py_height = min(min_h, track_h)
+            thumb_h, usable = self._slider_metrics(
+                track_h, smooth_max, smooth_page)
+            py_height = thumb_h
 
-            # Map editor scroll position to track pixels:
-            # slider_top = track_top + track_h * editor_scroll / editor_total
-            py_top = track_y0 + int(track_h * smooth_pos / smooth_max + 0.5)
+            # END-OF-TRACK MAPPING: the thumb's travel range (track
+            # minus thumb) maps linearly onto [0, pos_last]. At
+            # smooth_pos == pos_last (the end of the text) the thumb
+            # lands flush at the track bottom.
+            if pos_last > 0 and usable > 0:
+                py_top = track_y0 + int(usable * smooth_pos / pos_last + 0.5)
+            else:
+                # Everything fits (no scrolling possible): thumb pinned
+                # at the top, full height.
+                py_top = track_y0
 
             # Clamp slider within the track
             py_top = max(track_y0, min(py_top,
                                        track_y0 + track_h - py_height))
-            self._smooth_pos_last = scroll_info.get(
-                'smooth_pos_last', max(0, smooth_max - smooth_page))
+            self._smooth_pos_last = pos_last
             self._smooth_page = smooth_page
 
         # Solid slider: one CANVAS_RECT call (pen border + brush fill).
@@ -1601,7 +2219,7 @@ class PaintboxOverview:
             self._driving = True
             self._drag_offset = y - self._slider_top
         else:
-            # Click outside slider — jump (centered on click). The
+            # Click outside slider — jump (centered on the click). The
             # overview drives both halves from here until the button
             # is released (see is_driving_scroll).
             # THUMB FIRST, WRITE SECOND (the native-scrollbar order):
@@ -1897,11 +2515,12 @@ class PaintboxOverview:
     def _start_button_repeat(self, direction):
         """Begin a ▲/▼ button press: scroll one line immediately, then
         arm the initial-delay one-shot timer which starts the repeating
-        timer for the auto-scroll (like holding a usual scrollbar's
-        arrow button: one line per click, continuous scrolling after a
-        short hold). While the button is held the overview drives both
-        halves (is_driving_scroll) — see _scroll_one_line for why the
-        ScrollSplittedTab mirror must stay out of the way then."""
+        auto-scroll timer for the auto-scroll (like holding a usual
+        scrollbar's arrow button: one line per click, continuous
+        scrolling after a short hold). While the button is held the
+        overview drives both halves (is_driving_scroll) — see
+        _scroll_one_line for why the ScrollSplittedTab mirror must stay
+        out of the way then."""
         self._stop_button_repeat()
         self._btn_dir = direction
         self._driving = True
@@ -1980,8 +2599,9 @@ class PaintboxOverview:
             return
         smooth_max = scroll_info.get('smooth_max', 0)
         smooth_page = scroll_info.get('smooth_page', 0)
-        pos_last = scroll_info.get(
-            'smooth_pos_last', max(0, smooth_max - smooth_page))
+        pos_last = scroll_info.get('smooth_pos_last')
+        if pos_last is None:
+            pos_last = max(0, smooth_max - smooth_page)
         target = scroll_info.get('smooth_pos', 0) + direction * char_size
         # Clamp to the valid smooth range (no useless writes at the
         # edges: at the top/bottom the position cannot move).
@@ -2027,10 +2647,11 @@ class PaintboxOverview:
         than the rate limit).
 
         paint() is cheap on this path (one cached-bitmap copy + the
-        slider drawing -- the expensive static segments never run),
-        so ~33 repaints per second cost little CPU; the wall-clock gate
-        keeps the rate bounded no matter how fast the mouse moves or
-        how densely scroll events arrive.
+        slider drawing -- the expensive static segments never run, and
+        a resize-triggered static rebuild only happens in the
+        background), so ~33 repaints per second cost little CPU; the
+        wall-clock gate keeps the rate bounded no matter how fast the
+        mouse moves or how densely scroll events arrive.
 
         Args:
             force: bypass the throttle (final repaints on mouse-up and
@@ -2080,26 +2701,36 @@ class PaintboxOverview:
             self._pumping = False
 
     # ------------------------------------------------------------------
-    # Scroll mapping
+    # Scroll mapping (END-OF-TRACK SCROLL MAPPING — see the module
+    # docstring; the exact inverse pair of _paint_dynamic's mapping)
     # ------------------------------------------------------------------
 
     def _pixel_to_smooth_pos(self, overview_y, center=True):
         """Map an overview pixel Y to an editor smooth scroll position.
 
-        Pure pixel-based mapping onto the TRACK area (between the ▲/▼
-        buttons):
-            editor_target_scroll = smooth_max * (y - track_y0) / track_h
+        The inverse of the paint mapping: the thumb's TRAVEL RANGE (the
+        track minus the thumb) maps linearly onto the scrollable range
+        [0, smooth_pos_last]:
+            pos = pos_last * (thumb_top - track_y0) / usable
+        With the thumb flush at the BOTTOM of the track this is exactly
+        pos_last — the editor's end-of-content position — so dragging
+        the slider to the end shows the end of the text, like the
+        scrollbars of usual editors and browsers. (The old full-track
+        mapping peaked below pos_last whenever the 30px minimum thumb
+        clamp was active — on big files that left the text tens of
+        screens above the end, and the user had to scroll the rest
+        manually.)
 
         If center=True, the clicked position becomes the center of the
-        viewport (the target is pulled up by half the slider height,
+        viewport (the target thumb-top is pulled up by half the thumb,
         which corresponds to half the visible page).
         If center=False (dragging), the position becomes the slider top.
 
-        The result is clamped to the editor's valid smooth range
-        [0, smooth_pos_last] — so a drag past the track ends writes the
-        end-of-file position instead of a no-op-beyond-end value (the
-        editor would clamp it internally anyway, but clamping here
-        keeps the thumb preview and the written position consistent).
+        The result is clamped to [0, pos_last] — so a drag past the
+        track ends writes the end-of-file position instead of a
+        no-op-beyond-end value (the editor would clamp it internally
+        anyway, but clamping here keeps the thumb preview and the
+        written position consistent).
 
         Returns None when the geometry/mapping is not usable yet.
         """
@@ -2112,50 +2743,50 @@ class PaintboxOverview:
         if track_h <= 0:
             return None
 
+        info = self._cached_scroll_info()
+        if info is None:
+            return None
+        smooth_max, smooth_page, pos_last = info
+
+        if pos_last <= 0:
+            return 0  # everything fits in the viewport: no scrolling
+
+        thumb_h, usable = self._slider_metrics(track_h, smooth_max,
+                                               smooth_page)
         ty = overview_y - track_y0
         if center:
-            ty -= self._slider_height // 2
-
-        smooth_max = self._smooth_max
-        if smooth_max <= 0:
-            # Get it from the editor
-            scroll_info = self.a_ed.get_prop(ct.PROP_SCROLL_VERT_INFO) if self.a_ed else None
-            if scroll_info:
-                smooth_max = scroll_info.get('smooth_max', 0)
-            if smooth_max <= 0:
-                return None
-            self._smooth_max = smooth_max
-
-        # Map overview track pixel to editor scroll pixel:
-        # editor_scroll = smooth_max * overview_y / track_h
-        target_smooth_pos = int(smooth_max * ty / track_h)
-
-        # Clamp to the valid smooth range
-        pos_last = self._smooth_pos_last
-        if pos_last <= 0:
-            scroll_info = self.a_ed.get_prop(ct.PROP_SCROLL_VERT_INFO) if self.a_ed else None
-            pos_last = scroll_info.get(
-                'smooth_pos_last', 0) if scroll_info else 0
-            if pos_last <= 0 and scroll_info:
-                pos_last = max(0, smooth_max -
-                               scroll_info.get('smooth_page', 0))
-            self._smooth_pos_last = pos_last
-        return max(0, min(target_smooth_pos, pos_last))
+            ty -= thumb_h // 2
+        if usable <= 0:
+            # Degenerate track (no room for a thumb at all): the lower
+            # half of the panel maps to the end, the upper half to the
+            # top — the only sensible mapping left.
+            return pos_last if ty >= track_h // 2 else 0
+        # Clamp the thumb-top to its travel range FIRST (the drag clamp
+        # does the same), then map linearly onto [0, pos_last].
+        ty = max(0, min(ty, usable))
+        return int(pos_last * ty / usable + 0.5)
 
     def _preview_y_for_pos(self, smooth_pos):
         """Map a smooth scroll position to the track-pixel Y the slider
-        thumb should be shown at (the inverse of the paint mapping:
-        py_top = track_y0 + track_h * smooth_pos / smooth_max), clamped
-        to the track. Returns None when the mapping is not usable yet
-        (no truth read done, smooth_max unknown)."""
-        smooth_max = self._smooth_max
+        thumb should be shown at (the forward END-OF-TRACK mapping:
+        thumb_top = track_y0 + usable * pos / pos_last), clamped to the
+        track. Returns None when the mapping is not usable yet (no
+        truth read done, smooth_max unknown)."""
         track_h = self._track_h
         track_y0 = self._track_y0
-        if smooth_max <= 0 or track_h <= 0:
+        if track_h <= 0:
             return None
-        py_top = track_y0 + int(track_h * smooth_pos / smooth_max + 0.5)
-        py_height = self._slider_height
-        return max(track_y0, min(py_top, track_y0 + track_h - py_height))
+        info = self._cached_scroll_info()
+        if info is None:
+            return None
+        smooth_max, smooth_page, pos_last = info
+        thumb_h, usable = self._slider_metrics(track_h, smooth_max,
+                                               smooth_page)
+        if pos_last > 0 and usable > 0:
+            py_top = track_y0 + int(usable * smooth_pos / pos_last + 0.5)
+        else:
+            py_top = track_y0
+        return max(track_y0, min(py_top, track_y0 + track_h - thumb_h))
 
     def _write_scroll_position(self, target_smooth_pos):
         """Write the smooth scroll position to both editors and

@@ -1751,7 +1751,26 @@ class Command:
 
         Creates a new untitled tab, unlinks the split editors (so each half
         has independent text), splits vertically, then loads each original's
-        content and editor properties into the two halves."""
+        content and editor properties into the two halves.
+
+        The per-tab session AND the overview panel (when enabled) are
+        created BEFORE the texts are loaded. Docking the overview panel,
+        hiding the built-in scrollbars it replaces and enabling the
+        micromap all change the editors' WIDTH — doing any of that AFTER
+        the text was loaded would force CudaText to re-wrap the whole
+        text of both halves (very visible on big files). With the final
+        geometry already in place, the text wraps exactly once, at its
+        final width.
+
+        The overview is created EMPTY — the theme's editor background,
+        the ▲/▼ scroll buttons and the separator line only — and is
+        filled with the colored diff map when the compare finishes
+        (refresh_compare -> _paint_compare_events -> overview.
+        repaint_static, which paints in the background thread and swaps
+        the bitmap in when ready). refresh_compare also (re)creates the
+        overview whenever it is missing (Recompare on a restored tab,
+        the option toggled on, ...), so an overview always exists by
+        the time a compare paints its events."""
         files = [file0, file1]
         # Properties to copy from originals to the compare halves.
         # These affect how text is displayed and interpreted.
@@ -1830,14 +1849,19 @@ class Command:
                             ed.set_prop(prop, val)
                         except Exception:
                             pass  # some props may not be settable on untitled tabs
-            
-            # Load each original's content into the two split halves.
-            a_ed.set_text_all(orig_texts[0])
-            b_ed.set_text_all(orig_texts[1])
-            
+
+            # --- Everything that changes the editors' WIDTH runs BEFORE
+            # the texts are loaded (see the method docstring): session
+            # registration, micromap setup, built-in scrollbar hiding,
+            # overview creation. The texts then wrap exactly once, at
+            # the editors' final width.
+
             # Register the compare tab by its PROP_TAB_ID with the original
             # tab IDs and names, plus the session key for grouping. The
             # _TabSession is the tab's standalone world from here on.
+            # (Created BEFORE the texts are loaded: the session must
+            # exist when the spurious on_change events of set_text_all
+            # fire, and the overview is owned by the session.)
             compare_tab_id = ct.ed.get_prop(ct.PROP_TAB_ID)
             try:
                 session_path = ct.app_path(ct.APP_FILE_SESSION) or ''
@@ -1851,16 +1875,78 @@ class Command:
                 orig_tab_ids[0], orig_tab_ids[1],
                 orig_names[0], orig_names[1],
                 saved=True)  # initial state: content matches originals = saved
+            # Suppress the next 2 on_change events (one per split half)
+            # because set_text_all triggers on_change, which would reset
+            # the green color to red. Armed BEFORE the texts are loaded
+            # (the session now exists earlier than in the old layout, so
+            # the spurious events must never find an unarmed session).
+            # The counter is decremented in on_change; real user edits
+            # after this will work normally.
+            session.suppress_change = 2
+
+            # Set up the micromap on both editors when enabled (its
+            # gutter columns also change the editors' width -- hence
+            # here, before the text load; refresh_compare's own setup
+            # call is idempotent).
+            micromap_on = self.cfg.get('enable_micromap', False)
+            if micromap_on:
+                self._setup_micromap(a_ed, b_ed)
+
+            # Hide the built-in vertical scrollbars while the overview
+            # (which has its own slider + arrow buttons) replaces them —
+            # BEFORE the text load, for the same no-re-wrap reason.
+            overview_on = self.cfg.get('enable_overview', True)
+            self._apply_scrollbar_visibility(
+                session, a_ed, b_ed,
+                overview_on and self.cfg.get('hide_builtin_scrollbars', True))
+
+            # Create the overview panel BEFORE loading the texts: docking
+            # it to the right of the editors changes their width, and
+            # doing that after set_text_all would re-wrap both halves
+            # (the "re-warp of text" the fix exists for). The panel is
+            # created EMPTY — the theme's editor background color, the
+            # ▲/▼ buttons and the separator — and the colored diff map
+            # is filled in when the compare that starts right below
+            # finishes. (refresh_compare also creates the overview when
+            # it is missing — Recompare, restored tabs, the option
+            # toggled on — so a compare can always fill a panel.)
+            if overview_on:
+                overview = PaintboxOverview()
+                overview.create(a_ed, b_ed)
+                session.overview = overview
+                # Colors from the theme + config so the empty panel
+                # matches the editors from the first frame on.
+                try:
+                    ui_theme = ct.app_proc(ct.PROC_THEME_UI_DICT_GET, '')
+                    color_bg = ui_theme.get('EdTextBg', {}).get('color', 0xFFFFFF)
+                except Exception:
+                    color_bg = 0xFFFFFF
+                overview.set_colors(
+                    color_bg,
+                    self.cfg.get('color_deleted'),
+                    self.cfg.get('color_added'),
+                    self.cfg.get('color_changed'),
+                    self.cfg.get('color_gaps'),
+                    self.cfg.get('color_ignored_gap'))
+                overview.clear_data()
+                # Paint the empty overview right away: the default
+                # background, the ▲/▼ buttons, the separator. Cheap (no
+                # diff data yet) and already background-threaded inside
+                # the overview — this is the "default background color"
+                # state that stays visible until the compare finishes.
+                overview.repaint_static()
+
+            # Load each original's content into the two split halves.
+            # The overview is docked, the scrollbars are hidden and the
+            # micromap columns are in place by now, so the editors
+            # already have their FINAL width and the text wraps only
+            # once.
+            a_ed.set_text_all(orig_texts[0])
+            b_ed.set_text_all(orig_texts[1])
 
             # Color the tab title green to indicate 'synced' (no unsaved
             # changes yet -- content is identical to the originals).
             ct.ed.set_prop(ct.PROP_TAB_COLOR_FONT, 0x00A000)  # green
-
-            # Suppress the next 2 on_change events (one per split half)
-            # because set_text_all triggers on_change, which would reset the
-            # green color to red. The counter is decremented in on_change;
-            # real user edits after this will work normally.
-            session.suppress_change = 2
 
             # Persistently subscribe to on_start2 so the plugin auto-loads on
             # next startup to restore compare tabs.
@@ -2994,6 +3080,12 @@ class Command:
                 overview_on and self.cfg.get('hide_builtin_scrollbars', True))
             if overview_on:
                 if overview is None:
+                    # Overview missing (Recompare on a restored tab, the
+                    # option toggled on, set_files' early creation
+                    # failed, ...) -- CREATE it here so this compare
+                    # always has a panel to fill. create() already
+                    # paints the empty default-background panel, so the
+                    # compare below fills a visible overview.
                     overview = PaintboxOverview()
                     overview.create(a_ed, b_ed)
                     session.overview = overview
@@ -3037,6 +3129,17 @@ class Command:
                 # Clear THIS tab's diff records (the session's Differ --
                 # another tab's diffmap is never touched).
                 self._ensure_correct_differ(session).diffmap = []
+                # The overview's data was cleared above (clear_data);
+                # repaint it so the panel drops the previous compare's
+                # colors and returns to the empty default background
+                # instead of keeping stale colored pixels on the static
+                # bitmap. repaint_static only requests the background
+                # rebuild and returns at once.
+                if overview is not None:
+                    overview.set_line_counts(a_ed.get_line_count(),
+                                             b_ed.get_line_count())
+                    overview.set_wrap_counts(None, None)
+                    overview.repaint_static()
                 if show_dialog:
                     t = _('The two sides are identical.')
                     ct.msg_box(t, ct.MB_OK)
@@ -4030,8 +4133,17 @@ class Command:
             b_ed.action(ct.EDACTION_UPDATE)
 
         # Repaint the overview with the collected line states and gaps.
-        # repaint_static() rebuilds the static bitmap, then paint()
-        # copies it + draws the cursor marker.
+        # repaint_static() only hands the rebuild to the overview's
+        # background worker (the multi-second segment walk for
+        # million-line compares runs OFF the main thread; CudaText API
+        # stays on the main thread) and returns at once -- the fresh
+        # static bitmap is swapped in by the overview's apply timer
+        # when the worker finishes. Until then the panel keeps showing
+        # the previous bitmap. The paint:overview section therefore
+        # measures only the cheap main-thread half (line counts, wrap
+        # counts, the request issue); the worker-side compute is
+        # intentionally NOT profiled (the section profiler is
+        # main-thread state).
         if overview is not None:
             Profiler.start('paint:overview')
             overview.set_line_counts(a_ed.get_line_count(), b_ed.get_line_count())
