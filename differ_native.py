@@ -580,6 +580,50 @@ ALIGN = '='
 PAIR_CHANGED = '*'
 
 
+class _PureRun(list):
+    """A yielded event list the producer GUARANTEES contains events of
+    exactly ONE tag (a contiguous single-tag run: the equal blocks'
+    ALIGN runs, delete/insert blocks' per-line runs, ignore hunks'
+    line runs -- see compare_lists).
+
+    The paint consumer (__init__._paint_compare_events) checks
+    `type(evs) is _PureRun` and processes such a chunk with bulk list
+    operations (extends / zip / dict.update) instead of the per-event
+    branch ladder: on a 1M-line compare the ~1.2M delete/insert line
+    events and ~1M ALIGN events are the bulk of the dispatch ladder's
+    iterations, and each becomes one C-level extend per 4096-event
+    chunk.
+
+    It is a plain list subclass (isinstance passes, len/index/iterate
+    are the inherited C implementations, `== a plain list` works), so
+    the FLAT public protocol (compare()'s `yield from`) and every
+    existing list-protocol consumer see exactly the same events in the
+    same order -- only the CHUNK GROUPING gains a type tag the
+    consumer can trust with zero verification cost. Producing mixed
+    chunks as plain lists keeps the same code path honest: a plain
+    list always falls back to the ladder.
+
+    Purity is a PRODUCER promise about content, not about ordering:
+    the consumer still does its own ascending-line verification
+    before the bookmark flush (see __init__._ensure_parallel_sorted).
+    """
+    __slots__ = ()
+
+
+# Minimum run length that gets the _PureRun fast path. Runs shorter
+# than this are emitted exactly the way the pre-v9 walk emitted them
+# (one mixed list per small block / plain small lists): the consumer's
+# bulk dispatch pays off only on REAL runs (one extend + one zip per
+# chunk replaces per-event ladder iterations), and on scattered-diff
+# corpora -- 200k tiny opcodes over 1M lines, the autogen benchmark's
+# shape -- nearly every block is 3-5 lines, where a 1-4 event list is
+# faster through the plain ladder (measured: the ungated version cost
+# ~0.3s more SELF on a 300k-line scattered corpus while winning ~1.6s
+# on the same corpus with 5k-line blocks). The FLAT stream is
+# identical either way -- only the chunk type differs.
+_PURE_MIN = 16
+
+
 class Differ:
     """Differ for native algorithms (native_histogram, native_myers).
 
@@ -1138,8 +1182,11 @@ class Differ:
         # flattens them for the flat protocol). The trivial tags build
         # their lists here with the same _TAG_CHUNK bound, so a 1M-line
         # 'equal' opcode streams its ALIGNs in bounded pieces instead of
-        # materializing them all at once.
+        # materializing them all at once. Single-tag runs are yielded
+        # as _PureRun (see the class): the consumer bulk-processes
+        # them; the FLAT stream (event order) is identical either way.
         skip_align = self._skip_align
+        _chunk = self._TAG_CHUNK
         for tag, i1, i2, j1, j2 in opcodes:
             if tag not in ('equal', 'ignore'):
                 # 'ignore' hunks are suppressed differences, not diff
@@ -1151,41 +1198,62 @@ class Differ:
                 # when the consumer suppressed ALIGN events
                 # (skip_align): the events would be consumed as no-ops
                 # there (no wrap-height mismatch is possible).
+                # Runs >= _PURE_MIN are _PureRun (bulk dispatch); small
+                # blocks stay plain lists (see _PURE_MIN).
                 if not skip_align:
-                    for k0 in range(i1, i2, self._TAG_CHUNK):
-                        k2 = k0 + self._TAG_CHUNK
+                    count = i2 - i1
+                    for k0 in range(i1, i2, _chunk):
+                        k2 = k0 + _chunk
                         if k2 > i2:
                             k2 = i2
-                        yield [(ALIGN, k, j1 + (k - i1))
+                        evs = [(ALIGN, k, j1 + (k - i1))
                                for k in range(k0, k2)]
+                        if k2 - k0 >= _PURE_MIN:
+                            yield _PureRun(evs)
+                        else:
+                            yield evs
             elif tag == 'delete':
                 # Lines i1..i2-1 in A are deleted; gap in B after line j1-1.
                 # (j1 == j2 for 'delete'.) The gap compensates for A lines
-                # [i1, i2).
-                evs = [(B_GAP, j1, i1, i2)]
-                append = evs.append
-                for y in range(i1, i2):
-                    append((A_LINE_DEL, y))
-                    if len(evs) >= self._TAG_CHUNK:
-                        yield evs
-                        evs = []
+                # [i1, i2). Small blocks: one mixed list exactly like the
+                # pre-v9 emission; big blocks: the gap as its own list
+                # then PURE A_LINE_DEL runs -- same flat order either way.
+                count = i2 - i1
+                if count < _PURE_MIN:
+                    if count:
+                        evs = [(B_GAP, j1, i1, i2)]
                         append = evs.append
-                if evs:
-                    yield evs
+                        for y in range(i1, i2):
+                            append((A_LINE_DEL, y))
+                        yield evs
+                else:
+                    yield [(B_GAP, j1, i1, i2)]
+                    for k0 in range(i1, i2, _chunk):
+                        k2 = k0 + _chunk
+                        if k2 > i2:
+                            k2 = i2
+                        yield _PureRun(
+                            (A_LINE_DEL, y) for y in range(k0, k2))
             elif tag == 'insert':
                 # Lines j1..j2-1 in B are inserted; gap in A after line i1-1.
                 # (i1 == i2 for 'insert'.) The gap compensates for B lines
-                # [j1, j2).
-                evs = [(A_GAP, i1, j1, j2)]
-                append = evs.append
-                for y in range(j1, j2):
-                    append((B_LINE_ADD, y))
-                    if len(evs) >= self._TAG_CHUNK:
-                        yield evs
-                        evs = []
+                # [j1, j2). Same small/big restructure as 'delete'.
+                count = j2 - j1
+                if count < _PURE_MIN:
+                    if count:
+                        evs = [(A_GAP, i1, j1, j2)]
                         append = evs.append
-                if evs:
-                    yield evs
+                        for y in range(j1, j2):
+                            append((B_LINE_ADD, y))
+                        yield evs
+                else:
+                    yield [(A_GAP, i1, j1, j2)]
+                    for k0 in range(j1, j2, _chunk):
+                        k2 = k0 + _chunk
+                        if k2 > j2:
+                            k2 = j2
+                        yield _PureRun(
+                            (B_LINE_ADD, y) for y in range(k0, k2))
             elif tag == 'replace':
                 # Each REPLACE block's events are BUILT into lists (one
                 # list per bounded chunk of pairs) and yielded only after
@@ -1206,40 +1274,60 @@ class Differ:
                 # details. Paint both sides' lines with the ignored
                 # color and compensate the length mismatch with an
                 # ignored gap so lines below stay aligned.
+                # Small hunks: the pre-v9 shared-buffer emission (one
+                # mixed list, flat order gap/ALIGN/A/B); big hunks:
+                # per-section pure runs, same flat order.
                 da = i2 - i1
                 db = j2 - j1
-                evs = []
-                append = evs.append
-                if da > db:
-                    # Side A has extra blank lines: gap in B before line
-                    # j2 (after B's hunk lines), compensating A's extra
-                    # lines [i1 + db, i2).
-                    append((B_GAP_IGN, j2, i1 + db, i2))
-                elif db > da:
-                    # Side B has extra blank lines: gap in A before line
-                    # i2, compensating B's extra lines [j1 + da, j2).
-                    append((A_GAP_IGN, i2, j1 + da, j2))
-                if not skip_align:
-                    for k in range(da if da < db else db):
-                        append((ALIGN, i1 + k, j1 + k))
-                        if len(evs) >= self._TAG_CHUNK:
-                            yield evs
-                            evs = []
-                            append = evs.append
-                for y in range(i1, i2):
-                    append((A_LINE_IGN, y))
-                    if len(evs) >= self._TAG_CHUNK:
-                        yield evs
+                n_align = da if da < db else db
+                if (da < _PURE_MIN and db < _PURE_MIN
+                        and n_align < _PURE_MIN):
+                    if da or db:
                         evs = []
                         append = evs.append
-                for y in range(j1, j2):
-                    append((B_LINE_IGN, y))
-                    if len(evs) >= self._TAG_CHUNK:
+                        if da > db:
+                            append((B_GAP_IGN, j2, i1 + db, i2))
+                        elif db > da:
+                            append((A_GAP_IGN, i2, j1 + da, j2))
+                        if not skip_align:
+                            for k in range(n_align):
+                                append((ALIGN, i1 + k, j1 + k))
+                        for y in range(i1, i2):
+                            append((A_LINE_IGN, y))
+                        for y in range(j1, j2):
+                            append((B_LINE_IGN, y))
                         yield evs
-                        evs = []
-                        append = evs.append
-                if evs:
-                    yield evs
+                else:
+                    if da > db:
+                        # Side A has extra blank lines: gap in B before
+                        # line j2 (after B's hunk lines), compensating
+                        # A's extra lines [i1 + db, i2).
+                        yield [(B_GAP_IGN, j2, i1 + db, i2)]
+                    elif db > da:
+                        # Side B has extra blank lines: gap in A before
+                        # line i2, compensating B's extra lines
+                        # [j1 + da, j2).
+                        yield [(A_GAP_IGN, i2, j1 + da, j2)]
+                    if not skip_align:
+                        for k0 in range(0, n_align, _chunk):
+                            k2 = k0 + _chunk
+                            if k2 > n_align:
+                                k2 = n_align
+                            yield _PureRun(
+                                (ALIGN, i1 + k, j1 + k)
+                                for k in range(k0, k2))
+                    for k0 in range(i1, i2, _chunk):
+                        k2 = k0 + _chunk
+                        if k2 > i2:
+                            k2 = i2
+                        yield _PureRun(
+                            (A_LINE_IGN, y) for y in range(k0, k2))
+                    for k0 in range(j1, j2, _chunk):
+                        k2 = k0 + _chunk
+                        if k2 > j2:
+                            k2 = j2
+                        yield _PureRun(
+                            (B_LINE_IGN, y) for y in range(k0, k2))
 
         if _bm_start is not None:
             _bm_elapsed = time.perf_counter() - _bm_start

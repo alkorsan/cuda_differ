@@ -7,7 +7,7 @@ import time
 import typing as tp
 from bisect import bisect_left
 from collections import Counter
-from itertools import chain
+from itertools import chain, repeat
 from operator import itemgetter
 
 import cudatext as ct
@@ -38,6 +38,40 @@ try:
 except Exception:
     _ed_get_wrap_counts_api = None
 
+
+def _ensure_parallel_sorted(arrays):
+    """Verify the FIRST array is in non-descending order and, in the
+    (never-today) defensive case it is not, permute ALL arrays into
+    that order in place.
+
+    The paint loop collects its bookmark / micromap / char-run data in
+    the walk's emission order, which is non-descending per side by
+    construction (opcodes are walked top-down, each line belongs to
+    exactly one opcode, and every emission section iterates ascending
+    line ranges). The two consumers that NEED that order are:
+      - the bookmark flush: BOOKMARK2_APPEND / BOOKMARK2_APPEND_MANY's
+        no-sort, ascending-input contract (replaces the old
+        pending_bkm.sort(), which made the same guarantee the slow way
+        -- Timsort's O(n) pass over already-sorted tuples);
+      - _apply_marker_window: bisect_left(lines, lo/hi) requires
+        sorted line arrays (replaces the old _marks_to_arrays'
+        insertion-order scan + sorted() fallback).
+    Equal neighbors are fine (the char-run arrays repeat a line for
+    each of its runs; bisect_left lands on the first) -- only a strict
+    DECREASE triggers the permutation. The scan is one compare per
+    entry; the permute path sorts a stable index permutation so equal
+    keys keep their relative order, matching the old sort() exactly.
+    """
+    lines = arrays[0]
+    _prev = -1
+    for _r in lines:
+        if _r < _prev:
+            _order = sorted(range(len(lines)), key=lines.__getitem__)
+            for _arr in arrays:
+                _arr[:] = [_arr[_i] for _i in _order]
+            return
+        _prev = _r
+
 from . import differ_native as dfn
 from . import differ_python as dfp
 from .overview import PaintboxOverview
@@ -48,6 +82,13 @@ from .utils import split_lines_safe, ScrollSplittedTab
 from difflib import unified_diff
 from cudax_lib import get_translation
 _ = get_translation(__file__)  # I18N
+
+# The producer's pure single-tag chunk marker (see differ_native.
+# _PureRun): the paint consumer checks `type(evs) is _PURE_RUN` and
+# bulk-processes such chunks instead of running every event through
+# the branch ladder. Bound once here -- the producer is differ_native
+# for both flat and list protocols, so the check never misses.
+_PURE_RUN = dfn._PureRun
 
 # df is used as a namespace for event constants (A_LINE_DEL, B_LINE_ADD, etc.).
 # Both differ_native and differ_python define identical constants, so we alias
@@ -3365,27 +3406,51 @@ class Command:
         # docstring).
         #
         # Bookmarks are NOT set immediately in the loop. Instead, they
-        # are collected into pending_bkm_a / pending_bkm_b lists and
-        # appended in sorted order after the loop using BOOKMARK2_APPEND
-        # (which is much faster than BOOKMARK2_SET but requires sorted
-        # input and a manual repaint).
+        # are collected and appended after the loop (BOOKMARK2_APPEND
+        # semantics: no repaint per bookmark, sorted input required).
         #
         # Overview line states and gaps are also collected for the
         # paintbox overview (gap-aware mini-map) when enabled.
         # Micromap line highlights are painted via attr(show_on_map=1)
         # when micromap is enabled.
-        pending_bkm_a = []  # list of (line, nkind) for a_ed
-        pending_bkm_b = []  # list of (line, nkind) for b_ed
-        # Marker data COLLECTED here and applied WINDOWED (viewport +/-
-        # MARKER_WINDOW_MARGIN lines) by _store_and_apply_marker_windows
-        # after the loop — see MARKER_WINDOW_MARGIN for why the markers
-        # must not all be added to the editors. micromap marks: one color
-        # per diff/ignored line (map_only=1); char marks: the changed
-        # character runs inside modified lines (map_only=0).
-        pending_mm_a = {}  # {line: color} micromap marks for a_ed
-        pending_mm_b = {}  # {line: color} micromap marks for b_ed
-        pending_ch_a = {}  # {line: [(x, len, color), ...]} char marks
-        pending_ch_b = {}  # {line: [(x, len, color), ...]}
+        #
+        # FLAT PARALLEL-ARRAY COLLECTION (the v9 paint protocol): the
+        # walk emits events in non-descending per-side line order, so
+        # every collected category appends straight into parallel
+        # arrays -- no per-event dict writes, no (line, nkind) tuples,
+        # no end-of-walk dict->array conversion:
+        #   bookmarks: rows/kinds -> ONE BOOKMARK2_APPEND_MANY call per
+        #     editor on hosts that have it (per-line fallback below
+        #     otherwise); the old 1.6M-call flush on a 1M-line compare
+        #     became 2 calls.
+        #   micromap: lines/colors -- already the (lines, values) shape
+        #     _apply_marker_window's bisect+slice consumes; the old
+        #     'paint:marks:build' dict conversion is gone (the section
+        #     now only verifies the ascending invariant + stores).
+        #   char runs: lines/xs/lens/colors, ONE ENTRY PER RUN -- the
+        #     old {line: [(x, len, color)]} grouped runs by line only
+        #     so the window extraction could slice [i1:i2]; flat
+        #     arrays slice the SAME range with one bisect and feed
+        #     MARKERS_ADD_MANY's x/y/len/color_bg lists directly (the
+        #     old apply loop flattened them back out anyway).
+        # _ensure_parallel_sorted re-checks the ascending invariant
+        # before the flushes (defensive; see its docstring).
+        rows_a = []   # bookmark lines for a_ed (non-descending)
+        kinds_a = []  # bookmark nkind, parallel to rows_a
+        rows_b = []
+        kinds_b = []
+        mm_a_lines = []   # micromap (lines, colors) for a_ed
+        mm_a_colors = []
+        mm_b_lines = []
+        mm_b_colors = []
+        ch_a_lines = []  # char runs (lines, xs, lens, colors) for a_ed
+        ch_a_xs = []
+        ch_a_lens = []
+        ch_a_colors = []
+        ch_b_lines = []
+        ch_b_xs = []
+        ch_b_lens = []
+        ch_b_colors = []
         # Count of events that actually colorize something (line
         # marks, char highlights, line decors). Gaps and ALIGN events
         # are pure visual alignment and don't count. When this stays
@@ -3436,7 +3501,6 @@ class Command:
                 align_gap_events=job.align_gap_events)
             if Profiler.enabled:
                 _lists = _timed_produce(_lists)
-            compare_iter = chain.from_iterable(_lists)
             # RELEASE the job's refs to the raw texts now that the
             # generator has its own (param) refs. The native generator
             # splits the texts into line lists inside compare_lists()
@@ -3465,7 +3529,6 @@ class Command:
                 diff.compare(job.lines_a, job.lines_b))
             if Profiler.enabled:
                 _lists = _timed_produce(_lists)
-            compare_iter = chain.from_iterable(_lists)
             job.lines_a = None
             job.lines_b = None
         # Colors are read ONCE here, not per event (the loop below runs
@@ -3536,6 +3599,20 @@ class Command:
                 except KeyError:
                     _stats[cat] = [dt, 1, dt]
 
+            # bulk variant for the pure-chunk paths: one _perf pair per
+            # CHUNK, calls = the number of items the chunk covered (the
+            # rows stay comparable with the per-event sites' counts)
+            def _end_n(cat, t0, n_items):
+                dt = _perf() - t0
+                try:
+                    rec = _stats[cat]
+                    rec[0] += dt
+                    rec[1] += n_items
+                    if dt > rec[2]:
+                        rec[2] = dt
+                except KeyError:
+                    _stats[cat] = [dt, n_items, dt]
+
             # HOT categories -- paint:attr (~1.6M timed ops) and
             # paint:wrap_calc (up to 1M on wrapping compares) -- do NOT
             # go through _end: the closure call (a function call + a
@@ -3568,16 +3645,183 @@ class Command:
         # 2 method calls per ALIGN event into plain list indexing.
         wca_n = len(wrap_counts_a) if wrap_counts_a is not None else 0
         wcb_n = len(wrap_counts_b) if wrap_counts_b is not None else 0
-        # Per-event pending-dict accessors (setdefault(y, []) allocates
-        # the empty list EVERY call, even for the ~99% of calls where
-        # the key already exists -- get + None check skips that).
-        _ch_a_get = pending_ch_a.get
-        _ch_b_get = pending_ch_b.get
-        # Bookmark-list appends, pre-bound (the PAIR_CHANGED branch
-        # appends to both lists per changed pair -- 800k attribute
-        # lookups saved on a 1M-line compare).
-        _bkm_a_append = pending_bkm_a.append
-        _bkm_b_append = pending_bkm_b.append
+        # Flat parallel-array append bindings: the ladder's collection
+        # branches call these 1-4 times per event (a bound method is
+        # ~30% faster than an attribute+append lookup in a hot loop);
+        # the pure-chunk bulk paths bind the EXTEND forms below.
+        _rows_a_append = rows_a.append
+        _kinds_a_append = kinds_a.append
+        _rows_b_append = rows_b.append
+        _kinds_b_append = kinds_b.append
+        _mm_a_l_append = mm_a_lines.append
+        _mm_a_c_append = mm_a_colors.append
+        _mm_b_l_append = mm_b_lines.append
+        _mm_b_c_append = mm_b_colors.append
+        _ch_a_l_append = ch_a_lines.append
+        _ch_a_x_append = ch_a_xs.append
+        _ch_a_le_append = ch_a_lens.append
+        _ch_a_c_append = ch_a_colors.append
+        _ch_b_l_append = ch_b_lines.append
+        _ch_b_x_append = ch_b_xs.append
+        _ch_b_le_append = ch_b_lens.append
+        _ch_b_c_append = ch_b_colors.append
+
+        def _dispatch_pure(list_iter):
+            """Per-chunk dispatch layer between the producer's event
+            lists and the flattening chain: PURE single-tag chunks
+            (differ_native._PureRun -- the equal/delete/insert/ignore
+            line runs, the bulk of a big compare's events) are consumed
+            HERE with bulk list operations and never reach the per-event
+            ladder; every other list passes through unchanged (the
+            ladder still processes replace chunks, gap heads and any
+            future mixed emission exactly as before).
+
+            Why a generator and not an inline loop: the ladder below is
+            left byte-identical (it keeps consuming a flat
+            chain.from_iterable stream), the per-chunk work runs inside
+            this one reused frame, and -- critically for the report --
+            the processing happens while the compare:produce fetch
+            sections are CLOSED, so its time books into
+            refresh:compare_and_paint's SELF, exactly where the ladder's
+            dispatch time lands (it IS dispatch/collection work; see
+            _timed_produce's discipline notes).
+            """
+            nonlocal n_diff_events, _wc_dt, _wc_n, _wc_max
+            # bulk-path bindings (extends + infinite repeats for the
+            # C-speed dict.update / list.extend forms below)
+            _rows_a_ext = rows_a.extend
+            _kinds_a_ext = kinds_a.extend
+            _rows_b_ext = rows_b.extend
+            _kinds_b_ext = kinds_b.extend
+            _mm_a_l_ext = mm_a_lines.extend
+            _mm_a_c_ext = mm_a_colors.extend
+            _mm_b_l_ext = mm_b_lines.extend
+            _mm_b_c_ext = mm_b_colors.extend
+            _rep_del = repeat(color_deleted)
+            _rep_add = repeat(color_added)
+            _rep_ign = repeat(color_ignored)
+            for evs in list_iter:
+                if type(evs) is not _PURE_RUN:
+                    yield evs
+                    continue
+                n = len(evs)
+                if not n:
+                    continue
+                t = evs[0][0]
+                if t == df.ALIGN:
+                    if not (wrap_on and align_gaps):
+                        # whole chunk of no-op ALIGNs: dropped at chunk
+                        # level (this is the python differ's ALIGN
+                        # suppression -- the native walk already skips
+                        # producing them when align_gaps is False)
+                        continue
+                    # compute both sides' wrap rows for the whole chunk
+                    # in two guarded comprehensions -- timed ONCE per
+                    # chunk (paint:wrap_calc, calls = lines covered,
+                    # honest per-line count without 1M perf pairs) --
+                    # then walk only the height mismatches; equal pairs
+                    # (the overwhelming case) cost one zip step each.
+                    if prof_on:
+                        _t0 = _perf()
+                    vas = [wrap_counts_a[e[1]]
+                           if 0 <= e[1] < wca_n else 1 for e in evs]
+                    vbs = [wrap_counts_b[e[2]]
+                           if 0 <= e[2] < wcb_n else 1 for e in evs]
+                    if prof_on:
+                        _dt = _perf() - _t0
+                        _wc_dt += _dt
+                        _wc_n += n
+                        if _dt > _wc_max:
+                            _wc_max = _dt
+                    for d, va, vb in zip(evs, vas, vbs):
+                        if va > vb:
+                            a_line, b_line = d[1], d[2]
+                            diff_rows = va - vb
+                            if prof_on:
+                                _t0 = _perf()
+                            self._add_raw_gap(b_ed, b_line,
+                                              diff_rows * line_h_b,
+                                              color_gaps)
+                            if prof_on:
+                                _end('paint:gap', _t0)
+                            if overview is not None:
+                                # gap after b_line, before b_line+1
+                                overview.add_gap('b', b_line + 1,
+                                                 diff_rows)
+                        elif vb > va:
+                            a_line, b_line = d[1], d[2]
+                            diff_rows = vb - va
+                            if prof_on:
+                                _t0 = _perf()
+                            self._add_raw_gap(a_ed, a_line,
+                                              diff_rows * line_h_a,
+                                              color_gaps)
+                            if prof_on:
+                                _end('paint:gap', _t0)
+                            if overview is not None:
+                                overview.add_gap('a', a_line + 1,
+                                                 diff_rows)
+                    continue
+                if t == df.A_LINE_DEL:
+                    n_diff_events += n
+                    ys = [e[1] for e in evs]
+                    _rows_a_ext(ys)
+                    _kinds_a_ext([NKIND_DELETED] * n)
+                    if micromap_on:
+                        if prof_on:
+                            _t0 = _perf()
+                        _mm_a_l_ext(ys)
+                        _mm_a_c_ext([color_deleted] * n)
+                        if prof_on:
+                            _end_n('paint:micromap', _t0, n)
+                    if ov_states_a is not None:
+                        ov_states_a.update(zip(ys, _rep_del))
+                    continue
+                if t == df.B_LINE_ADD:
+                    n_diff_events += n
+                    ys = [e[1] for e in evs]
+                    _rows_b_ext(ys)
+                    _kinds_b_ext([NKIND_ADDED] * n)
+                    if micromap_on:
+                        if prof_on:
+                            _t0 = _perf()
+                        _mm_b_l_ext(ys)
+                        _mm_b_c_ext([color_added] * n)
+                        if prof_on:
+                            _end_n('paint:micromap', _t0, n)
+                    if ov_states_b is not None:
+                        ov_states_b.update(zip(ys, _rep_add))
+                    continue
+                if t == df.A_LINE_IGN:
+                    # lines of a suppressed all-blank hunk: ignored
+                    # color, NOT a difference (no bookmarks, no count)
+                    ys = [e[1] for e in evs]
+                    if micromap_on:
+                        if prof_on:
+                            _t0 = _perf()
+                        _mm_a_l_ext(ys)
+                        _mm_a_c_ext([color_ignored] * n)
+                        if prof_on:
+                            _end_n('paint:micromap', _t0, n)
+                    if ov_states_a is not None:
+                        ov_states_a.update(zip(ys, _rep_ign))
+                    continue
+                if t == df.B_LINE_IGN:
+                    ys = [e[1] for e in evs]
+                    if micromap_on:
+                        if prof_on:
+                            _t0 = _perf()
+                        _mm_b_l_ext(ys)
+                        _mm_b_c_ext([color_ignored] * n)
+                        if prof_on:
+                            _end_n('paint:micromap', _t0, n)
+                    if ov_states_b is not None:
+                        ov_states_b.update(zip(ys, _rep_ign))
+                    continue
+                # any other pure tag (none today): the ladder handles it
+                yield evs
+
+        compare_iter = chain.from_iterable(_dispatch_pure(_lists))
         for d in compare_iter:
             diff_id, y = d[0], d[1]
             if diff_id == df.ALIGN:
@@ -3627,12 +3871,13 @@ class Command:
                 n_diff_events += 1
                 if prof_on:
                     _t0 = _perf()
-                _tup = (d[2], d[3], color_deleted)
-                _lst = _ch_a_get(y)
-                if _lst is None:
-                    pending_ch_a[y] = [_tup]
-                else:
-                    _lst.append(_tup)
+                # flat char-run arrays: one entry PER RUN (no
+                # (x, len, color) tuple, no per-line dict grouping --
+                # _apply_marker_window slices the same range directly)
+                _ch_a_l_append(y)
+                _ch_a_x_append(d[2])
+                _ch_a_le_append(d[3])
+                _ch_a_c_append(color_deleted)
                 if prof_on:
                     _dt = _perf() - _t0
                     _attr_dt += _dt
@@ -3650,12 +3895,10 @@ class Command:
                 n_diff_events += 1
                 if prof_on:
                     _t0 = _perf()
-                _tup = (d[2], d[3], color_added)
-                _lst = _ch_b_get(y)
-                if _lst is None:
-                    pending_ch_b[y] = [_tup]
-                else:
-                    _lst.append(_tup)
+                _ch_b_l_append(y)
+                _ch_b_x_append(d[2])
+                _ch_b_le_append(d[3])
+                _ch_b_c_append(color_added)
                 if prof_on:
                     _dt = _perf() - _t0
                     _attr_dt += _dt
@@ -3675,13 +3918,17 @@ class Command:
                 # B_DECOR_YELLOW -> changed color.
                 ai, bj, deca, decb = d[1], d[2], d[3], d[4]
                 n_diff_events += 2
-                _bkm_a_append((ai, NKIND_CHANGED))
-                _bkm_b_append((bj, NKIND_CHANGED))
+                _rows_a_append(ai)
+                _kinds_a_append(NKIND_CHANGED)
+                _rows_b_append(bj)
+                _kinds_b_append(NKIND_CHANGED)
                 if micromap_on:
                     if prof_on:
                         _t0 = _perf()
-                    pending_mm_a[ai] = color_changed
-                    pending_mm_b[bj] = color_changed
+                    _mm_a_l_append(ai)
+                    _mm_a_c_append(color_changed)
+                    _mm_b_l_append(bj)
+                    _mm_b_c_append(color_changed)
                     if prof_on:
                         _end('paint:micromap', _t0)
                 if ov_states_a is not None:
@@ -3732,22 +3979,26 @@ class Command:
                             overview.add_gap('a', ai + 1, diff_rows)
             elif diff_id == df.A_LINE_CHANGE:
                 n_diff_events += 1
-                pending_bkm_a.append((y, NKIND_CHANGED))
+                _rows_a_append(y)
+                _kinds_a_append(NKIND_CHANGED)
                 if micromap_on:
                     if prof_on:
                         _t0 = _perf()
-                    pending_mm_a[y] = color_changed
+                    _mm_a_l_append(y)
+                    _mm_a_c_append(color_changed)
                     if prof_on:
                         _end('paint:micromap', _t0)
                 if ov_states_a is not None:
                     ov_states_a[y] = color_changed
             elif diff_id == df.B_LINE_CHANGE:
                 n_diff_events += 1
-                pending_bkm_b.append((y, NKIND_CHANGED))
+                _rows_b_append(y)
+                _kinds_b_append(NKIND_CHANGED)
                 if micromap_on:
                     if prof_on:
                         _t0 = _perf()
-                    pending_mm_b[y] = color_changed
+                    _mm_b_l_append(y)
+                    _mm_b_c_append(color_changed)
                     if prof_on:
                         _end('paint:micromap', _t0)
                 if ov_states_b is not None:
@@ -3770,22 +4021,26 @@ class Command:
                     ov_states_b[y] = color_changed
             elif diff_id == df.A_LINE_DEL:
                 n_diff_events += 1
-                pending_bkm_a.append((y, NKIND_DELETED))
+                _rows_a_append(y)
+                _kinds_a_append(NKIND_DELETED)
                 if micromap_on:
                     if prof_on:
                         _t0 = _perf()
-                    pending_mm_a[y] = color_deleted
+                    _mm_a_l_append(y)
+                    _mm_a_c_append(color_deleted)
                     if prof_on:
                         _end('paint:micromap', _t0)
                 if ov_states_a is not None:
                     ov_states_a[y] = color_deleted
             elif diff_id == df.B_LINE_ADD:
                 n_diff_events += 1
-                pending_bkm_b.append((y, NKIND_ADDED))
+                _rows_b_append(y)
+                _kinds_b_append(NKIND_ADDED)
                 if micromap_on:
                     if prof_on:
                         _t0 = _perf()
-                    pending_mm_b[y] = color_added
+                    _mm_b_l_append(y)
+                    _mm_b_c_append(color_added)
                     if prof_on:
                         _end('paint:micromap', _t0)
                 if ov_states_b is not None:
@@ -3927,7 +4182,8 @@ class Command:
                 if micromap_on:
                     if prof_on:
                         _t0 = _perf()
-                    pending_mm_a[y] = color_ignored
+                    _mm_a_l_append(y)
+                    _mm_a_c_append(color_ignored)
                     if prof_on:
                         _end('paint:micromap', _t0)
                 if ov_states_a is not None:
@@ -3936,7 +4192,8 @@ class Command:
                 if micromap_on:
                     if prof_on:
                         _t0 = _perf()
-                    pending_mm_b[y] = color_ignored
+                    _mm_b_l_append(y)
+                    _mm_b_c_append(color_ignored)
                     if prof_on:
                         _end('paint:micromap', _t0)
                 if ov_states_b is not None:
@@ -3974,39 +4231,49 @@ class Command:
                     ct.MB_OK)
             return
 
-        # Append all collected bookmarks in sorted order using
-        # BOOKMARK2_APPEND (much faster than BOOKMARK2_SET — skips
-        # duplicate search, sorting, event firing, and repainting).
-        # BOOKMARK2_APPEND requires bookmarks to be added in ascending
-        # line order, so we sort first.
+        # Append all collected bookmarks using BOOKMARK2_APPEND /
+        # BOOKMARK2_APPEND_MANY (both much faster than BOOKMARK2_SET —
+        # they skip duplicate search, sorting, event firing, and
+        # repainting; both require non-descending line input).
         Profiler.start('paint:bookmark')
-        pending_bkm_a.sort()
-        pending_bkm_b.sort()
+        # The walk emits each side's bookmark lines in non-descending
+        # order (every line belongs to exactly one opcode, blocks walk
+        # top-down) -- verify (replaces the old .sort(), which made the
+        # same guarantee via Timsort's O(n) pass) and permute
+        # defensively if a future producer ever breaks it.
+        _ensure_parallel_sorted((rows_a, kinds_a))
+        _ensure_parallel_sorted((rows_b, kinds_b))
         # Direct C-API when available: Editor.bookmark is a thin
-        # positional pass-through to cudatext_api.ed_bookmark, and this
-        # flush makes one call per changed line (1.6M on a 1M-line
-        # compare -- the wrapper layer alone was ~0.5s there). The
-        # fallback keeps the Editor wrapper (test sandboxes fake the
-        # editor without an .h handle; hosts without a reachable
-        # cudatext_api module).
+        # positional pass-through to cudatext_api.ed_bookmark. On hosts
+        # with BOOKMARK2_APPEND_MANY (added with this round's CudaText
+        # sources) the whole per-side flush is ONE call taking the
+        # parallel y/nkind lists -- the 1.6M per-line calls on a
+        # 1M-line compare became 2. Old hosts (and test sandboxes
+        # without a fake cudatext_api) keep the per-line calls, byte-
+        # identical painted state; the const is read per flush so a
+        # test process can exercise both paths.
         _bkm = _ed_bookmark_api
         h_a = getattr(a_ed, 'h', None)
         h_b = getattr(b_ed, 'h', None)
-        if _bkm is not None and h_a is not None:
-            for row, nk in pending_bkm_a:
+        _bkm_many = getattr(ct, 'BOOKMARK2_APPEND_MANY', None)
+        if _bkm is not None and h_a is not None and _bkm_many is not None:
+            _bkm(h_a, _bkm_many, rows_a, kinds_a, -1, '',
+                 True, False, DIFF_TAG)
+            _bkm(h_b, _bkm_many, rows_b, kinds_b, -1, '',
+                 True, False, DIFF_TAG)
+        elif _bkm is not None and h_a is not None:
+            for row, nk in zip(rows_a, kinds_a):
                 _bkm(h_a, ct.BOOKMARK2_APPEND, row, nk, -1, '',
                      True, False, DIFF_TAG)
-        else:
-            for row, nk in pending_bkm_a:
-                a_ed.bookmark(ct.BOOKMARK2_APPEND, row,
-                              nkind=nk, text='', auto_del=True,
-                              show=False, tag=DIFF_TAG)
-        if _bkm is not None and h_b is not None:
-            for row, nk in pending_bkm_b:
+            for row, nk in zip(rows_b, kinds_b):
                 _bkm(h_b, ct.BOOKMARK2_APPEND, row, nk, -1, '',
                      True, False, DIFF_TAG)
         else:
-            for row, nk in pending_bkm_b:
+            for row, nk in zip(rows_a, kinds_a):
+                a_ed.bookmark(ct.BOOKMARK2_APPEND, row,
+                              nkind=nk, text='', auto_del=True,
+                              show=False, tag=DIFF_TAG)
+            for row, nk in zip(rows_b, kinds_b):
                 b_ed.bookmark(ct.BOOKMARK2_APPEND, row,
                               nkind=nk, text='', auto_del=True,
                               show=False, tag=DIFF_TAG)
@@ -4021,7 +4288,13 @@ class Command:
         # _maintain_marker_window.
         Profiler.start('paint:marker_window')
         self._store_and_apply_marker_windows(
-            job, pending_mm_a, pending_mm_b, pending_ch_a, pending_ch_b)
+            job,
+            (mm_a_lines, mm_a_colors) if mm_a_lines else None,
+            (mm_b_lines, mm_b_colors) if mm_b_lines else None,
+            (ch_a_lines, ch_a_xs, ch_a_lens, ch_a_colors)
+            if ch_a_lines else None,
+            (ch_b_lines, ch_b_xs, ch_b_lens, ch_b_colors)
+            if ch_b_lines else None)
         Profiler.stop('paint:marker_window')
 
         # BOOKMARK2_APPEND doesn't repaint on its own. When the halves
@@ -4551,7 +4824,8 @@ class Command:
             names.append((label, name))
         return names
 
-    def _store_and_apply_marker_windows(self, job, mm_a, mm_b, ch_a, ch_b):
+    def _store_and_apply_marker_windows(self, job, mm_a, mm_b,
+                                        ch_a, ch_b):
         """Store the compare's collected marker data on the session and
         apply the initial marker windows around the editors' current
         viewports.
@@ -4566,8 +4840,8 @@ class Command:
         Ed.Attribs per paint), which is what made scrolling a
         million-line compare lag 100-200 ms per step behind the mouse.
 
-        Instead the data is stored per side as parallel SORTED arrays and
-        only the markers inside the current window (viewport +/-
+        Instead the data is stored per side as parallel SORTED arrays
+        and only the markers inside the current window (viewport +/-
         MARKER_WINDOW_MARGIN lines) are added, in at most two batch
         ed.attr(MARKERS_ADD_MANY) calls per editor (one Ed.Update each).
         _maintain_marker_window (wired into on_scroll) re-applies the
@@ -4576,56 +4850,57 @@ class Command:
         then bounded by the window size instead of the file's diff
         count — scrolling big files becomes as instant as on small
         files, exactly like the editors' own scrollbars.
+
+        Input shapes (the paint loop's flat parallel arrays, v9 paint
+        protocol -- the old dict->sorted-array conversion step is gone;
+        the walk already appends in non-descending line order):
+          mm_*: (lines, colors) or None -- one entry per marked line;
+          ch_*: (lines, xs, lens, colors) or None -- ONE ENTRY PER RUN
+          (a line with 3 highlighted runs repeats 3 times; the arrays
+          are still non-descending by line, so the same bisect+slice
+          extraction works and _apply_marker_window flattens nothing --
+          the runs ARE the MARKERS_ADD_MANY x/y/len/color_bg rows).
         """
         session = job.session
-        # Two sub-rows split the old single paint:marker_window self:
-        # 'build' = the four dict->sorted-arrays conversions (1.6M
-        # entries per side on a 1M-line compare), 'apply' = the two
-        # windowed MARKERS_ADD_MANY flushes. 2 section instances each.
+        # 'paint:marks:build' = the ascending-invariant verification +
+        # the session stores (the old row measured the dict->array
+        # conversions: 1.6M-entry dict walks per side on a 1M-line
+        # compare; the collection now appends straight into these
+        # arrays during the walk).
         Profiler.start('paint:marks:build')
-        session.marks_micromap_a = self._marks_to_arrays(mm_a)
-        session.marks_micromap_b = self._marks_to_arrays(mm_b)
-        session.marks_chars_a = self._marks_to_arrays(ch_a)
-        session.marks_chars_b = self._marks_to_arrays(ch_b)
-        Profiler.stop('paint:marks:build')
+        if mm_a is not None:
+            _ensure_parallel_sorted(mm_a)
+        if mm_b is not None:
+            _ensure_parallel_sorted(mm_b)
+        if ch_a is not None:
+            _ensure_parallel_sorted(ch_a)
+        if ch_b is not None:
+            _ensure_parallel_sorted(ch_b)
+        session.marks_micromap_a = mm_a
+        session.marks_micromap_b = mm_b
+        session.marks_chars_a = ch_a
+        session.marks_chars_b = ch_b
         session.mark_window_a = None
         session.mark_window_b = None
+        Profiler.stop('paint:marks:build')
         Profiler.start('paint:marks:apply')
         self._apply_marker_window(session, job.a_ed, 'a')
         self._apply_marker_window(session, job.b_ed, 'b')
         Profiler.stop('paint:marks:apply')
-
-    @staticmethod
-    def _marks_to_arrays(marks):
-        """Convert one collected marker dict to (sorted_lines, values)
-        parallel arrays — values are the per-line color for micromap
-        marks, or the per-line [(x, len, color)] lists for char marks.
-        None for an empty dict. Sorted lines let the window extraction
-        use binary search + slice instead of walking all collected
-        lines on every re-apply.
-
-        The paint loop collects the marks in the walk's order (ascending
-        by line), so the dict's INSERTION order is already sorted: a
-        one-comparison-per-key scan verifies that and list() serves
-        directly, where sorted() re-ran Timsort over the 1.6M-entry
-        dicts. Out-of-order dicts (defensive) still take the sorted()
-        path."""
-        if not marks:
-            return None
-        lines = list(marks)
-        _prev = -1
-        for _l in lines:
-            if _l <= _prev:
-                lines = sorted(marks)
-                break
-            _prev = _l
-        return (lines, [marks[k] for k in lines])
 
     def _apply_marker_window(self, session, ed, side):
         """(Re)apply one editor side's diff markers for the window around
         its current viewport: delete all DIFF_TAG markers of the editor,
         then batch-add the micromap line marks and the char-run
         highlights with lines inside [top - margin, top + page + margin).
+
+        Consumes the session's flat parallel arrays (see
+        _store_and_apply_marker_windows for the shapes): the extraction
+        is one bisect per bound per category plus four list slices --
+        the char runs ARE the MARKERS_ADD_MANY x/y/len/color_bg rows
+        (the old per-line items-of-runs structure existed only so the
+        window could slice by line; the flat arrays slice the same
+        range and skip the re-flattening loop).
 
         Sets the side's session window BEFORE touching the editor: the
         attr calls end with an Ed.Update invalidation, and the resulting
@@ -4674,28 +4949,27 @@ class Command:
                         show_on_map=1,
                         map_only=1)
         if ch is not None:
-            lines, items = ch
+            lines, xs, lens, colors = ch
             i1 = bisect_left(lines, lo)
             i2 = bisect_left(lines, hi)
             if i2 > i1:
-                xs = []
-                ys = []
-                lens = []
-                colors = []
-                for line, row_items in zip(lines[i1:i2], items[i1:i2]):
-                    for item_x, item_len, item_color in row_items:
-                        if item_x >= 0 and item_len > 0:
-                            # ADD_MANY stops at the first x<0 / y<0 /
-                            # len=0 item, so unusable entries are dropped
-                            # instead of truncating the batch.
-                            xs.append(item_x)
-                            ys.append(line)
-                            lens.append(item_len)
-                            colors.append(item_color)
-                if xs:
+                # ADD_MANY stops at the first x<0 / y<0 / len=0 item, so
+                # unusable entries are dropped instead of truncating the
+                # batch (defensive: engine opcodes always carry x>=0
+                # and len>0 -- the walk cannot emit anything else).
+                sel = [(x, ln, ln_y, c)
+                       for x, ln, ln_y, c in zip(xs[i1:i2], lens[i1:i2],
+                                                 lines[i1:i2],
+                                                 colors[i1:i2])
+                       if x >= 0 and ln > 0]
+                if sel:
                     ed.attr(ct.MARKERS_ADD_MANY, DIFF_TAG,
-                            x=xs, y=ys, len=lens, color_bg=colors,
-                            show_on_map=-1, map_only=0)
+                            x=[s[0] for s in sel],
+                            y=[s[2] for s in sel],
+                            len=[s[1] for s in sel],
+                            color_bg=[s[3] for s in sel],
+                            show_on_map=-1,
+                            map_only=0)
 
     @staticmethod
     def _visible_page_lines(ed):
