@@ -316,9 +316,10 @@ class Profiler:
             print('  !! under the cProfile layer (their timing calls would be')
             print('  !! traced themselves); their time is in')
             print('  !! refresh:compare_and_paint SELF. For those rows + clean')
-            print('  !! section numbers set ENABLE_CPROFILE=False in')
-            print('  !! profiling.py and re-run; use this run for the')
-            print('  !! function-level report printed after this one.')
+            print('  !! section numbers turn OFF differ.advanced.enable_cprofile')
+            print('  !! (Options dialog / settings/cuda_differ.json) and re-run;')
+            print('  !! use this run for the function-level report printed')
+            print('  !! after this one.')
         print('=' * 100)
         print('  {:<40s} {:>10s} {:>10s} {:>9s} {:>10s} {:>6s}'.format(
             'section', 'self', 'total', 'calls', 'max', '%'))
@@ -579,10 +580,17 @@ def reset_profiling():
 # imported them -- the Profiler class is used directly for sections).
 # --------------------------------------------------------------------------
 
-# Master switch for the cProfile layer. True: every profiled compare
-# also runs under cProfile and prints the function-level report after
-# the section report. False: only the (cheap) section Profiler runs.
-ENABLE_CPROFILE = True
+# Master switch for the cProfile layer. CONFIG-DRIVEN since v7: the
+# plugin reads differ.advanced.enable_cprofile (settings/cuda_differ.json
+# or the Options dialog, chapter Advanced) at every refresh_compare and
+# starts this layer only when BOTH that option and enable_profiling are
+# on -- no source edit needed to toggle it. This constant remains only
+# as a documented fallback default for embedding/exotic cases; the
+# normal way to switch the layer is the option. True: every profiled
+# compare also runs under cProfile and prints the function-level report
+# after the section report. False (default): only the (cheap) section
+# Profiler runs -- clean section numbers, no 2-3x tracing inflation.
+ENABLE_CPROFILE = False
 
 
 def start_profiling():
