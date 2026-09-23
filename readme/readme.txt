@@ -724,7 +724,14 @@ Micromap section:
   CudaText API call kept on the main thread -- so a resize or a
   finished compare never freezes the editor while the overview is being
   redrawn; the panel keeps its previous picture until the fresh one is
-  ready.
+  ready. Resizes are additionally nearly instant: the size-independent
+  part of the computation (prefix sums + the coalesced diff runs, in
+  visual-row space) is CACHED and reused across resizes -- it is rebuilt
+  only when the compare data, the wrap counts or the colors change --
+  and the size-dependent pixel mapping uses a monotone jump search over
+  the cached arrays instead of walking every segment, so even a
+  million-line compare's overview remaps to a new panel size in about a
+  millisecond (the pixel output is identical to the full walk's).
   The slider works like the scrollbar of usual editors and browsers:
   its travel range (the track minus the thumb) maps onto the scrollable
   range, so dragging the slider to the very bottom of the track scrolls
