@@ -715,6 +715,21 @@ Micromap section:
   any segment that would collapse onto already-painted pixels is
   skipped -- so even a 1M-line file with 200k differences paints at
   most a few hundred rectangles.
+  The panel is created BEFORE the compared texts are loaded (docking it
+  changes the editors' width -- doing that after the load would
+  re-wrap the whole text), and shows the default background until the
+  compare finishes; the colored map is filled in then. Recompare also
+  creates the panel when it is missing.
+  The heavy part of the drawing runs on a background thread, with every
+  CudaText API call kept on the main thread -- so a resize or a
+  finished compare never freezes the editor while the overview is being
+  redrawn; the panel keeps its previous picture until the fresh one is
+  ready.
+  The slider works like the scrollbar of usual editors and browsers:
+  its travel range (the track minus the thumb) maps onto the scrollable
+  range, so dragging the slider to the very bottom of the track scrolls
+  the text to the very end of the files, and dragging it to the top
+  scrolls to the beginning.
   Default: on.
 - differ.micromap.hide_builtin_scrollbars: Hide built-in scrollbars in
   compare tabs
