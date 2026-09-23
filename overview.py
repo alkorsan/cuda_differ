@@ -81,6 +81,40 @@ Architecture:
         (CPython raises on dicts resized during iteration), where it is
         caught and discarded — never a crash, never garbage on screen.
 
+  - RESIZE-FAST LAYOUT CACHE (the "overview redraws slowly on
+    resize" fix):
+    The pre-pixel pipeline is TWO radically different halves:
+      * the LAYOUT — prefix sums + merged color runs — lives in
+        VISUAL-ROW space: it depends ONLY on the collected data (line
+        states, gaps, wrap counts, colors), and NOT AT ALL on the
+        panel's pixel size;
+      * the PIXEL MAPPING — rows -> pixels + the WinMerge end-pixel
+        dedup — is the only part that depends on (w, h).
+    The old rebuild re-ran BOTH halves for every resize step, so even
+    the background (non-freezing) rebuild of a million-line compare
+    took seconds per size, and during a live drag the fresh map only
+    landed seconds after the mouse stopped. The layout is now CACHED
+    per side, keyed by the DATA GENERATION (_side_layout): a resize
+    never changes the data, so it reuses the cached layout and only
+    re-runs the pixel mapping. The cache is stored as parallel compact
+    arrays (array('q') starts / array('q') ends / array('i') colors —
+    ~20 bytes per segment instead of ~120 for tuple lists), built
+    once per compare / wrap-count change / color change, and freed by
+    clear_data / destroy.
+    The pixel mapping itself changed complexity: the WinMerge rule
+    ("emit a segment only when its end pixel EXCEEDS the previous
+    emitted end pixel") runs over MONOTONE non-decreasing end pixels,
+    so the old O(n) walk over 1.6M segments collapses into a MONOTONE
+    JUMP SEARCH — after each emitted rect, bisect finds the first
+    segment whose end pixel is greater, skipping the collapsed runs in
+    O(log n). Float-safe corrections around the bisect position make
+    the emitted sequence provably IDENTICAL to the old linear walk
+    (property-tested in the sandbox: randomized segment data x random
+    scales, rect lists compared exactly). A resize therefore costs
+    O(panel_height * log n) + a few hundred canvas calls — about a
+    millisecond of compute for a million-line file — instead of the
+    multi-second walk.
+
   - PANEL LAYOUT (like a usual scrollbar):
       +----------------+
       |       ▲        |  BUTTON_HEIGHT px, ▲ scrolls one line up
@@ -145,8 +179,10 @@ Architecture:
         `nPrevEndY != bottom_coord` rule), so the number of actual
         canvas calls is bounded by the panel's pixel HEIGHT, not by the
         number of diffs — 200k diffs still paint at most ~600 rects per
-        side. The whole pixel-dedup walk runs on the worker thread; only
-        the surviving rects cross back to the main thread.
+        side. Since v8 the dedup walk is a monotone JUMP SEARCH over
+        the cached layout arrays (see RESIZE-FAST LAYOUT CACHE) —
+        O(panel_height * log n) — and only the surviving rects cross
+        back to the main thread.
 
   - END-OF-TRACK SCROLL MAPPING (the "slider at the end" fix):
     A native scrollbar maps the thumb's TRAVEL RANGE — the track MINUS
@@ -261,6 +297,8 @@ Architecture:
 
 import threading
 import time
+from array import array
+from bisect import bisect_left
 from itertools import accumulate
 
 import cudatext as ct
@@ -751,6 +789,21 @@ class PaintboxOverview:
         # apply timer polls the result slot and stops itself when idle).
         self._apply_timer_on = False
 
+        # --- Layout cache (see the module docstring, RESIZE-FAST
+        #     LAYOUT CACHE) -------------------------------------------
+        # side -> (gen, starts, ends, colors, total): the cached
+        # VISUAL-ROW layout of one side — prefix sums + merged color
+        # runs as parallel compact arrays (array('q') / array('q') /
+        # array('i')) plus the side's total visual-row count. Keyed by
+        # the data generation: a resize (which never touches the data)
+        # reuses it, so the O(n) layout walk runs once per compare /
+        # wrap-count change / color change instead of once per rebuild.
+        # Published by a single atomic dict assignment from whichever
+        # thread computed it (the worker, or the main thread on the
+        # synchronous fallback path); contents are never mutated after
+        # publication, so no lock is needed around reads.
+        self._layout_cache = {}
+
     def is_created(self):
         """Return True if the overview dialog has been created."""
         return self.h_dlg is not None
@@ -1033,19 +1086,26 @@ class PaintboxOverview:
             border, self._slider_fill, SLIDER_LINE_LUM_DIFF)
         self.color_btn_arrow = _color_contrast(arrow, color_bg,
                                                SLIDER_LINE_LUM_DIFF)
+        # Colors are baked into the cached layout's segment arrays, so a
+        # color change invalidates the cache (and any in-flight result:
+        # the generation check in the apply timer drops it; the caller
+        # follows up with repaint_static, which issues a fresh request).
+        self._layout_cache = {}
+        self._data_gen += 1
 
     def set_line_counts(self, a_count, b_count):
         """Set the total line counts for both editors (without gaps).
 
-        Also bumps the data generation: line counts are installed right
+        Also bumps the data generation (invalidates the layout cache and
+        any in-flight background result): line counts are installed right
         before repaint_static() at the end of a compare, so any still-
-        pending background rebuild computed against the OLD layout is
-        invalidated (its result is dropped by the apply timer), and the
-        repaint_static() that follows is never deduplicated away behind
-        an older request with the same size.
+        pending rebuild computed against the OLD layout is dropped by the
+        apply timer, and the repaint_static() that follows is never
+        deduplicated away behind an older request with the same size.
         """
         self.a_line_count = a_count
         self.b_line_count = b_count
+        self._layout_cache = {}
         self._data_gen += 1
 
     def set_wrap_counts(self, wrap_a, wrap_b):
@@ -1056,11 +1116,13 @@ class PaintboxOverview:
                     or None if wrapping is off (each line = 1 row).
             wrap_b: same for b_ed.
 
-        Also bumps the data generation (same rationale as
+        Also bumps the data generation and drops the layout cache (the
+        cached prefix sums depend on the wrap counts; same rationale as
         set_line_counts: installed right before repaint_static()).
         """
         self.wrap_counts_a = wrap_a
         self.wrap_counts_b = wrap_b
+        self._layout_cache = {}
         self._data_gen += 1
 
     def add_line_state(self, side, line, color):
@@ -1096,17 +1158,19 @@ class PaintboxOverview:
         """Clear all collected line states and gaps. Called before a
         fresh compare.
 
-        Also bumps the data generation (_data_gen): any background
-        static rebuild still computing against the OLD data becomes
-        stale — its result is dropped by the apply timer's generation
-        check. (The worker iterating a dict that this clear() empties
-        just raises RuntimeError inside the worker, where it is caught
-        and discarded; the generation check covers the silent cases.)
+        Also bumps the data generation (_data_gen) and frees the layout
+        cache: any background static rebuild still computing against the
+        OLD data becomes stale — its result is dropped by the apply
+        timer's generation check. (The worker iterating a dict that this
+        clear() empties just raises RuntimeError inside the worker, where
+        it is caught and discarded; the generation check covers the
+        silent cases.)
         """
         self.line_states_a.clear()
         self.line_states_b.clear()
         self.gaps_a.clear()
         self.gaps_b.clear()
+        self._layout_cache = {}
         self._data_gen += 1
 
     # ------------------------------------------------------------------
@@ -1150,11 +1214,57 @@ class PaintboxOverview:
     # Static painting (WinMerge "Location Pane" model)
     #
     # Split into a pure-Python COMPUTE half (safe to run on the worker
-    # thread: _prefix_sums -> _build_segments -> _compute_side_rects ->
-    # _compute_static_rects) and a CudaText-API DRAW half that only
-    # replays the precomputed rect lists (_paint_rects /
-    # _paint_static_from_rects — main thread only).
+    # thread: _side_layout -> [_prefix_sums + _build_segment_arrays]
+    # -> _compute_side_rects -> _compute_static_rects) and a
+    # CudaText-API DRAW half that only replays the precomputed rect
+    # lists (_paint_rects / _paint_static_from_rects — main thread
+    # only). The row-space LAYOUT is cached per data generation
+    # (_side_layout — see the module docstring, RESIZE-FAST LAYOUT
+    # CACHE), so a resize only re-runs the size-dependent pixel
+    # mapping.
     # ------------------------------------------------------------------
+
+    def _side_layout(self, side, abort=None):
+        """Cached VISUAL-ROW layout of one side (see the module
+        docstring, RESIZE-FAST LAYOUT CACHE).
+
+        Returns (starts, ends, colors, total):
+          starts/ends  array('q') of the merged color segments' start
+                       and end VISUAL ROWS (run entries in paint
+                       order — ascending, non-overlapping);
+          colors       array('i') of the segments' colors;
+          total        the side's total visual-row count (lines + all
+                       gaps), or None when the `abort` callback fired
+                       while the layout was being built (superseded /
+                       shutdown — the caller drops the compute).
+
+        The layout depends ONLY on the collected data (line states,
+        gaps, wrap counts, colors) — never on the panel size — so it
+        is cached under the CURRENT data generation: a resize re-enters
+        here, hits the cache and skips the O(n) walk entirely. The
+        generation is bumped by every data mutation (clear_data /
+        set_line_counts / set_wrap_counts / set_colors / repaint_static
+        at the end of a collection), each of which also drops the cache.
+
+        Cache publication is a single atomic dict assignment; the
+        arrays are never mutated afterwards, so the main thread (sync
+        fallback) and the worker can safely share it without a lock.
+        A generation bump that lands MID-BUILD leaves the published
+        entry keyed by the OLD generation — unreachable, since reuse
+        requires gen == current — and the in-flight result is dropped
+        by the apply timer's generation check, exactly like before.
+        """
+        cached = self._layout_cache.get(side)
+        if cached is not None and cached[0] == self._data_gen:
+            return cached[1], cached[2], cached[3], cached[4]
+        gen = self._data_gen
+        cum, total, gap_map = self._prefix_sums(side)
+        built = self._build_segment_arrays(side, cum, gap_map, abort)
+        if built is None:
+            return None
+        starts, ends, colors = built
+        self._layout_cache[side] = (gen, starts, ends, colors, total)
+        return starts, ends, colors, total
 
     def _prefix_sums(self, side):
         """One-pass conversion of a side's line/gap layout to visual rows.
@@ -1230,21 +1340,21 @@ class PaintboxOverview:
         total = cum[n] + trailing
         return cum, total, gap_map
 
-    def _build_segments(self, side, cum=None, gap_map=None, abort=None):
+    def _build_segment_arrays(self, side, cum=None, gap_map=None,
+                              abort=None):
         """Build the colored segments of one side, in visual order.
 
-        Returns a list of (start_row, end_row, color) entries (run
-        entries are 3-element lists, gap entries 3-element tuples —
-        unpacking treats them identically), or None when the `abort`
+        Returns (starts, ends, colors) — parallel COMPACT ARRAYS
+        (array('q') / array('q') / array('i')) of the merged segments'
+        start row, end row and color in paint order (ascending by
+        start_row, non-overlapping) — or None when the `abort`
         callback fired (background rebuild superseded/shut down):
 
           - line runs: consecutive lines with the same color, merged
             when they are visually adjacent (no gap between them) —
-            one rect instead of per-line rects;
-          - gaps: one rect per gap position, split into its ignored
+            one segment instead of per-line segments;
+          - gaps: one segment per gap position, split into its ignored
             portion (if any) and its regular portion.
-
-        The list is ascending by start_row (paint order).
 
         cum / gap_map may be passed in (from a _prefix_sums call the
         caller already made) or computed here when omitted.
@@ -1263,13 +1373,22 @@ class PaintboxOverview:
         verifies that and the loop consumes items() directly, where
         sorted(items()) used to materialize 1.6M entry tuples + run
         Timsort per side (any violation falls back to sorted());
-        (2) the current run is kept in a LOCAL (the old code indexed
-        runs[-1][2] twice per line and cum[line] twice per line);
+        (2) the current run's end/color are kept in LOCALS (the old
+        code indexed runs[-1][2] twice per line and cum[line] twice
+        per line);
         (3) the runs stream is ascending by construction (line
         ascending, cum non-decreasing), so the tiny ascending
         gap-segment stream is MERGED in with a two-pointer pass
-        instead of sorting the concatenated 1.6M-entry list, and the
-        run entries stay lists (no 1.6M tuple() conversions).
+        instead of sorting the concatenated 1.6M-entry list.
+
+        v8: the tuples became PARALLEL ARRAYS (a ~6x smaller footprint
+        than 1.6M boxed tuple lists — the layout is now CACHED across
+        resizes, so its size matters), and run extension writes
+        ends[-1] instead of last[1]. The no-gap fast path returns the
+        run arrays as built — zero copying for the common big-file
+        case. Segment order and values are IDENTICAL to the v7 tuple
+        list (the sandbox property test asserts it against a reference
+        reimplementation of the old algorithm).
         """
         if side == 'a':
             n, wrap = self.a_line_count, self.wrap_counts_a
@@ -1302,11 +1421,16 @@ class PaintboxOverview:
 
         # Line runs: consecutive same-colored lines merge while they are
         # visually adjacent (line == prev+1 AND no gap before this line).
-        runs = []
-        runs_append = runs.append
+        r_starts = array('q')
+        r_ends = array('q')
+        r_colors = array('i')
+        rs_append = r_starts.append
+        re_append = r_ends.append
+        rc_append = r_colors.append
         has_gaps = bool(gap_map)
         prev_line = -2
-        last = None  # the run being extended (runs[-1], kept local)
+        last_color = -1     # color of the run being extended (local)
+        have_run = False    # any run emitted yet (last_color is valid)
         _i = 0
         for line, color in items:
             _i += 1
@@ -1322,13 +1446,16 @@ class PaintboxOverview:
                 rows = 1
             start_row = cum[line]
             end_row = start_row + rows
-            if (last is not None and line == prev_line + 1
+            if (have_run and line == prev_line + 1
                     and (not has_gaps or line not in gap_map)
-                    and last[2] == color):
-                last[1] = end_row  # extend the current run
+                    and last_color == color):
+                r_ends[-1] = end_row  # extend the current run
             else:
-                last = [start_row, end_row, color]
-                runs_append(last)
+                rs_append(start_row)
+                re_append(end_row)
+                rc_append(color)
+                have_run = True
+                last_color = color
             prev_line = line
 
         # Gap segments (positions in ascending order). The ignored
@@ -1363,28 +1490,49 @@ class PaintboxOverview:
         # merge reproduces the old sorted(gap_segs + runs) order
         # without sorting the 1.6M-run stream.
         if not gap_segs:
-            return runs
-        if not runs:
-            return gap_segs
-        segments = []
-        seg_append = segments.append
+            return r_starts, r_ends, r_colors   # common big-file fast path
+        if not have_run:
+            out_starts = array('q')
+            out_ends = array('q')
+            out_colors = array('i')
+            for gs, ge, gc in gap_segs:
+                out_starts.append(gs)
+                out_ends.append(ge)
+                out_colors.append(gc)
+            return out_starts, out_ends, out_colors
+        out_starts = array('q')
+        out_ends = array('q')
+        out_colors = array('i')
+        os_append = out_starts.append
+        oe_append = out_ends.append
+        oc_append = out_colors.append
         gi = 0
         ng = len(gap_segs)
-        for run in runs:
-            while gi < ng and gap_segs[gi][0] < run[0]:
-                seg_append(gap_segs[gi])
+        for run_start, run_end, run_color in zip(r_starts, r_ends,
+                                                 r_colors):
+            while gi < ng and gap_segs[gi][0] < run_start:
+                gs, ge, gc = gap_segs[gi]
+                os_append(gs)
+                oe_append(ge)
+                oc_append(gc)
                 gi += 1
-            seg_append(run)
+            os_append(run_start)
+            oe_append(run_end)
+            oc_append(run_color)
         while gi < ng:
-            seg_append(gap_segs[gi])
+            gs, ge, gc = gap_segs[gi]
+            os_append(gs)
+            oe_append(ge)
+            oc_append(gc)
             gi += 1
-        return segments
+        return out_starts, out_ends, out_colors
 
     def _compute_side_rects(self, side, x0, x1, y0, track_h, abort=None):
         """Compute one side's static PIXEL RECT list (pure Python —
         NO CudaText API, safe on the worker thread).
 
-        _prefix_sums + _build_segments + the WinMerge draw loop:
+        Cached layout (_side_layout: prefix sums + merged runs in
+        VISUAL-ROW space — size-independent) + the WinMerge draw rule:
         convert each segment to pixels once, then SKIP every segment
         whose end pixel equals the previous segment's end pixel — it
         would only repaint pixels that are already covered ("we cannot
@@ -1396,44 +1544,69 @@ class PaintboxOverview:
         diffs still produce at most ~600 rects per side, and replaying
         them on the main thread is a few hundred canvas calls.
 
-        v7 note: the end pixel is computed FIRST and the start pixel
-        only for surviving segments — the vast majority of the 1.6M
-        segments per side collapse onto already-covered pixels and
-        never needed ps.
+        v8 — MONOTONE JUMP SEARCH (the resize-speed fix; see the module
+        docstring, RESIZE-FAST LAYOUT CACHE): the end pixels are
+        non-decreasing (the layout's end rows are), so "the next
+        emitted segment is the first one whose end pixel EXCEEDS the
+        previous emitted end pixel" — which is the ENTIRE WinMerge rule
+        — can be found with bisect over the cached end-row array instead
+        of walking the collapsed segments one by one. Complexity drops
+        from O(#segments) to O(#emitted * log n); with the layout cached
+        across resizes, a full rebuild at a new size is now O(panel
+        height * log n) even for a million-line compare.
 
-        `abort` (worker thread only) is polled every
-        ABORT_CHECK_MASK+1 segments; returns None when aborted.
+        Exactness: the jump lands on a bisect estimate of the first end
+        row mapping past the previous end PIXEL; the two correction
+        loops then re-derive the exact condition with the same
+        y0 + int(row * scale) arithmetic the linear walk used, so the
+        emitted rect list is provably IDENTICAL to the old walk's
+        output (the sandbox property test compares them rect-by-rect on
+        randomized data). The corrections only fire on 1-ulp
+        float-division/multiply disagreements around the threshold;
+        each terminates because the condition is monotone in the index.
+
+        `abort` (worker thread only) is polled every emitted
+        ABORT_CHECK_MASK+1 rects (a cache-hit rebuild is fast, but a
+        cache MISS still walks millions of state entries in
+        _side_layout); returns None when aborted.
         Returns [] when the side has no paintable content.
         """
-        cum, total, gap_map = self._prefix_sums(side)
+        lay = self._side_layout(side, abort)
+        if lay is None:
+            return None
+        starts, ends, colors, total = lay
         if total <= 0 or track_h <= 0:
             return []
-        segments = self._build_segments(side, cum, gap_map, abort)
-        if segments is None:
-            return None
-        if not segments:
+        n = len(ends)
+        if n == 0:
             return []
         scale = track_h / total
 
         rects = []
         rects_append = rects.append
-        prev_end = -1     # raw end pixel of the previous segment (WinMerge's nPrevEndY)
-        _i = 0
-        for start_row, end_row, color in segments:
-            _i += 1
-            if abort is not None and (_i & ABORT_CHECK_MASK) == 0 and abort():
+        _emitted = 0
+        i = 0
+        while i < n:
+            raw_pe = y0 + int(ends[i] * scale)   # raw end pixel
+            ps = y0 + int(starts[i] * scale)
+            pe = raw_pe if raw_pe > ps else ps + 1  # sub-pixel: >=1 px
+            rects_append((colors[i], x0, x1, ps, pe))
+            _emitted += 1
+            if abort is not None and \
+                    (_emitted & ABORT_CHECK_MASK) == 0 and abort():
                 return None
-            raw_pe = y0 + int(end_row * scale)
-            if raw_pe == prev_end:
-                # Collapses onto pixels the previous segment already
-                # covered — useless write, skip it (ps not needed).
-                continue
-            ps = y0 + int(start_row * scale)
-            pe = raw_pe
-            if pe <= ps:
-                pe = ps + 1  # sub-pixel segment: draw at least one pixel
-            rects_append((color, x0, x1, ps, pe))
-            prev_end = raw_pe
+            # Next EMITTED segment: the first j > i whose end pixel is
+            # STRICTLY greater than raw_pe (the WinMerge skip rule over
+            # monotone end pixels). bisect gives the first end row that
+            # maps AT/after the next pixel bucket; the correction loops
+            # below pin the exact index with the original arithmetic,
+            # immune to 1-ulp division/multiply disagreements.
+            j = bisect_left(ends, (raw_pe - y0 + 1) / scale, i + 1)
+            while j < n and y0 + int(ends[j] * scale) <= raw_pe:
+                j += 1          # estimate undershot: still collapsing
+            while j - 1 > i and y0 + int(ends[j - 1] * scale) > raw_pe:
+                j -= 1          # estimate overshot: an emitted one was skipped
+            i = j
         return rects
 
     def _compute_static_rects(self, token, w, h):
@@ -1819,7 +1992,9 @@ class PaintboxOverview:
         The worker checks the shutdown flag in its hot loops, so it
         unwinds within milliseconds of a running compute; the join is
         only a short politeness wait (the thread is a daemon, so even a
-        stuck worker cannot block app exit)."""
+        stuck worker cannot block app exit). The layout cache is freed
+        here too — a destroyed overview must not keep million-entry
+        arrays alive."""
         with self._worker_cond:
             self._worker_shutdown = True
             self._req = None
@@ -1834,10 +2009,22 @@ class PaintboxOverview:
                 pass
         # Invalidate anything the worker could still publish.
         self._data_gen += 1
+        self._layout_cache = {}
 
     def repaint_static(self):
         """Force a full repaint of the static bitmap. Called after a
         fresh compare or when colors change.
+
+        Bumps the data generation FIRST: the plugin collects line
+        states and gaps with add_line_state / add_gap (which do NOT
+        bump — they fire millions of times during a compare), so a
+        background rebuild that was requested mid-collection (a resize
+        while the compare paints its events) may have computed — and
+        cached — a PARTIAL layout under the current generation. The
+        bump here invalidates that partial cache and any in-flight
+        result, and makes the fresh request below skip the identical-
+        request dedup, so the completed data is always rebuilt and
+        applied.
 
         With the background painting machinery (the normal path) this
         only PUBLISHES a rebuild request and returns AT ONCE: the
@@ -1856,6 +2043,10 @@ class PaintboxOverview:
         w, h = self._get_size()
         if w <= 0 or h <= 0:
             return
+        # Collection just ended (or colors changed): drop any layout
+        # cached under the previous (possibly partial) generation.
+        self._data_gen += 1
+        self._layout_cache = {}
         # Refresh the size cache too: paint() (drag path) reuses it for
         # up to OVERVIEW_SIZE_TTL, and a stale entry right after a resize
         # would blit a mismatched static bitmap.
