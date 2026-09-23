@@ -193,10 +193,11 @@ Architecture:
 
 import time
 from itertools import accumulate
-from operator import itemgetter
 
 import cudatext as ct
 import cudatext_cmd as ct_cmd
+
+from .profiling import Profiler
 
 # Overview dialog width in pixels (docked to the right)
 OVERVIEW_WIDTH = 40
@@ -1052,7 +1053,9 @@ class PaintboxOverview:
     def _build_segments(self, side, cum=None, gap_map=None):
         """Build the colored segments of one side, in visual order.
 
-        Returns a list of (start_row, end_row, color) tuples:
+        Returns a list of (start_row, end_row, color) entries (run
+        entries are 3-element lists, gap entries 3-element tuples —
+        unpacking treats them identically):
           - line runs: consecutive lines with the same color, merged
             when they are visually adjacent (no gap between them) —
             one rect instead of per-line rects;
@@ -1063,6 +1066,23 @@ class PaintboxOverview:
 
         cum / gap_map may be passed in (from a _prefix_sums call the
         caller already made) or computed here when omitted.
+
+        v7: on big compares this walk replaced ~3.7s of the 4.85s
+        paint:overview row (cProfile _build_segments self, 1.6M state
+        entries per side). Three behavior-identical accelerations:
+        (1) the states dict is written by the paint loop in the walk's
+        order, which is ascending by line, so dict INSERTION order is
+        already sorted order -- a one-comparison-per-entry scan
+        verifies that and the loop consumes items() directly, where
+        sorted(items()) used to materialize 1.6M entry tuples + run
+        Timsort per side (any violation falls back to sorted());
+        (2) the current run is kept in a LOCAL (the old code indexed
+        runs[-1][2] twice per line and cum[line] twice per line);
+        (3) the runs stream is ascending by construction (line
+        ascending, cum non-decreasing), so the tiny ascending
+        gap-segment stream is MERGED in with a two-pointer pass
+        instead of sorting the concatenated 1.6M-entry list, and the
+        run entries stay lists (no 1.6M tuple() conversions).
         """
         if side == 'a':
             n, wrap = self.a_line_count, self.wrap_counts_a
@@ -1072,6 +1092,19 @@ class PaintboxOverview:
             states = self.line_states_b
         if cum is None or gap_map is None:
             cum, _total, gap_map = self._prefix_sums(side)
+
+        # Ascending-order verification (see docstring): one comparison
+        # per entry replaces the sorted() materialization when the
+        # dict's insertion order is already ascending -- which it is
+        # whenever the events arrived in walk order. The fallback keeps
+        # the function correct for ANY dict handed to it.
+        items = states.items()
+        _prev = -1
+        for _line in states:
+            if _line <= _prev:
+                items = sorted(states.items())
+                break
+            _prev = _line
 
         # Inlined line_rows() (was one FUNCTION CALL per state line --
         # 1.6M calls on a 1M-line compare): line >= 0 is guaranteed by
@@ -1083,8 +1116,11 @@ class PaintboxOverview:
         # Line runs: consecutive same-colored lines merge while they are
         # visually adjacent (line == prev+1 AND no gap before this line).
         runs = []
+        runs_append = runs.append
+        has_gaps = bool(gap_map)
         prev_line = -2
-        for line, color in sorted(states.items()):
+        last = None  # the run being extended (runs[-1], kept local)
+        for line, color in items:
             if line < 0 or line >= n:
                 continue
             if wrap_hot is not None and line < wl:
@@ -1093,13 +1129,15 @@ class PaintboxOverview:
                     rows = 1
             else:
                 rows = 1
-            end_row = cum[line] + rows
-            if (runs and line == prev_line + 1
-                    and line not in gap_map
-                    and runs[-1][2] == color):
-                runs[-1][1] = end_row  # extend the current run
+            start_row = cum[line]
+            end_row = start_row + rows
+            if (last is not None and line == prev_line + 1
+                    and (not has_gaps or line not in gap_map)
+                    and last[2] == color):
+                last[1] = end_row  # extend the current run
             else:
-                runs.append([cum[line], end_row, color])
+                last = [start_row, end_row, color]
+                runs_append(last)
             prev_line = line
 
         # Gap segments (positions in ascending order). The ignored
@@ -1127,13 +1165,28 @@ class PaintboxOverview:
                 gap_segs.append((start + ign_rows, start + rows_total,
                                  self.color_gap))
 
-        # Merge both ascending streams by start row; a gap before line i
-        # ends where line i starts, so ties cannot happen between a run
-        # and a gap. The sort is stable, keeping a gap's split portions
-        # in their emitted (ignored, then regular) order. itemgetter(0)
-        # extracts the same key the lambda did, at C speed.
-        segments = gap_segs + [tuple(r) for r in runs]
-        segments.sort(key=itemgetter(0))
+        # Merge the two ascending streams (see docstring): runs ascend
+        # by construction, gap_segs by sorted(gap_map), and a run and a
+        # gap can never share a start row (a gap before line i ends
+        # exactly where line i starts), so the strict < two-pointer
+        # merge reproduces the old sorted(gap_segs + runs) order
+        # without sorting the 1.6M-run stream.
+        if not gap_segs:
+            return runs
+        if not runs:
+            return gap_segs
+        segments = []
+        seg_append = segments.append
+        gi = 0
+        ng = len(gap_segs)
+        for run in runs:
+            while gi < ng and gap_segs[gi][0] < run[0]:
+                seg_append(gap_segs[gi])
+                gi += 1
+            seg_append(run)
+        while gi < ng:
+            seg_append(gap_segs[gi])
+            gi += 1
         return segments
 
     def _paint_side_segments(self, c, side, x_start, x_end, y0, track_h):
@@ -1147,24 +1200,40 @@ class PaintboxOverview:
         the first sub-pixel diff of a region stays visible. The number
         of CANVAS_RECT_FILL calls is therefore bounded by the track
         height in pixels, not by the line/diff count.
+
+        v7: the end pixel is computed FIRST and the start pixel only
+        for surviving segments — the vast majority of the 1.6M
+        segments per side collapse onto already-covered pixels and
+        never needed ps. Two sub-sections (paint:overview:build /
+        paint:overview:draw, 2 instances each per repaint) split the
+        old single paint:overview row so the report shows how much is
+        segment CONSTRUCTION (states -> runs) and how much is pixel
+        mapping/drawing.
         """
+        # _prefix_sums + _build_segments: the segment CONSTRUCTION half.
+        Profiler.start('paint:overview:build')
         cum, total, gap_map = self._prefix_sums(side)
+        segments = self._build_segments(side, cum, gap_map) \
+            if total > 0 and track_h > 0 else None
+        Profiler.stop('paint:overview:build')
         if total <= 0 or track_h <= 0:
             return
-        segments = self._build_segments(side, cum, gap_map)
         if not segments:
             return
         scale = track_h / total
 
+        # the pixel-mapping + drawing half
+        Profiler.start('paint:overview:draw')
         prev_end = -1     # raw end pixel of the previous segment (WinMerge's nPrevEndY)
         last_color = None
         for start_row, end_row, color in segments:
-            ps = y0 + int(start_row * scale)
-            pe = y0 + int(end_row * scale)
-            if pe == prev_end:
+            raw_pe = y0 + int(end_row * scale)
+            if raw_pe == prev_end:
                 # Collapses onto pixels the previous segment already
-                # covered — useless write, skip it.
+                # covered — useless write, skip it (ps not needed).
                 continue
+            ps = y0 + int(start_row * scale)
+            pe = raw_pe
             if pe <= ps:
                 pe = ps + 1  # sub-pixel segment: draw at least one pixel
             if color != last_color:
@@ -1173,7 +1242,8 @@ class PaintboxOverview:
                 last_color = color
             ct.canvas_proc(c, ct.CANVAS_RECT_FILL,
                            x=x_start, y=ps, x2=x_end, y2=pe)
-            prev_end = y0 + int(end_row * scale)
+            prev_end = raw_pe
+        Profiler.stop('paint:overview:draw')
 
     def _paint_buttons(self, c, w, h):
         """Paint the ▲/▼ scroll button boxes at the top and bottom of

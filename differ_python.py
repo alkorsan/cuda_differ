@@ -162,6 +162,15 @@ B_GAP_IGN  = '+^i'  # ignored gap in file b: (id, y, start, end)
 # gaps when word-wrap is on and the two lines wrap to a different number
 # of visual rows.
 ALIGN = '='
+# Composite CHANGED-PAIR event (mirrored from differ_native — see its
+# comment there for the full rationale): one event per char-diffed pair,
+#           return (id, a_line, b_line, deca, decb)
+# replacing A_LINE_CHANGE + B_LINE_CHANGE + A_DECOR_* + B_DECOR_* and the
+# pair's trailing ALIGN. deca/decb are the pair's char-opcode counts;
+# deca > 0 / == 0 pick A_DECOR_RED's / A_DECOR_YELLOW's old colors, decb
+# > 0 / == 0 pick B_DECOR_GREEN's / B_DECOR_YELLOW's. The consumer paints
+# both lines and runs the pair's wrap-compensation from this one event.
+PAIR_CHANGED = '*'
 
 
 class Differ:
@@ -196,6 +205,13 @@ class Differ:
               return (id, a_line, b_line)
               Consumed by __init__.py to add a compensating gap when the two
               lines wrap to a different number of visual rows.
+          * composite changed line pair (a_line, b_line, deca, decb)
+              return (id, a_line, b_line, deca, decb)
+              One event per char-diffed REPLACE pair; replaces the old
+              A_LINE_CHANGE / B_LINE_CHANGE / A_DECOR_* / B_DECOR_*
+              quartet and the pair's trailing ALIGN (see PAIR_CHANGED
+              above). The non-detailed plain-replace path (withdetail=
+              False) still emits the old quartet -- it has no pairing.
     """
 
     def __init__(self):
@@ -601,8 +617,10 @@ class Differ:
                         eng_max = dt
                 else:
                     ops = char_diff_call(a[ai], b[bj])
+                # the composite PAIR_CHANGED event carries the pair's
+                # line-level work incl. its wrap-compensation (the old
+                # trailing ALIGN's job)
                 self._char_diff_pair_events(out, ai, bj, ops)
-                append((ALIGN, ai, bj))
         if prof_on and eng_n:
             Profiler.mark(row, eng_dt, eng_n, eng_max)
 
@@ -897,7 +915,8 @@ class Differ:
             else:
                 ops = self._char_diff(a_line, b_line)
             self._char_diff_pair_events(out, best_i, best_j, ops)
-            out.append((ALIGN, best_i, best_j))
+            # composite PAIR_CHANGED carries the pair's line-level work
+            # incl. its wrap-compensation (the old trailing ALIGN's job)
 
         # Recurse on the part after the best pair
         self._find_best_pairs_events(out, a, best_i + 1, ahi,
@@ -908,30 +927,32 @@ class Differ:
         given the char-level opcodes from char_diff().
         Shared by BOTH alignment modes. Pure glue — no decisions here.
 
-        The line is marked as A_LINE_CHANGE / B_LINE_CHANGE and the
-        specific character ranges that differ are emitted as
-        A_SYMBOL_DEL / B_SYMBOL_ADD events so the wrapper can highlight
-        them inline. Same event order as the old generator version.
+        The pair's line-level work travels as ONE composite PAIR_CHANGED
+        event (see the constant's comment): the consumer paints both
+        lines' bookmark / micromap mark / overview state and runs the
+        pair's wrap-compensation from that single event, where the walk
+        used to emit A_LINE_CHANGE + B_LINE_CHANGE + A_DECOR_* +
+        B_DECOR_* (+ a trailing ALIGN). The specific character ranges
+        that differ are still emitted as A_SYMBOL_DEL / B_SYMBOL_ADD
+        events so the wrapper can highlight them inline. Same final
+        painted state as the old four-event form, byte-for-byte.
         """
-        deca, decb = 0, 0
+        deca = 0
+        decb = 0
         append = out.append
         for tag, a_start, a_end, b_start, b_end in ops:
-            la, lb = a_end - a_start, b_end - b_start
             if tag == 'delete':
                 deca += 1
-                append((A_SYMBOL_DEL, ai, a_start, la))
+                append((A_SYMBOL_DEL, ai, a_start, a_end - a_start))
             elif tag == 'insert':
                 decb += 1
-                append((B_SYMBOL_ADD, bj, b_start, lb))
+                append((B_SYMBOL_ADD, bj, b_start, b_end - b_start))
             elif tag == 'replace':
                 deca += 1
                 decb += 1
-                append((A_SYMBOL_DEL, ai, a_start, la))
-                append((B_SYMBOL_ADD, bj, b_start, lb))
-        append((A_LINE_CHANGE, ai))
-        append((B_LINE_CHANGE, bj))
-        append((A_DECOR_YELLOW, ai) if deca == 0 else (A_DECOR_RED, ai))
-        append((B_DECOR_YELLOW, bj) if decb == 0 else (B_DECOR_GREEN, bj))
+                append((A_SYMBOL_DEL, ai, a_start, a_end - a_start))
+                append((B_SYMBOL_ADD, bj, b_start, b_end - b_start))
+        append((PAIR_CHANGED, ai, bj, deca, decb))
 
     def _plain_replace_chunks(self, a, alo, ahi, b, blo, bhi):
         """Non-detailed replace (withdetail=False). Pairs lines by

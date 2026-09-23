@@ -596,11 +596,10 @@ Advanced section:
   Default: 3.
 - differ.advanced.enable_profiling: Enable profiling
   Enable profiling to trace where compare time is consumed.
-  When enabled, prints TWO reports to the console after each
-  compare: the section report (which PHASE eats the time) and, when
-  the cProfile layer is on (ENABLE_CPROFILE in the plugin's
-  profiling.py, currently True), a cProfile report (which FUNCTION
-  eats the time), sorted by self time.
+  When enabled, prints the SECTION report to the console after each
+  compare (which PHASE eats the time), and, when the cProfile layer
+  is also on (differ.advanced.enable_cprofile), the cProfile report
+  (which FUNCTION eats the time) after it, sorted by self time.
   The section report is sorted by SELF time (time inside a
   row EXCLUDING its nested rows), so the real bottleneck is at the
   top. Rows you will see:
@@ -628,10 +627,14 @@ Advanced section:
   - refresh:wrapinfo_api -- the ed.get_wrapinfo() calls (one per
     editor, wrap on): the single most expensive editor API of a
     wrapped big-file refresh (~4.9s on 1M lines). Nests under
-    refresh:wrap_counts.
+    refresh:wrap_counts; the Counter pass that turns the API's
+    visual-row rows into per-line counts has its own
+    refresh:wrapinfo_count row.
   - refresh:compare_and_paint -- the consumer loop: event dispatch,
     marker/bookmark/overview data collection (its self time is the
-    honest per-event pipeline cost).
+    honest per-event pipeline cost). compare:produce underneath it
+    splits the event-list FETCHES (the differ's walk) from the
+    consumer's dispatch.
   - paint:attr / paint:gap / paint:micromap / paint:wrap_calc --
     per-operation paint costs, as BATCHED marks: each gap
     insertion, wrap computation, char-run collection and micromap
@@ -644,8 +647,10 @@ Advanced section:
     mismatches -- a compare of two files with equal line counts and
     equal wrap counts has ~none, so 'paint:gap 0.0ms 1 call' is
     CORRECT, not a profiling bug).
-  - refresh:*, paint:bookmark, paint:marker_window, paint:overview --
-    the other refresh phases.
+  - refresh:*, paint:bookmark, paint:marker_window (with the
+    paint:marks:build / paint:marks:apply split), paint:overview
+    (with the paint:overview:build / paint:overview:draw split) --
+    the other refresh phases and their sub-rows.
   The report header names what was compared (per side: the original
   file's path, or the tab title for untitled tabs), and a final
   block ESTIMATES the profiler's own overhead with ALL THREE cost
@@ -660,11 +665,28 @@ Advanced section:
   Python call pays ~1-2us, so rows with millions of cheap calls
   (paint:attr etc.) are inflated 2-3x in that run. The cProfile
   report attributes every Python function call on the main thread:
-  use it to find the hot function, then set ENABLE_CPROFILE=False
-  in profiling.py and re-compare for clean section numbers. The
-  tracing is always disabled before the section report prints, so
-  the overhead estimate's per-op costs are measured clean.
+  use it to find the hot function, then turn the cProfile layer off
+  and re-compare for clean section numbers. The tracing is always
+  disabled before the section report prints, so the overhead
+  estimate's per-op costs are measured clean.
+  See the "Profiling and reporting performance problems" section
+  below for the full description of both layers and the correct
+  way to use them together.
   Use for debugging performance issues only.
+  Default: off.
+- differ.advanced.enable_cprofile: Enable cProfile layer
+  (function-level report)
+  Adds the cProfile tracing profiler ON TOP of the section profiler
+  (needs "Enable profiling" on). After each compare the console also
+  gets the FUNCTION-level report -- which function/method eats the
+  time, the question the section report cannot answer.
+  cProfile traces every Python call (~1-2us each), so while it runs
+  the compare is 2-3x slower and the section report's rows are
+  inflated (the report prints a warning banner; the per-operation
+  paint rows are skipped under this layer). This is a diagnostic to
+  read, not a mode to keep on: find the hot function, then turn it
+  off and re-run for clean numbers. See the "Profiling and reporting
+  performance problems" section below.
   Default: off.
 
 Micromap section:
@@ -868,6 +890,73 @@ one:
   buttons write one line per repeat tick (like native arrow buttons)
   so the text glides at the editors' paint rate instead of crawling
   one line per paint.
+
+
+== Profiling and reporting performance problems ==
+
+The plugin ships TWO profilers, and they answer two DIFFERENT questions.
+Neither can answer the other's question, which is why a performance
+report needs both.
+
+The SECTION profiler (differ.advanced.enable_profiling)
+  The plugin's own lightweight hierarchical profiler. It instruments
+  PHASES: one timing row per pipeline stage (text fetch, wrap info,
+  line split, engine calls, event production, dispatch, bookmark flush,
+  overview build, ...), plus batched per-operation rows for the hot
+  loops. Its cost is small (a fraction of a second on a 1M-line
+  compare; the report prints an honest estimated-overhead line) and it
+  runs while the compare behaves normally.
+  It answers: WHICH PHASE eats the time? "positional_pairs is 5.8s of
+  the 39.7s refresh" -- a phase-level attribution, with self/total
+  separation so wrapper rows never mask their children.
+
+The cProfile LAYER (differ.advanced.enable_cprofile)
+  Python's standard tracing profiler, wrapped around one whole refresh.
+  It records EVERY Python function call on the main thread, so it can
+  attribute time to individual FUNCTIONS and methods -- the question
+  the section report cannot resolve (what inside the dispatch loop?
+  dict.get? list.append? the generator's next? a specific helper?).
+  Its cost is large: every traced call pays ~1-2us, and the compare's
+  hot loops make millions of calls, so a compare under cProfile runs
+  2-3x slower, and the section report printed in the same run carries
+  INFLATED numbers (it warns you with a banner). The per-operation
+  paint rows are skipped under this layer for the same reason.
+
+The two layers interact, and that is exactly why both are needed:
+  - The section report from the cProfile-OFF run is the only one with
+    clean, comparable phase numbers.
+  - The cProfile report from the cProfile-ON run is the only one that
+    names functions.
+  - Reading only one of them misleads: the inflated section report
+    points at the wrong phase magnitudes; the cProfile report alone
+    cannot tell which PHASE a hot function belongs to (its rows are
+    flat, not nested by pipeline stage) and its numbers include the
+    tracing overhead itself.
+
+The correct way to profile:
+  1. Open "Options / Settings-plugins / Differ / Config" (or edit
+     settings/cuda_differ.json directly; changes apply from the next
+     compare, no restart needed).
+  2. Turn ON differ.advanced.enable_profiling, leave
+     differ.advanced.enable_cprofile OFF. Recompare. Copy the whole
+     console output (the section report).
+  3. Turn ON differ.advanced.enable_cprofile too. Recompare the SAME
+     files. Copy the whole console output (the banner-carrying section
+     report + the function-level cProfile report).
+  4. Turn both options OFF when done -- they are diagnostics, not a
+     mode to leave on.
+
+Reporting a performance problem:
+  Post BOTH console reports (step 2's and step 3's) together with the
+  compared files' sizes and a description of what felt slow. Both are
+  needed because the maintainers must see the clean phase split (to
+  know which stage to attack) AND the function-level attribution (to
+  know what inside that stage to attack); each report without the
+  other sends half the coordinates. Include the "Estimated profiler
+  overhead" line -- it tells whether a small run's numbers are mostly
+  instrumentation, and the "Differ: compare took ...ms" status line
+  from an UNPROFILED run if you have it (the closest number to what
+  you actually experience).
 
 
 == Notes ==

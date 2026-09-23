@@ -1,4 +1,5 @@
 import functools
+import gc
 import os
 import re
 import json
@@ -30,7 +31,7 @@ from . import differ_python as dfp
 from .overview import PaintboxOverview
 from .profiling import (Profiler, enable_profiling, profiling_report,
                         reset_profiling, start_profiling, stop_profiling,
-                        cancel_profiling, ENABLE_CPROFILE)
+                        cancel_profiling)
 from .utils import split_lines_safe, ScrollSplittedTab
 from difflib import unified_diff
 from cudax_lib import get_translation
@@ -56,6 +57,71 @@ NKIND_CHANGED = 26
 GAP_WIDTH = 5000
 DEFAULT_SYNC_SCROLL = '1'
 U_PREFIX = 'untitled:'
+
+
+# ----------------------------------------------------------------------
+# GC pause suppression around the compare's synchronous stretches.
+#
+# CPython's generational GC is a pure observer-effect on this pipeline:
+# the walk / dispatch / flush loops allocate millions of short-lived,
+# ACYCLIC tuples and lists (event chunks, pending bookmark / attr /
+# micromap entries, wrap-count lists), and every ~700 tracked
+# allocations trigger a generation-0 collection that pauses whatever
+# code is running -- measured at up to HALF the paint-phase wall on a
+# dense 300k-line sandbox (1.72s vs 3.44s with the same work). The
+# suppression below removes those pauses with no behavior change:
+#
+#   * the window is single-threaded main-stack code -- while it runs,
+#     CudaText cannot pump messages, so no other plugin / app code
+#     can run and create reference cycles inside the window;
+#   * everything the window allocates is either reference-counted away
+#     immediately (tuples, lists of tuples) or intentionally kept
+#     (the pending lists) -- none of it needs the cycle collector;
+#   * the state is restored in a finally on EVERY exit (normal,
+#     exception, cancel-abandoned), so any cycle created by an error
+#     path is still collected by the first gc run after the stretch;
+#   * nesting is reference-counted, so refresh_compare -> paint ->
+#     epilogue each declaring the window do not enable gc early.
+#
+_gc_depth = 0
+_gc_was_enabled = None
+
+
+class _gc_quiet:
+    """Re-entrant context manager: gc.disable() for this stretch.
+
+    Keeps the global (module-level) nesting depth so a suppressor
+    inside another suppressor never re-enables gc early; restores the
+    exact state found at the OUTERMOST enter (gc off stays off).
+    Zero work per level beyond a counter when gc was already off."""
+
+    __slots__ = ()
+
+    def __enter__(self):
+        global _gc_depth, _gc_was_enabled
+        if _gc_depth == 0:
+            _gc_was_enabled = gc.isenabled()
+            if _gc_was_enabled:
+                gc.disable()
+        _gc_depth += 1
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        global _gc_depth, _gc_was_enabled
+        _gc_depth -= 1
+        if _gc_depth == 0 and _gc_was_enabled:
+            gc.enable()
+        return False
+
+
+def _gc_quiet_method(func):
+    """Method decorator form of _gc_quiet (one extra frame per CALL,
+    not per event: these are the pipeline's coarse entry points)."""
+    @functools.wraps(func)
+    def _gc_quiet_wrapper(*args, **kwargs):
+        with _gc_quiet():
+            return func(*args, **kwargs)
+    return _gc_quiet_wrapper
 
 
 def _chunk_events(ev_iter, chunk=4096):
@@ -788,6 +854,27 @@ OPTS_META = [
               'decor, gaps, attributes). Use for debugging performance '
               'issues only -- adds small overhead (~1-2us per timing '
               'point).\n'
+              'Default: off.'),
+     'def': False,
+     'frm': 'bool',
+     'chp': 'advanced',
+     },
+    {'opt': 'differ.advanced.enable_cprofile',
+     'cmt': _('Enable cProfile layer (function-level report)\n'
+              'Adds the cProfile tracing profiler ON TOP of the section '
+              'profiler (needs "Enable profiling" on): after each compare '
+              'the console also gets the FUNCTION-level report -- which '
+              'function/method eats the time, the question the section '
+              'report cannot answer.\n'
+              'cProfile traces every Python call (~1-2us each), so while '
+              'it runs the compare is 2-3x slower and the section report '
+              'rows are INFLATED (the report prints a warning banner; the '
+              'per-operation paint rows are skipped under this layer). '
+              'This is a diagnostic to read, not a mode to keep on.\n'
+              'To report a performance problem, run the compare TWICE: '
+              'once with this option OFF (clean section report) and once '
+              'with it ON (function report), and post BOTH console '
+              'reports -- see the "Profiling" section in readme.txt.\n'
               'Default: off.'),
      'def': False,
      'frm': 'bool',
@@ -2738,6 +2825,13 @@ class Command:
         # resolved algorithm is applied — avoid a duplicate message here.
         return diff
 
+    # _gc_quiet_method: suppress gen-0 GC pauses for this whole
+    # synchronous stretch (see the module-level comment block). The
+    # method returns at the async kick-off -- the finally restores gc
+    # then; the engine's background thread runs pure Pascal (no
+    # Python objects), and the completion callbacks re-enter their own
+    # quiet windows.
+    @_gc_quiet_method
     def refresh_compare(self, ed=None, show_dialog=None):
         """Unified refresh / re-compare entry point.
 
@@ -2850,16 +2944,23 @@ class Command:
         # for the WHOLE refresh -- which FUNCTION eats the time, the
         # question the section report cannot answer. Started only when
         # the section profiler is on (the same 'enable_profiling'
-        # config switch) AND ENABLE_CPROFILE in profiling.py; stopped +
-        # printed by _compare_epilogue (sync: this method's finally;
-        # background: _on_native_diff_done), cancelled without printing
-        # on every abandonment path (engine-refused below, _cancel_job).
+        # config switch) AND the 'enable_cprofile' config option is on
+        # (differ.advanced.enable_cprofile -- settings/cuda_differ.json
+        # or the Options dialog; editing the JSON takes effect on the
+        # next compare, no restart needed. Replaces the old
+        # ENABLE_CPROFILE module constant as the switch -- that constant
+        # now only serves as the option's fallback default for exotic
+        # embedding cases); stopped + printed by _compare_epilogue
+        # (sync: this method's finally; background:
+        # _on_native_diff_done), cancelled without printing on every
+        # abandonment path (engine-refused below, _cancel_job).
         # cProfile traces every Python call, so profiled compares run
         # 2-3x slower while it is on -- a diagnostic, not the norm.
         _cprof = None
         try:
             Profiler.start('refresh')
-            if ENABLE_CPROFILE and Profiler.is_enabled():
+            if (self.cfg.get('enable_cprofile', False)
+                    and Profiler.is_enabled()):
                 _cprof = start_profiling()
 
             a_ed = ct.Editor(ed.get_prop(ct.PROP_HANDLE_PRIMARY))
@@ -3183,6 +3284,11 @@ class Command:
                                        tab_id,
                                        _cprof)
 
+    # _gc_quiet_method: the paint loop is the single biggest allocation
+    # stretch (event chunks + pending lists, ~millions of tracked
+    # objects per big compare); the suppression nests safely inside the
+    # callbacks' own windows.
+    @_gc_quiet_method
     def _paint_compare_events(self, job, opcodes=None, char_ops=None):
         """Consume the Differ's events (flattened from bounded lists by
         chain.from_iterable -- see the compare_iter setup below) and
@@ -3360,7 +3466,13 @@ class Command:
         # matched line dominates, then the char/line/decor events of
         # changed pairs, then del/add, then gaps) — the ladder is
         # behavior-neutral (ids are mutually exclusive) but the hot ids
-        # are matched after the fewest comparisons.
+        # are matched after the fewest comparisons. NOTE the per-changed-
+        # PAIR traffic now arrives as ONE PAIR_CHANGED event (hot ids:
+        # A_SYMBOL_DEL, B_SYMBOL_ADD, PAIR_CHANGED — one ladder pass
+        # each per pair instead of the old five); the A_LINE_CHANGE /
+        # B_LINE_CHANGE / A_DECOR_* / B_DECOR_* branches below remain
+        # for the non-detailed plain-replace stream (withdetail=False),
+        # which still emits the old per-line quartet.
         #
         # Per-event Profiler SECTIONS stay gone (they were the biggest
         # fake cost in the old report: ~4M start/stop pairs charged
@@ -3449,6 +3561,11 @@ class Command:
         # the key already exists -- get + None check skips that).
         _ch_a_get = pending_ch_a.get
         _ch_b_get = pending_ch_b.get
+        # Bookmark-list appends, pre-bound (the PAIR_CHANGED branch
+        # appends to both lists per changed pair -- 800k attribute
+        # lookups saved on a 1M-line compare).
+        _bkm_a_append = pending_bkm_a.append
+        _bkm_b_append = pending_bkm_b.append
         for d in compare_iter:
             diff_id, y = d[0], d[1]
             if diff_id == df.ALIGN:
@@ -3510,8 +3627,13 @@ class Command:
                     _attr_n += 1
                     if _dt > _attr_max:
                         _attr_max = _dt
-                if ov_states_a is not None:
-                    ov_states_a[y] = color_deleted
+                # NOTE: no ov_states_a write here -- every A_SYMBOL_DEL
+                # belongs to a changed pair whose PAIR_CHANGED event
+                # follows immediately in the stream and writes the
+                # line's FINAL overview color (decor-based); the old
+                # intermediate color_deleted store was always
+                # overwritten (1.6M dead dict writes on a 1M-line
+                # compare).
             elif diff_id == df.B_SYMBOL_ADD:
                 n_diff_events += 1
                 if prof_on:
@@ -3528,8 +3650,74 @@ class Command:
                     _attr_n += 1
                     if _dt > _attr_max:
                         _attr_max = _dt
+                # no ov_states_b write -- same rationale as A_SYMBOL_DEL
+            elif diff_id == df.PAIR_CHANGED:
+                # Composite changed-pair event (see differ_native's
+                # PAIR_CHANGED): does the line-level work of the old
+                # A_LINE_CHANGE + B_LINE_CHANGE + A_DECOR_* +
+                # B_DECOR_* quartet AND the pair's trailing ALIGN in
+                # ONE dispatch. Decor colors reproduce the quartet's
+                # exactly: deca > 0 was A_DECOR_RED -> deleted color,
+                # deca == 0 was A_DECOR_YELLOW -> changed color; decb
+                # > 0 was B_DECOR_GREEN -> added color, decb == 0 was
+                # B_DECOR_YELLOW -> changed color.
+                ai, bj, deca, decb = d[1], d[2], d[3], d[4]
+                n_diff_events += 2
+                _bkm_a_append((ai, NKIND_CHANGED))
+                _bkm_b_append((bj, NKIND_CHANGED))
+                if micromap_on:
+                    if prof_on:
+                        _t0 = _perf()
+                    pending_mm_a[ai] = color_changed
+                    pending_mm_b[bj] = color_changed
+                    if prof_on:
+                        _end('paint:micromap', _t0)
+                if ov_states_a is not None:
+                    ov_states_a[ai] = color_deleted if deca else color_changed
                 if ov_states_b is not None:
-                    ov_states_b[y] = color_added
+                    ov_states_b[bj] = color_added if decb else color_changed
+                # the pair's wrap-compensation -- the old trailing
+                # (ALIGN, ai, bj) event's job, same va/vb logic as the
+                # ALIGN branch below (pairs and equal lines both feed
+                # it; the branch is skipped when ALIGN events are
+                # suppressed, exactly like the old no-op consumption)
+                if wrap_on and align_gaps:
+                    if prof_on:
+                        _t0 = _perf()
+                    va = (wrap_counts_a[ai]
+                          if 0 <= ai < wca_n else 1)
+                    vb = (wrap_counts_b[bj]
+                          if 0 <= bj < wcb_n else 1)
+                    if prof_on:
+                        _dt = _perf() - _t0
+                        _wc_dt += _dt
+                        _wc_n += 1
+                        if _dt > _wc_max:
+                            _wc_max = _dt
+                    if va > vb:
+                        diff_rows = va - vb
+                        if prof_on:
+                            _t0 = _perf()
+                        self._add_raw_gap(b_ed, bj,
+                                          diff_rows * line_h_b, color_gaps)
+                        if prof_on:
+                            _end('paint:gap', _t0)
+                        if overview is not None:
+                            # _add_raw_gap inserts AFTER b_line
+                            # (between b_line and b_line+1): after_line
+                            # = b_line + 1 (gap appears before line
+                            # b_line+1 in paint order).
+                            overview.add_gap('b', bj + 1, diff_rows)
+                    elif vb > va:
+                        diff_rows = vb - va
+                        if prof_on:
+                            _t0 = _perf()
+                        self._add_raw_gap(a_ed, ai,
+                                          diff_rows * line_h_a, color_gaps)
+                        if prof_on:
+                            _end('paint:gap', _t0)
+                        if overview is not None:
+                            overview.add_gap('a', ai + 1, diff_rows)
             elif diff_id == df.A_LINE_CHANGE:
                 n_diff_events += 1
                 pending_bkm_a.append((y, NKIND_CHANGED))
@@ -3875,6 +4063,7 @@ class Command:
         if job.session is not None and job.session.job is job:
             job.session.job = None
 
+    @_gc_quiet_method
     def _on_native_diff_done(self, job, opcodes):
         """diff_proc completion callback for a background line-level
         compare (native algorithms) -- PHASE 1 of the two-phase flow.
@@ -4071,6 +4260,7 @@ class Command:
             import traceback
             traceback.print_exc()
 
+    @_gc_quiet_method
     def _on_char_diff_done(self, job, opcodes, results):
         """diff_proc completion callback for the background BATCHED
         char-level compare (native algorithms) -- PHASE 2 of the
@@ -4264,10 +4454,14 @@ class Command:
             enable_profiling(False)
         # cProfile layer: function-level report, sorted by SELF time
         # (tottime). Switch the call below to sort_key='cumulative' for
-        # the call-tree view, or raise max_lines for a longer table.
+        # the call-tree view. 70 rows: the 30-row cut of the 1M-line
+        # benchmark report (188 entries) hid the mid-table functions
+        # that carry the per-event collection work (dict.get/append
+        # helpers, _marks_to_arrays, the overview walk) -- the rows a
+        # performance report is actually read for.
         if cprofile is not None:
             stop_profiling(cprofile[0], cprofile[1],
-                           sort_key='time', max_lines=30,
+                           sort_key='time', max_lines=70,
                            title='cProfile: refresh_compare')
 
     def _compared_names_for_report(self, tab_id):
@@ -4360,14 +4554,22 @@ class Command:
         files, exactly like the editors' own scrollbars.
         """
         session = job.session
+        # Two sub-rows split the old single paint:marker_window self:
+        # 'build' = the four dict->sorted-arrays conversions (1.6M
+        # entries per side on a 1M-line compare), 'apply' = the two
+        # windowed MARKERS_ADD_MANY flushes. 2 section instances each.
+        Profiler.start('paint:marks:build')
         session.marks_micromap_a = self._marks_to_arrays(mm_a)
         session.marks_micromap_b = self._marks_to_arrays(mm_b)
         session.marks_chars_a = self._marks_to_arrays(ch_a)
         session.marks_chars_b = self._marks_to_arrays(ch_b)
+        Profiler.stop('paint:marks:build')
         session.mark_window_a = None
         session.mark_window_b = None
+        Profiler.start('paint:marks:apply')
         self._apply_marker_window(session, job.a_ed, 'a')
         self._apply_marker_window(session, job.b_ed, 'b')
+        Profiler.stop('paint:marks:apply')
 
     @staticmethod
     def _marks_to_arrays(marks):
@@ -4376,10 +4578,23 @@ class Command:
         marks, or the per-line [(x, len, color)] lists for char marks.
         None for an empty dict. Sorted lines let the window extraction
         use binary search + slice instead of walking all collected
-        lines on every re-apply."""
+        lines on every re-apply.
+
+        The paint loop collects the marks in the walk's order (ascending
+        by line), so the dict's INSERTION order is already sorted: a
+        one-comparison-per-key scan verifies that and list() serves
+        directly, where sorted() re-ran Timsort over the 1.6M-entry
+        dicts. Out-of-order dicts (defensive) still take the sorted()
+        path."""
         if not marks:
             return None
-        lines = sorted(marks)
+        lines = list(marks)
+        _prev = -1
+        for _l in lines:
+            if _l <= _prev:
+                lines = sorted(marks)
+                break
+            _prev = _l
         return (lines, [marks[k] for k in lines])
 
     def _apply_marker_window(self, session, ed, side):
@@ -4603,7 +4818,11 @@ class Command:
         # ~2.5s (cProfile-on) for two 1M-row editors. ANY deviation from
         # the contract (non-dict row, missing 'line' key) raises and
         # falls back to the original tolerant loop, whose skip
-        # semantics are preserved verbatim below.
+        # semantics are preserved verbatim below. Booked as its own row
+        # (refresh:wrapinfo_count, 2 instances): this pass is the
+        # non-API half of refresh:wrap_counts and its cost was
+        # invisible inside that row's self.
+        Profiler.start('refresh:wrapinfo_count')
         try:
             rows = Counter(map(itemgetter('line'), info))
         except (TypeError, KeyError):
@@ -4615,6 +4834,8 @@ class Command:
                     # like the tolerant loop; n is always > 0 in a Counter.
                     if 0 <= line < line_count:
                         counts[line] = n
+        Profiler.stop('refresh:wrapinfo_count')
+        if rows is not None:
             return counts
         # Tolerant fallback (original loop): non-dict rows skipped,
         # missing 'line' treated as -1 -> skipped by the bounds check.
@@ -4852,6 +5073,8 @@ class Command:
                 get_opt('advanced.diff_context', 3),
             'enable_profiling':
                 get_opt('advanced.enable_profiling', False),
+            'enable_cprofile':
+                get_opt('advanced.enable_cprofile', False),
             # --- micromap ---
             'enable_micromap':
                 get_opt('micromap.enable_micromap', False),
