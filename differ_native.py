@@ -650,7 +650,7 @@ class Differ:
             # Native API not available — fall back to Python char_diff.
             return char_diff(line_a, line_b)
 
-    def collect_char_pairs(self, a_text, b_text, opcodes):
+    def collect_char_pairs(self, a_text, b_text, opcodes, progress=None):
         """COLLECT pass of the two-phase native compare (phase 2, step 1).
 
         Splits the two raw texts into line lists (cached on the Differ
@@ -668,12 +668,24 @@ class Differ:
         Returns the collected pairs as a list of (line_a, line_b)
         string tuples, in walk order. The caller (Command.
         _on_native_diff_done) sends the whole list to the engine in ONE
-        batched asynchronous diff_proc(DIF_CHARS) call.
+        batched asynchronous diff_proc(DIF_CHARS) call. Returns None
+        when 'progress' aborted the walk (see below).
 
         Only 'replace' opcodes are walked: every other tag (equal /
         delete / insert / ignore) produces no char diff -- their events
         are pure line-level bookkeeping generated (again) by the
         replay pass's compare() loop.
+
+        'progress' (optional, no-argument callable -> bool) is the
+        ANTI-HANG hook of this O(N) main-thread stretch: called after
+        every bounded event-list chunk the walk produces (~512 pairs of
+        work), it pumps the UI / checks cancellation in the CALLER
+        (Command._on_native_diff_done builds it around
+        _pump_checkpoint). Returning False aborts the collect: the
+        partially-filled pair list is discarded, the cached state is
+        dropped, and None is returned -- the caller then unwinds
+        through its normal cancel/release paths. The hook must stay
+        cheap (a perf_counter read and compare when no pump is due).
 
         The pairing walk's per-chunk Profiler sections are suppressed
         while collecting (the collect cost lands in the caller's
@@ -701,18 +713,33 @@ class Differ:
         self._lines_b = split_lines_safe(b_text)
         Profiler.stop('compare:split_lines')
         pairs = []
+        aborted = False
         self._char_pairs_pending = pairs
         try:
             for tag, i1, i2, j1, j2 in opcodes:
                 if tag == 'replace' and self.withdetail:
                     # Drain the chunk generator: drives the pairing
                     # (and records the pairs); the yielded event lists
-                    # are throwaway.
+                    # are throwaway. The progress hook runs at every
+                    # chunk boundary -- the same granularity the paint
+                    # loop's pump checkpoints use.
                     for _evs in self._replace_block_chunks(
                             self._lines_a, i1, i2, self._lines_b, j1, j2):
-                        pass
+                        if progress is not None and not progress():
+                            aborted = True
+                            break
+                if aborted:
+                    break
         finally:
             self._char_pairs_pending = None
+            if aborted:
+                # Discard the partial list (a cancelled compare never
+                # reaches its replay pass) and drop the cached line
+                # lists so the Differ holds no text between compares.
+                del pairs[:]
+                self.drop_cached_state()
+        if aborted:
+            return None
         return pairs
 
     def drop_cached_state(self):

@@ -427,7 +427,62 @@ class Differ:
         """
         return result
 
-    def compare(self, a, b):
+    def engine_opcodes(self, a, b):
+        """Run ONLY the Python diff engine on the two line sequences and
+        return the final opcode list: matcher construction + get_opcodes
+        + the _realign_opcodes post-pass -- everything compare() does
+        before its event walk starts.
+
+        This is the BACKGROUND-THREAD half of a Python compare (see
+        Command.refresh_compare's Python kick-off): it is PURE Python
+        -- no CudaText API, no Profiler sections (the section profiler
+        is main-thread state), no editor access -- so it runs on a
+        daemon thread while the main thread stays free and responsive.
+        compare(a, b, opcodes=<this result>) then walks the opcodes
+        without running the engine again; the two halves together are
+        identical to the old all-in-one compare(a, b).
+
+        The matcher is released before returning (same memory
+        rationale as the old inline `del diff`)."""
+        if self.diff_algorithm == 'hybrid':
+            diff = HybridSequenceMatcher(None, a, b)
+        elif self.diff_algorithm == 'myers':
+            diff = MyersSequenceMatcher(None, a, b)
+        elif self.diff_algorithm == 'vscode':
+            diff = VSCodeSequenceMatcher(None, a, b)
+        elif self.diff_algorithm == 'patience':
+            diff = PatienceSequenceMatcher(None, a, b)
+        else:
+            # Default: difflib stdlib SequenceMatcher with autojunk=False
+            diff = DefaultSequenceMatcher(None, a, b, autojunk=False)
+
+        # get_opcodes() runs the selected pure-Python algorithm — this is
+        # where the actual diff is computed (no cudatext.diff_proc call
+        # happens on this path; that is the native differ's job).
+        opcodes = diff.get_opcodes()
+        # RELEASE THE MATCHER NOW — we already have the opcodes and the
+        # matcher no longer serves any purpose. The pure-Python matchers
+        # (difflib SequenceMatcher, PatienceSequenceMatcher, the
+        # HybridSequenceMatcher's internal _CombinedMatcher, the
+        # MyersSequenceMatcher) all build substantial internal state
+        # during get_opcodes() — hash tables of line fingerprints,
+        # back-pointer matrices for the LCS walk, the matching-blocks
+        # list, junk-detection dicts — and that state stays alive until
+        # the matcher object itself is collected. Without this `del`, all
+        # of that intermediate state survives until the caller drops the
+        # opcode list. For a 33k-line compare that's ~15-25MB of dead
+        # matcher state holding the peak up unnecessarily.
+        del diff
+
+        # _realign_opcodes fixes LCS tie-breaking issues where Myers
+        # matches trivial lines (empty, whitespace) instead of meaningful
+        # ones. This is needed for Python Myers/difflib (which produce
+        # INSERT+EQUAL(trivial)+DELETE patterns). The line list `a` is
+        # passed in so _realign_opcodes can read the EQUAL block's text
+        # without storing it on the instance.
+        return self._realign_opcodes(a, opcodes)
+
+    def compare(self, a, b, opcodes=None):
         """Generator that yields diff events for side-by-side display.
 
         Runs the selected Python diff algorithm on the two line
@@ -456,6 +511,15 @@ class Differ:
                 the editor tabs are the source of truth, a Python-side
                 persistent copy would be a transient duplicate with no
                 consumer after compare() returns).
+            opcodes: precomputed engine result (engine_opcodes(a, b)),
+                delivered by the background Python-engine thread -- the
+                same engine/walk split the native differ makes between
+                its background line diff and its replay walk. When
+                given, the engine and the realign pass are skipped and
+                the walk starts at once. None (default) keeps the
+                legacy behavior: the engine runs lazily inside this
+                generator on the consumer's thread (tests / the inline
+                fallback when threads are unavailable).
         """
         # Benchmark: when _BENCHMARK is True, measure the total time from
         # when the generator starts executing until it is fully consumed
@@ -473,49 +537,22 @@ class Differ:
         # compare:positional_pairs / compare:find_best_pairs).
 
         self.diffmap = []
-        Profiler.start('compare:algorithm')
-        if self.diff_algorithm == 'hybrid':
-            diff = HybridSequenceMatcher(None, a, b)
-        elif self.diff_algorithm == 'myers':
-            diff = MyersSequenceMatcher(None, a, b)
-        elif self.diff_algorithm == 'vscode':
-            diff = VSCodeSequenceMatcher(None, a, b)
-        elif self.diff_algorithm == 'patience':
-            diff = PatienceSequenceMatcher(None, a, b)
-        else:
-            # Default: difflib stdlib SequenceMatcher with autojunk=False
-            diff = DefaultSequenceMatcher(None, a, b, autojunk=False)
-
-        # get_opcodes() runs the selected pure-Python algorithm — this is
-        # where the actual diff is computed (no cudatext.diff_proc call
-        # happens on this path; that is the native differ's job).
-        opcodes = diff.get_opcodes()
-        Profiler.stop('compare:algorithm')
-
-        # RELEASE THE MATCHER NOW — we already have the opcodes and the
-        # matcher no longer serves any purpose. The pure-Python matchers
-        # (difflib SequenceMatcher, PatienceSequenceMatcher, the
-        # HybridSequenceMatcher's internal _CombinedMatcher, the
-        # MyersSequenceMatcher) all build substantial internal state
-        # during get_opcodes() — hash tables of line fingerprints,
-        # back-pointer matrices for the LCS walk, the matching-blocks
-        # list, junk-detection dicts — and that state stays alive until
-        # the matcher object itself is collected. Without this `del`,
-        # all of that intermediate state survives through the entire
-        # paint loop below alongside the line lists `a`/`b` we still
-        # need. For a 33k-line compare that's ~15-25MB of dead matcher
-        # state holding the peak up unnecessarily.
-        del diff
-
-        # _realign_opcodes fixes LCS tie-breaking issues where Myers
-        # matches trivial lines (empty, whitespace) instead of meaningful
-        # ones. This is needed for Python Myers/difflib (which produce
-        # INSERT+EQUAL(trivial)+DELETE patterns). The line list `a` is
-        # passed in so _realign_opcodes can read the EQUAL block's text
-        # without storing it on the instance.
-        Profiler.start('compare:realign_opcodes')
-        opcodes = self._realign_opcodes(a, opcodes)
-        Profiler.stop('compare:realign_opcodes')
+        if opcodes is None:
+            # LEGACY synchronous mode: the engine + realign run HERE, on
+            # the consumer's thread, inside this generator's first
+            # next(). engine_opcodes is the same code the background
+            # Python-engine thread runs -- kept as one call, so the old
+            # 'compare:realign_opcodes' row now folds into
+            # 'compare:algorithm' on this path (realign is O(n) and
+            # dwarfed by the engine; the background path books the whole
+            # engine wait as an async pair instead, mirroring the native
+            # kick-off).
+            Profiler.start('compare:algorithm')
+            opcodes = self.engine_opcodes(a, b)
+            Profiler.stop('compare:algorithm')
+        # else: background mode -- 'opcodes' is what the engine thread
+        # computed (engine_opcodes); no engine work happens while
+        # painting, exactly like the native replay walk.
 
         # Event production for REPLACE blocks is instrumented per chunk
         # ('compare:positional_pairs' / 'compare:find_best_pairs' open

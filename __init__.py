@@ -3,11 +3,11 @@ import gc
 import os
 import re
 import json
+import threading
 import time
 import typing as tp
 from bisect import bisect_left
 from collections import Counter
-from itertools import chain
 from operator import itemgetter
 
 import cudatext as ct
@@ -71,12 +71,16 @@ U_PREFIX = 'untitled:'
 # dense 300k-line sandbox (1.72s vs 3.44s with the same work). The
 # suppression below removes those pauses with no behavior change:
 #
-#   * the window is single-threaded main-stack code -- while it runs,
-#     CudaText cannot pump messages, so no other plugin / app code
-#     can run and create reference cycles inside the window;
-#   * everything the window allocates is either reference-counted away
-#     immediately (tuples, lists of tuples) or intentionally kept
-#     (the pending lists) -- none of it needs the cycle collector;
+#   * the window is main-thread code whose OWN allocations are either
+#     reference-counted away immediately (tuples, lists of tuples) or
+#     intentionally kept (the pending lists) -- none of it needs the
+#     cycle collector. Since the anti-hang UI pumps (see the pump block
+#     below) other plugin / app code CAN run inside a window and
+#     allocate cyclic garbage -- it simply stays uncollected until the
+#     window closes and gc is re-enabled (stretches are bounded by the
+#     pump cadence and event-handler cycles are small); a nested
+#     gc.disable()/gc.enable() pair from OTHER code could end the
+#     suppression early -- a performance cost, never a correctness one;
 #   * the state is restored in a finally on EVERY exit (normal,
 #     exception, cancel-abandoned), so any cycle created by an error
 #     path is still collected by the first gc run after the stretch;
@@ -128,13 +132,12 @@ def _chunk_events(ev_iter, chunk=4096):
     """Batch a FLAT event generator (the pure-Python Differ's compare())
     into bounded event lists.
 
-    The paint loop consumes BOTH differs through one path:
-    itertools.chain.from_iterable over a list-yielding iterator (the
-    native Differ already yields lists -- compare_lists; this wrapper
-    adapts the flat generator to the same shape). Bounded lists keep
-    the adaptation's memory constant, and nothing is added between
-    the source's yields, so the per-event cost stays the source
-    generator's own."""
+    The paint loop consumes BOTH differs through one path: direct
+    iteration over a list-yielding iterator's LISTS (the native Differ
+    already yields lists -- compare_lists; this wrapper adapts the flat
+    generator to the same shape). Bounded lists keep the adaptation's
+    memory constant, and nothing is added between the source's yields,
+    so the per-event cost stays the source generator's own."""
     buf = []
     append = buf.append
     for d in ev_iter:
@@ -183,8 +186,8 @@ def _timed_produce(list_iter):
     (equal/delete/insert), the replay pops, generator machinery.
 
     Only used while the section profiler is enabled (the consumer
-    bypasses it otherwise -- chain.from_iterable straight over the
-    source, zero added calls on the clean path)."""
+    bypasses it otherwise -- direct iteration over the source's lists,
+    zero added calls on the clean path)."""
     while True:
         Profiler.start('compare:produce')
         evs = next(list_iter, None)
@@ -192,6 +195,113 @@ def _timed_produce(list_iter):
         if evs is None:
             return
         yield evs
+
+
+# ----------------------------------------------------------------------
+# UI message pumping for long MAIN-THREAD stretches -- the anti-hang core.
+#
+# The native engine jobs (line diff, batched char diff) already run on
+# the engine's own OS threads, and the overview rebuilds on its worker
+# thread. What still ran SYNCHRONOUSLY on the main thread -- freezing
+# every repaint, every keystroke and the whole window for seconds at a
+# time on big compares -- was everything BETWEEN those background jobs:
+#
+#   * the CHAR-PAIR COLLECT pass (_on_native_diff_done ->
+#     Differ.collect_char_pairs): splits both texts and walks every
+#     replace opcode through the pairing machinery, pure Python, O(N);
+#   * the PAINT phase (_paint_compare_events): the replay walk + the
+#     event dispatch loop (up to ~5.8M events on a 1M-line compare),
+#     the bookmark flush (one C-API call per changed line -- up to
+#     1.6M calls), and the marker-array builds (4x up to 1.6M-entry
+#     dict->list conversions);
+#   * the whole PYTHON-algorithm compare: its engine ran inline inside
+#     the first next() of the event generator (now moved to a daemon
+#     thread -- see refresh_compare's Python kick-off).
+#
+# The fix is NOT to move that work off the main thread (it is a dense
+# stream of CudaText API calls -- editor(), bookmark(), gap() -- and
+# CudaText's API is main-thread-only) but to CHUNK it and hand the
+# message queue back to LCL between chunks: one Application.-
+# ProcessMessages pass (app_proc(PROC_IDLE), the same call the
+# overview's slider drag already uses to keep the thumb glued to the
+# mouse) every UI_PUMP_INTERVAL seconds of work. The stretches keep
+# their editors under the whole-compare EDACTION_LOCK, so editor-side
+# calls stay cheap (no repaint per call -- the final EDACTION_UNLOCK
+# repaints once), while the REST of the app -- menus, other tabs,
+# window dragging, the Cancel compare command -- stays fully alive.
+#
+# Pump points double as CANCELLATION CHECKPOINTS: the pump dispatches
+# pending messages synchronously, so a close / cancel / app-exit event
+# lands INSIDE the pump (on_close -> _cancel_job -> job.stale=True);
+# checking job.stale right AFTER the pump aborts the stretch within
+# ~UI_PUMP_INTERVAL of the user's action instead of running to the end.
+# ----------------------------------------------------------------------
+# Seconds of work between pumps. 50ms keeps the app perfectly responsive
+# (~20 pumps/sec, the same cadence as the overview's apply timer) while
+# adding ~0.1us of gate-check overhead per 4096-event chunk boundary.
+UI_PUMP_INTERVAL = 0.05
+# Seconds between 'applying colors...' status-bar updates (the pump
+# itself may run 20x/sec; the status text is throttled to 2x/sec).
+UI_STATUS_INTERVAL = 0.5
+# Poll period of the Python-engine completion timer (the main thread is
+# idle while the engine thread computes, so this only paces how quickly
+# the finished opcodes are picked up).
+PY_ENGINE_POLL_MS = 50
+
+# Re-entrancy guard: PROC_IDLE dispatches messages synchronously, and a
+# dispatched event handler that itself reaches a pump point must NOT
+# nest a second ProcessMessages pass inside ours (LCL tolerates nested
+# pumps, but deep nesting under message storms risks stack growth for
+# no benefit -- the inner pump point simply retries on the next chunk).
+_ui_pump_depth = 0
+
+
+def _pump_ui_messages():
+    """One Application.ProcessMessages + idle pass on the main thread.
+
+    Dispatches ALL pending OS/editor messages synchronously: paints,
+    input, timers -- and therefore any plugin event handlers those
+    messages trigger (on_scroll, on_caret, on_close, hotkeys, ...).
+    This is exactly what keeps CudaText responsive while a big compare
+    paints. Guarded against self-nesting; exceptions (exotic hosts /
+    test sandboxes without PROC_IDLE) are swallowed -- a failed pump only
+    means 'this stretch stays atomic', never a broken compare."""
+    global _ui_pump_depth
+    if _ui_pump_depth:
+        return
+    _ui_pump_depth += 1
+    try:
+        ct.app_proc(ct.PROC_IDLE, 'false')
+    except Exception:
+        pass
+    finally:
+        _ui_pump_depth -= 1
+
+
+class _PumpState:
+    """Per-stretch pump scheduler state (created once per long stretch).
+
+    t_pump: perf_counter of the last ADMITTED pump (the gate in the hot
+    paths compares against it -- one perf_counter + compare per chunk
+    boundary, no call).
+    t_status: perf_counter of the last status-bar update."""
+    __slots__ = ('t_pump', 't_status')
+
+    def __init__(self):
+        now = time.perf_counter()
+        self.t_pump = now
+        self.t_status = now
+
+
+class _PaintAborted(Exception):
+    """Raised by helper methods (not the loops, which return directly)
+    when a UI pump checkpoint reports the compare was cancelled --
+    _store_and_apply_marker_windows uses it to unwind out of the middle
+    of the marker-array builds. _paint_compare_events catches it, stops
+    its open Profiler sections in order and returns; every caller's
+    release paths (editor lock, job slot, cProfile layer) run as on any
+    other cancelled compare."""
+    pass
 
 
 # Marker windowing: lines above/below the viewport that stay colored in
@@ -246,7 +356,8 @@ _HOTKEYS = {
 _HOTKEY_KEY_FILTER = ','.join(str(k) for k in sorted(_HOTKEYS))
 
 # HARD-CODED MODULE CONSTANT — deliberately NOT a config option. Flips
-# the whole-compare editor lock for background (native) compares:
+# the whole-compare editor lock for background compares (BOTH the native
+# flow and the Python-engine flow):
 #
 #   True  (default): from kick-off until the result is fully rendered,
 #          both compare-tab editors are
@@ -257,14 +368,20 @@ _HOTKEY_KEY_FILTER = ','.join(str(k) for k in sorted(_HOTKEYS))
 #              NOT block input, the user could still write blind.
 #          The lock/RO pair is released ONLY after the compare finished
 #          AND everything is painted (or the compare was cancelled).
+#          It is also what makes the paint phase's UI pump checkpoints
+#          safe: the input they dispatch cannot modify the locked
+#          halves, and each editor call under the lock costs no repaint
+#          (the single EDACTION_UNLOCK at the end repaints once).
 #
 #   False: pre-lock behavior — the editors stay fully editable (and
 #          paintable) for the whole compare: no kick-off lock, no
 #          read-only. The paint phase runs unlocked too.
 #
-# The synchronous (Python-algorithm) mode never takes this lock: it
-# runs inline on the main thread, so no keystroke can land mid-compare
-# and the UI cannot repaint the busy screen anyway.
+# The legacy INLINE fallback path (Python algorithms when threads are
+# unavailable) takes the SAME lock around its paint: its pump
+# checkpoints dispatch real input, and without RO a keystroke could
+# land mid-compare and desync the colors from the snapshot being
+# painted.
 LOCK_EDITORS_WHILE_COMPARING = True
 
 PLG_NAME = _('Differ')
@@ -1152,6 +1269,8 @@ class _CompareJob:
         'editor_lock',      # whole-compare lock/RO state (see class docstring)
         'stale',            # job dropped (tab closed / app exiting)
         'in_flight',        # background engine call was started
+        'py_poll_cb',       # Python-engine completion poll timer callback (to TIMER_STOP on cancel), None when off
+        'py_engine_thread', # daemon thread running the Python engine (diagnostic ref), None when off
     )
 
     def __init__(self):
@@ -1188,6 +1307,8 @@ class _CompareJob:
         self.editor_lock = None
         self.stale = False
         self.in_flight = False
+        self.py_poll_cb = None
+        self.py_engine_thread = None
 
 
 class _TabSession:
@@ -2670,18 +2791,37 @@ class Command:
         """Cancel one in-flight background compare job: mark it stale (so
         its completion callback, if the engine delivers one after all,
         turns into a no-op -- see _CompareJob.stale in
-        _on_native_diff_done / _on_char_diff_done), release the
-        whole-compare editor lock / read-only state the job's kick-off
-        acquired (the editors must become editable again the moment the
-        compare is gone), and tell the engine to stop cooperatively via
-        diff_proc(DIF_CANCEL) for whichever engine job is still running
-        -- the LINE-level compare (job_handle), the BATCHED char-level
-        compare (char_job_handle), or both. No-op for a Python-
-        algorithm job, which never gets a handle. Does not touch the
-        session's job slot -- callers clear session.job themselves
-        (close / save / cancel command / exit each handle it
-        differently but identically safe)."""
+        _on_native_diff_done / _on_char_diff_done / _on_python_diff_done,
+        and so the PAINT loop's pump checkpoints abort a running paint at
+        the next chunk boundary), release the whole-compare editor lock /
+        read-only state the job's kick-off acquired (the editors must
+        become editable again the moment the compare is gone), stop the
+        PYTHON-engine completion poll timer if it is armed, and tell the
+        engine to stop cooperatively via diff_proc(DIF_CANCEL) for
+        whichever native engine job is still running -- the LINE-level
+        compare (job_handle) or the BATCHED char-level compare
+        (char_job_handle) or both. No engine handle exists for a
+        Python-algorithm job: its daemon engine thread cannot be
+        interrupted mid-get_opcodes (pure-Python matchers poll nothing)
+        -- it runs to its natural end and the result is discarded via
+        the stale checks. Does not touch the session's job slot --
+        callers clear session.job themselves (close / save / cancel
+        command / exit each handle it differently but identically
+        safe)."""
         job.stale = True
+        # Disarm the Python-engine completion poll timer FIRST: without
+        # it a 50ms tick could re-enter _on_python_diff_done right after
+        # this cancel (its stale check would no-op, but stopping the
+        # timer also drops the last reference chain to the engine
+        # thread's result holder).
+        if job.py_poll_cb is not None:
+            _cb = job.py_poll_cb
+            job.py_poll_cb = None
+            job.py_engine_thread = None
+            try:
+                ct.timer_proc(ct.TIMER_STOP, _cb, PY_ENGINE_POLL_MS)
+            except Exception:
+                pass
         # Drop the Differ's two-phase transient state (cached line
         # lists / replay bookkeeping): a cancelled compare never reaches
         # its replay pass, so the Differ must not hold the texts.
@@ -2957,8 +3097,25 @@ class Command:
         precomputed char opcodes -- no engine call while painting),
         sets the bookmarks, repaints the overview, shows the timing
         epilogue, and only then releases the editor lock / read-only
-        state. Python algorithms run the paint phase inline,
-        synchronously."""
+        state.
+
+        With the PYTHON algorithms the same two-phase shape applies:
+        the engine (matcher + get_opcodes + realign) runs on a daemon
+        thread, a repeating poll timer marshals the finished opcodes
+        back to the main thread (_on_python_diff_done), and the paint
+        runs from the precomputed opcodes. Only when threads are
+        unavailable does the legacy inline fallback run the engine
+        synchronously.
+
+        ANTI-HANG: the remaining main-thread stretches -- the collect
+        pass and the whole paint phase (event dispatch, bookmark flush,
+        marker-array builds) -- are chunked with UI pump checkpoints
+        (see the module-level pump block): one app_proc(PROC_IDLE)
+        message pass every UI_PUMP_INTERVAL seconds of work keeps
+        CudaText repainting and accepting input while big compares
+        colorize, and a cancel delivered through a pump (tab close /
+        Cancel compare / app exit) aborts the stretch at its next
+        chunk boundary."""
         if ed is None:
             ed = ct.ed
         if show_dialog is None:
@@ -3370,17 +3527,121 @@ class Command:
                 Profiler.stop('refresh')
                 return
 
-            # Synchronous compare: the paint phase runs inline. The
-            # Differ's generator runs the engine itself while being
-            # consumed (opcodes=None).
-            self._paint_compare_events(job)
+            # PYTHON-ALGORITHM compare: the engine (matcher +
+            # get_opcodes + realign -- minutes on big files for the slow
+            # matchers) runs on a daemon THREAD, and a repeating poll
+            # timer on the main thread picks the finished opcodes up and
+            # paints -- the exact two-phase shape of the native flow
+            # (kick-off -> background engine -> callback -> paint), so a
+            # Python-algorithm compare keeps the UI alive too. The
+            # engine thread computes PURE Python only (no CudaText API,
+            # no Profiler state -- see differ_python.engine_opcodes);
+            # the GIL interleaves it with the main thread's message
+            # loop, so the app stays responsive for the whole run.
+            _py_armed = False
+            _async_pair = Profiler.start_async_pair(
+                'compare:algorithm', 'python_engine_wait')
+            _py_holder = {'done': False, 'opcodes': None, 'error': None}
+
+            def _py_engine_worker(
+                    _diff=diff, _lines_a=job.lines_a,
+                    _lines_b=job.lines_b, _holder=_py_holder):
+                try:
+                    _holder['opcodes'] = _diff.engine_opcodes(
+                        _lines_a, _lines_b)
+                except Exception as _ex:
+                    _holder['error'] = _ex
+                finally:
+                    _holder['done'] = True
+
+            try:
+                _py_thread = threading.Thread(
+                    target=_py_engine_worker,
+                    name='cuda_differ_pyengine',
+                    daemon=True)
+                _py_thread.start()
+
+                def _py_poll_tick(tag='', info=''):
+                    # MAIN-thread poll: apply + release when the engine
+                    # thread finishes; simply return while it runs (the
+                    # repeating timer stays armed). A cancelled job is
+                    # detected by the callback itself (stale checks), so
+                    # no extra state is needed here.
+                    if not _py_holder['done']:
+                        return
+                    try:
+                        ct.timer_proc(ct.TIMER_STOP, _py_poll_tick,
+                                      PY_ENGINE_POLL_MS)
+                    except Exception:
+                        pass
+                    if job.py_poll_cb is _py_poll_tick:
+                        job.py_poll_cb = None
+                    self._on_python_diff_done(job, _py_holder, _async_pair)
+
+                ct.timer_proc(ct.TIMER_START, _py_poll_tick,
+                              PY_ENGINE_POLL_MS)
+                _py_armed = True
+                job.py_poll_cb = _py_poll_tick
+                job.py_engine_thread = _py_thread
+                session.job = job
+                # Editors are locked + read-only for the whole run, like
+                # the native kick-off (released in _on_python_diff_done /
+                # _cancel_job).
+                self._lock_compare_editors(job)
+                _epilogue = False
+                ct.msg_status(_('Differ: comparing in background...'))
+                return
+            except Exception:
+                # Thread / timer unavailable (exotic host, test sandbox)
+                # or a raise in the kick-off tail: fall back to the
+                # legacy INLINE compare below -- it still paints with
+                # pump checkpoints; only the engine stretch runs
+                # synchronously. Disarm whatever half-started (the
+                # daemon thread finishes on its own and its result is
+                # simply never consumed).
+                if _py_armed:
+                    try:
+                        ct.timer_proc(ct.TIMER_STOP, _py_poll_tick,
+                                      PY_ENGINE_POLL_MS)
+                    except Exception:
+                        pass
+                    job.py_poll_cb = None
+                    job.py_engine_thread = None
+                    self._free_job_slot(job)
+                    self._release_compare_editors(job)
+                Profiler.stop_async_pair(_async_pair)
+                msg('Python engine could not start in the background -- '
+                    'comparing inline', level=1)
+
+            # LEGACY inline compare (Python path fallback / tests): the
+            # paint phase runs inline; the Differ's generator runs the
+            # engine itself while being consumed (opcodes=None). The
+            # session's job slot is held and the editors locked for the
+            # whole paint -- the pump checkpoints inside dispatch real
+            # events, and the slot/RO pair is what makes those events
+            # safe (a mid-paint refresh is dropped as 'already
+            # running', typing is blocked, a mid-paint close cancels
+            # cleanly).
+            session.job = job
+            self._lock_compare_editors(job)
+            try:
+                self._paint_compare_events(job)
+            finally:
+                self._free_job_slot(job)
+                self._release_compare_editors(job)
+                # Belt-and-braces mirror of _finish_native_compare: an
+                # exception mid-paint must not leave a suspended native
+                # walk holding cached state (no-op for the Python
+                # Differ, which has no two-phase state).
+                if isinstance(diff, dfn.Differ):
+                    diff.drop_cached_state()
         finally:
             # Compare-time epilogue: status-bar timing message + profiling
             # report. Runs here for every synchronous completion path
             # (identical texts, all differences ignored, normal paint,
-            # exception). The background mode clears _epilogue at
-            # kick-off and runs the same epilogue in _on_native_diff_done
-            # when the paint phase finishes on the main thread.
+            # exception). The background modes clear _epilogue at
+            # kick-off and run the same epilogue in their completion
+            # callbacks when the paint phase finishes on the main thread.
             if _epilogue:
                 self._compare_epilogue(_compare_start,
                                        _profiling_enabled_here,
@@ -3393,34 +3654,49 @@ class Command:
     # callbacks' own windows.
     @_gc_quiet_method
     def _paint_compare_events(self, job, opcodes=None, char_ops=None):
-        """Consume the Differ's events (flattened from bounded lists by
-        chain.from_iterable -- see the compare_iter setup below) and
-        paint every event into both editor halves.
+        """Consume the Differ's events (bounded event LISTS -- see the
+        _lists setup below) and paint every event into both editor
+        halves.
 
-        Shared by both compare modes: the synchronous mode (Python
-        algorithms) calls it directly from refresh_compare; the native
-        background mode calls it from _finish_native_compare (reached
-        from _on_native_diff_done or the char batch's _on_char_diff_done),
-        passing the opcodes the engine produced on its background thread
-        and char_ops -- the precomputed BATCHED char-level results the
-        char phase delivered (REPLAY mode: the Differ's generator pops
-        each pair's ready opcodes instead of calling the engine). None
-        keeps the legacy behavior (per-pair synchronous engine calls).
+        Shared by all compare modes: the native background mode calls it
+        from _finish_native_compare (reached from _on_native_diff_done or
+        the char batch's _on_char_diff_done), passing the opcodes the
+        engine produced on its background thread and char_ops -- the
+        precomputed BATCHED char-level results the char phase delivered
+        (REPLAY mode: the Differ's generator pops each pair's ready
+        opcodes instead of calling the engine); the Python background
+        mode (_on_python_diff_done) passes the opcodes its engine thread
+        computed; None keeps the legacy synchronous behavior (the
+        Differ's generator runs the engine itself while consumed).
 
-        Locking: this method takes NO lock of its own. When the whole-
-        compare lock is held (job.editor_lock -- the background mode's
-        kick-off lock, see _lock_compare_editors), the whole burst runs
-        under it already and the single EDACTION_UNLOCK that releases it
-        repaints everything in one pass. When it is not held (sync mode
-        always; background mode with LOCK_EDITORS_WHILE_COMPARING off),
-        the paint runs unlocked: every attr/gap/decor call repaints by
-        itself, and the bookmark appends -- which do NOT repaint on
-        their own -- are followed by an explicit EDACTION_UPDATE pair
-        (see the end of this method).
+        Locking: this method takes NO lock of its own. Both background
+        modes hold the whole-compare lock (job.editor_lock -- the
+        kick-off lock, see _lock_compare_editors) for the whole paint,
+        and the single EDACTION_UNLOCK that releases it repaints
+        everything in one pass; the legacy inline mode (Python fallback /
+        tests) takes the same lock around the call in refresh_compare.
+        With LOCK_EDITORS_WHILE_COMPARING off the paint runs unlocked:
+        every attr/gap/decor call repaints by itself, and the bookmark
+        appends -- which do NOT repaint on their own -- are followed by
+        an explicit EDACTION_UPDATE pair (see the end of this method).
+
+        ANTI-HANG: the dispatch loop, the bookmark flush and the marker
+        array builds are CHUNKED with UI pump checkpoints (see the
+        module-level pump block): every event-list boundary whose chunk
+        of work outlived UI_PUMP_INTERVAL pumps the message queue once
+        (app_proc(PROC_IDLE)) so CudaText keeps repainting and accepting
+        input while multi-second / multi-million-event paints run, and a
+        checkpoint that finds the job cancelled (job.stale -- tab
+        closed, Cancel compare, app exit, dispatched right through the
+        pump itself) aborts the paint at the next boundary: balanced
+        Profiler stops, plain return, the callers' release paths unwind
+        the lock and slot. The aborted paint leaves whatever it managed
+        to apply in the editors -- exactly the existing cancel contract
+        (the next refresh's clear() wipes it).
 
         'job' carries everything the paint phase needs (editor halves,
         colors, wrap state, overview, dialog flag). 'opcodes' is the
-        precomputed line-level opcode list for the background mode;
+        precomputed line-level opcode list for the background modes;
         None for the synchronous mode -- the Differ's generator then
         runs the engine itself while being consumed.
         """
@@ -3445,9 +3721,9 @@ class Command:
         color_ignored = job.color_ignored
         color_ignored_gap = job.color_ignored_gap
         show_dialog = job.show_dialog
-        # The for loop below consumes events (flattened at C speed by
-        # chain.from_iterable -- see the compare_iter setup below) and
-        # paints each event. One section wraps the whole
+        # The loop below consumes events (one bounded LIST per outer
+        # iteration -- see the _lists setup above) and paints each
+        # event. One section wraps the whole
         # loop: its SELF time is the honest per-event dispatch+collection
         # cost (the generator's production time is booked separately by
         # the differ's per-chunk 'compare:positional_pairs' /
@@ -3491,7 +3767,7 @@ class Command:
         # set_seqs() call, no persistent storage on either Differ between
         # compares -- see differ_native.Differ and differ_python.Differ).
         # Native takes raw texts (the job's snapshots); Python takes line
-        # lists (split in refresh_compare). In the background mode the native
+        # lists (split in refresh_compare). In the background modes the
         # call receives the engine's opcodes, so the generator skips its
         # own engine call and walks them directly. The Differ used is the
         # JOB'S SESSION's -- each compare tab paints from its own records.
@@ -3505,21 +3781,24 @@ class Command:
             # collect split).
             #
             # LIST PROTOCOL: the native walk yields bounded EVENT
-            # LISTS (compare_lists) and chain.from_iterable flattens
-            # them at C speed -- a 5.8M-event compare drops from 5.8M
+            # LISTS (compare_lists); the consumption loop below iterates
+            # the LISTS directly (outer loop = chunk boundaries, inner
+            # loop = the hot per-event dispatch) instead of flattening
+            # with chain.from_iterable -- the boundaries are where the
+            # UI pump checkpoints live, and a flattened C iterator would
+            # hide them. A 5.8M-event compare still drops from 5.8M
             # Python generator resumes (each a frame switch that
             # cProfile traces as a function call) to a few hundred
-            # list yields. align_gap_events=False (no line wraps to
+            # list fetches. align_gap_events=False (no line wraps to
             # 2+ rows, see refresh_compare) additionally skips the
-            # ~1M ALIGN events whose consumer branch would be a
-            # no-op.
+            # ~1M ALIGN events whose consumer branch would be a no-op.
             #
             # PROFILING: with the section profiler on, _timed_produce
             # wraps each fetch in a 'compare:produce' section so the
             # report separates the walk's PRODUCTION time from the
             # consumer's DISPATCH time (which stays in
             # refresh:compare_and_paint's self). Bypassed when
-            # profiling is off -- chain straight over the source, no
+            # profiling is off -- iterate the source straight, no
             # added calls on the clean path.
             _lists = diff.compare_lists(
                 job.a_text, job.b_text,
@@ -3527,7 +3806,6 @@ class Command:
                 align_gap_events=job.align_gap_events)
             if Profiler.enabled:
                 _lists = _timed_produce(_lists)
-            compare_iter = chain.from_iterable(_lists)
             # RELEASE the job's refs to the raw texts now that the
             # generator has its own (param) refs. The native generator
             # splits the texts into line lists inside compare_lists()
@@ -3548,15 +3826,19 @@ class Command:
         else:
             # Pure-Python Differ: flat per-event generator, batched
             # into bounded lists by _chunk_events so the consumption
-            # path below is the SAME chain.from_iterable for both
-            # differs. _timed_produce (profiling on) wraps the fetches
-            # in 'compare:produce' sections -- same split as the
-            # native path above.
+            # path below is the SAME bounded-list iteration for both
+            # differs (chunk boundaries = pump checkpoints).
+            # 'opcodes' is the precomputed engine result of the
+            # background Python flow (_on_python_diff_done); None runs
+            # the engine lazily inside the generator (legacy inline
+            # mode / tests).
+            # _timed_produce (profiling on) wraps the fetches in
+            # 'compare:produce' sections -- same split as the native
+            # path above.
             _lists = _chunk_events(
-                diff.compare(job.lines_a, job.lines_b))
+                diff.compare(job.lines_a, job.lines_b, opcodes))
             if Profiler.enabled:
                 _lists = _timed_produce(_lists)
-            compare_iter = chain.from_iterable(_lists)
             job.lines_a = None
             job.lines_b = None
         # Colors are read ONCE here, not per event (the loop below runs
@@ -3669,370 +3951,403 @@ class Command:
         # lookups saved on a 1M-line compare).
         _bkm_a_append = pending_bkm_a.append
         _bkm_b_append = pending_bkm_b.append
-        for d in compare_iter:
-            diff_id, y = d[0], d[1]
-            if diff_id == df.ALIGN:
-                if wrap_on and align_gaps:
-                    a_line, b_line = d[1], d[2]
-                    if prof_on:
-                        _t0 = _perf()
-                    # inlined _visual_rows: wrap_counts_* are lists
-                    # whenever wrap_on (see bindings above)
-                    va = (wrap_counts_a[a_line]
-                          if 0 <= a_line < wca_n else 1)
-                    vb = (wrap_counts_b[b_line]
-                          if 0 <= b_line < wcb_n else 1)
-                    if prof_on:
-                        _dt = _perf() - _t0
-                        _wc_dt += _dt
-                        _wc_n += 1
-                        if _dt > _wc_max:
-                            _wc_max = _dt
-                    if va > vb:
-                        diff_rows = va - vb
+        # Anti-hang pump state for this stretch: the OUTER loop below
+        # consumes one bounded event LIST per iteration (<= _TAG_CHUNK /
+        # _REPLACE_CHUNK events -- a few ms of work), and at every
+        # boundary whose chunk outlived UI_PUMP_INTERVAL the message
+        # queue is pumped + the job's staleness checked (see the
+        # module-level pump block). The gate itself is one perf_counter
+        # read + compare per boundary -- zero cost inside the hot inner
+        # loop, which is kept IDENTICAL to the old flat dispatch.
+        _pump = _PumpState()
+        # 'ok' mirrors the last checkpoint's verdict so the bail-out
+        # path below can stop the open Profiler sections in order.
+        for _evlist in _lists:
+            for d in _evlist:
+                diff_id, y = d[0], d[1]
+                if diff_id == df.ALIGN:
+                    if wrap_on and align_gaps:
+                        a_line, b_line = d[1], d[2]
                         if prof_on:
                             _t0 = _perf()
-                        self._add_raw_gap(b_ed, b_line,
-                                          diff_rows * line_h_b, color_gaps)
+                        # inlined _visual_rows: wrap_counts_* are lists
+                        # whenever wrap_on (see bindings above)
+                        va = (wrap_counts_a[a_line]
+                              if 0 <= a_line < wca_n else 1)
+                        vb = (wrap_counts_b[b_line]
+                              if 0 <= b_line < wcb_n else 1)
+                        if prof_on:
+                            _dt = _perf() - _t0
+                            _wc_dt += _dt
+                            _wc_n += 1
+                            if _dt > _wc_max:
+                                _wc_max = _dt
+                        if va > vb:
+                            diff_rows = va - vb
+                            if prof_on:
+                                _t0 = _perf()
+                            self._add_raw_gap(b_ed, b_line,
+                                              diff_rows * line_h_b, color_gaps)
+                            if prof_on:
+                                _end('paint:gap', _t0)
+                            if overview is not None:
+                                # _add_raw_gap inserts AFTER b_line (between
+                                # b_line and b_line+1), so record as
+                                # after_line = b_line + 1 (gap appears
+                                # before line b_line+1 in paint order).
+                                overview.add_gap('b', b_line + 1, diff_rows)
+                        elif vb > va:
+                            diff_rows = vb - va
+                            if prof_on:
+                                _t0 = _perf()
+                            self._add_raw_gap(a_ed, a_line,
+                                              diff_rows * line_h_a, color_gaps)
+                            if prof_on:
+                                _end('paint:gap', _t0)
+                            if overview is not None:
+                                # Same: gap is after a_line, so record
+                                # as after_line = a_line + 1.
+                                overview.add_gap('a', a_line + 1, diff_rows)
+                elif diff_id == df.A_SYMBOL_DEL:
+                    n_diff_events += 1
+                    if prof_on:
+                        _t0 = _perf()
+                    _tup = (d[2], d[3], color_deleted)
+                    _lst = _ch_a_get(y)
+                    if _lst is None:
+                        pending_ch_a[y] = [_tup]
+                    else:
+                        _lst.append(_tup)
+                    if prof_on:
+                        _dt = _perf() - _t0
+                        _attr_dt += _dt
+                        _attr_n += 1
+                        if _dt > _attr_max:
+                            _attr_max = _dt
+                    # NOTE: no ov_states_a write here -- every A_SYMBOL_DEL
+                    # belongs to a changed pair whose PAIR_CHANGED event
+                    # follows immediately in the stream and writes the
+                    # line's FINAL overview color (decor-based); the old
+                    # intermediate color_deleted store was always
+                    # overwritten (1.6M dead dict writes on a 1M-line
+                    # compare).
+                elif diff_id == df.B_SYMBOL_ADD:
+                    n_diff_events += 1
+                    if prof_on:
+                        _t0 = _perf()
+                    _tup = (d[2], d[3], color_added)
+                    _lst = _ch_b_get(y)
+                    if _lst is None:
+                        pending_ch_b[y] = [_tup]
+                    else:
+                        _lst.append(_tup)
+                    if prof_on:
+                        _dt = _perf() - _t0
+                        _attr_dt += _dt
+                        _attr_n += 1
+                        if _dt > _attr_max:
+                            _attr_max = _dt
+                    # no ov_states_b write -- same rationale as A_SYMBOL_DEL
+                elif diff_id == df.PAIR_CHANGED:
+                    # Composite changed-pair event (see differ_native's
+                    # PAIR_CHANGED): does the line-level work of the old
+                    # A_LINE_CHANGE + B_LINE_CHANGE + A_DECOR_* +
+                    # B_DECOR_* quartet AND the pair's trailing ALIGN in
+                    # ONE dispatch. Decor colors reproduce the quartet's
+                    # exactly: deca > 0 was A_DECOR_RED -> deleted color,
+                    # deca == 0 was A_DECOR_YELLOW -> changed color; decb
+                    # > 0 was B_DECOR_GREEN -> added color, decb == 0 was
+                    # B_DECOR_YELLOW -> changed color.
+                    ai, bj, deca, decb = d[1], d[2], d[3], d[4]
+                    n_diff_events += 2
+                    _bkm_a_append((ai, NKIND_CHANGED))
+                    _bkm_b_append((bj, NKIND_CHANGED))
+                    if micromap_on:
+                        if prof_on:
+                            _t0 = _perf()
+                        pending_mm_a[ai] = color_changed
+                        pending_mm_b[bj] = color_changed
+                        if prof_on:
+                            _end('paint:micromap', _t0)
+                    if ov_states_a is not None:
+                        ov_states_a[ai] = color_deleted if deca else color_changed
+                    if ov_states_b is not None:
+                        ov_states_b[bj] = color_added if decb else color_changed
+                    # the pair's wrap-compensation -- the old trailing
+                    # (ALIGN, ai, bj) event's job, same va/vb logic as the
+                    # ALIGN branch below (pairs and equal lines both feed
+                    # it; the branch is skipped when ALIGN events are
+                    # suppressed, exactly like the old no-op consumption)
+                    if wrap_on and align_gaps:
+                        if prof_on:
+                            _t0 = _perf()
+                        va = (wrap_counts_a[ai]
+                              if 0 <= ai < wca_n else 1)
+                        vb = (wrap_counts_b[bj]
+                              if 0 <= bj < wcb_n else 1)
+                        if prof_on:
+                            _dt = _perf() - _t0
+                            _wc_dt += _dt
+                            _wc_n += 1
+                            if _dt > _wc_max:
+                                _wc_max = _dt
+                        if va > vb:
+                            diff_rows = va - vb
+                            if prof_on:
+                                _t0 = _perf()
+                            self._add_raw_gap(b_ed, bj,
+                                              diff_rows * line_h_b, color_gaps)
+                            if prof_on:
+                                _end('paint:gap', _t0)
+                            if overview is not None:
+                                # _add_raw_gap inserts AFTER b_line
+                                # (between b_line and b_line+1): after_line
+                                # = b_line + 1 (gap appears before line
+                                # b_line+1 in paint order).
+                                overview.add_gap('b', bj + 1, diff_rows)
+                        elif vb > va:
+                            diff_rows = vb - va
+                            if prof_on:
+                                _t0 = _perf()
+                            self._add_raw_gap(a_ed, ai,
+                                              diff_rows * line_h_a, color_gaps)
+                            if prof_on:
+                                _end('paint:gap', _t0)
+                            if overview is not None:
+                                overview.add_gap('a', ai + 1, diff_rows)
+                elif diff_id == df.A_LINE_CHANGE:
+                    n_diff_events += 1
+                    pending_bkm_a.append((y, NKIND_CHANGED))
+                    if micromap_on:
+                        if prof_on:
+                            _t0 = _perf()
+                        pending_mm_a[y] = color_changed
+                        if prof_on:
+                            _end('paint:micromap', _t0)
+                    if ov_states_a is not None:
+                        ov_states_a[y] = color_changed
+                elif diff_id == df.B_LINE_CHANGE:
+                    n_diff_events += 1
+                    pending_bkm_b.append((y, NKIND_CHANGED))
+                    if micromap_on:
+                        if prof_on:
+                            _t0 = _perf()
+                        pending_mm_b[y] = color_changed
+                        if prof_on:
+                            _end('paint:micromap', _t0)
+                    if ov_states_b is not None:
+                        ov_states_b[y] = color_changed
+                elif diff_id == df.A_DECOR_RED:
+                    n_diff_events += 1
+                    if ov_states_a is not None:
+                        ov_states_a[y] = color_deleted
+                elif diff_id == df.A_DECOR_YELLOW:
+                    n_diff_events += 1
+                    if ov_states_a is not None:
+                        ov_states_a[y] = color_changed
+                elif diff_id == df.B_DECOR_GREEN:
+                    n_diff_events += 1
+                    if ov_states_b is not None:
+                        ov_states_b[y] = color_added
+                elif diff_id == df.B_DECOR_YELLOW:
+                    n_diff_events += 1
+                    if ov_states_b is not None:
+                        ov_states_b[y] = color_changed
+                elif diff_id == df.A_LINE_DEL:
+                    n_diff_events += 1
+                    pending_bkm_a.append((y, NKIND_DELETED))
+                    if micromap_on:
+                        if prof_on:
+                            _t0 = _perf()
+                        pending_mm_a[y] = color_deleted
+                        if prof_on:
+                            _end('paint:micromap', _t0)
+                    if ov_states_a is not None:
+                        ov_states_a[y] = color_deleted
+                elif diff_id == df.B_LINE_ADD:
+                    n_diff_events += 1
+                    pending_bkm_b.append((y, NKIND_ADDED))
+                    if micromap_on:
+                        if prof_on:
+                            _t0 = _perf()
+                        pending_mm_b[y] = color_added
+                        if prof_on:
+                            _end('paint:micromap', _t0)
+                    if ov_states_b is not None:
+                        ov_states_b[y] = color_added
+                elif diff_id == df.A_GAP:
+                    a_line_after, b_start, b_end = d[1], d[2], d[3]
+                    if wrap_on:
+                        if prof_on:
+                            _t0 = _perf()
+                        total_visual = self._sum_visual_rows(
+                            wrap_counts_b, b_start, b_end)
+                        if prof_on:
+                            _dt = _perf() - _t0
+                            _wc_dt += _dt
+                            _wc_n += 1
+                            if _dt > _wc_max:
+                                _wc_max = _dt
+                            _t0 = _perf()
+                        self._add_raw_gap(a_ed, a_line_after - 1,
+                                          total_visual * line_h_a, color_gaps)
                         if prof_on:
                             _end('paint:gap', _t0)
                         if overview is not None:
-                            # _add_raw_gap inserts AFTER b_line (between
-                            # b_line and b_line+1), so record as
-                            # after_line = b_line + 1 (gap appears
-                            # before line b_line+1 in paint order).
-                            overview.add_gap('b', b_line + 1, diff_rows)
-                    elif vb > va:
-                        diff_rows = vb - va
+                            # Gap appears BEFORE a_line_after (between lines
+                            # a_line_after-1 and a_line_after)
+                            overview.add_gap('a', a_line_after, total_visual)
+                    else:
                         if prof_on:
                             _t0 = _perf()
-                        self._add_raw_gap(a_ed, a_line,
-                                          diff_rows * line_h_a, color_gaps)
+                        self.set_gap(a_ed, a_line_after, b_end - b_start)
                         if prof_on:
                             _end('paint:gap', _t0)
                         if overview is not None:
-                            # Same: gap is after a_line, so record
-                            # as after_line = a_line + 1.
-                            overview.add_gap('a', a_line + 1, diff_rows)
-            elif diff_id == df.A_SYMBOL_DEL:
-                n_diff_events += 1
-                if prof_on:
-                    _t0 = _perf()
-                _tup = (d[2], d[3], color_deleted)
-                _lst = _ch_a_get(y)
-                if _lst is None:
-                    pending_ch_a[y] = [_tup]
-                else:
-                    _lst.append(_tup)
-                if prof_on:
-                    _dt = _perf() - _t0
-                    _attr_dt += _dt
-                    _attr_n += 1
-                    if _dt > _attr_max:
-                        _attr_max = _dt
-                # NOTE: no ov_states_a write here -- every A_SYMBOL_DEL
-                # belongs to a changed pair whose PAIR_CHANGED event
-                # follows immediately in the stream and writes the
-                # line's FINAL overview color (decor-based); the old
-                # intermediate color_deleted store was always
-                # overwritten (1.6M dead dict writes on a 1M-line
-                # compare).
-            elif diff_id == df.B_SYMBOL_ADD:
-                n_diff_events += 1
-                if prof_on:
-                    _t0 = _perf()
-                _tup = (d[2], d[3], color_added)
-                _lst = _ch_b_get(y)
-                if _lst is None:
-                    pending_ch_b[y] = [_tup]
-                else:
-                    _lst.append(_tup)
-                if prof_on:
-                    _dt = _perf() - _t0
-                    _attr_dt += _dt
-                    _attr_n += 1
-                    if _dt > _attr_max:
-                        _attr_max = _dt
-                # no ov_states_b write -- same rationale as A_SYMBOL_DEL
-            elif diff_id == df.PAIR_CHANGED:
-                # Composite changed-pair event (see differ_native's
-                # PAIR_CHANGED): does the line-level work of the old
-                # A_LINE_CHANGE + B_LINE_CHANGE + A_DECOR_* +
-                # B_DECOR_* quartet AND the pair's trailing ALIGN in
-                # ONE dispatch. Decor colors reproduce the quartet's
-                # exactly: deca > 0 was A_DECOR_RED -> deleted color,
-                # deca == 0 was A_DECOR_YELLOW -> changed color; decb
-                # > 0 was B_DECOR_GREEN -> added color, decb == 0 was
-                # B_DECOR_YELLOW -> changed color.
-                ai, bj, deca, decb = d[1], d[2], d[3], d[4]
-                n_diff_events += 2
-                _bkm_a_append((ai, NKIND_CHANGED))
-                _bkm_b_append((bj, NKIND_CHANGED))
-                if micromap_on:
-                    if prof_on:
-                        _t0 = _perf()
-                    pending_mm_a[ai] = color_changed
-                    pending_mm_b[bj] = color_changed
-                    if prof_on:
-                        _end('paint:micromap', _t0)
-                if ov_states_a is not None:
-                    ov_states_a[ai] = color_deleted if deca else color_changed
-                if ov_states_b is not None:
-                    ov_states_b[bj] = color_added if decb else color_changed
-                # the pair's wrap-compensation -- the old trailing
-                # (ALIGN, ai, bj) event's job, same va/vb logic as the
-                # ALIGN branch below (pairs and equal lines both feed
-                # it; the branch is skipped when ALIGN events are
-                # suppressed, exactly like the old no-op consumption)
-                if wrap_on and align_gaps:
-                    if prof_on:
-                        _t0 = _perf()
-                    va = (wrap_counts_a[ai]
-                          if 0 <= ai < wca_n else 1)
-                    vb = (wrap_counts_b[bj]
-                          if 0 <= bj < wcb_n else 1)
-                    if prof_on:
-                        _dt = _perf() - _t0
-                        _wc_dt += _dt
-                        _wc_n += 1
-                        if _dt > _wc_max:
-                            _wc_max = _dt
-                    if va > vb:
-                        diff_rows = va - vb
+                            overview.add_gap('a', a_line_after, b_end - b_start)
+                elif diff_id == df.B_GAP:
+                    b_line_after, a_start, a_end = d[1], d[2], d[3]
+                    if wrap_on:
                         if prof_on:
                             _t0 = _perf()
-                        self._add_raw_gap(b_ed, bj,
-                                          diff_rows * line_h_b, color_gaps)
+                        total_visual = self._sum_visual_rows(
+                            wrap_counts_a, a_start, a_end)
+                        if prof_on:
+                            _dt = _perf() - _t0
+                            _wc_dt += _dt
+                            _wc_n += 1
+                            if _dt > _wc_max:
+                                _wc_max = _dt
+                            _t0 = _perf()
+                        self._add_raw_gap(b_ed, b_line_after - 1,
+                                          total_visual * line_h_b, color_gaps)
                         if prof_on:
                             _end('paint:gap', _t0)
                         if overview is not None:
-                            # _add_raw_gap inserts AFTER b_line
-                            # (between b_line and b_line+1): after_line
-                            # = b_line + 1 (gap appears before line
-                            # b_line+1 in paint order).
-                            overview.add_gap('b', bj + 1, diff_rows)
-                    elif vb > va:
-                        diff_rows = vb - va
+                            overview.add_gap('b', b_line_after, total_visual)
+                    else:
                         if prof_on:
                             _t0 = _perf()
-                        self._add_raw_gap(a_ed, ai,
-                                          diff_rows * line_h_a, color_gaps)
+                        self.set_gap(b_ed, b_line_after, a_end - a_start)
                         if prof_on:
                             _end('paint:gap', _t0)
                         if overview is not None:
-                            overview.add_gap('a', ai + 1, diff_rows)
-            elif diff_id == df.A_LINE_CHANGE:
-                n_diff_events += 1
-                pending_bkm_a.append((y, NKIND_CHANGED))
-                if micromap_on:
-                    if prof_on:
-                        _t0 = _perf()
-                    pending_mm_a[y] = color_changed
-                    if prof_on:
-                        _end('paint:micromap', _t0)
-                if ov_states_a is not None:
-                    ov_states_a[y] = color_changed
-            elif diff_id == df.B_LINE_CHANGE:
-                n_diff_events += 1
-                pending_bkm_b.append((y, NKIND_CHANGED))
-                if micromap_on:
-                    if prof_on:
-                        _t0 = _perf()
-                    pending_mm_b[y] = color_changed
-                    if prof_on:
-                        _end('paint:micromap', _t0)
-                if ov_states_b is not None:
-                    ov_states_b[y] = color_changed
-            elif diff_id == df.A_DECOR_RED:
-                n_diff_events += 1
-                if ov_states_a is not None:
-                    ov_states_a[y] = color_deleted
-            elif diff_id == df.A_DECOR_YELLOW:
-                n_diff_events += 1
-                if ov_states_a is not None:
-                    ov_states_a[y] = color_changed
-            elif diff_id == df.B_DECOR_GREEN:
-                n_diff_events += 1
-                if ov_states_b is not None:
-                    ov_states_b[y] = color_added
-            elif diff_id == df.B_DECOR_YELLOW:
-                n_diff_events += 1
-                if ov_states_b is not None:
-                    ov_states_b[y] = color_changed
-            elif diff_id == df.A_LINE_DEL:
-                n_diff_events += 1
-                pending_bkm_a.append((y, NKIND_DELETED))
-                if micromap_on:
-                    if prof_on:
-                        _t0 = _perf()
-                    pending_mm_a[y] = color_deleted
-                    if prof_on:
-                        _end('paint:micromap', _t0)
-                if ov_states_a is not None:
-                    ov_states_a[y] = color_deleted
-            elif diff_id == df.B_LINE_ADD:
-                n_diff_events += 1
-                pending_bkm_b.append((y, NKIND_ADDED))
-                if micromap_on:
-                    if prof_on:
-                        _t0 = _perf()
-                    pending_mm_b[y] = color_added
-                    if prof_on:
-                        _end('paint:micromap', _t0)
-                if ov_states_b is not None:
-                    ov_states_b[y] = color_added
-            elif diff_id == df.A_GAP:
-                a_line_after, b_start, b_end = d[1], d[2], d[3]
-                if wrap_on:
-                    if prof_on:
-                        _t0 = _perf()
-                    total_visual = self._sum_visual_rows(
-                        wrap_counts_b, b_start, b_end)
-                    if prof_on:
-                        _dt = _perf() - _t0
-                        _wc_dt += _dt
-                        _wc_n += 1
-                        if _dt > _wc_max:
-                            _wc_max = _dt
-                        _t0 = _perf()
-                    self._add_raw_gap(a_ed, a_line_after - 1,
-                                      total_visual * line_h_a, color_gaps)
-                    if prof_on:
-                        _end('paint:gap', _t0)
-                    if overview is not None:
-                        # Gap appears BEFORE a_line_after (between lines
-                        # a_line_after-1 and a_line_after)
-                        overview.add_gap('a', a_line_after, total_visual)
-                else:
-                    if prof_on:
-                        _t0 = _perf()
-                    self.set_gap(a_ed, a_line_after, b_end - b_start)
-                    if prof_on:
-                        _end('paint:gap', _t0)
-                    if overview is not None:
-                        overview.add_gap('a', a_line_after, b_end - b_start)
-            elif diff_id == df.B_GAP:
-                b_line_after, a_start, a_end = d[1], d[2], d[3]
-                if wrap_on:
-                    if prof_on:
-                        _t0 = _perf()
-                    total_visual = self._sum_visual_rows(
-                        wrap_counts_a, a_start, a_end)
-                    if prof_on:
-                        _dt = _perf() - _t0
-                        _wc_dt += _dt
-                        _wc_n += 1
-                        if _dt > _wc_max:
-                            _wc_max = _dt
-                        _t0 = _perf()
-                    self._add_raw_gap(b_ed, b_line_after - 1,
-                                      total_visual * line_h_b, color_gaps)
-                    if prof_on:
-                        _end('paint:gap', _t0)
-                    if overview is not None:
-                        overview.add_gap('b', b_line_after, total_visual)
-                else:
-                    if prof_on:
-                        _t0 = _perf()
-                    self.set_gap(b_ed, b_line_after, a_end - a_start)
-                    if prof_on:
-                        _end('paint:gap', _t0)
-                    if overview is not None:
-                        overview.add_gap('b', b_line_after, a_end - a_start)
-            elif diff_id == df.A_GAP_IGN:
-                # Compensating gap for a suppressed all-blank hunk
-                # (DIFF_IGN_BLANK_LINES): same geometry as A_GAP but
-                # painted with the ignored-gap color and carrying the
-                # dedicated IGN_GAP_TAG, so ignored regions look
-                # distinct from regular alignment gaps. Pure visual
-                # alignment — not a difference, so no n_diff_events.
-                a_line_after, b_start, b_end = d[1], d[2], d[3]
-                if wrap_on:
-                    if prof_on:
-                        _t0 = _perf()
-                    total_visual = self._sum_visual_rows(
-                        wrap_counts_b, b_start, b_end)
-                    if prof_on:
-                        _dt = _perf() - _t0
-                        _wc_dt += _dt
-                        _wc_n += 1
-                        if _dt > _wc_max:
-                            _wc_max = _dt
-                        _t0 = _perf()
-                    self._add_raw_gap(a_ed, a_line_after - 1,
-                                      total_visual * line_h_a,
-                                      color_ignored_gap, tag=IGN_GAP_TAG)
-                    if prof_on:
-                        _end('paint:gap', _t0)
-                    if overview is not None:
-                        overview.add_gap('a', a_line_after, total_visual,
-                                         ignored=True)
-                else:
-                    if prof_on:
-                        _t0 = _perf()
-                    self.set_gap(a_ed, a_line_after, b_end - b_start,
-                                 color=color_ignored_gap, tag=IGN_GAP_TAG)
-                    if prof_on:
-                        _end('paint:gap', _t0)
-                    if overview is not None:
-                        overview.add_gap('a', a_line_after, b_end - b_start,
-                                         ignored=True)
-            elif diff_id == df.B_GAP_IGN:
-                b_line_after, a_start, a_end = d[1], d[2], d[3]
-                if wrap_on:
-                    if prof_on:
-                        _t0 = _perf()
-                    total_visual = self._sum_visual_rows(
-                        wrap_counts_a, a_start, a_end)
-                    if prof_on:
-                        _dt = _perf() - _t0
-                        _wc_dt += _dt
-                        _wc_n += 1
-                        if _dt > _wc_max:
-                            _wc_max = _dt
-                        _t0 = _perf()
-                    self._add_raw_gap(b_ed, b_line_after - 1,
-                                      total_visual * line_h_b,
-                                      color_ignored_gap, tag=IGN_GAP_TAG)
-                    if prof_on:
-                        _end('paint:gap', _t0)
-                    if overview is not None:
-                        overview.add_gap('b', b_line_after, total_visual,
-                                         ignored=True)
-                else:
-                    if prof_on:
-                        _t0 = _perf()
-                    self.set_gap(b_ed, b_line_after, a_end - a_start,
-                                 color=color_ignored_gap, tag=IGN_GAP_TAG)
-                    if prof_on:
-                        _end('paint:gap', _t0)
-                    if overview is not None:
-                        overview.add_gap('b', b_line_after, a_end - a_start,
-                                         ignored=True)
-            elif diff_id == df.A_LINE_IGN:
-                # Line of a suppressed all-blank hunk: painted with the
-                # ignored color, but NOT a difference — no bookmark, no
-                # diffmap entry, not counted in n_diff_events (a file
-                # differing only in blank lines still reports "No
-                # differences found").
-                if micromap_on:
-                    if prof_on:
-                        _t0 = _perf()
-                    pending_mm_a[y] = color_ignored
-                    if prof_on:
-                        _end('paint:micromap', _t0)
-                if ov_states_a is not None:
-                    ov_states_a[y] = color_ignored
-            elif diff_id == df.B_LINE_IGN:
-                if micromap_on:
-                    if prof_on:
-                        _t0 = _perf()
-                    pending_mm_b[y] = color_ignored
-                    if prof_on:
-                        _end('paint:micromap', _t0)
-                if ov_states_b is not None:
-                    ov_states_b[y] = color_ignored
+                            overview.add_gap('b', b_line_after, a_end - a_start)
+                elif diff_id == df.A_GAP_IGN:
+                    # Compensating gap for a suppressed all-blank hunk
+                    # (DIFF_IGN_BLANK_LINES): same geometry as A_GAP but
+                    # painted with the ignored-gap color and carrying the
+                    # dedicated IGN_GAP_TAG, so ignored regions look
+                    # distinct from regular alignment gaps. Pure visual
+                    # alignment — not a difference, so no n_diff_events.
+                    a_line_after, b_start, b_end = d[1], d[2], d[3]
+                    if wrap_on:
+                        if prof_on:
+                            _t0 = _perf()
+                        total_visual = self._sum_visual_rows(
+                            wrap_counts_b, b_start, b_end)
+                        if prof_on:
+                            _dt = _perf() - _t0
+                            _wc_dt += _dt
+                            _wc_n += 1
+                            if _dt > _wc_max:
+                                _wc_max = _dt
+                            _t0 = _perf()
+                        self._add_raw_gap(a_ed, a_line_after - 1,
+                                          total_visual * line_h_a,
+                                          color_ignored_gap, tag=IGN_GAP_TAG)
+                        if prof_on:
+                            _end('paint:gap', _t0)
+                        if overview is not None:
+                            overview.add_gap('a', a_line_after, total_visual,
+                                             ignored=True)
+                    else:
+                        if prof_on:
+                            _t0 = _perf()
+                        self.set_gap(a_ed, a_line_after, b_end - b_start,
+                                     color=color_ignored_gap, tag=IGN_GAP_TAG)
+                        if prof_on:
+                            _end('paint:gap', _t0)
+                        if overview is not None:
+                            overview.add_gap('a', a_line_after, b_end - b_start,
+                                             ignored=True)
+                elif diff_id == df.B_GAP_IGN:
+                    b_line_after, a_start, a_end = d[1], d[2], d[3]
+                    if wrap_on:
+                        if prof_on:
+                            _t0 = _perf()
+                        total_visual = self._sum_visual_rows(
+                            wrap_counts_a, a_start, a_end)
+                        if prof_on:
+                            _dt = _perf() - _t0
+                            _wc_dt += _dt
+                            _wc_n += 1
+                            if _dt > _wc_max:
+                                _wc_max = _dt
+                            _t0 = _perf()
+                        self._add_raw_gap(b_ed, b_line_after - 1,
+                                          total_visual * line_h_b,
+                                          color_ignored_gap, tag=IGN_GAP_TAG)
+                        if prof_on:
+                            _end('paint:gap', _t0)
+                        if overview is not None:
+                            overview.add_gap('b', b_line_after, total_visual,
+                                             ignored=True)
+                    else:
+                        if prof_on:
+                            _t0 = _perf()
+                        self.set_gap(b_ed, b_line_after, a_end - a_start,
+                                     color=color_ignored_gap, tag=IGN_GAP_TAG)
+                        if prof_on:
+                            _end('paint:gap', _t0)
+                        if overview is not None:
+                            overview.add_gap('b', b_line_after, a_end - a_start,
+                                             ignored=True)
+                elif diff_id == df.A_LINE_IGN:
+                    # Line of a suppressed all-blank hunk: painted with the
+                    # ignored color, but NOT a difference — no bookmark, no
+                    # diffmap entry, not counted in n_diff_events (a file
+                    # differing only in blank lines still reports "No
+                    # differences found").
+                    if micromap_on:
+                        if prof_on:
+                            _t0 = _perf()
+                        pending_mm_a[y] = color_ignored
+                        if prof_on:
+                            _end('paint:micromap', _t0)
+                    if ov_states_a is not None:
+                        ov_states_a[y] = color_ignored
+                elif diff_id == df.B_LINE_IGN:
+                    if micromap_on:
+                        if prof_on:
+                            _t0 = _perf()
+                        pending_mm_b[y] = color_ignored
+                        if prof_on:
+                            _end('paint:micromap', _t0)
+                    if ov_states_b is not None:
+                        ov_states_b[y] = color_ignored
 
+
+            # ---- chunk boundary: anti-hang pump checkpoint ----
+            # One bounded event list just finished dispatching; when the
+            # chunk outlived UI_PUMP_INTERVAL, pump the message queue so
+            # the app stays alive, then honor a cancel that landed
+            # through the pump (tab closed / Cancel compare / exit) by
+            # aborting the paint at this boundary.
+            if _perf() - _pump.t_pump >= UI_PUMP_INTERVAL:
+                if not self._pump_checkpoint(
+                        _pump, job,
+                        _('Differ: applying diff colors... {:.1f}s')
+                          .format(_perf() - job.compare_start)):
+                    # Cancelled / exiting mid-paint: stop the open
+                    # sections in order and return; the callers' finally
+                    # blocks release the editor lock / job slot. The
+                    # suspended walk generator is dropped with this
+                    # frame; the Differ's cached state is cleared by
+                    # _finish_native_compare / refresh_compare's finally.
+                    Profiler.stop('refresh:compare_and_paint')
+                    Profiler.stop('refresh')
+                    return
         # Book the per-operation paint rows collected inside the loop,
         # while 'refresh:compare_and_paint' is still open, so they nest
         # under it (its self time excludes them — they are its children).
@@ -4070,6 +4385,15 @@ class Command:
         # duplicate search, sorting, event firing, and repainting).
         # BOOKMARK2_APPEND requires bookmarks to be added in ascending
         # line order, so we sort first.
+        #
+        # ANTI-HANG: on a 1M-line compare this flush makes up to 1.6M
+        # C-API calls -- seconds of main-thread work on its own. The
+        # flush loops are therefore punctuated by the SAME pump
+        # checkpoints as the dispatch loop (counter-gated: the gate is
+        # checked every _BKM_FLUSH_CHUNK bookmarks, one perf_counter
+        # read + compare per admitted chunk), so the app stays alive
+        # and a mid-flush cancel aborts the paint instead of pushing
+        # bookmarks into a tab the user already closed.
         Profiler.start('paint:bookmark')
         pending_bkm_a.sort()
         pending_bkm_b.sort()
@@ -4083,24 +4407,75 @@ class Command:
         _bkm = _ed_bookmark_api
         h_a = getattr(a_ed, 'h', None)
         h_b = getattr(b_ed, 'h', None)
+        # Bookmark count between pump-gate checks (~8-15ms of C-API
+        # calls per chunk -- fine enough granularity for a 50ms pump).
+        _BKM_FLUSH_CHUNK = 16384
         if _bkm is not None and h_a is not None:
+            _n = 0
             for row, nk in pending_bkm_a:
                 _bkm(h_a, ct.BOOKMARK2_APPEND, row, nk, -1, '',
                      True, False, DIFF_TAG)
+                _n += 1
+                if _n >= _BKM_FLUSH_CHUNK:
+                    _n = 0
+                    if _perf() - _pump.t_pump >= UI_PUMP_INTERVAL:
+                        if not self._pump_checkpoint(
+                                _pump, job,
+                                _('Differ: applying diff colors... {:.1f}s')
+                                  .format(_perf() - job.compare_start)):
+                            Profiler.stop('paint:bookmark')
+                            Profiler.stop('refresh')
+                            return
         else:
+            _n = 0
             for row, nk in pending_bkm_a:
                 a_ed.bookmark(ct.BOOKMARK2_APPEND, row,
                               nkind=nk, text='', auto_del=True,
                               show=False, tag=DIFF_TAG)
+                _n += 1
+                if _n >= _BKM_FLUSH_CHUNK:
+                    _n = 0
+                    if _perf() - _pump.t_pump >= UI_PUMP_INTERVAL:
+                        if not self._pump_checkpoint(
+                                _pump, job,
+                                _('Differ: applying diff colors... {:.1f}s')
+                                  .format(_perf() - job.compare_start)):
+                            Profiler.stop('paint:bookmark')
+                            Profiler.stop('refresh')
+                            return
         if _bkm is not None and h_b is not None:
+            _n = 0
             for row, nk in pending_bkm_b:
                 _bkm(h_b, ct.BOOKMARK2_APPEND, row, nk, -1, '',
                      True, False, DIFF_TAG)
+                _n += 1
+                if _n >= _BKM_FLUSH_CHUNK:
+                    _n = 0
+                    if _perf() - _pump.t_pump >= UI_PUMP_INTERVAL:
+                        if not self._pump_checkpoint(
+                                _pump, job,
+                                _('Differ: applying diff colors... {:.1f}s')
+                                  .format(_perf() - job.compare_start)):
+                            Profiler.stop('paint:bookmark')
+                            Profiler.stop('refresh')
+                            return
         else:
+            _n = 0
             for row, nk in pending_bkm_b:
                 b_ed.bookmark(ct.BOOKMARK2_APPEND, row,
                               nkind=nk, text='', auto_del=True,
                               show=False, tag=DIFF_TAG)
+                _n += 1
+                if _n >= _BKM_FLUSH_CHUNK:
+                    _n = 0
+                    if _perf() - _pump.t_pump >= UI_PUMP_INTERVAL:
+                        if not self._pump_checkpoint(
+                                _pump, job,
+                                _('Differ: applying diff colors... {:.1f}s')
+                                  .format(_perf() - job.compare_start)):
+                            Profiler.stop('paint:bookmark')
+                            Profiler.stop('refresh')
+                            return
         Profiler.stop('paint:bookmark')
 
         # Apply the collected markers WINDOWED around the editors'
@@ -4110,9 +4485,19 @@ class Command:
         # per-repaint cost that made scrolling million-line compares
         # crawl. on_scroll keeps the windows centered via
         # _maintain_marker_window.
+        # The ARRAY BUILDS inside (_marks_to_arrays: up to 1.6M entries
+        # per side) get pump checkpoints between the four conversions --
+        # they are pure-Python seconds on the biggest compares. A cancel
+        # reported by one of them unwinds here via _PaintAborted.
         Profiler.start('paint:marker_window')
-        self._store_and_apply_marker_windows(
-            job, pending_mm_a, pending_mm_b, pending_ch_a, pending_ch_b)
+        try:
+            self._store_and_apply_marker_windows(
+                job, pending_mm_a, pending_mm_b, pending_ch_a, pending_ch_b,
+                pump=_pump)
+        except _PaintAborted:
+            Profiler.stop('paint:marker_window')
+            Profiler.stop('refresh')
+            return
         Profiler.stop('paint:marker_window')
 
         # BOOKMARK2_APPEND doesn't repaint on its own. When the halves
@@ -4174,6 +4559,41 @@ class Command:
         themselves BEFORE _cancel_job, so they never rely on this."""
         if job.session is not None and job.session.job is job:
             job.session.job = None
+
+    def _pump_checkpoint(self, pump, job, status=None):
+        """One UI-pump + cancellation checkpoint inside a long
+        main-thread stretch (see the module-level pump block).
+
+        Pumps the message queue (one Application.ProcessMessages pass),
+        then tells the caller whether it must ABORT: False means the
+        compare was cancelled while the pump dispatched messages (tab
+        closed / Cancel compare / app exiting -- _cancel_job set
+        job.stale, possibly inside THIS very call) or the app is
+        exiting; the caller stops its stretch at the next chunk and
+        unwinds through its normal release paths. The stale check runs
+        AFTER the pump on purpose: the cancel event usually arrives
+        THROUGH the pump, so checking before it would miss it.
+
+        'pump' is the stretch's _PumpState; its timestamps are advanced
+        here. 'status' (optional, already translated+formatted by the
+        caller) is shown on the status bar at most every
+        UI_STATUS_INTERVAL -- a live progress signal for compares that
+        take seconds, replacing the old 'frozen window' feedback."""
+        _pump_ui_messages()
+        pump.t_pump = time.perf_counter()
+        if job is not None and getattr(job, 'stale', False):
+            return False
+        if self._app_exiting:
+            return False
+        if status is not None:
+            now = time.perf_counter()
+            if now - pump.t_status >= UI_STATUS_INTERVAL:
+                pump.t_status = now
+                try:
+                    ct.msg_status(status)
+                except Exception:
+                    pass
+        return True
 
     @_gc_quiet_method
     def _on_native_diff_done(self, job, opcodes):
@@ -4284,12 +4704,41 @@ class Command:
                     # Also splits the texts into line lists (cached on
                     # the Differ for the paint pass); the raw text
                     # snapshots are dropped right after.
+                    #
+                    # ANTI-HANG: the collect is an O(N) pure-Python
+                    # main-thread stretch (seconds on big compares) --
+                    # its walk is pumped via the 'progress' hook: one
+                    # _pump_checkpoint per bounded chunk, which keeps
+                    # the UI alive and turns a mid-walk cancel into an
+                    # immediate abort (collect returns None -> the
+                    # finally below releases everything, exactly like
+                    # the other cancelled paths).
                     Profiler.start('compare:collect_pairs')
+                    _collect_pump = _PumpState()
+
+                    def _collect_progress():
+                        _now = time.perf_counter()
+                        if _now - _collect_pump.t_pump \
+                                < UI_PUMP_INTERVAL:
+                            return True
+                        return self._pump_checkpoint(
+                            _collect_pump, job,
+                            _('Differ: comparing in background... {:.1f}s')
+                              .format(_now - job.compare_start))
+
                     pairs = diff.collect_char_pairs(
-                        job.a_text, job.b_text, opcodes)
+                        job.a_text, job.b_text, opcodes,
+                        progress=_collect_progress)
                     job.a_text = None
                     job.b_text = None
                     Profiler.stop('compare:collect_pairs')
+
+                    if pairs is None:
+                        # Collect aborted (cancelled / exiting through a
+                        # pump): the finally below releases the lock,
+                        # slot and cProfile layer like every other
+                        # abandoned compare.
+                        return
 
                     if pairs:
                         job.char_pairs_count = len(pairs)
@@ -4459,42 +4908,125 @@ class Command:
             cancel_profiling(job.cprofile)
             job.cprofile = None
 
-    def _finish_native_compare(self, job, opcodes, char_ops):
-        """Finish a native compare after BOTH phases have their
-        results: paint the events (the Differ walks the line opcodes in
-        REPLAY mode, popping each pair's precomputed char opcodes --
-        no engine call while painting), run the timing/profiling
-        epilogue, and release the editor lock / read-only state taken
-        at kick-off.
+    @_gc_quiet_method
+    def _on_python_diff_done(self, job, holder, async_pair=None):
+        """Completion callback of the background PYTHON-engine compare
+        (the poll timer's tick found holder['done']) -- the Python-path
+        twin of _on_native_diff_done's happy path.
 
-        Frees the session's job slot FIRST (a refresh fired by an event
-        arriving right after the paint must not be dropped), then keeps
-        everything else in try/finally so an exception mid-paint still
-        runs the epilogue and re-enables editing.
+        Validates the job against the live state exactly like the native
+        callback (stale / exiting / closed tab / algorithm switch -- the
+        switch re-runs the refresh), closes the engine-wait profiling
+        pair, then finishes through _finish_native_compare: the paint
+        walk consumes the PRECOMPUTED opcodes (no engine call while
+        painting), the timing epilogue runs, and the editor lock /
+        read-only state taken at kick-off is released. The session's job
+        slot is freed there too.
+
+        An engine-thread exception (holder['error']) prints its traceback
+        and releases everything -- the tab stays uncolored, same
+        contract as a native engine failure.
         """
-        # The compare is finishing: the slot must be free BEFORE the
-        # paint loop starts processing events, so a refresh triggered
-        # from inside the paint's editor updates (wrap sync, caret
-        # events queued behind EDACTION_UNLOCK repaints) is queued, not
-        # dropped. Idempotent (the char callback's finally re-frees).
-        self._free_job_slot(job)
+        # Close the engine-wait profiling pair FIRST (every outcome;
+        # token-guarded no-op after a cancel already closed it).
+        Profiler.stop_async_pair(async_pair)
+        try:
+            if job.stale:
+                return
+            if self._app_exiting:
+                return
+            # Compare tab closed while the engine thread ran?
+            if not self._is_compare_tab(job.tab_id):
+                return
+
+            diff = self._session_diff(job.session)
+            if not isinstance(diff, dfp.Differ):
+                # Algorithm switched to a native one while the engine
+                # thread was running: release this job's lock and slot
+                # BEFORE the re-run (same as the native callback), then
+                # re-run the refresh with the new algorithm.
+                self._free_job_slot(job)
+                self._release_compare_editors(job)
+                self.refresh_compare(job.ed, show_dialog=job.show_dialog)
+                return
+
+            if holder.get('error') is not None:
+                # Engine-thread exception: report it (traceback, like
+                # the callbacks' exception paths) and abandon -- the
+                # finally below releases the lock / slot / cProfile.
+                import traceback
+                traceback.print_exception(
+                    type(holder['error']), holder['error'],
+                    holder['error'].__traceback__)
+                return
+
+            opcodes = holder.get('opcodes')
+            if opcodes is None:
+                # Defensive: done-without-result-and-without-error should
+                # be impossible (the worker always sets one of them).
+                return
+
+            # Paint with the precomputed opcodes (the walk generator
+            # skips its engine entirely), then epilogue + release via
+            # the SAME finisher the native flow uses.
+            self._finish_native_compare(job, opcodes, [])
+        except Exception:
+            # Never let an exception escape into the timer dispatcher:
+            # print the traceback; the finally below released the lock
+            # and freed the slot so the tab is not stuck 'comparing'.
+            import traceback
+            traceback.print_exc()
+        finally:
+            # EVERY outcome releases (idempotent -- the paint path inside
+            # _finish_native_compare released already when it finished;
+            # the stale / exiting / closed paths were released by
+            # _cancel_job; the exception / engine-error paths need it
+            # HERE).
+            self._free_job_slot(job)
+            self._release_compare_editors(job)
+            cancel_profiling(job.cprofile)
+            job.cprofile = None
+
+    def _finish_native_compare(self, job, opcodes, char_ops):
+        """Finish a background compare after its results are in (BOTH
+        native phases, or the Python engine's single phase): paint the
+        events (the Differ walks the precomputed line opcodes -- no
+        engine call while painting; native REPLAY mode pops each pair's
+        precomputed char opcodes), run the timing/profiling epilogue,
+        and release the editor lock / read-only state taken at kick-off.
+
+        The session's job slot is held for the WHOLE paint (freed in the
+        finally): the paint's UI pump checkpoints dispatch real events,
+        and a refresh re-entering MID-paint would clear the editors /
+        stack a second editor lock while this paint still runs -- the
+        slot is what makes refresh_compare drop it ('compare already
+        running'). Events arriving right AFTER the paint (wrap sync,
+        on_scroll from the EDACTION_UNLOCK repaint) find the slot free
+        and run normally.
+        """
         try:
             try:
                 self._paint_compare_events(job, opcodes, char_ops)
             finally:
                 # Timing epilogue (status-bar message + profiling
                 # report) covers the WHOLE compare: kick-off ->
-                # paint done, the wall time the user waited.
-                self._compare_epilogue(job.compare_start,
-                                       job.profiling_enabled_here,
-                                       job.tab_id,
-                                       job.cprofile)
+                # paint done, the wall time the user waited. Skipped
+                # for cancelled compares (nothing to report).
+                if not job.stale:
+                    self._compare_epilogue(job.compare_start,
+                                           job.profiling_enabled_here,
+                                           job.tab_id,
+                                           job.cprofile)
                 job.cprofile = None
         finally:
-            # Compare finished and everything is rendered: make the
-            # halves editable again / drop the busy placeholder.
-            # Idempotent -- the callback's finally re-releases.
+            # Compare finished (or aborted): make the halves editable
+            # again / drop the busy placeholder. Idempotent -- the
+            # callbacks' finally blocks re-release.
             self._release_compare_editors(job)
+            # Free the job slot AFTER the release: the next refresh can
+            # start only when the editors are actually editable again.
+            # Idempotent (the callbacks' finally re-frees).
+            self._free_job_slot(job)
             # Belt-and-braces: compare() clears the Differ's two-phase
             # transient state at the natural end of its walk; an
             # exception mid-paint leaves a suspended generator holding
@@ -4639,7 +5171,8 @@ class Command:
             names.append((label, name))
         return names
 
-    def _store_and_apply_marker_windows(self, job, mm_a, mm_b, ch_a, ch_b):
+    def _store_and_apply_marker_windows(self, job, mm_a, mm_b, ch_a, ch_b,
+                                        pump=None):
         """Store the compare's collected marker data on the session and
         apply the initial marker windows around the editors' current
         viewports.
@@ -4664,6 +5197,15 @@ class Command:
         then bounded by the window size instead of the file's diff
         count — scrolling big files becomes as instant as on small
         files, exactly like the editors' own scrollbars.
+
+        'pump' (optional, the paint stretch's _PumpState) inserts UI
+        pump checkpoints between the four dict->array conversions: each
+        conversion touches up to 1.6M entries on a 1M-line compare, so
+        the whole build can be seconds of pure-Python main-thread work.
+        A checkpoint that reports cancellation (job.stale / app exit)
+        aborts the paint via the _PaintAborted exception -- the caller
+        (_paint_compare_events) catches it, stops its open Profiler
+        sections and returns through the normal release paths.
         """
         session = job.session
         # Two sub-rows split the old single paint:marker_window self:
@@ -4672,8 +5214,26 @@ class Command:
         # windowed MARKERS_ADD_MANY flushes. 2 section instances each.
         Profiler.start('paint:marks:build')
         session.marks_micromap_a = self._marks_to_arrays(mm_a)
+        if pump is not None and not self._pump_checkpoint(
+                pump, job,
+                _('Differ: applying diff colors... {:.1f}s')
+                  .format(time.perf_counter() - job.compare_start)):
+            Profiler.stop('paint:marks:build')
+            raise _PaintAborted()
         session.marks_micromap_b = self._marks_to_arrays(mm_b)
+        if pump is not None and not self._pump_checkpoint(
+                pump, job,
+                _('Differ: applying diff colors... {:.1f}s')
+                  .format(time.perf_counter() - job.compare_start)):
+            Profiler.stop('paint:marks:build')
+            raise _PaintAborted()
         session.marks_chars_a = self._marks_to_arrays(ch_a)
+        if pump is not None and not self._pump_checkpoint(
+                pump, job,
+                _('Differ: applying diff colors... {:.1f}s')
+                  .format(time.perf_counter() - job.compare_start)):
+            Profiler.stop('paint:marks:build')
+            raise _PaintAborted()
         session.marks_chars_b = self._marks_to_arrays(ch_b)
         Profiler.stop('paint:marks:build')
         session.mark_window_a = None
