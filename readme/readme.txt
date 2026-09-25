@@ -791,6 +791,19 @@ If a diff is hard to read, try a different algorithm: Histogram, Hybrid,
 Patience or VSCode tend to generate much cleaner results. If you compare
 massive files and need maximum speed, use Native Myers instead.
 
+Big files and responsiveness: the whole compare is non-blocking. The
+diff engine, the char-level details and the overview rebuild all run on
+background threads, and every longer main-thread stretch (collecting
+the changed line pairs, applying the diff colors, the bookmark pass) is
+split into chunks that hand the message queue back to the application
+about 20 times a second -- so CudaText keeps repainting and accepting
+input (menus, other tabs, window dragging) WHILE a big compare is being
+colored, instead of freezing until it finishes. Both compare-tab editors
+show the 'busy' placeholder and stay read-only for the whole run, the
+status bar shows live progress, and the "Differ\Cancel compare" command
+works at any moment: a compare cancelled mid-paint stops applying
+colors at the next chunk instead of running to the end.
+
 Myers vs. Histogram Differences:
 native_histogram generally produces more "human-readable" and semantically meaningful alignments. By anchoring the comparison on unique or low-frequency lines first, it keeps moved, refactored, or reordered code blocks intact rather than scrambling them with spurious matches on common elements (like braces or blank lines). native_myers simply looks for the shortest possible edit path without semantic context. For normal files, the speed difference between the two is negligible. However, native_myers is noticeably faster when comparing massive files with extreme differences, thanks to its early-exit heuristics.
 
