@@ -1,4 +1,30 @@
 2026.09.27 (by @badrelmers)
+- add (toolbar): a thin full-width border line at the toolbar's bottom
+  edge separating it visually from the editor below. It is a button_ex
+  of kind BTNKIND_SEP_VERT (TATButton's abuSeparatorVert paints the
+  HORIZONTAL line -- the 'HORZ' kind is the vertical one), stretched
+  with a_l/a_r to the form's full width and glued to the form's bottom
+  (a_t disabled, a_b + sp_b=0); the line's color comes from the
+  theme's separator color, which CudaText keeps equal to the active UI
+  theme's ButtonBorderPassive -- so the border follows theme switches
+  by itself (repaint re-reads the theme), light and dark. All buttons'
+  a_b anchors were re-targeted from the form's bottom to the strip's
+  top ('brd','['), and the status label is now vertically centered on
+  the last real button instead of the (border-including) form, so the
+  row sits fully above the line.
+- fix (toolbar): captions were clipped at the bottom (the 'g' of
+  "Config" lost its descender). TATButton centers the caption in the
+  stretched control ((ClientHeight - TextExtent.cy) div 2) and
+  SetAutoSize sizes only the WIDTH, so nothing guarded the height: on
+  systems whose OS font is a little taller than the OS 'button'
+  metrics of PROC_GET_GUI_HEIGHT the descenders get cut. The toolbar's
+  height is now the OS GUI button height PLUS 4 extra px for the
+  captions (the user-confirmed amount) PLUS the 2px border strip --
+  and both extras are scaled for high-DPI screens with
+  PROC_GET_SYSTEM_PPI (dlg_proc control sizes are raw device pixels,
+  never auto-scaled; at 150% DPI the extras become 6+3).
+
+2026.09.27 (by @badrelmers)
 - fix (session restore, ROOT CAUSE): the previous round's hardening was
   removed -- it did not address the actual bug and made things worse
   (the state file could come back completely reset after a restart).

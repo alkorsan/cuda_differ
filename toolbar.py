@@ -30,18 +30,39 @@ Implementation notes:
 * SIZING: buttons are AUTO-SIZED -- control prop 'autosize' makes
   TATButton compute its width from the caption measured with the REAL
   UI-theme font, DPI-scaled (TATButton.SetAutoSize), so no text or icon
-  can ever be cut off. No widths are computed here at all; the
-  w_min constraint only keeps icon-only buttons clickable.
+  can ever be cut off HORIZONTALLY. No widths are computed here at all;
+  the w_min constraint only keeps icon-only buttons clickable.
   Re-setting the prop (a caption change is always followed by an
   'autosize': True re-set) re-runs the width computation.
+
+  HEIGHT: TATButton.SetAutoSize does NOT size the height -- it centers
+  the caption in whatever height the layout gives the control
+  ((ClientHeight - TextExtent.cy) div 2) and clips the descenders
+  ('g', 'y', 'p'...) when the OS font is a little taller than the
+  OS 'button' metrics of PROC_GET_GUI_HEIGHT. So the form's height =
+  GUI button height + _TEXT_SLACK extra px (DPI-scaled) + the bottom
+  border strip (see below).
+
+* BOTTOM BORDER: the toolbar ends in a 2px full-width horizontal line
+  that separates it from the editor below. It is a button_ex with
+  kind=BTNKIND_SEP_VERT -- TATButton's abuSeparatorVert paints a
+  HORIZONTAL line across the whole control at height/2, 1px thick
+  (DPI-scaled), in Theme.ColorSeparators. CudaText patches that color
+  to the active UI theme's ButtonBorderPassive, so the line follows
+  theme switches by itself (repaint re-reads the theme) and no color
+  is ever computed here. All buttons' a_b anchors reference this
+  strip's top ('brd', '[') instead of the form's bottom, so the row
+  sits fully above the line.
 
 * POSITIONING: anchors, not coordinates. Every button's LEFT side is
   anchored (a_l) to the RIGHT side (']') of the previous control with
   sp_l spacing, so the whole row re-flows automatically whenever a
   button's width changes (Recompare <-> Cancel swap, Ignore counter,
-  show_btn_text toggle). Tops/bottoms are anchored to the form
-  (a_t/a_b), the status label to the form's right edge (a_r) and
-  vertically centered (a_t '-'). 'x'/'w' are never set.
+  show_btn_text toggle). Tops are anchored to the form (a_t), bottoms
+  to the TOP of the bottom-border strip; the status label is anchored
+  to the form's right edge (a_r) and vertically centered (a_t '-')
+  on the last real button, i.e. on the button row's height rather
+  than the (border-including) form height. 'x'/'w' are never set.
 
 * The status LABEL on the right side carries the compare state
   ("Comparing...", "Cancelled", "N differences") -- the feedback the
@@ -170,8 +191,8 @@ _STATUS_SP_R = 10
 
 
 def _bar_height():
-    """Height of the toolbar: the OS/DPI-correct height of a GUI button
-    (PROC_GET_GUI_HEIGHT), clamped to a sane band."""
+    """Height of the toolbar's BUTTON ZONE: the OS/DPI-correct height of
+    a GUI button (PROC_GET_GUI_HEIGHT), clamped to a sane band."""
     try:
         h = ct.app_proc(ct.PROC_GET_GUI_HEIGHT, 'button')
         if h and h > 0:
@@ -179,6 +200,42 @@ def _bar_height():
     except Exception:
         pass
     return 30
+
+
+def _dpi_percent():
+    """OS high-DPI scale in percent (100 = no scaling), read from
+    PROC_GET_SYSTEM_PPI: usual value is 96ppi = 100%, 144ppi = 150%.
+    dlg_proc control sizes are RAW device pixels (no auto-scaling),
+    so the plugin's logical constants must be scaled by hand."""
+    try:
+        ppi = ct.app_proc(ct.PROC_GET_SYSTEM_PPI, '')
+        ppi = int(ppi or 0)
+        if ppi >= 96:
+            return max(100, ppi * 100 // 96)
+    except Exception:
+        pass
+    return 100
+
+
+def _scaled(px):
+    """Logical (96-DPI) pixels -> physical pixels at the current OS DPI
+    (at least 1, so a strip is never zero-sized)."""
+    return max(1, int(px) * _dpi_percent() // 100)
+
+
+# Height of the bottom-border strip, logical px (see _add_bottom_border).
+_BORDER_H = 2
+# Extra logical px on top of the OS GUI button height: TATButton centers
+# the caption and clips its descenders when the font's TextExtent is taller
+# than the stretched button (the 'g' of 'Config' was eaten at the bottom),
+# so the zone gets a little breathing room.
+_TEXT_SLACK = 4
+
+
+def _total_height():
+    """Total height of the toolbar form: button zone + descender slack
+    + the bottom-border strip (the last two DPI-scaled)."""
+    return _bar_height() + _scaled(_TEXT_SLACK) + _scaled(_BORDER_H)
 
 
 # ---------------------------------------------------------------------------
@@ -227,7 +284,7 @@ class CompareToolbar:
         self.n_diffs = 0
         self.show_text = True
         self.status = ''
-        self.height = _bar_height()
+        self.height = _total_height()
 
     # -- creation ----------------------------------------------------------
 
@@ -258,6 +315,12 @@ class CompareToolbar:
             'color': bgcolor,
         })
 
+        # The bottom border FIRST: the buttons' and separators' a_b
+        # anchors reference it by name ('brd'), so it must exist before
+        # they are created (dlg_proc resolves anchor targets at
+        # prop-set time).
+        self._add_bottom_border()
+
         # Controls are chained left-to-right with anchors: each control's
         # a_l is the PREVIOUS control's ']' (right side), so the row
         # re-flows by itself whenever any button's auto-sized width
@@ -286,6 +349,42 @@ class CompareToolbar:
         self._update_nav_enabled()
         return True
 
+    def _add_bottom_border(self):
+        """Full-width horizontal line glued to the form's bottom edge:
+        a button_ex of kind BTNKIND_SEP_VERT. TATButton's
+        abuSeparatorVert paints a HORIZONTAL line across the whole
+        control (y = height div 2, DPI-scaled 1px thickness) in
+        Theme.ColorSeparators -- which CudaText keeps equal to the
+        active UI theme's ButtonBorderPassive -- so the toolbar is
+        visually separated from the editor below and the line follows
+        theme switches with zero work here (it repaints from the live
+        theme). No caption, no on_change: a separator-kind button
+        never highlights and never fires."""
+        n = ct.dlg_proc(self.h_dlg, ct.DLG_CTL_ADD, 'button_ex')
+        self.ctl['brd'] = n
+        ct.dlg_proc(self.h_dlg, ct.DLG_CTL_PROP_SET, index=n, prop={
+            'name': 'brd',
+            'h': _scaled(_BORDER_H),
+            'a_l': ('', '['),
+            'a_r': ('', ']'),
+            'a_t': None,
+            'a_b': ('', ']'),
+            'sp_l': 0,
+            'sp_r': 0,
+            'sp_b': 0,
+            'tab_stop': False,
+        })
+        hb = ct.dlg_proc(self.h_dlg, ct.DLG_CTL_HANDLE, index=n)
+        self.hbtn['brd'] = hb
+        try:
+            # BTNKIND_SEP_VERT = abuSeparatorVert = the HORIZONTAL line
+            # (the vertical-line kind for horizontal rows is
+            # BTNKIND_SEP_HORZ).
+            ct.button_proc(hb, ct.BTN_SET_KIND, ct.BTNKIND_SEP_VERT)
+            ct.button_proc(hb, ct.BTN_SET_FOCUSABLE, False)
+        except Exception:
+            pass
+
     def _anchor_left(self, prev):
         """a_l value chaining this control to the RIGHT side of the
         previous control ('' = the form for the first one)."""
@@ -305,7 +404,7 @@ class CompareToolbar:
             'autosize': True,
             'a_l': self._anchor_left(prev),
             'a_t': ('', '['),
-            'a_b': ('', ']'),
+            'a_b': ('brd', '['),
             'sp_l': _BTN_GAP,
             'sp_t': _BTN_V_PAD,
             'sp_b': _BTN_V_PAD,
@@ -329,7 +428,7 @@ class CompareToolbar:
             'w': _SEP_W,
             'a_l': self._anchor_left(prev),
             'a_t': ('', '['),
-            'a_b': ('', ']'),
+            'a_b': ('brd', '['),
             'sp_l': _SEP_GAP,
             'sp_t': _BTN_V_PAD + 1,
             'sp_b': _BTN_V_PAD + 1,
@@ -354,9 +453,9 @@ class CompareToolbar:
             'cap': '',
             'autosize': True,    # TLabel sizes itself to the caption
             'a_l': None,         # anchored to the form's RIGHT edge,
-            'a_r': ('', ']'),    # vertically centered
-            'a_t': ('', '-'),
-            'sp_r': _STATUS_SP_R,
+            'a_r': ('', ']'),    # vertically centered on the LAST real
+            'a_t': ('config', '-'),  # button (the button row's height,
+            'sp_r': _STATUS_SP_R,    # not the border-including form)
             'tab_stop': False,
         })
 

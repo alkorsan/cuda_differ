@@ -290,13 +290,22 @@ into the compare view):
 
 Every button has a tooltip (with the hotkey hint where one exists).
 Buttons size themselves to their captions (auto-sized with the real
-UI-theme font, DPI-scaled -- nothing can be cut off) and are chained
-with anchors, so the row re-flows by itself whenever a caption changes.
-The captions' texts can be turned off (icons only) with the option
+UI-theme font, DPI-scaled -- nothing can be cut off horizontally) and
+are chained with anchors, so the row re-flows by itself whenever a
+caption changes. The bar ends in a thin full-width border line that
+separates it from the editor below; the line is painted by the theme
+(the UI theme's button-border color), so it adapts to light and dark
+themes automatically. The toolbar's height = the OS GUI button height
+plus a little extra room for the captions' descenders (on some
+systems the OS font is taller than the OS 'button' metrics and
+letters like the 'g' of "Config" would be clipped) plus the border
+line -- all extra pixels are scaled for high-DPI screens. The
+captions' texts can be turned off (icons only) with the option
 differ.toolbar.show_btn_text; the whole toolbar can be hidden with
 differ.toolbar.show_toolbar. Toolbars are restored at startup for
 compare tabs restored by the CudaText session, and follow UI theme
-switches (the background re-reads EdTextBg).
+switches (the background re-reads EdTextBg; the border line re-reads
+the theme at every repaint).
 
 The toolbar's lifetime follows the tab's: it is destroyed when the
 compare tab is really closed, and at app exit it is destroyed in the
