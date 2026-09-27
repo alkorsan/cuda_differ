@@ -304,8 +304,10 @@ captions' texts can be turned off (icons only) with the option
 differ.toolbar.show_btn_text; the whole toolbar can be hidden with
 differ.toolbar.show_toolbar. Toolbars are restored at startup for
 compare tabs restored by the CudaText session, and follow UI theme
-switches (the background re-reads EdTextBg; the border line re-reads
-the theme at every repaint).
+switches (the background re-reads EdTextBg; the status label's text
+color re-reads EdTextFont of the same theme, so it stays readable on
+dark themes too -- a bare label would take the OS's black; the border
+line re-reads the theme at every repaint).
 
 The toolbar's lifetime follows the tab's: it is destroyed when the
 compare tab is really closed, and at app exit it is destroyed in the

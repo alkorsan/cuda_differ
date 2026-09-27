@@ -1,4 +1,19 @@
 2026.09.27 (by @badrelmers)
+- fix (toolbar): on some dark/black UI themes the status label's text
+  ("N differences"...) was black on the dark toolbar background and
+  almost unreadable. The label is a plain LCL TLabel, whose default
+  font color comes from the OS WIDGETSET (black on many systems), not
+  from CudaText's UI theme -- while the toolbar's background is the
+  theme's EdTextBg, so the two could contradict. The label's
+  font_color is now set from the same theme: EdTextFont, the editor
+  text color, which is the guaranteed-contrast pair of EdTextBg
+  (whatever the theme does, its editor text is readable on its editor
+  background -- the toolbar uses that very background). apply_theme
+  re-reads BOTH colors together, so a light<->dark theme switch
+  recolors the label too (a stale font on the new background would be
+  the same bug).
+
+2026.09.27 (by @badrelmers)
 - add (toolbar): a thin full-width border line at the toolbar's bottom
   edge separating it visually from the editor below. It is a button_ex
   of kind BTNKIND_SEP_VERT (TATButton's abuSeparatorVert paints the

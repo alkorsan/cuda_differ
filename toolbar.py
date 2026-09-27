@@ -67,7 +67,11 @@ Implementation notes:
 * The status LABEL on the right side carries the compare state
   ("Comparing...", "Cancelled", "N differences") -- the feedback the
   old status-bar timer spam used to provide, now without any running
-  timer. It is auto-sized too (TLabel.AutoSize).
+  timer. It is auto-sized too (TLabel.AutoSize). Its font color is
+  set from the UI theme (EdTextFont, the contrast pair of the
+  toolbar's EdTextBg background) and re-applied on every theme
+  switch: a bare LCL TLabel would draw in the OS widgetset's color
+  (black on many systems) and vanish on dark themes.
 
 * The IGNORE dropdown is a popup menu (menu_proc MENU_CREATE) shown
   under the button via MENU_SHOW; its items are checkable and multiple
@@ -124,6 +128,12 @@ _JSON_FILE = 'cuda_differ.json'
 # Editor text background of the active UI theme -- the toolbar's
 # background color (see _ed_text_bg). One flat color that always
 # matches the compare view below it, both light and dark themes.
+# EdTextFont is its contrast pair: the status label's font color
+# (see _ed_text_font). A dlg_proc 'label' is a plain LCL TLabel,
+# whose default font color follows the OS WIDGETSET, not CudaText's
+# UI theme -- black on many systems, i.e. invisible on the dark
+# toolbar background of dark UI themes. So the label's font_color
+# is set explicitly from the same theme the background comes from.
 
 
 def _ed_text_bg():
@@ -132,6 +142,22 @@ def _ed_text_bg():
     try:
         ui = ct.app_proc(ct.PROC_THEME_UI_DICT_GET, '')
         return ui.get('EdTextBg', {}).get('color')
+    except Exception:
+        return None
+
+
+def _ed_text_font():
+    """Live editor text FONT color from the current UI theme
+    (PROC_THEME_UI_DICT_GET / EdTextFont), or None when unavailable.
+
+    The guaranteed-contrast pair of EdTextBg (the toolbar's
+    background): whatever the theme does, its editor text color is
+    readable on its editor background -- and the toolbar uses that
+    very background. Black-on-black status text on dark themes
+    (the LCL default font color) is impossible with this."""
+    try:
+        ui = ct.app_proc(ct.PROC_THEME_UI_DICT_GET, '')
+        return ui.get('EdTextFont', {}).get('color')
     except Exception:
         return None
 
@@ -448,6 +474,15 @@ class CompareToolbar:
     def _add_status_label(self):
         n = ct.dlg_proc(self.h_dlg, ct.DLG_CTL_ADD, 'label')
         self.ctl['status'] = n
+        # A plain LCL TLabel defaults to the OS widgetset font color
+        # (black on many systems) -- invisible on the dark toolbar
+        # background of dark UI themes. Font color comes from the SAME
+        # theme as the background (EdTextFont vs EdTextBg); the black
+        # fallback only pairs with create()'s white bg fallback (both
+        # hit only when the theme dict itself is unavailable).
+        fontcolor = _ed_text_font()
+        if fontcolor is None:
+            fontcolor = 0x000000
         ct.dlg_proc(self.h_dlg, ct.DLG_CTL_PROP_SET, index=n, prop={
             'name': 'status',
             'cap': '',
@@ -457,6 +492,7 @@ class CompareToolbar:
             'a_t': ('config', '-'),  # button (the button row's height,
             'sp_r': _STATUS_SP_R,    # not the border-including form)
             'tab_stop': False,
+            'font_color': fontcolor,   # theme text color, NOT OS black
         })
 
     # -- captions / layout --------------------------------------------------
@@ -640,18 +676,23 @@ class CompareToolbar:
         self._layout_buttons()
 
     def apply_theme(self):
-        """Re-apply the toolbar background color for the (possibly
-        switched) UI theme -- EdTextBg of the current theme."""
+        """Re-apply the toolbar colors for the (possibly switched) UI
+        theme: background EdTextBg, status-label font EdTextFont.
+        Both must be re-read together -- a theme switch can flip
+        light<->dark, and a stale label font on the new background is
+        the black-on-black bug again."""
         if self.h_dlg is None:
             return
         bgcolor = _ed_text_bg()
-        if bgcolor is None:
+        fontcolor = _ed_text_font()
+        if bgcolor is None or fontcolor is None:
             return
         try:
             ct.dlg_proc(self.h_dlg, ct.DLG_PROP_SET,
                         prop={'color': bgcolor})
             ct.dlg_proc(self.h_dlg, ct.DLG_CTL_PROP_SET,
-                        name='status', prop={'color': bgcolor})
+                        name='status', prop={'color': bgcolor,
+                                             'font_color': fontcolor})
         except Exception:
             pass
 
