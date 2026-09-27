@@ -29,6 +29,8 @@ except Exception:
 from . import differ_native as dfn
 from . import differ_python as dfp
 from .overview import PaintboxOverview
+from .toolbar import IGNORE_OPTS as _IGNORE_OPTS
+from . import toolbar as difftb
 from .profiling import (Profiler, enable_profiling, profiling_report,
                         reset_profiling, start_profiling, stop_profiling,
                         cancel_profiling)
@@ -240,9 +242,6 @@ def _timed_produce(list_iter):
 # (~20 pumps/sec, the same cadence as the overview's apply timer) while
 # adding ~0.1us of gate-check overhead per 4096-event chunk boundary.
 UI_PUMP_INTERVAL = 0.05
-# Seconds between 'applying colors...' status-bar updates (the pump
-# itself may run 20x/sec; the status text is throttled to 2x/sec).
-UI_STATUS_INTERVAL = 0.5
 # Poll period of the Python-engine completion timer (the main thread is
 # idle while the engine thread computes, so this only paces how quickly
 # the finished opcodes are picked up).
@@ -283,14 +282,11 @@ class _PumpState:
 
     t_pump: perf_counter of the last ADMITTED pump (the gate in the hot
     paths compares against it -- one perf_counter + compare per chunk
-    boundary, no call).
-    t_status: perf_counter of the last status-bar update."""
-    __slots__ = ('t_pump', 't_status')
+    boundary, no call)."""
+    __slots__ = ('t_pump',)
 
     def __init__(self):
-        now = time.perf_counter()
-        self.t_pump = now
-        self.t_status = now
+        self.t_pump = time.perf_counter()
 
 
 class _PaintAborted(Exception):
@@ -1049,6 +1045,45 @@ OPTS_META = [
      'frm': 'bool',
      'chp': 'micromap',
      },
+    # --- chapter "toolbar": the compare-tab toolbar (toolbar.py) ----------
+    {'opt': 'differ.toolbar.show_toolbar',
+     'cmt': _('Show the compare-tab toolbar\n'
+              'When enabled, a toolbar is docked to the top of every '
+              'compare tab: [Recompare or Cancel] [Resize] | [Prev] '
+              '[Next] | [Copy to left] [Copy to right] | [Ignore '
+              'options dropdown] [Config], plus a status label on the '
+              'right that shows the compare state ("Comparing...", '
+              '"N differences") and the difference count of the last '
+              'compare.\n'
+              'The Recompare button becomes the Cancel button while a '
+              'compare runs. The Ignore dropdown lists the five ignore '
+              'options as checkable items (multiple can be checked) and '
+              'an "Uncheck all options" item; it is rebuilt on every '
+              'compare start so it always matches the config dialog and '
+              'the tab context menu.\n'
+              'Toolbars are restored at startup for session-restored '
+              'compare tabs.\n'
+              'Every button has a tooltip.\n'
+              'Default: on.'),
+     'def': True,
+     'frm': 'bool',
+     'chp': 'toolbar',
+     },
+    {'opt': 'differ.toolbar.show_btn_text',
+     'cmt': _('Show button texts in the toolbar\n'
+              'When enabled, the toolbar buttons show their icon plus a '
+              'text caption ("\u21bb Recompare", "\u2194 Resize", "\u2191 Prev", '
+              '"\u2193 Next", "\u2190 Copy", "\u2192 Copy", "\u2261 Ignore '
+              '2/5 \u25be", "\u2699 Config"); when disabled, only the '
+              'UTF-8 icons are shown (the Ignore button keeps its '
+              'enabled-options counter).\n'
+              'Only used when the toolbar itself is enabled '
+              '(differ.toolbar.show_toolbar).\n'
+              'Default: on.'),
+     'def': True,
+     'frm': 'bool',
+     'chp': 'toolbar',
+     },
 ]
 
 DIFF_TAB_COUNT = 1
@@ -1086,20 +1121,16 @@ def set_opt(key, val):
     return ctx.set_opt('differ.' + key, val, user_json=JSONFILE)
 
 
-# Ignore options exposed as checkable items in the diff-tab right-click
-# context menu (below 'Recompare' -- see tabmenu_init) and in the config
-# dialog (chapter 'ignoreopt' -- see OPTS_META). Order = context-menu
-# display order.
-# Each entry: (config key suffix under 'ignoreopt.', menu caption).
-# The values feed differ_native.build_ignore_flags() which builds the
-# diff_proc DIFF_IGN_* bitmask for the native algorithms.
-_IGNORE_OPTS = (
-    ('ignore_case',        _('Ignore case')),
-    ('ignore_whitespace',  _('Ignore whitespace')),
-    ('ignore_blank_lines', _('Ignore blank lines')),
-    ('ignore_eol',         _('Ignore line endings')),
-    ('ignore_numbers',     _('Ignore numbers')),
-)
+# Ignore options exposed as checkable items of the compare-tab
+# TOOLBAR's Ignore dropdown, of the diff-tab right-click context menu
+# (below 'Recompare' -- see tabmenu_init) and of the config dialog
+# (chapter 'ignoreopt' -- see OPTS_META). Display order = menu order.
+# Defined in toolbar.py (one source of truth shared with the toolbar)
+# and imported above; each entry is (config key suffix under
+# 'ignoreopt.', menu caption). The values feed
+# differ_native.build_ignore_flags() which builds the diff_proc
+# DIFF_IGN_* bitmask for the native algorithms.
+
 
 def msg(s, level=0):
     """Print a plugin message to the console. level: 0=info, 1=warning, 2=error."""
@@ -1730,6 +1761,13 @@ class Command:
             self.config()
             self.scroll.toggle(self.cfg['sync_scroll'])
             # self.scroll.enable_sync_caret = self.cfg['enable_sync_caret']
+            # Toolbars follow the (possibly changed) toolbar options:
+            # create missing ones, destroy the ones the option turned
+            # off, apply show_btn_text, refresh Ignore captions/menus
+            # (the dialog can change the ignore options and even the
+            # diff algorithm -- the Python-algorithm guard needs the
+            # new value).
+            difftb.sync_all(self)
 
     # ------------------------------------------------------------------
     # Ignore options
@@ -2013,6 +2051,17 @@ class Command:
             if micromap_on:
                 self._setup_micromap(a_ed, b_ed)
 
+            # Create the compare TOOLBAR before loading the texts (like
+            # the overview below: docking the toolbar into the editor
+            # parent changes the tab's layout, and doing it after the
+            # text is loaded would trigger a needless re-layout with the
+            # texts in place). The toolbar spans the parent's top side
+            # ('T' dock); it is created EMPTY -- idle buttons, the theme's
+            # editor background, an empty status label -- and reflects
+            # the running compare as soon as refresh_compare (below)
+            # kicks it off.
+            difftb.ensure_for_session(self, session, a_ed)
+
             # Hide the built-in vertical scrollbars while the overview
             # (which has its own slider + arrow buttons) replaces them —
             # BEFORE the text load, for the same no-re-wrap reason.
@@ -2144,6 +2193,9 @@ class Command:
             # cost on big compares outweighs the benefit (the next refresh,
             # manual or automatic, paints with the new colors).
             self.config()
+            # Toolbars re-read the editor background color (EdTextBg)
+            # so they keep blending into the new theme.
+            difftb.update_theme_all()
         elif state == ct.APPSTATE_THEME_SYNTAX:
             self.config()
 
@@ -2285,6 +2337,32 @@ class Command:
         session.overview_timer = False
         if session.overview is not None:
             session.overview.paint()
+
+    def _toolbar_restore_timer(self, tag='', info=''):
+        """One-shot startup timer (armed by on_start2, 300ms after the
+        sessions were rebuilt): create the toolbar of every compare tab
+        the CudaText session restored, so the toolbars are back at
+        startup exactly as they were before the restart. Tabs closed
+        again in the meantime resolve to no editor and are skipped;
+        ensure_for_session itself checks the show_toolbar option."""
+        for session in list(self._sessions.values()):
+            if difftb.get_for(session) is None:
+                ed = self._editor_by_tab_id(session.tab_id)
+                if ed is not None:
+                    difftb.ensure_for_session(self, session, ed)
+
+    def _toolbar_refresh_timer(self, tag='', info=''):
+        """100ms one-shot timer for toolbar-initiated refreshes: info
+        carries the PROP_TAB_ID of the compare tab whose compare must
+        re-run (an ignore option was toggled in the toolbar's dropdown
+        -- the same menu-close-first convention as the tabmenu_*
+        callbacks). Automatic refresh -- no 'two sides are identical'
+        dialog."""
+        if not info:
+            return
+        ed = self._editor_by_tab_id(info)
+        if ed is not None:
+            self.refresh_compare(ed, show_dialog=False)
 
     def on_caret(self, ed_self):
         """Mirror caret to opposite editor when sync_caret is enabled."""
@@ -2663,6 +2741,16 @@ class Command:
             # Re-apply the title color: green only when no half is dirty.
             if tab_session.saved:
                 self._apply_color_to_tab(tab_id_str, 0x00A000)  # green
+
+        # Restore the compare TOOLBARS of the session-restored compare
+        # tabs (the toolbar is docked into the editor parent, which is
+        # destroyed with the tab on exit). on_start2 fires just before
+        # the main form shows, and docking needs the fully-laid-out
+        # editor parents -- so the creation runs on a one-shot 300ms
+        # timer instead of here.
+        if self.cfg.get('show_toolbar', True) and self._sessions:
+            callback = 'module=cuda_differ;cmd=_toolbar_restore_timer;info=_;'
+            ct.timer_proc(ct.TIMER_START_ONE, callback, 300)
         # Re-subscribe to on_scroll event if sync_scroll is enabled.
         if self.cfg.get('sync_scroll') and self.scroll.tab_id:
             ct.app_proc(ct.PROC_EVENTS_SUB, self.scroll.name+';on_scroll;;')
@@ -2873,8 +2961,14 @@ class Command:
         job.profiler_async_token = None
         job.char_profiler_token = None
         job.cprofile = None
+        # Toolbar: leave the 'comparing' state with 'Cancelled' on the
+        # status label (no-op when the tab -- and with it the toolbar --
+        # is already gone; on_close destroys it).
+        if job.session is not None:
+            difftb.on_compare_end(self, job.session, n_diffs=None,
+                                  cancelled=True)
 
-    def cancel_compare(self):
+    def cancel_compare(self, ed=None):
         """Command: cancel the in-flight background compare for the
         current compare tab, if any is running. Does not close the tab
         or touch its existing diff markers -- it only stops a compare
@@ -2882,8 +2976,11 @@ class Command:
         or a prior manual refresh on a large file). Same effect as
         on_close's cancellation, but callable directly without closing
         the tab, and without needing on_save_pre's close-then-save
-        path."""
-        tab_id = ct.ed.get_prop(ct.PROP_TAB_ID)
+        path. 'ed' (any editor of the compare tab, used by the
+        toolbar's Cancel button) defaults to the focused editor."""
+        if ed is None:
+            ed = ct.ed
+        tab_id = ed.get_prop(ct.PROP_TAB_ID)
         session = self._session_for(tab_id)
         if session is None:
             return ct.msg_status(_('Differ: not a compare tab'))
@@ -3209,6 +3306,13 @@ class Command:
             a_ed = ct.Editor(ed.get_prop(ct.PROP_HANDLE_PRIMARY))
             b_ed = ct.Editor(ed.get_prop(ct.PROP_HANDLE_SECONDARY))
 
+            # Make sure the compare TOOLBAR exists (it is normally created
+            # by set_files; recreated here for restored tabs and for the
+            # case the option was just enabled -- the same self-healing
+            # the overview gets below). All later compare-state updates
+            # (kick-off / finish / cancel) are no-ops when it does not.
+            difftb.ensure_for_session(self, session, a_ed)
+
             # Set up the micromap on both editors when enabled.
             micromap_on = self.cfg.get('enable_micromap', False)
             if micromap_on:
@@ -3283,6 +3387,8 @@ class Command:
                 # drop it so on_scroll cannot re-apply cleared markers.
                 self._reset_marker_windows(session)
                 Profiler.stop('refresh:clear')
+                # The toolbar's status label: both sides identical.
+                difftb.on_compare_end(self, session, n_diffs=0)
                 # Clear THIS tab's diff records (the session's Differ --
                 # another tab's diffmap is never touched).
                 self._ensure_correct_differ(session).diffmap = []
@@ -3468,6 +3574,12 @@ class Command:
                 job.lines_b = lines_b
                 del lines_a, lines_b
 
+            # Toolbar: enter the 'comparing' state (Recompare swaps to
+            # Cancel, the navigation buttons disable, the status label
+            # shows 'Comparing...') and rebuild the Ignore dropdown so
+            # it always mirrors the current settings at compare start.
+            difftb.on_compare_start(self, session)
+
             if isinstance(diff, dfn.Differ):
                 # functools.partial carries the job to the callback, so
                 # the engine's completion knows WHICH compare finished.
@@ -3523,6 +3635,12 @@ class Command:
                 cancel_profiling(_cprof)
                 _cprof = None
                 msg('diff_proc failed to start the background compare', level=1)
+                # Toolbar: the kick-off promised a compare that never
+                # started -- leave the 'comparing' state right away
+                # (the old markers/colors are still in place, so the
+                # label reports the cancellation, not a diff count).
+                difftb.on_compare_end(self, session, n_diffs=None,
+                                      cancelled=True)
                 _epilogue = False
                 Profiler.stop('refresh')
                 return
@@ -3629,6 +3747,15 @@ class Command:
             finally:
                 self._free_job_slot(job)
                 self._release_compare_editors(job)
+                # Inline-mode twin of _finish_native_compare's toolbar
+                # update: leave the 'comparing' state, refresh the
+                # status label with the diff count / 'Cancelled'.
+                _diff = session.diff
+                _diffmap = getattr(_diff, 'diffmap', None)
+                difftb.on_compare_end(
+                    self, session,
+                    n_diffs=len(_diffmap) if _diffmap else 0,
+                    cancelled=job.stale)
                 # Belt-and-braces mirror of _finish_native_compare: an
                 # exception mid-paint must not leave a suspended native
                 # walk holding cached state (no-op for the Python
@@ -3762,6 +3889,15 @@ class Command:
         # 'ignore numbers' on -- and the user must be told the sides
         # are equal instead of staring at an uncolored compare tab.
         n_diff_events = 0
+        # One-shot status message for the paint phase (no running timer:
+        # the periodic 'applying diff colors... X.Xs' updates were removed
+        # -- they spammed the status bar up to 2x/sec for the whole paint;
+        # the toolbar's status label and the final 'compared in ...'
+        # epilogue carry the rest of the feedback).
+        try:
+            ct.msg_status(_('Differ: applying diff colors...'))
+        except Exception:
+            pass
         Profiler.start('refresh:compare_and_paint')
         # Both differs take their inputs as compare() parameters (no
         # set_seqs() call, no persistent storage on either Differ between
@@ -4335,10 +4471,7 @@ class Command:
             # through the pump (tab closed / Cancel compare / exit) by
             # aborting the paint at this boundary.
             if _perf() - _pump.t_pump >= UI_PUMP_INTERVAL:
-                if not self._pump_checkpoint(
-                        _pump, job,
-                        _('Differ: applying diff colors... {:.1f}s')
-                          .format(_perf() - job.compare_start)):
+                if not self._pump_checkpoint(_pump, job):
                     # Cancelled / exiting mid-paint: stop the open
                     # sections in order and return; the callers' finally
                     # blocks release the editor lock / job slot. The
@@ -4419,10 +4552,7 @@ class Command:
                 if _n >= _BKM_FLUSH_CHUNK:
                     _n = 0
                     if _perf() - _pump.t_pump >= UI_PUMP_INTERVAL:
-                        if not self._pump_checkpoint(
-                                _pump, job,
-                                _('Differ: applying diff colors... {:.1f}s')
-                                  .format(_perf() - job.compare_start)):
+                        if not self._pump_checkpoint(_pump, job):
                             Profiler.stop('paint:bookmark')
                             Profiler.stop('refresh')
                             return
@@ -4436,10 +4566,7 @@ class Command:
                 if _n >= _BKM_FLUSH_CHUNK:
                     _n = 0
                     if _perf() - _pump.t_pump >= UI_PUMP_INTERVAL:
-                        if not self._pump_checkpoint(
-                                _pump, job,
-                                _('Differ: applying diff colors... {:.1f}s')
-                                  .format(_perf() - job.compare_start)):
+                        if not self._pump_checkpoint(_pump, job):
                             Profiler.stop('paint:bookmark')
                             Profiler.stop('refresh')
                             return
@@ -4452,10 +4579,7 @@ class Command:
                 if _n >= _BKM_FLUSH_CHUNK:
                     _n = 0
                     if _perf() - _pump.t_pump >= UI_PUMP_INTERVAL:
-                        if not self._pump_checkpoint(
-                                _pump, job,
-                                _('Differ: applying diff colors... {:.1f}s')
-                                  .format(_perf() - job.compare_start)):
+                        if not self._pump_checkpoint(_pump, job):
                             Profiler.stop('paint:bookmark')
                             Profiler.stop('refresh')
                             return
@@ -4469,10 +4593,7 @@ class Command:
                 if _n >= _BKM_FLUSH_CHUNK:
                     _n = 0
                     if _perf() - _pump.t_pump >= UI_PUMP_INTERVAL:
-                        if not self._pump_checkpoint(
-                                _pump, job,
-                                _('Differ: applying diff colors... {:.1f}s')
-                                  .format(_perf() - job.compare_start)):
+                        if not self._pump_checkpoint(_pump, job):
                             Profiler.stop('paint:bookmark')
                             Profiler.stop('refresh')
                             return
@@ -4560,7 +4681,7 @@ class Command:
         if job.session is not None and job.session.job is job:
             job.session.job = None
 
-    def _pump_checkpoint(self, pump, job, status=None):
+    def _pump_checkpoint(self, pump, job):
         """One UI-pump + cancellation checkpoint inside a long
         main-thread stretch (see the module-level pump block).
 
@@ -4574,25 +4695,19 @@ class Command:
         AFTER the pump on purpose: the cancel event usually arrives
         THROUGH the pump, so checking before it would miss it.
 
-        'pump' is the stretch's _PumpState; its timestamps are advanced
-        here. 'status' (optional, already translated+formatted by the
-        caller) is shown on the status bar at most every
-        UI_STATUS_INTERVAL -- a live progress signal for compares that
-        take seconds, replacing the old 'frozen window' feedback."""
+        'pump' is the stretch's _PumpState; its timestamp is advanced
+        here. No status-bar text is printed here on purpose: the pump
+        may run ~20x/sec, and re-printing a running-timer message at
+        that cadence is exactly the status-bar spam that was removed
+        (the compare start says 'comparing in background...', the paint
+        phase says 'applying diff colors...' ONCE, and the epilogue
+        reports the total when the compare is done)."""
         _pump_ui_messages()
         pump.t_pump = time.perf_counter()
         if job is not None and getattr(job, 'stale', False):
             return False
         if self._app_exiting:
             return False
-        if status is not None:
-            now = time.perf_counter()
-            if now - pump.t_status >= UI_STATUS_INTERVAL:
-                pump.t_status = now
-                try:
-                    ct.msg_status(status)
-                except Exception:
-                    pass
         return True
 
     @_gc_quiet_method
@@ -4721,10 +4836,7 @@ class Command:
                         if _now - _collect_pump.t_pump \
                                 < UI_PUMP_INTERVAL:
                             return True
-                        return self._pump_checkpoint(
-                            _collect_pump, job,
-                            _('Differ: comparing in background... {:.1f}s')
-                              .format(_now - job.compare_start))
+                        return self._pump_checkpoint(_collect_pump, job)
 
                     pairs = diff.collect_char_pairs(
                         job.a_text, job.b_text, opcodes,
@@ -5019,6 +5131,18 @@ class Command:
                                            job.cprofile)
                 job.cprofile = None
         finally:
+            # Toolbar: leave the 'comparing' state (Cancel swaps back to
+            # Recompare, the navigation buttons re-enable, the status
+            # label shows the difference count / 'Cancelled' for stale
+            # jobs). Computed from the session's Differ without creating
+            # one (a restored tab that never compared has diff=None).
+            if job.session is not None:
+                _diff = job.session.diff
+                _diffmap = getattr(_diff, 'diffmap', None)
+                difftb.on_compare_end(
+                    self, job.session,
+                    n_diffs=len(_diffmap) if _diffmap else 0,
+                    cancelled=job.stale)
             # Compare finished (or aborted): make the halves editable
             # again / drop the busy placeholder. Idempotent -- the
             # callbacks' finally blocks re-release.
@@ -5214,24 +5338,15 @@ class Command:
         # windowed MARKERS_ADD_MANY flushes. 2 section instances each.
         Profiler.start('paint:marks:build')
         session.marks_micromap_a = self._marks_to_arrays(mm_a)
-        if pump is not None and not self._pump_checkpoint(
-                pump, job,
-                _('Differ: applying diff colors... {:.1f}s')
-                  .format(time.perf_counter() - job.compare_start)):
+        if pump is not None and not self._pump_checkpoint(pump, job):
             Profiler.stop('paint:marks:build')
             raise _PaintAborted()
         session.marks_micromap_b = self._marks_to_arrays(mm_b)
-        if pump is not None and not self._pump_checkpoint(
-                pump, job,
-                _('Differ: applying diff colors... {:.1f}s')
-                  .format(time.perf_counter() - job.compare_start)):
+        if pump is not None and not self._pump_checkpoint(pump, job):
             Profiler.stop('paint:marks:build')
             raise _PaintAborted()
         session.marks_chars_a = self._marks_to_arrays(ch_a)
-        if pump is not None and not self._pump_checkpoint(
-                pump, job,
-                _('Differ: applying diff colors... {:.1f}s')
-                  .format(time.perf_counter() - job.compare_start)):
+        if pump is not None and not self._pump_checkpoint(pump, job):
             Profiler.stop('paint:marks:build')
             raise _PaintAborted()
         session.marks_chars_b = self._marks_to_arrays(ch_b)
@@ -5754,6 +5869,11 @@ class Command:
                 get_opt('micromap.enable_overview', True),
             'hide_builtin_scrollbars':
                 get_opt('micromap.hide_builtin_scrollbars', True),
+            # --- toolbar (see toolbar.py) ---
+            'show_toolbar':
+                get_opt('toolbar.show_toolbar', True),
+            'show_btn_text':
+                get_opt('toolbar.show_btn_text', True),
         }
 
         new_nkind(NKIND_DELETED, config.get('color_deleted'))
@@ -6310,6 +6430,10 @@ class Command:
         key = info
         old = bool(get_opt('ignoreopt.' + key, False))
         set_opt('ignoreopt.' + key, not old)
+        # Keep the toolbars' Ignore captions/tooltips in step with this
+        # change (the dropdown itself is rebuilt at the next compare
+        # start; the caption counter updates right away).
+        difftb.sync_ignore_state(self)
         captions = dict(_IGNORE_OPTS)
         state = _('enabled') if not old else _('disabled')
         ct.msg_status('{}: {} -- {}'.format(
@@ -6437,6 +6561,11 @@ class Command:
         session.overview = None
         if overview is not None:
             overview.destroy()
+
+        # Destroy the compare toolbar docked to this tab's editor
+        # parent (the parent goes away with the tab, but the toolbar
+        # form must be undocked/freed explicitly).
+        difftb.destroy_for(session.tab_id_str)
 
         # Drop any in-flight background compare for this tab and CANCEL
         # the engine compare: closing the tab means the result will

@@ -251,6 +251,50 @@ Right-clicking a tab title shows "Differ" submenu with:
   config dialog is reflected here the next time the menu opens). See
   "Ignore options" below for what each option does.
 
+== Toolbar ==
+
+Every compare tab gets a toolbar docked to the top of the compare view
+(above the two editors, spanning the tab's width; its background uses
+the editor text background color of the current UI theme, so it blends
+into the compare view):
+
+    [↻ Recompare or × Cancel][↔ Resize] | [↑ Prev][↓ Next] |
+    [← Copy][→ Copy] | [≡ Ignore 2/5 ▾] [⚙ Config]      ...status
+
+- ↻ Recompare -- re-runs the compare (same as F5 / the menu's
+  Recompare). While a compare runs, the button becomes × Cancel and
+  cancels that tab's running compare; when the compare finishes or is
+  cancelled it becomes ↻ Recompare again.
+- ↔ Resize -- resize the two editors to equal width (50/50) after
+  dragging the splitter.
+- ↑ Prev / ↓ Next -- jump to the previous/next difference (same as
+  Alt+Up / Alt+Down). Disabled while there are no differences or a
+  compare is running.
+- ← Copy / → Copy -- copy the current difference hunk to the left /
+  right side (same as Alt+Left / Alt+Right).
+- ≡ Ignore 2/5 ▾ -- dropdown with the five "ignore" options as
+  CHECKABLE items -- multiple options can be checked at once (they
+  combine; see "Ignore options" below). The counter shows how many of
+  the five are enabled (omitted when none is). The last item, after a
+  separator, is "Uncheck all options". Ticking an item re-runs the
+  compare immediately; the dropdown is rebuilt on every compare start
+  so it always matches the config dialog and the tab context menu.
+  While a pure-Python algorithm is the effective one, the items
+  disable themselves and an explanatory item heads the menu (same
+  guard as the tab context menu).
+- ⚙ Config -- opens the Differ options dialog.
+- status label (right side) -- shows the compare state: "Comparing..."
+  while a compare runs, "N differences" / "No differences" when it
+  finishes, "Cancelled" after a cancel. This replaces the old status
+  bar progress spam.
+
+Every button has a tooltip (with the hotkey hint where one exists).
+The captions' texts can be turned off (icons only) with the option
+differ.toolbar.show_btn_text; the whole toolbar can be hidden with
+differ.toolbar.show_toolbar. Toolbars are restored at startup for
+compare tabs restored by the CudaText session, and follow UI theme
+switches (the background re-reads EdTextBg).
+
 == Ignore options ==
 
 Five options control what kind of differences the compare treats as
@@ -413,7 +457,7 @@ This launches CudaText with the two given files opened in the Differ plugin.
 Open the options dialog via "Options / Settings-plugins / Differ / Config"
 or "Plugins / Differ / Config...".
 
-All options are stored in settings/cuda_differ.json. The option names grouped into five categories: theme, algorithm, ignoreopt, advanced, micromap.
+All options are stored in settings/cuda_differ.json. The option names grouped into six categories: theme, algorithm, ignoreopt, advanced, micromap, toolbar.
 
 Ignore options section (see the "Ignore options" chapter above for details):
 - differ.ignoreopt.ignore_case: Ignore case (default: off)
@@ -750,6 +794,22 @@ Micromap section:
   Only has an effect when differ.micromap.enable_overview is on.
   Default: on.
 
+Toolbar section (see the "Toolbar" chapter above for details):
+- differ.toolbar.show_toolbar: Show the compare-tab toolbar (default: on)
+  A toolbar docked to the top of every compare tab: Recompare (Cancel
+  while a compare runs), Resize, Prev, Next, Copy to left, Copy to
+  right, the Ignore-options dropdown (multiple checkable options plus
+  "Uncheck all"), Config, and a status label on the right (compare
+  state + difference count). Every button has a tooltip; the toolbar
+  follows UI theme switches and is restored at startup for
+  session-restored compare tabs.
+- differ.toolbar.show_btn_text: Show button texts in the toolbar
+  (default: on)
+  When on, buttons show "↻ Recompare", "↔ Resize", "↑ Prev", "↓ Next",
+  "← Copy", "→ Copy", "≡ Ignore 2/5 ▾", "⚙ Config"; when off, only the
+  UTF-8 icons are shown (the Ignore button keeps its enabled-options
+  counter).
+
 
 == Diff algorithms and best practices ==
 
@@ -800,7 +860,9 @@ about 20 times a second -- so CudaText keeps repainting and accepting
 input (menus, other tabs, window dragging) WHILE a big compare is being
 colored, instead of freezing until it finishes. Both compare-tab editors
 show the 'busy' placeholder and stay read-only for the whole run, the
-status bar shows live progress, and the "Differ\Cancel compare" command
+status bar shows a one-shot 'applying diff colors...' message when the
+paint phase starts (no running timer -- the toolbar's status label
+carries the live state), and the "Differ\Cancel compare" command
 works at any moment: a compare cancelled mid-paint stops applying
 colors at the next chunk instead of running to the end.
 
