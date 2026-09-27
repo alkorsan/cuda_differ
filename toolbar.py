@@ -24,13 +24,29 @@ Implementation notes:
 * BUTTONS are 'button_ex' controls (application-themed, CudaText's own
   button look) in flat mode with kind=BTNKIND_TEXT_ONLY, so UTF-8 icon
   captions render like native toolbar buttons. Separators are
-  button_ex with kind=BTNKIND_SEP_VERT. Tooltips are the 'hint'
-  property of every control.
+  button_ex with kind=BTNKIND_SEP_HORZ (a vertical line: the 'HORZ'
+  kind is for controls placed in a horizontal row).
+
+* SIZING: buttons are AUTO-SIZED -- control prop 'autosize' makes
+  TATButton compute its width from the caption measured with the REAL
+  UI-theme font, DPI-scaled (TATButton.SetAutoSize), so no text or icon
+  can ever be cut off. No widths are computed here at all; the
+  w_min constraint only keeps icon-only buttons clickable.
+  Re-setting the prop (a caption change is always followed by an
+  'autosize': True re-set) re-runs the width computation.
+
+* POSITIONING: anchors, not coordinates. Every button's LEFT side is
+  anchored (a_l) to the RIGHT side (']') of the previous control with
+  sp_l spacing, so the whole row re-flows automatically whenever a
+  button's width changes (Recompare <-> Cancel swap, Ignore counter,
+  show_btn_text toggle). Tops/bottoms are anchored to the form
+  (a_t/a_b), the status label to the form's right edge (a_r) and
+  vertically centered (a_t '-'). 'x'/'w' are never set.
 
 * The status LABEL on the right side carries the compare state
   ("Comparing...", "Cancelled", "N differences") -- the feedback the
   old status-bar timer spam used to provide, now without any running
-  timer.
+  timer. It is auto-sized too (TLabel.AutoSize).
 
 * The IGNORE dropdown is a popup menu (menu_proc MENU_CREATE) shown
   under the button via MENU_SHOW; its items are checkable and multiple
@@ -41,10 +57,13 @@ Implementation notes:
   item appears -- same guard as the tab context menu / config dialog.
 
 * CALLBACKS: dlg event handlers (on_change) are live callables
-  (dlg_proc cleans them up on DLG_FREE); menu item commands are STRING
-  callbacks ("module=cuda_differ.toolbar;func=_menu_click;info=...;")
-  so nothing accumulates in cudatext's live-callback registry when the
-  menu is rebuilt on every compare; the post-toggle refresh goes
+  (dlg_proc cleans them up on DLG_FREE); menu item commands and timers
+  use STRING callbacks in the 'module=...;cmd=...;info=...' form
+  (Command methods) -- CudaText passes that form's info as the raw
+  string, so '<tab id>|<ignore key>' survives without quoting (the
+  'func=' form would parse the info value and turn an unquoted
+  non-numeric value into None -- the reason the first toolbar version
+  silently did nothing on click). The post-toggle refresh goes
   through Command._toolbar_refresh_timer on a 100ms one-shot timer
   (the plugin's established menu-close-first convention).
 
@@ -114,67 +133,28 @@ def _set_ignore_opt(key, val):
 
 
 # ---------------------------------------------------------------------------
-# Text measurement (DPI-correct button widths).
-#
-# button captions must fit their flat buttons; widths are computed from
-# the REAL text size measured on a scratch bitmap canvas (the canvas
-# font matches the default UI font the themed buttons use), so they
-# follow the OS high-DPI scale without any manual scaling. The results
-# are cached; the fallback (~7 px per char) only serves sandboxes where
-# the bitmap/canvas API is missing.
-# ---------------------------------------------------------------------------
-
-_meas_cache = {}
-_CHAR_W_FALLBACK = 7
-
-
-def _text_size(s):
-    """Measured (w, h) of a string, or (None, None) when the
-    bitmap/canvas API is unavailable."""
-    try:
-        hb = ct.bitmap_proc(0, ct.BITMAP_CREATE, 256, 64)
-        try:
-            hc = ct.bitmap_proc(hb, ct.BITMAP_GET_CANVAS)
-            return ct.canvas_proc(hc, ct.CANVAS_GET_TEXT_SIZE, text=s)
-        finally:
-            ct.bitmap_proc(hb, ct.BITMAP_FREE)
-    except Exception:
-        return (None, None)
-
-
-def _text_w(s):
-    if s not in _meas_cache:
-        w = _text_size(s)[0]
-        if not w or w <= 0:
-            w = _CHAR_W_FALLBACK * len(s)
-        _meas_cache[s] = int(w)
-    return _meas_cache[s]
-
-
-def _text_h(s):
-    key = '\x00h:' + s
-    if key not in _meas_cache:
-        h = _text_size(s)[1]
-        if not h or h <= 0:
-            h = 16
-        _meas_cache[key] = int(h)
-    return _meas_cache[key]
-
-
-# ---------------------------------------------------------------------------
 # Layout constants.
+#
+# NO widths are computed anywhere: buttons are auto-sized (control prop
+# 'autosize' -> TATButton.SetAutoSize measures the caption with the
+# real UI-theme font, DPI-scaled), and positions come from anchors.
 # ---------------------------------------------------------------------------
 
-# Horizontal padding inside a flat button around its caption.
-_BTN_PAD_X = 12
-# Space between two neighboring buttons.
+# Spacing to the LEFT of every button (anchor sp_l; visual gap between
+# two neighboring buttons).
 _BTN_GAP = 2
-# Extra space around a separator (in addition to _BTN_GAP per side).
-_SEP_GAP = 4
+# Extra spacing to the left of a separator (in addition to _BTN_GAP),
+# so groups breathe a little more than single buttons.
+_SEP_GAP = 6
 # Width of the vertical separator buttons.
-_SEP_W = 6
-# Minimum width of an icon-only button, so single glyphs stay clickable.
+_SEP_W = 2
+# Minimum width of a button (constraint): keeps single-glyph icon-only
+# buttons comfortably clickable.
 _BTN_W_MIN = 26
+# Vertical inset of buttons/separators from the form's top/bottom.
+_BTN_V_PAD = 1
+# Spacing between the status label and the form's right edge.
+_STATUS_SP_R = 10
 
 
 def _bar_height():
@@ -266,11 +246,18 @@ class CompareToolbar:
             'color': bgcolor,
         })
 
+        # Controls are chained left-to-right with anchors: each control's
+        # a_l is the PREVIOUS control's ']' (right side), so the row
+        # re-flows by itself whenever any button's auto-sized width
+        # changes. No 'x'/'w' is ever set on buttons.
+        prev = None
         for name, kind, icon, text in self._BTNS:
             if kind == 'sep':
-                self._add_separator(name)
+                self._add_separator(name, prev)
+                prev = name
             else:
-                self._add_button(name, icon, text)
+                self._add_button(name, icon, text, prev)
+                prev = name
 
         # Status label on the right: the compare state / diff count.
         self._add_status_label()
@@ -287,16 +274,29 @@ class CompareToolbar:
         self._update_nav_enabled()
         return True
 
-    def _add_button(self, name, icon, text):
+    def _anchor_left(self, prev):
+        """a_l value chaining this control to the RIGHT side of the
+        previous control ('' = the form for the first one)."""
+        return (prev, ']') if prev else ('', '[')
+
+    def _add_button(self, name, icon, text, prev):
         n = ct.dlg_proc(self.h_dlg, ct.DLG_CTL_ADD, 'button_ex')
         self.ctl[name] = n
+        # Dict order matters: 'cap' BEFORE 'autosize' -- the auto-size
+        # pass must measure the final caption. 'w_min' (constraints) is
+        # applied by CudaText before everything else.
         ct.dlg_proc(self.h_dlg, ct.DLG_CTL_PROP_SET, index=n, prop={
             'name': name,
-            'x': 0,
-            'y': 0,
-            'w': _BTN_W_MIN,
-            'h': self.height,
+            'w_min': _BTN_W_MIN,
             'hint': self._tooltip(name),
+            'cap': self._caption(icon, text),
+            'autosize': True,
+            'a_l': self._anchor_left(prev),
+            'a_t': ('', '['),
+            'a_b': ('', ']'),
+            'sp_l': _BTN_GAP,
+            'sp_t': _BTN_V_PAD,
+            'sp_b': _BTN_V_PAD,
             'tab_stop': False,
             'on_change': self._on_button,
         })
@@ -309,21 +309,27 @@ class CompareToolbar:
         except Exception:
             pass
 
-    def _add_separator(self, name):
+    def _add_separator(self, name, prev):
         n = ct.dlg_proc(self.h_dlg, ct.DLG_CTL_ADD, 'button_ex')
         self.ctl[name] = n
         ct.dlg_proc(self.h_dlg, ct.DLG_CTL_PROP_SET, index=n, prop={
             'name': name,
-            'x': 0,
-            'y': 2,
             'w': _SEP_W,
-            'h': self.height - 4,
+            'a_l': self._anchor_left(prev),
+            'a_t': ('', '['),
+            'a_b': ('', ']'),
+            'sp_l': _SEP_GAP,
+            'sp_t': _BTN_V_PAD + 1,
+            'sp_b': _BTN_V_PAD + 1,
             'tab_stop': False,
         })
         hb = ct.dlg_proc(self.h_dlg, ct.DLG_CTL_HANDLE, index=n)
         self.hbtn[name] = hb
         try:
-            ct.button_proc(hb, ct.BTN_SET_KIND, ct.BTNKIND_SEP_VERT)
+            # BTNKIND_SEP_HORZ is the vertical LINE kind (for controls
+            # laid out in a horizontal row); BTNKIND_SEP_VERT draws a
+            # horizontal line instead.
+            ct.button_proc(hb, ct.BTN_SET_KIND, ct.BTNKIND_SEP_HORZ)
             ct.button_proc(hb, ct.BTN_SET_FOCUSABLE, False)
         except Exception:
             pass
@@ -331,18 +337,14 @@ class CompareToolbar:
     def _add_status_label(self):
         n = ct.dlg_proc(self.h_dlg, ct.DLG_CTL_ADD, 'label')
         self.ctl['status'] = n
-        h = _text_h('Xg') + 4
         ct.dlg_proc(self.h_dlg, ct.DLG_CTL_PROP_SET, index=n, prop={
             'name': 'status',
             'cap': '',
-            'w': 8,
-            'x': 0,
-            'y': (self.height - h) // 2,
-            'h': h,
-            'color': _ed_text_bg() or 0xFFFFFF,
-            'a_l': None,          # anchored to the form's RIGHT edge
-            'a_r': ('', ']'),
-            'sp_r': 10,
+            'autosize': True,    # TLabel sizes itself to the caption
+            'a_l': None,         # anchored to the form's RIGHT edge,
+            'a_r': ('', ']'),    # vertically centered
+            'a_t': ('', '-'),
+            'sp_r': _STATUS_SP_R,
             'tab_stop': False,
         })
 
@@ -354,9 +356,6 @@ class CompareToolbar:
         if self.show_text and text:
             return icon + ' ' + _(text)
         return icon
-
-    def _btn_width(self, cap):
-        return max(_BTN_W_MIN, _text_w(cap) + 2 * _BTN_PAD_X)
 
     def _ignore_counts(self):
         """(enabled, total) over the five ignore options, read live from
@@ -376,21 +375,22 @@ class CompareToolbar:
         return '\u2261' + counter + arrow
 
     def _layout_buttons(self):
-        """(Re)assign captions, widths and x positions of all buttons in
-        order -- called whenever a caption changes (Recompare <-> Cancel
-        swap, Ignore counter, show_btn_text toggle)."""
+        """(Re)assign the captions of all buttons -- called whenever a
+        caption changes (Recompare <-> Cancel swap, Ignore counter,
+        show_btn_text toggle).
+
+        Widths and positions need NO management here: every caption
+        change is followed by an 'autosize': True re-set, which re-runs
+        TATButton's width computation for the new caption (measured
+        with the real UI-theme font), and the a_l anchor chain then
+        re-positions all following controls by itself."""
         if self.h_dlg is None:
             return
-        x = 0
         for name, kind, icon, text in self._BTNS:
+            if kind == 'sep':
+                continue
             n = self.ctl.get(name)
             if n is None:
-                continue
-            if kind == 'sep':
-                x += _SEP_GAP
-                ct.dlg_proc(self.h_dlg, ct.DLG_CTL_PROP_SET, index=n,
-                            prop={'x': x, 'w': _SEP_W})
-                x += _SEP_W + _SEP_GAP + _BTN_GAP
                 continue
             if name == 'ignore':
                 cap = self._ignore_caption()
@@ -398,10 +398,13 @@ class CompareToolbar:
                 cap = self._caption('\u00d7', 'Cancel')
             else:
                 cap = self._caption(icon, text)
-            w = self._btn_width(cap)
-            ct.dlg_proc(self.h_dlg, ct.DLG_CTL_PROP_SET, index=n,
-                        prop={'cap': cap, 'x': x, 'w': w})
-            x += w + _BTN_GAP
+            try:
+                # 'cap' first, 'autosize' second: the width pass must
+                # measure the NEW caption.
+                ct.dlg_proc(self.h_dlg, ct.DLG_CTL_PROP_SET, index=n,
+                            prop={'cap': cap, 'autosize': True})
+            except Exception:
+                pass
 
     def _tooltip(self, name):
         """Tooltip of a button (hotkey hints included)."""
@@ -502,16 +505,15 @@ class CompareToolbar:
                                            _('differences')))
 
     def set_status(self, text):
-        """Text of the right-side status label (resized to fit)."""
+        """Text of the right-side status label. The label is auto-sized,
+        so the caption change alone adjusts its width; the a_r anchor
+        keeps it glued to the form's right edge."""
         self.status = text
         if self.h_dlg is None:
             return
         try:
             ct.dlg_proc(self.h_dlg, ct.DLG_CTL_PROP_SET,
-                        name='status', prop={
-                            'cap': text,
-                            'w': (_text_w(text) + 12) if text else 8,
-                        })
+                        name='status', prop={'cap': text})
         except Exception:
             pass
 
@@ -553,9 +555,18 @@ class CompareToolbar:
         effective one the DIFF_IGN_* flags do nothing (Python compares
         strictly), so the items disable themselves and an explanatory
         disabled item heads the menu -- the toolbar twin of the tab
-        context menu hiding its ignore items."""
+        context menu hiding its ignore items.
+
+        The whole body is guarded: a failure here must never propagate
+        into the compare flow that called it."""
         if self.h_dlg is None:
             return
+        try:
+            self._rebuild_ignore_menu_inner()
+        except Exception:
+            pass
+
+    def _rebuild_ignore_menu_inner(self):
         if self.h_menu is None:
             self.h_menu = ct.menu_proc(0, ct.MENU_CREATE)
         ct.menu_proc(self.h_menu, ct.MENU_CLEAR)
@@ -596,7 +607,13 @@ class CompareToolbar:
             mi = ct.menu_proc(
                 self.h_menu, ct.MENU_ADD,
                 caption=caption,
-                command='module=cuda_differ.toolbar;func=_menu_click;'
+                # 'cmd=' form (a Command method): CudaText passes this
+                # form's info to the method as the RAW string, so the
+                # '<tab id>|<key>' payload survives. (The 'func=' form
+                # would parse the info value and an unquoted value like
+                # '501|ignore_case' arrives as None -> the click did
+                # nothing in the first toolbar version.)
+                command='module=cuda_differ;cmd=toolbar_menu_ignore;'
                         'info={}|{};'.format(self.tab_id_str, key))
             try:
                 ct.menu_proc(mi, ct.MENU_SET_CHECKED,
@@ -610,7 +627,7 @@ class CompareToolbar:
         mi = ct.menu_proc(
             self.h_menu, ct.MENU_ADD,
             caption=_('Uncheck all options'),
-            command='module=cuda_differ.toolbar;func=_menu_click;'
+            command='module=cuda_differ;cmd=toolbar_menu_ignore;'
                     'info={}|*;'.format(self.tab_id_str))
         self.menu_items['*'] = mi
 
@@ -651,7 +668,10 @@ class CompareToolbar:
                         pass
             self._layout_buttons()
             self._set_hint('ignore', self._ignore_tooltip())
-            ct.msg_status(_('Differ: all ignore options disabled'))
+            try:
+                ct.msg_status(_('Differ: all ignore options disabled'))
+            except Exception:
+                pass
             self._schedule_refresh()
             return
         key = action
@@ -666,9 +686,12 @@ class CompareToolbar:
         self._layout_buttons()
         self._set_hint('ignore', self._ignore_tooltip())
         captions = dict(IGNORE_OPTS)
-        ct.msg_status('{}: {} -- {}'.format(
-            _('Differ ignore option'), captions.get(key, key),
-            _('enabled') if not old else _('disabled')))
+        try:
+            ct.msg_status('{}: {} -- {}'.format(
+                _('Differ ignore option'), captions.get(key, key),
+                _('enabled') if not old else _('disabled')))
+        except Exception:
+            pass
         self._schedule_refresh()
 
     def _schedule_refresh(self):
@@ -894,14 +917,38 @@ def sync_all(cmd):
 
 
 # ---------------------------------------------------------------------------
-# String-callback entry points (menu items reach these via
-# 'module=cuda_differ.toolbar;func=_menu_click;info=<tabid>|<action>;').
+# String-callback entry points.
+#
+# Menu items use the 'module=cuda_differ;cmd=toolbar_menu_ignore;
+# info=<tab id>|<action>;' form (Command method -- info arrives as the
+# RAW string). The module-level entry below is the belt-and-braces twin
+# for any 'module=cuda_differ.toolbar;func=_menu_click;
+# info="<tab id>|<action>;"' callback (info QUOTED: the engine's
+# ValueFromString turns an unquoted non-numeric value into None).
 # ---------------------------------------------------------------------------
 
+def menu_action(info):
+    """'info' is '<tab_id_str>|<ignore key or *>': route the click to the
+    toolbar of that compare tab. Returns True when a toolbar handled
+    it (False: unknown tab / no toolbar / bad payload)."""
+    if not info or not isinstance(info, str) or '|' not in info:
+        return False
+    try:
+        tab_id_str, action = info.split('|', 1)
+    except ValueError:
+        return False
+    tb = _TOOLBARS.get(tab_id_str)
+    if tb is None:
+        return False
+    tb.on_menu_action(action)
+    return True
+
+
 def _menu_click(*args, **kwargs):
-    """Menu-item callback: info is '<tab_id_str>|<ignore key or *>'. The
-    flexible signature absorbs every way CudaText hands the info value
-    to module functions (positional / keyword / mixed)."""
+    """'func=' callback twin of menu_action: info must be QUOTED in the
+    command string ('info="501|ignore_case";') so the engine passes it
+    as a string -- an unquoted value would arrive as None here (that
+    was the silent no-op of the first toolbar version)."""
     info = kwargs.get('info', '')
     if not info:
         for a in args:
@@ -909,11 +956,11 @@ def _menu_click(*args, **kwargs):
                 info = a
                 break
     if not info:
+        import cudatext as _ct
+        try:
+            _ct.msg_log_console(
+                'Differ toolbar: menu callback got empty info')
+        except Exception:
+            pass
         return
-    try:
-        tab_id_str, action = info.split('|', 1)
-    except ValueError:
-        return
-    tb = _TOOLBARS.get(tab_id_str)
-    if tb is not None:
-        tb.on_menu_action(action)
+    menu_action(info)

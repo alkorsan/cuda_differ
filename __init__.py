@@ -1210,38 +1210,15 @@ def _migrate_old_option_names():
         msg('failed to migrate old option names: {}'.format(ex), level=1)
 
 
-def _migrate_color_theme_choice():
-    """One-time migration for the color_theme option.
-
-    Older versions had no color_theme: the six differ.theme.*_color
-    options ALWAYS overrode the theme-derived defaults. The new default
-    'auto' ignores them (preset colors win), so a user who configured
-    custom compare colors would silently lose them after the update.
-    Detect that case -- any *_color option set to a non-empty value
-    while color_theme is not yet chosen -- and switch that user to
-    'custom' mode, which restores the old colors-take-precedence
-    behavior (empty slots still fill from the detected preset).
-    """
-    if not os.path.exists(JSONPATH):
-        return
-    try:
-        with open(JSONPATH, 'r', encoding='utf8') as f:
-            body = f.read()
-    except OSError:
-        return
-    if re.search(r'(?m)^\s*"differ\.theme\.color_theme"\s*:', body):
-        return  # already chose a mode -- leave the choice alone
-    cre_color = re.compile(
-        r'(?m)^\s*"differ\.theme\.(?:changed|added|deleted|gap|ignored|ignored_gap)_color"'
-        r'\s*:\s*"([^"]*)"')
-    if not any(val for val in cre_color.findall(body)):
-        return  # no configured colors -- the 'auto' default is right
-    set_opt('theme.color_theme', 'custom')
-    msg('color theme set to "custom" to keep your configured compare colors')
+# NOTE: there is deliberately NO color_theme migration. The theme mode
+# ('differ.theme.color_theme') defaults to 'auto' and is only ever
+# changed by the user in the config dialog -- the plugin never writes
+# it, not even when custom 'differ.theme.*_color' values exist in the
+# settings (an earlier version auto-switched such configs to 'custom',
+# which changed a user-visible setting without their consent).
 
 
 _migrate_old_option_names()
-_migrate_color_theme_choice()
 
 
 class _CompareJob:
@@ -1486,12 +1463,24 @@ class Command:
         return data
 
     def _save_state(self, state):
-        """Save the state to disk."""
+        """Save the state to disk. ATOMIC write: the JSON is fully
+        written to a temp file first and then moved over the real one
+        (os.replace is atomic on every platform), so an interrupted
+        write -- crash, power loss, exit racing a save -- can never
+        leave a truncated/empty state file behind (which would make
+        the next startup forget every compare tab)."""
+        tmp = STATE_FILE + '.tmp'
         try:
-            with open(STATE_FILE, 'w', encoding='utf8') as f:
+            with open(tmp, 'w', encoding='utf8') as f:
                 json.dump(state, f, indent=2)
+            os.replace(tmp, STATE_FILE)
         except OSError as ex:
             msg('failed to save state file: {}'.format(ex), level=2)
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except OSError:
+                pass
 
     def _new_session(self, tab_id, state_key=''):
         """Create and register the standalone session for a compare tab
@@ -2344,12 +2333,20 @@ class Command:
         the CudaText session restored, so the toolbars are back at
         startup exactly as they were before the restart. Tabs closed
         again in the meantime resolve to no editor and are skipped;
-        ensure_for_session itself checks the show_toolbar option."""
-        for session in list(self._sessions.values()):
-            if difftb.get_for(session) is None:
-                ed = self._editor_by_tab_id(session.tab_id)
-                if ed is not None:
-                    difftb.ensure_for_session(self, session, ed)
+        ensure_for_session itself checks the show_toolbar option.
+
+        Fully guarded: a failure here (whatever the GUI state at that
+        moment) must never be able to disturb the restored sessions --
+        the toolbars also come back via the lazy self-healing check
+        (_lazy_restore_check) on the first caret move / right-click."""
+        try:
+            for session in list(self._sessions.values()):
+                if difftb.get_for(session) is None:
+                    ed = self._editor_by_tab_id(session.tab_id)
+                    if ed is not None:
+                        difftb.ensure_for_session(self, session, ed)
+        except Exception:
+            pass
 
     def _toolbar_refresh_timer(self, tag='', info=''):
         """100ms one-shot timer for toolbar-initiated refreshes: info
@@ -2364,8 +2361,26 @@ class Command:
         if ed is not None:
             self.refresh_compare(ed, show_dialog=False)
 
+    def toolbar_menu_ignore(self, info=''):
+        """Ignore-dropdown click from a compare tab's toolbar: info is
+        '<PROP_TAB_ID>|<ignore key or *>' (raw string, same 'cmd='
+        callback convention as tabmenu_ignore). Routed to the toolbar
+        that built the menu item; it persists the option, updates the
+        checkmark/caption/tooltip and re-compares on the 100ms timer.
+        Unknown tab (closed since the menu was built) is a no-op."""
+        if not info:
+            return
+        try:
+            difftb.menu_action(str(info))
+        except Exception:
+            pass
+
     def on_caret(self, ed_self):
-        """Mirror caret to opposite editor when sync_caret is enabled."""
+        """Mirror caret to opposite editor when sync_caret is enabled.
+        Also runs the cheap self-healing restore check (one stat call:
+        only a CHANGED state file with unrestored compare tabs does
+        any work -- see _lazy_restore_check)."""
+        self._lazy_restore_check(ed_self)
         if self.cfg.get('enable_sync_caret', False):
             self.sync_caret()
 
@@ -2692,11 +2707,16 @@ class Command:
         state = self._load_state()
 
         # --- Cleanup dead records ---
-        # Get all open tab IDs so we can check which compare tabs still exist.
+        # Get all open tab IDs so we can check which compare tabs still
+        # exist. Each probe is guarded: a dead or panel editor handle
+        # must never abort the restore before it even started.
         open_tab_ids = set()
         for h in ct.ed_handles():
-            e = ct.Editor(h)
-            open_tab_ids.add(str(e.get_prop(ct.PROP_TAB_ID)))
+            try:
+                e = ct.Editor(h)
+                open_tab_ids.add(str(e.get_prop(ct.PROP_TAB_ID)))
+            except Exception:
+                pass
 
         # Check the current session's compare tabs. If a compare tab ID is
         # not in open_tab_ids, it's a dead record (CudaText didn't restore it
@@ -2712,48 +2732,149 @@ class Command:
             self._save_state(state)
 
         # --- Rebuild the sessions for the surviving compare tabs ---
+        # Every step is guarded individually: one bad editor handle or
+        # one bad state entry must never abort the whole restore loop
+        # (a mid-loop abort would leave the restored diff tabs as
+        # 'normal' tabs with no commands and no toolbars).
         self.scroll.tab_id = set()
         self._sessions = {}
         for tab_id_str, entry in session.items():
             if not isinstance(entry, dict):
                 continue
             try:
-                tab_id_int = int(tab_id_str)
-            except (ValueError, TypeError):
-                tab_id_int = tab_id_str
-            self.scroll.tab_id.add(tab_id_int)
-            # A restored tab gets a full standalone session, but its
-            # Differ stays None until the first compare needs it (no
-            # 'Using ... Algo' status spam at startup; a restored tab's
-            # diff markers are not re-painted on purpose -- see the
-            # commented-out refresh above).
-            tab_session = _TabSession(tab_id_int, self._current_session_key)
-            # Populate the saved/dirty caches from disk. Entries
-            # written by older plugin versions have no 'dirty' key --
-            # _entry_dirty maps the legacy 'saved' flag instead (unsaved
-            # -> both halves dirty, so the first Ctrl+S after upgrade
-            # syncs both sides, exactly like the old always-sync-both
-            # behavior).
-            tab_session.dirty = self._entry_dirty(entry)
-            tab_session.saved = not tab_session.dirty
-            self._sessions[tab_id_str] = tab_session
-
-            # Re-apply the title color: green only when no half is dirty.
-            if tab_session.saved:
-                self._apply_color_to_tab(tab_id_str, 0x00A000)  # green
+                self._restore_one_session_entry(tab_id_str, entry,
+                                                self._current_session_key)
+            except Exception:
+                msg('failed to restore compare tab {} (skipped)'
+                    .format(tab_id_str), level=1)
 
         # Restore the compare TOOLBARS of the session-restored compare
         # tabs (the toolbar is docked into the editor parent, which is
         # destroyed with the tab on exit). on_start2 fires just before
         # the main form shows, and docking needs the fully-laid-out
         # editor parents -- so the creation runs on a one-shot 300ms
-        # timer instead of here.
-        if self.cfg.get('show_toolbar', True) and self._sessions:
-            callback = 'module=cuda_differ;cmd=_toolbar_restore_timer;info=_;'
-            ct.timer_proc(ct.TIMER_START_ONE, callback, 300)
+        # timer instead of here. The lazy self-healing check below is
+        # the safety net for the case this timer ever gets lost.
+        try:
+            if self.cfg.get('show_toolbar', True) and self._sessions:
+                callback = 'module=cuda_differ;cmd=_toolbar_restore_timer;info=_;'
+                ct.timer_proc(ct.TIMER_START_ONE, callback, 300)
+        except Exception:
+            pass
+        # Seed the lazy check's mtime cache so the first on_caret does
+        # not re-read what was just processed here.
+        try:
+            self._state_file_mtime = os.path.getmtime(STATE_FILE)
+        except OSError:
+            self._state_file_mtime = None
         # Re-subscribe to on_scroll event if sync_scroll is enabled.
         if self.cfg.get('sync_scroll') and self.scroll.tab_id:
             ct.app_proc(ct.PROC_EVENTS_SUB, self.scroll.name+';on_scroll;;')
+
+    def _restore_one_session_entry(self, tab_id_str, entry, state_key):
+        """Rebuild ONE compare tab's session from a persisted state
+        entry (shared by on_start2 and the lazy self-healing check).
+        'state_key' is the entry's OWN persisted session group -- the
+        group it was found under, so later unregistration and dirty
+        writes always hit the right group."""
+        try:
+            tab_id_int = int(tab_id_str)
+        except (ValueError, TypeError):
+            tab_id_int = tab_id_str
+        self.scroll.tab_id.add(tab_id_int)
+        # A restored tab gets a full standalone session, but its
+        # Differ stays None until the first compare needs it (no
+        # 'Using ... Algo' status spam at startup; a restored tab's
+        # diff markers are not re-painted on purpose -- see the
+        # commented-out refresh above).
+        tab_session = _TabSession(tab_id_int, state_key)
+        # Populate the saved/dirty caches from disk. Entries
+        # written by older plugin versions have no 'dirty' key --
+        # _entry_dirty maps the legacy 'saved' flag instead (unsaved
+        # -> both halves dirty, so the first Ctrl+S after upgrade
+        # syncs both sides, exactly like the old always-sync-both
+        # behavior).
+        tab_session.dirty = self._entry_dirty(entry)
+        tab_session.saved = not tab_session.dirty
+        self._sessions[tab_id_str] = tab_session
+
+        # Re-apply the title color: green only when no half is dirty.
+        if tab_session.saved:
+            self._apply_color_to_tab(tab_id_str, 0x00A000)  # green
+
+        # Bring the toolbar back right away too (set_files creates it
+        # for fresh compares; here it catches the tabs adopted by the
+        # lazy check, for which no 300ms timer is pending).
+        try:
+            if self.cfg.get('show_toolbar', True):
+                ed = self._editor_by_tab_id(tab_session.tab_id)
+                if ed is not None:
+                    difftb.ensure_for_session(self, tab_session, ed)
+        except Exception:
+            pass
+
+    def _lazy_restore_check(self, ed_self=None):
+        """Self-healing twin of on_start2's restore, run from on_caret /
+        on_tab_menu.
+
+        If a compare tab the CudaText session restored is MISSING from
+        _sessions -- on_start2 interrupted, its event never delivered,
+        the state file not yet written at that moment, whatever -- the
+        tab is a 'normal' tab: no commands act on it and it has no
+        toolbar. This check rebuilds exactly those sessions (and their
+        toolbars) from the persisted state, so the plugin converges to
+        the correct state no matter which one-time startup event was
+        missed.
+
+        ALL persisted session groups are scanned (not just the current
+        one): an entry for a tab that is open right now but missing
+        from _sessions is a missed restore by definition, whatever
+        session file it was created under -- and each rebuilt session
+        remembers its OWN group key, so closing it later still
+        unregisters from the right place.
+
+        Cheap on the hot paths: a single os.path.getmtime, and the full
+        read+rebuild runs only when the state file changed since the
+        last look AND it has entries for currently-open tabs that are
+        not yet in _sessions. Closing a diff tab updates the state
+        file, but its entry is gone then, so a closed tab is never
+        resurrected."""
+        try:
+            if not os.path.exists(STATE_FILE):
+                return
+            mtime = os.path.getmtime(STATE_FILE)
+            if mtime == getattr(self, '_state_file_mtime', None):
+                return  # nothing changed since the last look
+            self._state_file_mtime = mtime
+
+            state = self._load_state()
+            if not state['sessions']:
+                return
+            open_ids = set()
+            for h in ct.ed_handles():
+                try:
+                    open_ids.add(str(ct.Editor(h).get_prop(ct.PROP_TAB_ID)))
+                except Exception:
+                    pass  # dead/panel editor handle -- skip it
+            if not open_ids:
+                return
+            for state_key, group in list(state['sessions'].items()):
+                if not isinstance(group, dict):
+                    continue
+                for tab_id_str in list(group.keys()):
+                    if tab_id_str in self._sessions:
+                        continue
+                    if tab_id_str not in open_ids:
+                        continue  # not restored by CudaText -- dead entry
+                    # Found one: rebuild it exactly like on_start2 does
+                    # (with its OWN session group key).
+                    msg('restoring compare tab {} (missed at startup)'
+                        .format(tab_id_str), level=0)
+                    self._restore_one_session_entry(tab_id_str,
+                                                    group[tab_id_str],
+                                                    state_key)
+        except Exception:
+            pass
 
     def _apply_color_to_tab(self, tab_id_str, color):
         """Apply a title font color to a compare tab by its PROP_TAB_ID.
@@ -2791,7 +2912,11 @@ class Command:
     '''
 
     def on_tab_menu(self, ed_self):
-        """Build the right-click tab context menu (Compare with..., Recompare, etc.)."""
+        """Build the right-click tab context menu (Compare with..., Recompare, etc.).
+        The self-healing restore check runs first, so a compare tab the
+        startup restore missed becomes a diff tab again BEFORE the menu
+        is built -- its 'Recompare' / ignore / cancel items work."""
+        self._lazy_restore_check(ed_self)
         self.tabmenu_init(ed_self)
 
     def _lock_compare_editors(self, job):
@@ -2963,10 +3088,16 @@ class Command:
         job.cprofile = None
         # Toolbar: leave the 'comparing' state with 'Cancelled' on the
         # status label (no-op when the tab -- and with it the toolbar --
-        # is already gone; on_close destroys it).
+        # is already gone; on_close destroys it). Guarded: _cancel_job
+        # runs from on_close/on_exit_pre, where an exception must never
+        # skip the state re-registration that keeps the tab a diff tab
+        # across restarts.
         if job.session is not None:
-            difftb.on_compare_end(self, job.session, n_diffs=None,
-                                  cancelled=True)
+            try:
+                difftb.on_compare_end(self, job.session, n_diffs=None,
+                                      cancelled=True)
+            except Exception:
+                pass
 
     def cancel_compare(self, ed=None):
         """Command: cancel the in-flight background compare for the
@@ -6564,8 +6695,15 @@ class Command:
 
         # Destroy the compare toolbar docked to this tab's editor
         # parent (the parent goes away with the tab, but the toolbar
-        # form must be undocked/freed explicitly).
-        difftb.destroy_for(session.tab_id_str)
+        # form must be undocked/freed explicitly). Guarded AND placed
+        # before the job teardown: during app exit the state
+        # re-registration at the end of on_close is the ONE thing that
+        # keeps this tab a diff tab after the restart, so nothing in
+        # the teardown above it may ever raise past this point.
+        try:
+            difftb.destroy_for(session.tab_id_str)
+        except Exception:
+            pass
 
         # Drop any in-flight background compare for this tab and CANCEL
         # the engine compare: closing the tab means the result will

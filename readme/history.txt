@@ -1,4 +1,54 @@
 2026.09.26 (by @badrelmers)
+- fix (toolbar): clicking an ignore option did nothing -- the menu
+  items used the 'func=' string-callback form whose 'info' value
+  CudaText PARSES ('ValueFromString'): an unquoted non-numeric value
+  like '<tab id>|<ignore key>' arrived as None, so the handler exited
+  silently. Items now use the 'module=cuda_differ;cmd=toolbar_menu_
+  ignore;info=<tab id>|<key>;' form (Command method, raw info -- the
+  same convention the tab context menu uses); the module twin
+  _menu_click was kept for compatibility and now requires quoted info.
+- fix (toolbar): button texts/icons were cut off -- button widths were
+  measured on a scratch canvas whose font did not match the themed
+  buttons. All width computation is gone: buttons are AUTO-SIZED now
+  (control prop 'autosize', TATButton measures the caption with the
+  real UI-theme font, DPI-scaled) with a w_min constraint so icon-only
+  buttons stay clickable; captions are followed by an 'autosize' re-set
+  which re-runs the width pass. Positions are pure anchors: every
+  control's a_l chains to the previous control's ']' (sp_l gap),
+  tops/bottoms anchor to the form (a_t/a_b), the status label is
+  auto-sized and anchored a_r to the form's right edge, vertically
+  centered -- so the whole row re-flows by itself on caption swaps
+  (Recompare <-> Cancel, Ignore counter, show_btn_text) and on form
+  resize. Separators: _SEP_W 6 -> 2 (user request) and the kind fixed
+  to BTNKIND_SEP_HORZ (the vertical-line kind for horizontal rows --
+  BTNKIND_SEP_VERT draws a horizontal line and painted nothing usable
+  in a 2px-wide button).
+- fix (session restore): diff tabs could come back after a restart as
+  plain tabs (no commands, no toolbar) when anything disturbed the
+  one-shot startup restore. Hardening, belt and braces:
+  * on_start2: every editor probe and every state entry is restored
+    individually guarded -- one bad handle/entry can no longer abort
+    the whole loop (a mid-loop abort left ALL restored tabs normal).
+  * _save_state is now an ATOMIC write (temp file + os.replace): an
+    interrupted save can never truncate the state file, which would
+    have made the next startup forget every compare tab.
+  * on_close: the toolbar teardown is guarded and can never raise past
+    the exit-time state re-registration (the ONE thing that keeps a
+    tab a diff tab across restarts); _cancel_job's toolbar update got
+    the same guard.
+  * NEW self-healing restore (_lazy_restore_check, mtime-cached, runs
+    on on_caret / on_tab_menu): any persisted state entry for a tab
+    that is open right now but missing from _sessions is rebuilt --
+    with its toolbar -- whatever startup event was missed. The 300ms
+    restore timer is guarded too.
+- fix (config): the plugin no longer auto-writes
+  differ.theme.color_theme="custom" when custom
+  differ.theme.*_color values are found in the settings. The mode
+  stays at its 'auto' default and is only ever changed by the user in
+  the config dialog (the one-time migration is removed; delete the
+  auto-added "custom" line once or pick Auto-detect in the dialog).
+
+2026.09.26 (by @badrelmers)
 - feature (toolbar): NEW toolbar.py -- every compare tab gets a toolbar docked to the TOP of its editor parent (ed.prop(PROP_HANDLE_PARENT), DLG_DOCK prop='T' -- the same docking the overview panel uses for 'R'): [↻ Recompare or × Cancel][↔ Resize] | [↑ Prev][↓ Next] | [← Copy][→ Copy] | [≡ Ignore 2/5 ▾] [⚙ Config] plus a right-anchored status label. The toolbar is a borderless dlg_proc form whose background is the live theme's EdTextBg (PROC_THEME_UI_DICT_GET; re-read on APPSTATE_THEME_UI), the buttons are flat application-themed button_ex controls (BTN_SET_FLAT, BTNKIND_TEXT_ONLY; separators are BTNKIND_SEP_VERT), and every button has a tooltip (hotkey hints included). Recompare swaps to × Cancel while a compare runs (kick-off -> _finish_native_compare / the inline finally / _cancel_job / the engine-refused path all reset it), the navigation buttons disable themselves while a compare runs or the last compare found no differences, and the status label carries the live state ("Comparing...", "N differences" / "No differences", "Cancelled") -- the feedback slot the old status-bar timer spam used to occupy. The Ignore dropdown is a menu_proc MENU_CREATE popup shown under its button (MENU_SHOW at the button's screen coords via DLG_COORD_LOCAL_TO_SCREEN): the five differ.ignoreopt.* options as CHECKABLE items -- multiple can be checked -- plus a separator and "Uncheck all options" at the end; the caption counter "2/5" shows how many are enabled (omitted at 0), toggles persist to settings/cuda_differ.json and re-compare the tab on a 100ms one-shot timer (Command._toolbar_refresh_timer, the menu-close-first convention), and the menu is REBUILT on every compare start so it always mirrors the config dialog and the tab context menu (which also live-update the caption via difftb.sync_ignore_state). Python-algorithm guard: while a pure-Python algorithm is the effective one, the items disable themselves and an explanatory disabled item heads the menu -- the toolbar twin of the tab menu hiding its ignore items. Callbacks use the leak-free forms: live callables for the dlg on_change events (cleaned on DLG_FREE) and STRING callbacks for the popup items ('module=cuda_differ.toolbar;func=_menu_click;info=<tabid>|<key>;'). Button widths are measured from the real canvas text size (DPI-correct), with a char-width fallback for sandboxes. Two new options (chapter 'toolbar'): differ.toolbar.show_toolbar (default on; config-dialog OK -> difftb.sync_all creates/destroys all toolbars) and differ.toolbar.show_btn_text (default on; icon-only mode when off, the Ignore counter stays). Toolbars are created by set_files before the texts load, self-healed by refresh_compare, destroyed by on_close, and RESTORED at startup: on_start2 arms a 300ms one-shot timer (Command._toolbar_restore_timer) that creates the toolbar of every session-restored compare tab.
 - change (status bar): the compare progress no longer spams the status bar with a running timer. The pump checkpoints' status printing is GONE (_pump_checkpoint lost its 'status' parameter; the 9 call sites -- the dispatch loop, the 4 bookmark-flush loops, the collect-progress hook, the 3 marker-array checkpoints -- no longer format 'applying diff colors... X.Xs' / 'comparing in background... X.Xs'; the UI_STATUS_INTERVAL throttle constant and _PumpState.t_status are dead and removed). What remains on the status bar: 'Differ: comparing in background...' at kick-off, ONE 'Differ: applying diff colors...' when the paint phase starts (new, one-shot, at the top of _paint_compare_events), and the single 'Differ: compared in Xms/s' epilogue when the compare completes -- no incremented timer anywhere. The live progress feedback moved into the toolbar's status label, which updates only on state changes (kick-off / finish / cancel), never on a timer.
 - plugin: cancel_compare() accepts an optional editor argument (defaults to the focused editor) so the toolbar's Cancel button can cancel ITS tab's compare; set_files creates the toolbar; change_config / on_state(APPSTATE_THEME_UI) / tabmenu_ignore / on_close / on_start2 are toolbar-aware; readme gained a "Toolbar" chapter + the two toolbar options in the Options chapter; IGNORE_OPTS now lives in toolbar.py (one source of truth shared by the toolbar, the tab menu and get_config's ignore reads).

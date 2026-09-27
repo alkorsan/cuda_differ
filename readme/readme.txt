@@ -289,11 +289,17 @@ into the compare view):
   bar progress spam.
 
 Every button has a tooltip (with the hotkey hint where one exists).
+Buttons size themselves to their captions (auto-sized with the real
+UI-theme font, DPI-scaled -- nothing can be cut off) and are chained
+with anchors, so the row re-flows by itself whenever a caption changes.
 The captions' texts can be turned off (icons only) with the option
 differ.toolbar.show_btn_text; the whole toolbar can be hidden with
 differ.toolbar.show_toolbar. Toolbars are restored at startup for
 compare tabs restored by the CudaText session, and follow UI theme
-switches (the background re-reads EdTextBg).
+switches (the background re-reads EdTextBg). The restore is
+self-healing: even if the startup restore is ever missed, the first
+caret move or tab right-click rebuilds the compare tab's session and
+toolbar from the persisted state.
 
 == Ignore options ==
 
