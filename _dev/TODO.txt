@@ -1,172 +1,92 @@
 
+add a new command to compare cliboard to selection, and add it to the diff tab right click context menu, after resize editors, and add it to inf file too as a command. i got idea from this: Compare (diff) text selections within a file, across files, or to the clipboard https://marketplace.visualstudio.com/items?itemName=ryu1kn.partial-diff
+
+bug: add something to user.json and save, return to diff tab, the toolbar disapear
+or run import cudatext_cmd as cmds; ed.cmd(cmds.cmd_OpsReloadAndApply);
+___
+add new menu: compare mode: 
+- max speed
+- best readibility (slow)
+- separator
+- native histograme 
+- native myers
+- beautify alignment
+
+for this two:
+- max speed
+- best readibility (slow)
+only one can be choosed
+if user click max speed, we enable native myers and disable beautify alignment
+if user click best readibility, we enable native histograme and enable beautify alignment
+
+for this two:
+- native histograme 
+- native myers
+only one can be choosed
+
+for this:
+- beautify alignment
+user can check or uncheck it as he want, it can be used with histograme or myers
+
+we must detect what the config have:
+- if it have enabled native myers and disabled beautify alignment, then we must autocheck max speed
+- if it have enabled native histograme and enabled beautify alignment, then we must autocheck best readibility
+- if other combination is configured then we must not check max speed / best readibility 
+
+
+
+___
+reduce editor line numbres width https://github.com/Alexey-T/CudaText/issues/6491
+
  
-remove the colored squares in left bar, it s not needed and may only slow things more
+remove EDACTION_LOCK from  set_files , it create bug of drift
 
 
+if there is a diff tab then i switch session, the session manager ask to save the diff tab, if i respond no, the diff tab gets deleted from differ json; think in a better fix
 
-if there a diff tab then i switch session, the session manager ask to save the diff tab if i respond no, the diff tab get deleted from differ json; think in a better fix
 
-
+when i switch session while a tab is split, it prompts for saving, it should not because it s automatically saved to session https://github.com/Alexey-T/CudaText/issues/6490
 
 
 remove all events from install inf and subscribe dynamically to the events we need when the plugin is loaded , when we close the last diff tab we must unsubscribe from all events except right click menu
 
-if cuda_differ_history.ini exist copy its content to the new json file and delete this old json
-
-bug: after restart if diff tab is not focused colors are not restored
-test:create a diff, switch to any other tab, restart, go to the diff tab, colors are not visible
-
-in the doc add the options in Available options include section
-
-remove back to separate tabs command
-
-
-  _______________________________
-bug1
-
-compare two files 1.txt 3.txt with differ, keep both unchanged
-run
-file_open([r"", r"D:\\zbala\\2.txt"])
-restart
-you get a strange window saying: The file is empty  !!!!!
-
-bug2
-compare two files 1.txt 3.txt with differ, keep both unchanged
-run
-file_open([r"", r"D:\\zbala\\2.txt"])
-write something in the empty editor at the left
-restart
-it gets colored like if we enabled compare on it !!!!!!!!!!
-and the diff tab is not colored
-
-_____________
-
-
-use this colors for white theme
-//   "differ.changed_color": "#f0bf5e",
-  // "differ.added_color": "#a2ffa2",
-  // "differ.deleted_color": "#ffd7d7",
-  // "differ.gap_color": "#c0c0c0",
-or
-  "differ.changed_color": "#f8dfad",
-  "differ.added_color": "#b3ffb3",
-  "differ.deleted_color": "#ffc4c4",
-  "differ.gap_color": "#e3e3e3",
-_______________________
-
-add right click menu only on diff tab that enables:
-Line details
-Ignore CR/LF
-Ignore Case
-Ignore Whitespace at the begning
-Ignore Whitespace at the end
-Ignore Blank lines
-Ignore Code page
-Ignore Numbers
-
-Swap View
-Refresh/Recompare
-___
-implement this https://marketplace.visualstudio.com/items?itemName=ryu1kn.partial-diff
-___
-
-add micromap and force it show deleted added and changed not only changed
-find why there is an orange line near micromap
-
-add use auto junk option and make default true
-
-
-
-bug :on_state do not fire for differ
-
-  
-___
-add ignore white space and ignore lines like winmerge using this
-class difflib.SequenceMatcher(isjunk=None, a='', b='', autojunk=True)
-Optional argument isjunk must be None (the default) or a one-argument function that takes a sequence element and returns true if and only if the element is “junk” and should be ignored. Passing None for isjunk is equivalent to passing lambda x: False; in other words, no elements are ignored. For example, pass:
-
-lambda x: x in " \t"
-if you’re comparing lines as sequences of characters, and don’t want to synch up on blanks or hard tabs.
-  
-____________
-i opened an issue about this here
-https://github.com/Alexey-T/CudaText/issues/6398#top
-when cudatext starts and there is a diff tab but the tab is not focused, the _refresh_ex code sets gaps incorrectly because ed.get_wrapinfo() returns nothing , EDACTION_UPDATE did not fix the problem
-
-there a changelog in api that says: fix: Editor.action: EDACTION_UPDATE did not work sometimes (cmd_RepaintEditor worked better)
-
-but ed.cmd(cmd_RepaintEditor) did not fix the problem too
-
-the api says:
-Notes:
-  - When you perform some caret-positioning command (e.g. "cCommand_GotoTextEnd") in not yet painted editor-control, it doesn't run OK. Reason: editor must be properly inited which happens on first painting. If you need to place the caret on form showing ("dlg_proc" API), do it in form's "on_show" event. Maybe you need also to start a timer ("timer_proc" API) which will run the caret command.
-
-so maybe this is the problem
-how can i know that the editor was properly inited? i found no event for that
-
-i used timer_proc to fix it and i wait 20s but get_wrapinfo is always empty, 
-
-get_wrapinfo return data after restart only if the tab is focused which is not a solution because of tabs flickering if i force focus the wanted tabs after restarts
-
+if a compare take more than 3min and it s not using 'native myers+disabled beautifier' then show to the user a dialog to ask him if he want to switch to 'native myers+disabled beautifier' temporarly for this compare
  
-______________________
-splitlines(False) change to true and why it have no effect
-
-
-
-
-
-_________________________
-
-add collapsing of unchanged regions, so review of a huge file with three small hunks does not means scrolling through everything 
-
+cleanup doc and changelog
 _______________________
 
-rewrite the pythonpplugin to do like beyound compare:
-Standard alignment (default) — a proprietary divide-and-conquer scheme that aligns "by comparing successively smaller sections of each file. Parts of the alignment can be shown before the entire comparison is finished" alignment — i.e. it is incremental/streaming, chosen so huge files paint progressively.
-https://sparkles-docs.pages.dev/research/diff-review/beyond-compare.html
-
-_____________________________________________
-when a compare is runing use
-a_ed.action(ct.EDACTION_LOCK); b_ed.action(ct.EDACTION_LOCK)
-and only when compare finishes and everything is rendered run
-a_ed.action(ct.EDACTION_UNLOCK); b_ed.action(ct.EDACTION_UNLOCK)
-
-is t good idea? do you have a better idea or a better place to do it?
-
-____
-canceled: make overview height same as default scrollbar, canceled: it s not necesary
-canceled: reduce overview slider min-height to 5px, canceled: i prefer 30px so i can move it always 
+for unifdiff use the choosed algo instead of the python buitin one
 
 
+add Swap View
+___
 
-run all in a thread in pascal and python
 
-make ui paint on viewport only
-
-scroll of very big files like 50mb is very slow 
 
 move block or text or line between editors is broken
 
 split beautifier to blocks/modules
 
-put python algorithm _realign_opcodes inside  beautifier only
+put python algorithm _realign_opcodes inside  beautifier only, i mean realign opcode must run only when beautifier is choosed
 
-vscode algo have a bug with space it does not considere it
+bug:vscode algo have a bug with space it does not considere it
 
-add aligne opcode to native algo too like before
-
-
+add _realign_opcodes to native algo too like it was before, but is it necesary, i still need to study this carefully
 
 __________________________
-
 
 does cudadiffhistogram.pas and cudadiffmyers.pas both split on \r\n and \r and \n or not?
 does cudadiffhistogram.pas and cudadiffmyers.pas implement DIFF_IGN_* flags in a similar way or are they diferent?
 
 
-
 BREAK_CHARS (G6): uses the WinMerge default ",.;:"  what should i add? should i offer setting to user to edit it?
 
-___________________________
-hide default scrollbars, reduce editor line numbres width,hide folding
+
+
+===============================
+canceled: make overview height same as default scrollbar, canceled: it s not necesary
+canceled: reduce overview slider min-height to 5px, canceled: i prefer 30px so i can move it always 
+
+
+
+

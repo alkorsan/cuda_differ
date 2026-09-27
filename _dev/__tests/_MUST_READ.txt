@@ -16,7 +16,7 @@ must not consome more than 30s
 must not consome more than 10s
 
 - test_2 files
-this lines must align exactly like that:
+this lines must align exactly like that (using naive histogram algo or hybrid python algo + beautify):
 273 """Register a compare tab       259 """Register a compare tab     like vscode 
 291 entry = state  now align with   297 entry = session               like vscode
 
