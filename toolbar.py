@@ -71,6 +71,18 @@ Implementation notes:
   which calls ensure_for_session() for every session-restored compare
   tab, so the toolbars come back at startup.
 
+* TEARDOWN: a toolbar is destroyed when its compare tab is REALLY
+  closed (on_close's non-exit branch) and at app exit -- in the
+  plugin's on_exit, AFTER all on_close events fired, never inside
+  on_close's exit branch: at app exit CudaText fires on_close
+  synthetically from its own exit loop and writes the session file
+  only afterwards, so GUI calls there re-enter the message loop
+  between the plugin's state-file writes (unregister / re-register)
+  and used to cost the compare tabs their persisted session entries.
+  destroy() also NEVER calls menu_proc(MENU_REMOVE) -- that frees the
+  popup's ROOT menu item and leaves the (main-form-owned) popup
+  dangling; MENU_CLEAR empties it safely.
+
 Options (settings/cuda_differ.json, chapter 'toolbar' in the config
 dialog):
 * differ.toolbar.show_toolbar (default on) -- create/hide toolbars.
@@ -759,7 +771,18 @@ class CompareToolbar:
 
     def destroy(self):
         """Undock and free the form (+ its live on_change callbacks --
-        DLG_FREE cleans them) and drop the popup menu."""
+        DLG_FREE cleans them) and empty the popup menu.
+
+        The popup menu is NOT disposed with menu_proc(MENU_REMOVE):
+        that Pascal handler frees the menu ITEM it is given -- meant
+        for items ADDED to an existing menu -- and our handle IS the
+        popup's ROOT item. Freeing it would leave the TPopupMenu (owned
+        by CudaText's main form) with a dangling root for the rest of
+        the app's life, crashing/corrupting the exit that eventually
+        frees it. MENU_CLEAR frees all items + their callback data and
+        is the safe way to empty the menu; the emptied popup itself is
+        owned by the main form and dies safely with the app (the same
+        convention CudaText's own plugins use for their popups)."""
         h = self.h_dlg
         self.h_dlg = None
         if h is not None:
@@ -774,7 +797,6 @@ class CompareToolbar:
         if self.h_menu is not None:
             try:
                 ct.menu_proc(self.h_menu, ct.MENU_CLEAR)
-                ct.menu_proc(self.h_menu, ct.MENU_REMOVE)
             except Exception:
                 pass
             self.h_menu = None

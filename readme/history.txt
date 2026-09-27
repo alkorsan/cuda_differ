@@ -1,3 +1,53 @@
+2026.09.27 (by @badrelmers)
+- fix (session restore, ROOT CAUSE): the previous round's hardening was
+  removed -- it did not address the actual bug and made things worse
+  (the state file could come back completely reset after a restart).
+  The real culprit, found by the user: on_close destroyed the compare
+  toolbar with difftb.destroy_for() IN THE SHARED PATH, i.e. also in
+  the APP-EXIT branch. Why that removed the state entry: at app exit
+  CudaText does not really close tabs -- FormClose fires on_close
+  SYNTHETICALLY for every editor from its own loop over the editor
+  frames and writes the session file only afterwards. on_close's exit
+  branch performs two state-file writes around that point: the
+  _unregister write at the top and the re-register write at the end
+  (the ONE thing that keeps the tab a diff tab across restarts).
+  destroy_for() in between calls dlg_proc(DLG_UNDOCK/DLG_FREE) and
+  menu_proc on live GUI objects -- freeing/undocking a docked form and
+  its popup menu re-enters the widgetset message processing NESTED
+  inside the still-running on_close, so editor events get re-delivered
+  into the plugin exactly between those two writes; the interleaved
+  second pass through the teardown finds the entry already
+  unregistered (entry=None) and skips the re-registration. Result: the
+  tab's entry (and, once the startup dead-record cleanup sees the tabs
+  did not come back as diff tabs, ALL entries) gone from
+  cuda_differ_state.json.
+  The fix, by construction:
+  * on_close's app-exit branch now does NO GUI teardown at all -- it
+    returns right after the re-registration + the PROP_MODIFIED
+    restore; the toolbar is destroyed ONLY in the non-exit branch (a
+    REAL tab close, where the entry is meant to be gone and nothing
+    re-registers afterwards).
+  * NEW on_exit handler (added to install.inf's events): destroys all
+    remaining toolbars AFTER every on_close event fired and BEFORE
+    CudaText writes the session file -- CudaText's own convention for
+    plugin UI teardown at exit.
+- fix (toolbar): destroy() no longer disposes the ignore popup menu
+  with menu_proc(MENU_REMOVE). That Pascal handler frees the menu ITEM
+  it is given -- it is meant for items ADDED to an existing menu, but
+  the MENU_CREATE handle IS the popup's ROOT item. Freeing it left the
+  TPopupMenu (owned by CudaText's main form) with a dangling root
+  pointer for the rest of the app's life, crashing/corrupting the exit
+  that eventually frees it. The menu is now only emptied with
+  MENU_CLEAR (which frees the items and their callback data safely);
+  the emptied popup itself dies with the app, the same convention
+  CudaText's own plugins use.
+- removed: the 2nd-round hardening (per user request) -- the
+  _lazy_restore_check self-healing and its on_caret/on_tab_menu hooks,
+  the _restore_one_session_entry refactor, the per-probe guards in
+  on_start2, and the atomic (tmp+os.replace) state write. The restore
+  path is the original simple one again plus the 300ms toolbar-restore
+  timer.
+
 2026.09.26 (by @badrelmers)
 - fix (toolbar): clicking an ignore option did nothing -- the menu
   items used the 'func=' string-callback form whose 'info' value

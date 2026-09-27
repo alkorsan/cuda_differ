@@ -296,10 +296,16 @@ The captions' texts can be turned off (icons only) with the option
 differ.toolbar.show_btn_text; the whole toolbar can be hidden with
 differ.toolbar.show_toolbar. Toolbars are restored at startup for
 compare tabs restored by the CudaText session, and follow UI theme
-switches (the background re-reads EdTextBg). The restore is
-self-healing: even if the startup restore is ever missed, the first
-caret move or tab right-click rebuilds the compare tab's session and
-toolbar from the persisted state.
+switches (the background re-reads EdTextBg).
+
+The toolbar's lifetime follows the tab's: it is destroyed when the
+compare tab is really closed, and at app exit it is destroyed in the
+plugin's on_exit event -- AFTER all on_close events fired, before
+CudaText writes its session file. (It is deliberately NOT destroyed
+inside on_close's app-exit branch: that event fires synthetically
+from CudaText's own exit loop, and GUI calls there re-enter the
+message processing between the plugin's state-file writes, which
+could cost the compare tabs their persisted session entries.)
 
 == Ignore options ==
 
