@@ -294,8 +294,8 @@ UI-theme font, DPI-scaled -- nothing can be cut off horizontally) and
 are chained with anchors, so the row re-flows by itself whenever a
 caption changes. The bar ends in a thin full-width border line that
 separates it from the editor below: exactly 1 device pixel at any
-DPI (a height-1 statusbar strip, not DPI-scaled), colored with the
-theme's EdBlockSepLine. The toolbar's height = the OS GUI
+DPI (a height-1 panel strip filled with the theme's EdBlockSepLine
+color; dlg_proc never scales control sizes). The toolbar's height = the OS GUI
 button height plus a little extra room for the captions' descenders (on
 some systems the OS font is taller than the OS 'button' metrics and
 letters like the 'g' of "Config" would be clipped) plus the 1px border

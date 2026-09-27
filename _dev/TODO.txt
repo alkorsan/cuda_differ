@@ -1,8 +1,7 @@
 
 add a new command to compare cliboard to selection, and add it to the diff tab right click context menu, after resize editors, and add it to inf file too as a command. i got idea from this: Compare (diff) text selections within a file, across files, or to the clipboard https://marketplace.visualstudio.com/items?itemName=ryu1kn.partial-diff
 
-bug: add something to user.json and save, return to diff tab, the toolbar disapear
-or run import cudatext_cmd as cmds; ed.cmd(cmds.cmd_OpsReloadAndApply);
+
 ___
 add new menu: compare mode: 
 - max speed

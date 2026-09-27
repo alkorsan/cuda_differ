@@ -1,3 +1,10 @@
+2026.09.28 (by @badrelmers)
+- change (toolbar): the 1px bottom border is now a height-1 'panel'
+  filled with the theme's EdBlockSepLine (dlg_proc never scales
+  control sizes) -- simpler and lighter than the statusbar strip:
+  no control handle, no statusbar_proc call, the color is set
+  directly in the creation prop dict.
+
 2026.09.27 (by @badrelmers)
 - fix (toolbar): the bottom border was a separator button whose line
   TATButton draws DPI-scaled (2+ device px at 125-150% scaling). It is

@@ -44,13 +44,14 @@ Implementation notes:
   bottom border strip (see below).
 
 * BOTTOM BORDER: the toolbar ends in a full-width 1-device-px line
-  separating it from the editor below: a dlg_proc 'statusbar'
-  (TATStatus) control of height 1. TATStatus paints the bottom
-  border with pen width 1 and NO DPI scaling (a separator button's
-  line is DPI-scaled, i.e. 2px at 150%), and its color is fed once
-  at creation from the theme's EdBlockSepLine. All buttons' a_b
-  anchors reference this strip's top ('brd', '[') instead of the
-  form's bottom, so the row sits fully above the line.
+  separating it from the editor below: a dlg_proc 'panel' control
+  of height 1 filled with the theme's EdBlockSepLine color (a plain
+  TPanel paints a flat solid fill -- the strip IS the line). dlg_proc
+  never scales control sizes (scaling is only the explicit DLG_SCALE
+  action, which this form never calls), so the strip is exactly one
+  device pixel at any DPI. All buttons' a_b anchors reference this
+  strip's top ('brd', '[') instead of the form's bottom, so the row
+  sits fully above the line.
 
 * POSITIONING: anchors, not coordinates. Every button's LEFT side is
   anchored (a_l) to the RIGHT side (']') of the previous control with
@@ -376,36 +377,29 @@ class CompareToolbar:
 
     def _add_bottom_border(self):
         """Full-width horizontal line glued to the form's bottom edge:
-        a dlg_proc 'statusbar' (TATStatus) control of height 1 --
-        TATStatus paints its bottom border with pen width 1 and no
-        DPI scaling, i.e. exactly ONE device pixel at any DPI.
-        Created FIRST: the buttons' a_b anchors reference it by name
-        ('brd')."""
-        n = ct.dlg_proc(self.h_dlg, ct.DLG_CTL_ADD, 'statusbar')
+        a 'panel' control of height 1 filled with the theme's
+        EdBlockSepLine. dlg_proc never scales control sizes (only the
+        explicit DLG_SCALE action scales, and this form never calls
+        it), so h=1 is exactly one device pixel at any DPI -- the
+        whole strip is the line. Created FIRST: the buttons' a_b
+        anchors reference it by name ('brd')."""
+        try:
+            c = int(ct.app_proc(ct.PROC_THEME_UI_DICT_GET, '')
+                    .get('EdBlockSepLine', {}).get('color', 0x808080))
+        except Exception:
+            c = 0x808080
+        n = ct.dlg_proc(self.h_dlg, ct.DLG_CTL_ADD, 'panel')
         self.ctl['brd'] = n
         ct.dlg_proc(self.h_dlg, ct.DLG_CTL_PROP_SET, index=n, prop={
             'name': 'brd',
-            'h': _BORDER_H,      # 1 device px at ANY DPI (never scaled)
+            'cap': '',
+            'h': _BORDER_H,      # 1 device px at ANY DPI
+            'color': c,          # the line: EdBlockSepLine, fallback clMedGray
             'a_l': ('', '['),
             'a_r': ('', ']'),
             'a_t': None,
             'a_b': ('', ']'),
-            'sp_l': 0,
-            'sp_r': 0,
-            'sp_b': 0,
-            'tab_stop': False,
         })
-        # feed the line's color: the theme's EdBlockSepLine (fallback
-        # clMedGray); a build without the statusbar API just skips it
-        try:
-            hb = ct.dlg_proc(self.h_dlg, ct.DLG_CTL_HANDLE, index=n)
-            ct.statusbar_proc(hb, ct.STATUSBAR_SET_COLOR_BORDER_BOTTOM,
-                              value=int(ct.app_proc(
-                                  ct.PROC_THEME_UI_DICT_GET, '')
-                                  .get('EdBlockSepLine', {})
-                                  .get('color', 0x808080)))
-        except Exception:
-            pass
 
     def _anchor_left(self, prev):
         """a_l value chaining this control to the RIGHT side of the
