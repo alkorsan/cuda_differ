@@ -43,18 +43,14 @@ Implementation notes:
   GUI button height + _TEXT_SLACK extra px (DPI-scaled) + the 1-device-px
   bottom border strip (see below).
 
-* BOTTOM BORDER: the toolbar ends in a full-width horizontal line
-  that separates it from the editor below: a dlg_proc 'statusbar'
-  (TATStatus) control of height 1. TATStatus paints its bottom
-  border (ColorBorderBottom) as MoveTo(0,Height-1)/LineTo(Width,
-  Height-1) with pen width 1 and NO DPI scaling -- exactly ONE
-  DEVICE PIXEL at any DPI, the very same primitive that draws the
-  1px bottom border of cuda_folding_caption's bar. The color is
-  fed from the UI theme (EdBlockSepLine, see _sep_line_color), the
-  same theme key the folding-caption bar uses, and re-applied on
-  theme switches (apply_theme). All buttons' a_b anchors reference
-  this strip's top ('brd', '[') instead of the form's bottom, so
-  the row sits fully above the line.
+* BOTTOM BORDER: the toolbar ends in a full-width 1-device-px line
+  separating it from the editor below: a dlg_proc 'statusbar'
+  (TATStatus) control of height 1. TATStatus paints the bottom
+  border with pen width 1 and NO DPI scaling (a separator button's
+  line is DPI-scaled, i.e. 2px at 150%), and its color is fed once
+  at creation from the theme's EdBlockSepLine. All buttons' a_b
+  anchors reference this strip's top ('brd', '[') instead of the
+  form's bottom, so the row sits fully above the line.
 
 * POSITIONING: anchors, not coordinates. Every button's LEFT side is
   anchored (a_l) to the RIGHT side (']') of the previous control with
@@ -164,23 +160,6 @@ def _ed_text_font():
         return None
 
 
-def _sep_line_color():
-    """Color of the toolbar's 1px bottom border: the theme's
-    EdBlockSepLine (the editor's fold-block separator line) -- the
-    same theme key cuda_folding_caption's bar uses for its own
-    bottom border, so the two lines look identical when both
-    plugins are active. Fallback 0x808080 = clMedGray, the theme
-    engine's own default for that key."""
-    try:
-        ui = ct.app_proc(ct.PROC_THEME_UI_DICT_GET, '')
-        c = ui.get('EdBlockSepLine', {}).get('color')
-        if c is not None:
-            return int(c)
-    except Exception:
-        pass
-    return 0x808080
-
-
 # The five ignore options, exposed as checkable items of the toolbar's
 # Ignore dropdown, of the diff-tab context menu and of the config
 # dialog ('differ.ignoreopt.*'). Defined HERE so the toolbar and
@@ -268,10 +247,8 @@ def _scaled(px):
     return max(1, int(px) * _dpi_percent() // 100)
 
 
-# Height of the bottom-border strip, in DEVICE px. Never scaled by
-# _scaled(): TATStatus draws the border line itself as one device
-# pixel (pen 1, no DPI scaling) inside the strip's single row -- the
-# strip is exactly as tall as the line it shows.
+# Height of the bottom-border strip, DEVICE px -- never scaled: the
+# line itself is 1 device px at any DPI (see _add_bottom_border).
 _BORDER_H = 1
 # Extra logical px on top of the OS GUI button height: TATButton centers
 # the caption and clips its descenders when the font's TextExtent is taller
@@ -324,7 +301,6 @@ class CompareToolbar:
         self.a_ed = a_ed
         self.h_dlg = None
         self.h_menu = None
-        self.h_brd = None      # statusbar handle of the border strip
         self.ctl = {}          # name -> control index
         self.hbtn = {}         # name -> button_ex handle (button_proc)
         self.menu_items = {}   # ignore key -> popup menu item id
@@ -400,17 +376,11 @@ class CompareToolbar:
 
     def _add_bottom_border(self):
         """Full-width horizontal line glued to the form's bottom edge:
-        a dlg_proc 'statusbar' (TATStatus) control of height 1.
-        TATStatus paints its bottom border as MoveTo(0, Height-1) /
-        LineTo(Width, Height-1), pen width 1, with NO DPI scaling --
-        ONE DEVICE PIXEL at any DPI (the user's 1px requirement is
-        inherent to the control, exactly like the folding-caption
-        bar's border). The color comes from the UI theme's
-        EdBlockSepLine (see _sep_line_color) and is re-applied on
-        theme switches (apply_theme). No caption, no on_change: an
-        empty statusbar never fires. Buttons' a_b anchors reference
-        this control by name ('brd'), so it must be created FIRST
-        (dlg_proc resolves anchor targets at prop-set time)."""
+        a dlg_proc 'statusbar' (TATStatus) control of height 1 --
+        TATStatus paints its bottom border with pen width 1 and no
+        DPI scaling, i.e. exactly ONE device pixel at any DPI.
+        Created FIRST: the buttons' a_b anchors reference it by name
+        ('brd')."""
         n = ct.dlg_proc(self.h_dlg, ct.DLG_CTL_ADD, 'statusbar')
         self.ctl['brd'] = n
         ct.dlg_proc(self.h_dlg, ct.DLG_CTL_PROP_SET, index=n, prop={
@@ -425,23 +395,17 @@ class CompareToolbar:
             'sp_b': 0,
             'tab_stop': False,
         })
+        # feed the line's color: the theme's EdBlockSepLine (fallback
+        # clMedGray); a build without the statusbar API just skips it
         try:
-            self.h_brd = ct.dlg_proc(self.h_dlg, ct.DLG_CTL_HANDLE, index=n)
-            self._set_border_color()
+            hb = ct.dlg_proc(self.h_dlg, ct.DLG_CTL_HANDLE, index=n)
+            ct.statusbar_proc(hb, ct.STATUSBAR_SET_COLOR_BORDER_BOTTOM,
+                              value=int(ct.app_proc(
+                                  ct.PROC_THEME_UI_DICT_GET, '')
+                                  .get('EdBlockSepLine', {})
+                                  .get('color', 0x808080)))
         except Exception:
-            self.h_brd = None
-
-    def _set_border_color(self):
-        """(Re)feed the border line's color to the TATStatus strip
-        (STATUSBAR_SET_COLOR_BORDER_BOTTOM). Guarded: on a build
-        without the statusbar API the toolbar simply stays without
-        the line."""
-        if self.h_brd:
-            try:
-                ct.statusbar_proc(self.h_brd, ct.STATUSBAR_SET_COLOR_BORDER_BOTTOM,
-                                  value=_sep_line_color())
-            except Exception:
-                pass
+            pass
 
     def _anchor_left(self, prev):
         """a_l value chaining this control to the RIGHT side of the
@@ -709,24 +673,22 @@ class CompareToolbar:
 
     def apply_theme(self):
         """Re-apply the toolbar colors for the (possibly switched) UI
-        theme: background EdTextBg, status-label font EdTextFont,
-        border-line color EdBlockSepLine. All must be re-read
-        together -- a theme switch can flip light<->dark, and a stale
-        color on the new background is the black-on-black bug again."""
+        theme: background EdTextBg, status-label font EdTextFont.
+        Both must be re-read together -- a theme switch can flip
+        light<->dark, and a stale label font on the new background is
+        the black-on-black bug again."""
         if self.h_dlg is None:
             return
         bgcolor = _ed_text_bg()
         fontcolor = _ed_text_font()
+        if bgcolor is None or fontcolor is None:
+            return
         try:
-            if bgcolor is not None and fontcolor is not None:
-                ct.dlg_proc(self.h_dlg, ct.DLG_PROP_SET,
-                            prop={'color': bgcolor})
-                ct.dlg_proc(self.h_dlg, ct.DLG_CTL_PROP_SET,
-                            name='status', prop={'color': bgcolor,
-                                                 'font_color': fontcolor})
-            # the border line follows the theme independently of the
-            # label/bg pair (it has its own theme key and fallback)
-            self._set_border_color()
+            ct.dlg_proc(self.h_dlg, ct.DLG_PROP_SET,
+                        prop={'color': bgcolor})
+            ct.dlg_proc(self.h_dlg, ct.DLG_CTL_PROP_SET,
+                        name='status', prop={'color': bgcolor,
+                                             'font_color': fontcolor})
         except Exception:
             pass
 
@@ -976,7 +938,6 @@ class CompareToolbar:
             self.h_menu = None
         self.ctl = {}
         self.hbtn = {}
-        self.h_brd = None
         self.menu_items = {}
         self.menu_guard_item = None
 

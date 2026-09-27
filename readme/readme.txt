@@ -293,25 +293,21 @@ Buttons size themselves to their captions (auto-sized with the real
 UI-theme font, DPI-scaled -- nothing can be cut off horizontally) and
 are chained with anchors, so the row re-flows by itself whenever a
 caption changes. The bar ends in a thin full-width border line that
-separates it from the editor below: EXACTLY ONE DEVICE PIXEL at any
-DPI (a height-1 'statusbar'/TATStatus strip whose bottom border is
-drawn with pen width 1 and no DPI scaling -- the same primitive
-cuda_folding_caption's bar uses), colored with the UI theme's
-EdBlockSepLine (the editor's block-separator line), so it adapts to
-light and dark themes automatically. The toolbar's height = the OS GUI
+separates it from the editor below: exactly 1 device pixel at any
+DPI (a height-1 statusbar strip, not DPI-scaled), colored with the
+theme's EdBlockSepLine. The toolbar's height = the OS GUI
 button height plus a little extra room for the captions' descenders (on
 some systems the OS font is taller than the OS 'button' metrics and
 letters like the 'g' of "Config" would be clipped) plus the 1px border
 line -- the descender room is scaled for high-DPI screens, the border
-line itself never is (it stays 1 device pixel). The
+line itself never is. The
 captions' texts can be turned off (icons only) with the option
 differ.toolbar.show_btn_text; the whole toolbar can be hidden with
 differ.toolbar.show_toolbar. Toolbars are restored at startup for
 compare tabs restored by the CudaText session, and follow UI theme
 switches (the background re-reads EdTextBg; the status label's text
 color re-reads EdTextFont of the same theme, so it stays readable on
-dark themes too -- a bare label would take the OS's black; the border
-line's color is re-fed on every theme switch too).
+dark themes too -- a bare label would take the OS's black).
 
 The toolbar's lifetime follows the tab's: it is destroyed when the
 compare tab is really closed, and at app exit it is destroyed in the

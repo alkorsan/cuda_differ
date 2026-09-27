@@ -1,20 +1,9 @@
 2026.09.27 (by @badrelmers)
-- fix (toolbar): the bottom border line looked thicker than 1px on
-  scaled (high-DPI) screens. It was drawn by a BTNKIND_SEP_VERT
-  button_ex: TATButton's separator paints its line with a DPI-SCALED
-  thickness, so at 125-150% DPI it rendered 2+ device pixels while the
-  folding-caption plugin's border (the user's reference) stayed 1px.
-  The strip is now a dlg_proc 'statusbar' (TATStatus) control of
-  height 1: TATStatus draws its bottom border (ColorBorderBottom) as
-  MoveTo(0,Height-1)/LineTo(Width,Height-1) with pen width 1 and NO
-  DPI scaling -- exactly ONE DEVICE PIXEL at any DPI, the same
-  primitive that paints the folding-caption bar's border. The color
-  is fed from the theme's EdBlockSepLine (the same key the
-  folding-caption bar uses, so the two lines are identical when both
-  plugins run; fallback clMedGray 0x808080) and re-fed on every UI
-  theme switch (apply_theme). The form's height math is unchanged
-  except the strip now contributes 1 device px instead of the scaled
-  2px.
+- fix (toolbar): the bottom border was a separator button whose line
+  TATButton draws DPI-scaled (2+ device px at 125-150% scaling). It is
+  now a height-1 'statusbar' (TATStatus) strip: pen width 1, no DPI
+  scaling -> exactly one device pixel at any DPI; color fed once from
+  the theme's EdBlockSepLine (fallback clMedGray).
 
 2026.09.27 (by @badrelmers)
 - fix (toolbar): on some dark/black UI themes the status label's text
