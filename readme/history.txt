@@ -1,4 +1,13 @@
 2026.09.28 (by @badrelmers)
+- change (toolbar): the 1px bottom border's color is now the theme's
+  SplitMain (was EdBlockSepLine) and apply_theme() re-feeds it on
+  every UI theme switch -- a plain prop re-set on the 'brd' panel,
+  no handle and no statusbar_proc.
+- change (overview): the left separator line now uses the theme's
+  SplitMain too (SEP_LINE_COLOR stays the fallback; refreshed by
+  set_colors on every compare start).
+
+2026.09.28 (by @badrelmers)
 - change (toolbar): the 1px bottom border is now a height-1 'panel'
   filled with the theme's EdBlockSepLine (dlg_proc never scales
   control sizes) -- simpler and lighter than the statusbar strip:

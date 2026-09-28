@@ -124,9 +124,10 @@ Architecture:
       |----------------|
       |       ▼        |  BUTTON_HEIGHT px, ▼ scrolls one line down
       +----------------+
-      x=0..SEP_LINE_WIDTH is a grey vertical separator line spanning the
+      x=0..SEP_LINE_WIDTH is a vertical separator line spanning the
       FULL panel height (the button boxes included), visually separating
-      the overview from the editor / the editor's scrollbar.
+      the overview from the editor / the editor's scrollbar. Its color
+      is the theme's SplitMain (the main splitters' color).
     The ▲/▼ boxes use the OVERVIEW background color (the theme's
     EdTextBg) so they blend into the panel, and the theme's ScrollArrow
     color for the arrow glyph (read via PROC_THEME_UI_DICT_GET). The
@@ -377,11 +378,14 @@ APPLY_TIMER_MS = 40
 # segments).
 ABORT_CHECK_MASK = 0xFFF
 
-# Width of the grey vertical separator line at the very left of the
+# Width of the vertical separator line at the very left of the
 # overview panel (full panel height, buttons included). Separates the
 # overview from the editor / the editor's scrollbar.
 SEP_LINE_WIDTH = 1
-SEP_LINE_COLOR = 0x808080  # grey — visible on both light and dark themes
+# Fallback color of that line; the live color is the UI theme's
+# SplitMain (refreshed by set_colors on every compare start -- the
+# same key the differ toolbar's 1px bottom border uses).
+SEP_LINE_COLOR = 0x808080
 
 # --- Slider visibility: guaranteed-contrast color derivation -----------
 # Minimum luminance difference between the slider FILL and the overview
@@ -653,6 +657,9 @@ class PaintboxOverview:
         # refreshed by set_colors() from PROC_THEME_UI_DICT_GET.
         self.color_btn_bg = 0xFFFFFF
         self.color_btn_arrow = 0x000000
+        # Left separator line: the theme's SplitMain (refreshed by
+        # set_colors(); SEP_LINE_COLOR is only the pre-compare fallback).
+        self.color_sep_line = SEP_LINE_COLOR
         # Slider state for drag-to-scroll
         self._slider_top = 0
         self._slider_height = 0
@@ -858,6 +865,8 @@ class PaintboxOverview:
         try:
             ui = ct.app_proc(ct.PROC_THEME_UI_DICT_GET, '')
             self.color_bg = ui.get('EdTextBg', {}).get('color', 0xFFFFFF)
+            self.color_sep_line = ui.get('SplitMain', {}).get(
+                'color', SEP_LINE_COLOR)
         except Exception:
             pass
         self.color_btn_bg = self.color_bg
@@ -1053,10 +1062,13 @@ class PaintboxOverview:
             arrow = ui.get('ScrollArrow', {}).get('color', 0x000000)
             fill = ui.get('ScrollFill', {}).get('color', 0xEAEAEA)
             border = ui.get('ScrollRect', {}).get('color', 0x666666)
+            self.color_sep_line = ui.get('SplitMain', {}).get(
+                'color', SEP_LINE_COLOR)
         except Exception:
             arrow = 0x000000
             fill = 0xEAEAEA
             border = 0x666666
+            self.color_sep_line = SEP_LINE_COLOR
         # Guaranteed-visibility pass (see the module docstring and
         # _color_contrast): the native scrollbar colors sit on the
         # scrollbar track in real scrollbars, but here they sit on the
@@ -1772,12 +1784,13 @@ class PaintboxOverview:
         ct.canvas_proc(c, ct.CANVAS_POLYGON, text=pts)
 
     def _paint_separator(self, c, w, h):
-        """Paint the grey vertical separator line at the very left of
-        the overview panel (x = 0..SEP_LINE_WIDTH), spanning the FULL
+        """Paint the vertical separator line at the very left of the
+        overview panel (x = 0..SEP_LINE_WIDTH), spanning the FULL
         panel height — the ▲/▼ button boxes included — so the overview
         is visually separated from the editor / the editor's scrollbar
-        by the same line all the way down."""
-        ct.canvas_proc(c, ct.CANVAS_SET_BRUSH, color=SEP_LINE_COLOR,
+        by the same line all the way down. Color: the theme's
+        SplitMain (self.color_sep_line, refreshed by set_colors)."""
+        ct.canvas_proc(c, ct.CANVAS_SET_BRUSH, color=self.color_sep_line,
                        style=ct.BRUSH_SOLID)
         ct.canvas_proc(c, ct.CANVAS_RECT_FILL,
                        x=0, y=0, x2=SEP_LINE_WIDTH, y2=h)

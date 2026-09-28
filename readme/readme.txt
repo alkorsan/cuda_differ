@@ -294,8 +294,8 @@ UI-theme font, DPI-scaled -- nothing can be cut off horizontally) and
 are chained with anchors, so the row re-flows by itself whenever a
 caption changes. The bar ends in a thin full-width border line that
 separates it from the editor below: exactly 1 device pixel at any
-DPI (a height-1 panel strip filled with the theme's EdBlockSepLine
-color; dlg_proc never scales control sizes). The toolbar's height = the OS GUI
+DPI (a height-1 panel strip filled with the theme's SplitMain color;
+dlg_proc never scales control sizes). The toolbar's height = the OS GUI
 button height plus a little extra room for the captions' descenders (on
 some systems the OS font is taller than the OS 'button' metrics and
 letters like the 'g' of "Config" would be clipped) plus the 1px border
@@ -307,7 +307,8 @@ differ.toolbar.show_toolbar. Toolbars are restored at startup for
 compare tabs restored by the CudaText session, and follow UI theme
 switches (the background re-reads EdTextBg; the status label's text
 color re-reads EdTextFont of the same theme, so it stays readable on
-dark themes too -- a bare label would take the OS's black).
+dark themes too -- a bare label would take the OS's black; the border
+line's color re-reads SplitMain).
 
 The toolbar's lifetime follows the tab's: it is destroyed when the
 compare tab is really closed, and at app exit it is destroyed in the

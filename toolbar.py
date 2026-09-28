@@ -45,13 +45,14 @@ Implementation notes:
 
 * BOTTOM BORDER: the toolbar ends in a full-width 1-device-px line
   separating it from the editor below: a dlg_proc 'panel' control
-  of height 1 filled with the theme's EdBlockSepLine color (a plain
+  of height 1 filled with the theme's SplitMain color (a plain
   TPanel paints a flat solid fill -- the strip IS the line). dlg_proc
   never scales control sizes (scaling is only the explicit DLG_SCALE
   action, which this form never calls), so the strip is exactly one
-  device pixel at any DPI. All buttons' a_b anchors reference this
-  strip's top ('brd', '[') instead of the form's bottom, so the row
-  sits fully above the line.
+  device pixel at any DPI; apply_theme() re-feeds the color on every
+  UI theme switch. All buttons' a_b anchors reference this strip's
+  top ('brd', '[') instead of the form's bottom, so the row sits
+  fully above the line.
 
 * POSITIONING: anchors, not coordinates. Every button's LEFT side is
   anchored (a_l) to the RIGHT side (']') of the previous control with
@@ -159,6 +160,20 @@ def _ed_text_font():
         return ui.get('EdTextFont', {}).get('color')
     except Exception:
         return None
+
+
+def _split_color():
+    """Color of the toolbar's 1px bottom border: the theme's SplitMain
+    (the main splitters' color; the overview's left separator reads the
+    same key). Fallback 0x808080 = clMedGray."""
+    try:
+        c = ct.app_proc(ct.PROC_THEME_UI_DICT_GET, '')\
+            .get('SplitMain', {}).get('color')
+        if c is not None:
+            return int(c)
+    except Exception:
+        pass
+    return 0x808080
 
 
 # The five ignore options, exposed as checkable items of the toolbar's
@@ -378,23 +393,18 @@ class CompareToolbar:
     def _add_bottom_border(self):
         """Full-width horizontal line glued to the form's bottom edge:
         a 'panel' control of height 1 filled with the theme's
-        EdBlockSepLine. dlg_proc never scales control sizes (only the
+        SplitMain. dlg_proc never scales control sizes (only the
         explicit DLG_SCALE action scales, and this form never calls
         it), so h=1 is exactly one device pixel at any DPI -- the
         whole strip is the line. Created FIRST: the buttons' a_b
         anchors reference it by name ('brd')."""
-        try:
-            c = int(ct.app_proc(ct.PROC_THEME_UI_DICT_GET, '')
-                    .get('EdBlockSepLine', {}).get('color', 0x808080))
-        except Exception:
-            c = 0x808080
         n = ct.dlg_proc(self.h_dlg, ct.DLG_CTL_ADD, 'panel')
         self.ctl['brd'] = n
         ct.dlg_proc(self.h_dlg, ct.DLG_CTL_PROP_SET, index=n, prop={
             'name': 'brd',
             'cap': '',
             'h': _BORDER_H,      # 1 device px at ANY DPI
-            'color': c,          # the line: EdBlockSepLine, fallback clMedGray
+            'color': _split_color(),
             'a_l': ('', '['),
             'a_r': ('', ']'),
             'a_t': None,
@@ -667,22 +677,25 @@ class CompareToolbar:
 
     def apply_theme(self):
         """Re-apply the toolbar colors for the (possibly switched) UI
-        theme: background EdTextBg, status-label font EdTextFont.
-        Both must be re-read together -- a theme switch can flip
-        light<->dark, and a stale label font on the new background is
-        the black-on-black bug again."""
+        theme: background EdTextBg, status-label font EdTextFont,
+        border-line color SplitMain. All must be re-read together --
+        a theme switch can flip light<->dark, and a stale color on the
+        new background is the black-on-black bug again."""
         if self.h_dlg is None:
             return
         bgcolor = _ed_text_bg()
         fontcolor = _ed_text_font()
-        if bgcolor is None or fontcolor is None:
-            return
         try:
-            ct.dlg_proc(self.h_dlg, ct.DLG_PROP_SET,
-                        prop={'color': bgcolor})
+            if bgcolor is not None and fontcolor is not None:
+                ct.dlg_proc(self.h_dlg, ct.DLG_PROP_SET,
+                            prop={'color': bgcolor})
+                ct.dlg_proc(self.h_dlg, ct.DLG_CTL_PROP_SET,
+                            name='status', prop={'color': bgcolor,
+                                                 'font_color': fontcolor})
+            # the border line's color is a plain prop re-set (the strip
+            # is a 'panel': the color lives in the prop dict, no handle)
             ct.dlg_proc(self.h_dlg, ct.DLG_CTL_PROP_SET,
-                        name='status', prop={'color': bgcolor,
-                                             'font_color': fontcolor})
+                        name='brd', prop={'color': _split_color()})
         except Exception:
             pass
 
