@@ -1049,9 +1049,10 @@ OPTS_META = [
     {'opt': 'differ.toolbar.show_toolbar',
      'cmt': _('Show the compare-tab toolbar\n'
               'When enabled, a toolbar is docked to the top of every '
-              'compare tab: [Recompare or Cancel] [Resize] | [Prev] '
-              '[Next] | [Copy to left] [Copy to right] | [Ignore '
-              'options dropdown] [Config], plus a status label on the '
+              'compare tab: [Recompare or Cancel] | [Prev] [Next] | '
+              '[Copy to left] [Copy to right] | [Ignore options '
+              'dropdown] [Preset dropdown] | [Resize] [View dropdown] '
+              '[Config], plus a status label on the '
               'right that shows the compare state ("Comparing...", '
               '"N differences") and the difference count of the last '
               'compare.\n'
@@ -2367,6 +2368,22 @@ class Command:
             return
         try:
             difftb.preset_menu_action(str(info))
+        except Exception:
+            pass
+
+    def toolbar_menu_view(self, info=''):
+        """View-dropdown click from a compare tab's toolbar: info is
+        '<PROP_TAB_ID>|<view key>' (raw string, same 'cmd=' callback
+        convention as toolbar_menu_preset). Routed to the toolbar that
+        built the menu item; it toggles the app bar / gutter column /
+        overview visibility (the overview toggle writes
+        differ.micromap.enable_overview and re-compares on the 100ms
+        timer). Unknown tab (closed since the menu was built) is a
+        no-op."""
+        if not info:
+            return
+        try:
+            difftb.view_menu_action(str(info))
         except Exception:
             pass
 

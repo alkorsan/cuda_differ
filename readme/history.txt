@@ -1,4 +1,22 @@
 2026.09.28 (by @badrelmers)
+- add (toolbar): new "▦ View ▾" dropdown between Resize and Config:
+  "Hide all" / "Show all" flip every item at once, then (after a
+  separator) CHECKABLE items for CudaText's status bar, toolbar,
+  sidebar, side panel, bottom panel, tab bar, the gutter's numbers /
+  bookmarks columns (set on both halves of the compare tab) and the
+  gap-aware overview panel. The menu is rebuilt on every open and the
+  checkmarks derive from the live state (the PROC_SHOW_* pairs for the
+  bars, the editor gutter props, differ.micromap.enable_overview for
+  the overview). Ticking Overview writes that option and re-runs this
+  tab's compare on the 100ms timer (the refresh creates / destroys
+  the panel); the bar / gutter items apply at once. Unlike Ignore /
+  Preset the button stays enabled while a compare runs.
+- change (toolbar): buttons reorganized into five groups --
+  [Recompare/Cancel] | [Prev][Next] | [Copy][Copy] | [Ignore][Preset]
+  | [Resize][View][Config] (Resize moved from the first group to the
+  last); the Presets button renamed "★ Preset ▾" (was "☰ Presets ▾").
+
+2026.09.28 (by @badrelmers)
 - add (toolbar): new "☰ Presets ▾" dropdown between Ignore and Config:
   two mutually exclusive presets ("Preset 1: Fastest comparison -
   Myers, Beautify Off" sets Native Myers + Beautify off; "Preset 2:

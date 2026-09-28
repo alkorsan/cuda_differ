@@ -3,8 +3,9 @@
 A small toolbar docked to the TOP of every compare tab (the editor
 parent's top side), built with dlg_proc:
 
-  [↻ Recompare or × Cancel][↔ Resize] | [↑ Prev][↓ Next] |
-  [← Copy][→ Copy] | [≡ Ignore 2/5 ▾] [☰ Presets ▾] [⚙ Config] ...status label
+  [↻ Recompare or × Cancel] | [↑ Prev][↓ Next] | [← Copy][→ Copy] |
+  [≡ Ignore 2/5 ▾] [★ Preset ▾] | [↔ Resize] [▦ View ▾] [⚙ Config]
+  ...status label
 
 Everything the toolbar does goes through the Command object of
 cuda_differ/__init__.py, which passes itself to every module-level
@@ -94,6 +95,21 @@ Implementation notes:
   selection is visible at a glance). Clicks persist
   'differ.algorithm.*' (the config dialog's store) and re-compare
   this tab on the 100ms timer, like the ignore items.
+
+* The VIEW dropdown toggles the surrounding UI from the compare tab:
+  "Hide all" / "Show all" flip every item at once; the checkable items
+  are CudaText's status bar, toolbar, sidebar, side panel, bottom
+  panel and tab bar (the PROC_SHOW_* app-proc pairs -- the app's own
+  View-menu toggles), the gutter's numbers / bookmarks columns (an
+  editor prop, set on BOTH halves of the tab) and the gap-aware
+  overview panel (the differ.micromap.enable_overview option; the
+  100ms re-compare's refresh then creates or destroys the panel).
+  REBUILT on every open, so the checkmarks always mirror the live
+  state -- the bars can be toggled from CudaText's own View menu too.
+  Unlike Ignore / Presets the button stays enabled while a compare
+  runs: visibility is orthogonal to comparing, and the overview
+  item's refresh is simply dropped (the usual status hint) when a
+  compare is already running.
 
 * CALLBACKS: dlg event handlers (on_change) are live callables
   (dlg_proc cleans them up on DLG_FREE); menu item commands and timers
@@ -272,6 +288,50 @@ def _set_beautify(val):
                        user_json=_JSON_FILE)
 
 
+# The View dropdown's checkable items, in the user's order: CudaText's
+# six main UI bars, the gutter's two columns, then the overview panel
+# ('overview', a single key -- the differ.micromap.enable_overview
+# option). Each bar entry: (menu key, caption, app-proc GET id,
+# app-proc SET id) -- the PROC_SHOW_* pairs are the app's own
+# View-menu toggles. Each gutter entry: (menu key, caption, editor
+# prop). 'Hide all' / 'Show all' (above the separator) are plain
+# actions, not checkable.
+_VIEW_BARS = (
+    ('statusbar',   _('Status bar'),
+     ct.PROC_SHOW_STATUSBAR_GET, ct.PROC_SHOW_STATUSBAR_SET),
+    ('toolbar',     _('Toolbar'),
+     ct.PROC_SHOW_TOOLBAR_GET, ct.PROC_SHOW_TOOLBAR_SET),
+    ('sidebar',     _('Sidebar'),
+     ct.PROC_SHOW_SIDEBAR_GET, ct.PROC_SHOW_SIDEBAR_SET),
+    ('sidepanel',   _('Side panel'),
+     ct.PROC_SHOW_SIDEPANEL_GET, ct.PROC_SHOW_SIDEPANEL_SET),
+    ('bottompanel', _('Bottom panel'),
+     ct.PROC_SHOW_BOTTOMPANEL_GET, ct.PROC_SHOW_BOTTOMPANEL_SET),
+    ('tabs',        _('Tab bar'),
+     ct.PROC_SHOW_TABS_GET, ct.PROC_SHOW_TABS_SET),
+)
+_VIEW_GUTTERS = (
+    ('gutter_num', _('Gutter numbers'), ct.PROP_GUTTER_NUM),
+    ('gutter_bm',  _('Gutter bookmarks'), ct.PROP_GUTTER_BM),
+)
+
+
+def _get_overview_opt():
+    """The gap-aware overview panel option
+    ('differ.micromap.enable_overview'), read live from the plugin's
+    settings (mtime-cached by cudax_lib, so config-dialog writes are
+    picked up at once)."""
+    return bool(ctx.get_opt('differ.micromap.enable_overview', True,
+                            user_json=_JSON_FILE))
+
+
+def _set_overview_opt(val):
+    """Write 'differ.micromap.enable_overview' to the plugin's settings
+    (same store the config dialog uses)."""
+    return ctx.set_opt('differ.micromap.enable_overview', bool(val),
+                       user_json=_JSON_FILE)
+
+
 # ---------------------------------------------------------------------------
 # Layout constants.
 #
@@ -360,13 +420,15 @@ class CompareToolbar:
     commands, and for refreshes).
     """
 
-    # (name, kind, icon, text) in visual order; the 'ignore' caption is
-    # assembled dynamically (see _ignore_caption), the 'presets' caption
-    # carries the dropdown arrow (see _presets_caption), the recompare
-    # button swaps icon/text with '× Cancel' while a compare runs.
+    # (name, kind, icon, text) in visual order -- five groups:
+    # [Recompare/Cancel] | [Prev][Next] | [Copy][Copy] |
+    # [Ignore][Preset] | [Resize][View][Config]. The 'ignore' caption
+    # is assembled dynamically (see _ignore_caption), the 'presets' and
+    # 'view' captions carry the dropdown arrow (see _presets_caption /
+    # _view_caption), the recompare button swaps icon/text with
+    # '× Cancel' while a compare runs.
     _BTNS = (
         ('recompare', 'btn', '\u21bb', 'Recompare'),
-        ('resize',     'btn', '\u2194', 'Resize'),
         ('sep1',       'sep', None, None),
         ('prev',       'btn', '\u2191', 'Prev'),
         ('next',       'btn', '\u2193', 'Next'),
@@ -375,7 +437,10 @@ class CompareToolbar:
         ('copy_right', 'btn', '\u2192', 'Copy'),
         ('sep3',       'sep', None, None),
         ('ignore',     'btn', '\u2261', 'Ignore'),
-        ('presets',    'btn', '\u2630', 'Presets'),
+        ('presets',    'btn', '\u2605', 'Preset'),
+        ('sep4',       'sep', None, None),
+        ('resize',     'btn', '\u2194', 'Resize'),
+        ('view',       'btn', '\u25a6', 'View'),
         ('config',     'btn', '\u2699', 'Config'),
     )
 
@@ -387,6 +452,7 @@ class CompareToolbar:
         self.h_dlg = None
         self.h_menu = None
         self.h_pmenu = None
+        self.h_vmenu = None
         self.ctl = {}          # name -> control index
         self.hbtn = {}         # name -> button_ex handle (button_proc)
         self.menu_items = {}   # ignore key -> popup menu item id
@@ -592,12 +658,20 @@ class CompareToolbar:
         return '\u2261' + counter + arrow
 
     def _presets_caption(self):
-        """'☰ Presets ▾' -- the trailing arrow marks it as a dropdown
+        """'★ Preset ▾' -- the trailing arrow marks it as a dropdown
         (the Ignore twin's convention); with button texts off only the
         glyph and the arrow remain."""
         if self.show_text:
-            return '\u2630 ' + _('Presets') + ' \u25be'
-        return '\u2630 \u25be'
+            return '\u2605 ' + _('Preset') + ' \u25be'
+        return '\u2605 \u25be'
+
+    def _view_caption(self):
+        """'▦ View ▾' -- the trailing arrow marks it as a dropdown (the
+        Ignore twin's convention); with button texts off only the glyph
+        and the arrow remain."""
+        if self.show_text:
+            return '\u25a6 ' + _('View') + ' \u25be'
+        return '\u25a6 \u25be'
 
     def _layout_buttons(self):
         """(Re)assign the captions of all buttons -- called whenever a
@@ -621,6 +695,8 @@ class CompareToolbar:
                 cap = self._ignore_caption()
             elif name == 'presets':
                 cap = self._presets_caption()
+            elif name == 'view':
+                cap = self._view_caption()
             elif name == 'recompare' and self.comparing:
                 cap = self._caption('\u00d7', 'Cancel')
             else:
@@ -655,6 +731,8 @@ class CompareToolbar:
             return self._ignore_tooltip()
         if name == 'presets':
             return self._presets_tooltip()
+        if name == 'view':
+            return self._view_tooltip()
         return ''
 
     def _ignore_tooltip(self):
@@ -679,6 +757,32 @@ class CompareToolbar:
                                     _('Beautify alignment'),
                                     _('on') if beautify else _('off')),
         ))
+
+    def _view_tooltip(self):
+        """Two-line tooltip: what the menu toggles + which of the nine
+        elements are currently hidden (the same live-state feedback
+        the Ignore / Presets tooltips give; the bars can change from
+        CudaText's own View menu in between)."""
+        state = self._view_state()
+        hidden = [self._view_caption_of(key)
+                  for key in state if not state[key]]
+        lines = [_('Show or hide UI parts (bars, gutters, overview)')]
+        if hidden:
+            lines.append('{}: {}'.format(_('Hidden'), ', '.join(hidden)))
+        else:
+            lines.append(_('All shown'))
+        return '\r'.join(lines)
+
+    def _view_caption_of(self, key):
+        """Menu caption of one view item (for tooltips / status
+        feedback)."""
+        for k, cap, _get, _set in _VIEW_BARS:
+            if k == key:
+                return cap
+        for k, cap, _prop in _VIEW_GUTTERS:
+            if k == key:
+                return cap
+        return _('Overview') if key == 'overview' else key
 
     def _set_hint(self, name, hint):
         hb = self.hbtn.get(name)
@@ -1068,6 +1172,170 @@ class CompareToolbar:
             pass
         self._schedule_refresh()
 
+    # -- view popup menu ----------------------------------------------------
+
+    def rebuild_view_menu(self):
+        """(Re)build the View dropdown: 'Hide all' / 'Show all', a
+        separator, then the checkable items (the six app bars, the two
+        gutter columns, the overview panel). REBUILT on every open so
+        the checkmarks always mirror the live state -- the bars can be
+        toggled from CudaText's own View menu too. The whole body is
+        guarded like the ignore / presets twins."""
+        if self.h_dlg is None:
+            return
+        try:
+            self._rebuild_view_menu_inner()
+        except Exception:
+            pass
+
+    def _rebuild_view_menu_inner(self):
+        if self.h_vmenu is None:
+            self.h_vmenu = ct.menu_proc(0, ct.MENU_CREATE)
+        ct.menu_proc(self.h_vmenu, ct.MENU_CLEAR)
+
+        state = self._view_state()
+
+        def _add(key, caption, checked):
+            # 'cmd=' form (a Command method): CudaText passes this
+            # form's info to the method as the RAW string, so the
+            # '<tab id>|<view key>' payload survives -- the same
+            # convention as the ignore / preset items.
+            mi = ct.menu_proc(
+                self.h_vmenu, ct.MENU_ADD,
+                caption=caption,
+                command='module=cuda_differ;cmd=toolbar_menu_view;'
+                        'info={}|{};'.format(self.tab_id_str, key))
+            if checked is not None:
+                try:
+                    ct.menu_proc(mi, ct.MENU_SET_CHECKED,
+                                 command=checked)
+                except Exception:
+                    pass
+
+        _add('hide_all', _('Hide all'), None)
+        _add('show_all', _('Show all'), None)
+        ct.menu_proc(self.h_vmenu, ct.MENU_ADD, caption='-')
+        for key, caption, _get, _set in _VIEW_BARS:
+            _add(key, caption, state[key])
+        for key, caption, _prop in _VIEW_GUTTERS:
+            _add(key, caption, state[key])
+        _add('overview', _('Overview'), state['overview'])
+
+    def popup_view_menu(self):
+        """Show the View dropdown right under its button. The menu is
+        rebuilt FIRST, so the checkmarks always mirror the live
+        visibility state (CudaText's own View menu can change the bars
+        in between) -- the view twin of the presets popup."""
+        if self.h_dlg is None:
+            return
+        self.rebuild_view_menu()
+        if self.h_vmenu is None:
+            return
+        try:
+            props = ct.dlg_proc(self.h_dlg, ct.DLG_CTL_PROP_GET,
+                                name='view')
+            x = int(props.get('x', 0))
+            y = int(props.get('y', 0)) + int(props.get('h', 0))
+            sx, sy = ct.dlg_proc(self.h_dlg, ct.DLG_COORD_LOCAL_TO_SCREEN,
+                                 index=x, index2=y)
+            ct.menu_proc(self.h_vmenu, ct.MENU_SHOW, command=(sx, sy))
+        except Exception:
+            # Fallback: show at the mouse cursor.
+            try:
+                ct.menu_proc(self.h_vmenu, ct.MENU_SHOW, command='')
+            except Exception:
+                pass
+
+    def _view_state(self):
+        """Live visibility of every checkable View item (dict, menu
+        key -> bool): the bars through their PROC_SHOW_* GET pairs, the
+        gutter columns from the tab's left half (both halves are always
+        set together, so one IS the pair's state), the overview from
+        the settings file."""
+        state = {}
+        for key, _cap, get_id, _set in _VIEW_BARS:
+            try:
+                state[key] = bool(ct.app_proc(get_id, ''))
+            except Exception:
+                state[key] = True
+        for key, _cap, prop in _VIEW_GUTTERS:
+            try:
+                state[key] = bool(self.a_ed.get_prop(prop))
+            except Exception:
+                state[key] = True
+        state['overview'] = _get_overview_opt()
+        return state
+
+    def _tab_editors(self):
+        """Both halves of this compare tab (the toolbar's a_ed + its
+        secondary): the gutter column toggles must hit both sides or
+        the compare view goes asymmetric."""
+        eds = [self.a_ed]
+        try:
+            h2 = self.a_ed.get_prop(ct.PROP_HANDLE_SECONDARY)
+            if h2:
+                eds.append(ct.Editor(h2))
+        except Exception:
+            pass
+        return eds
+
+    def _set_view_item(self, key, val):
+        """Apply ONE view item's visibility ('val' = the new shown
+        state). Returns True when the change needs the 100ms
+        re-compare (only the overview: its panel is created /
+        destroyed by the refresh)."""
+        for k, _cap, _get, set_id in _VIEW_BARS:
+            if k == key:
+                ct.app_proc(set_id, bool(val))
+                return False
+        for k, _cap, prop in _VIEW_GUTTERS:
+            if k == key:
+                for e in self._tab_editors():
+                    e.set_prop(prop, bool(val))
+                return False
+        if key == 'overview':
+            _set_overview_opt(bool(val))
+            return True
+        return False
+
+    def on_view_action(self, action):
+        """View-dropdown item executed: 'hide_all' / 'show_all' flip
+        EVERY item at once (the bars via their SET procs, both halves'
+        gutters, the overview option); any other key toggles ONE
+        element. The overview writes differ.micromap.enable_overview
+        (the config dialog's store) and re-compares this tab on the
+        100ms timer -- the refresh creates or destroys the panel,
+        exactly like the preset items; hide/show-all schedule the same
+        refresh once for their overview part. The menu is rebuilt on
+        every open, so the new checkmarks show up the next time it
+        pops; unknown keys are safe no-ops."""
+        if action in ('hide_all', 'show_all'):
+            show = (action == 'show_all')
+            for key in self._view_state():
+                self._set_view_item(key, show)
+            try:
+                ct.msg_status(
+                    _('Differ: all view items {}').format(
+                        _('shown') if show else _('hidden')))
+            except Exception:
+                pass
+            self._schedule_refresh()
+            self._set_hint('view', self._view_tooltip())
+            return
+        state = self._view_state()
+        if action not in state:
+            return
+        val = not state[action]
+        if self._set_view_item(action, val):
+            self._schedule_refresh()
+        try:
+            ct.msg_status('{}: {} -- {}'.format(
+                _('Differ view'), self._view_caption_of(action),
+                _('shown') if val else _('hidden')))
+        except Exception:
+            pass
+        self._set_hint('view', self._view_tooltip())
+
     # -- button actions -----------------------------------------------------
 
     def _focus_tab(self):
@@ -1114,6 +1382,8 @@ class CompareToolbar:
                 self.popup_ignore_menu()
             elif name == 'presets':
                 self.popup_preset_menu()
+            elif name == 'view':
+                self.popup_view_menu()
             elif name == 'config':
                 self.cmd.change_config()
         except Exception:
@@ -1159,6 +1429,12 @@ class CompareToolbar:
             except Exception:
                 pass
             self.h_pmenu = None
+        if self.h_vmenu is not None:
+            try:
+                ct.menu_proc(self.h_vmenu, ct.MENU_CLEAR)
+            except Exception:
+                pass
+            self.h_vmenu = None
         self.ctl = {}
         self.hbtn = {}
         self.menu_items = {}
@@ -1301,9 +1577,10 @@ def sync_all(cmd):
 # String-callback entry points.
 #
 # Menu items use the 'module=cuda_differ;cmd=toolbar_menu_ignore /
-# toolbar_menu_preset; info=<tab id>|<action>;' form (Command methods
-# -- info arrives as the RAW string). The module-level entries below
-# are the belt-and-braces twins for any 'module=cuda_differ.toolbar;
+# toolbar_menu_preset / toolbar_menu_view; info=<tab id>|<action>;' form
+# (Command methods -- info arrives as the RAW string). The
+# module-level entries below are the belt-and-braces twins for any
+# 'module=cuda_differ.toolbar;
 # func=_menu_click; info="<tab id>|<action>;"' callback (info QUOTED:
 # the engine's ValueFromString turns an unquoted non-numeric value
 # into None).
@@ -1340,6 +1617,23 @@ def preset_menu_action(info):
     if tb is None:
         return False
     tb.on_preset_action(action)
+    return True
+
+
+def view_menu_action(info):
+    """'info' is '<tab_id_str>|<view key>': route the click to the
+    toolbar of that compare tab. Returns True when a toolbar handled
+    it (False: unknown tab / no toolbar / bad payload)."""
+    if not info or not isinstance(info, str) or '|' not in info:
+        return False
+    try:
+        tab_id_str, action = info.split('|', 1)
+    except ValueError:
+        return False
+    tb = _TOOLBARS.get(tab_id_str)
+    if tb is None:
+        return False
+    tb.on_view_action(action)
     return True
 
 

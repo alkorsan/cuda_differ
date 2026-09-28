@@ -258,16 +258,14 @@ Every compare tab gets a toolbar docked to the top of the compare view
 the editor text background color of the current UI theme, so it blends
 into the compare view):
 
-    [↻ Recompare or × Cancel][↔ Resize] | [↑ Prev][↓ Next] |
-    [← Copy][→ Copy] | [≡ Ignore 2/5 ▾] [☰ Presets ▾] [⚙ Config]
+    [↻ Recompare or × Cancel] | [↑ Prev][↓ Next] | [← Copy][→ Copy] |
+    [≡ Ignore 2/5 ▾] [★ Preset ▾] | [↔ Resize] [▦ View ▾] [⚙ Config]
     ...status
 
 - ↻ Recompare -- re-runs the compare (same as F5 / the menu's
   Recompare). While a compare runs, the button becomes × Cancel and
   cancels that tab's running compare; when the compare finishes or is
   cancelled it becomes ↻ Recompare again.
-- ↔ Resize -- resize the two editors to equal width (50/50) after
-  dragging the splitter.
 - ↑ Prev / ↓ Next -- jump to the previous/next difference (same as
   Alt+Up / Alt+Down). Disabled while there are no differences or a
   compare is running.
@@ -283,7 +281,7 @@ into the compare view):
   While a pure-Python algorithm is the effective one, the items
   disable themselves and an explanatory item heads the menu (same
   guard as the tab context menu).
-- ☰ Presets ▾ -- dropdown with quick "preset" combinations: "Preset 1:
+- ★ Preset ▾ -- dropdown with quick "preset" combinations: "Preset 1:
   Fastest comparison - Myers, Beautify Off" and "Preset 2: Better
   readability (slower) - Histogram, Beautify On"; only one of the two
   presets can be checked at a time. After a separator, "Algorithm 1:
@@ -299,6 +297,22 @@ into the compare view):
   compare immediately. The button is disabled while a compare runs
   (like the Ignore dropdown); its tooltip shows the current
   algorithm / beautify combination.
+- ↔ Resize -- resize the two editors to equal width (50/50) after
+  dragging the splitter.
+- ▦ View ▾ -- dropdown to show / hide the surrounding UI from the
+  compare tab: "Hide all" and "Show all" flip everything at once,
+  and CHECKABLE items toggle CudaText's status bar, toolbar, sidebar,
+  side panel, bottom panel, tab bar, the gutter's numbers / bookmarks
+  columns (both halves of the tab always change together) and the
+  gap-aware overview panel. The checkmarks are re-derived from the
+  live state on every menu open (the bars can be toggled from
+  CudaText's own View menu too). Ticking "Overview" writes
+  differ.micromap.enable_overview (the same setting the config dialog
+  edits) and re-runs this tab's compare immediately, whose refresh
+  creates or destroys the panel; the bar / gutter items apply at
+  once with no re-compare. Unlike Ignore / Preset the button stays
+  enabled while a compare runs; its tooltip lists the currently
+  hidden items.
 - ⚙ Config -- opens the Differ options dialog.
 - status label (right side) -- shows the compare state: "Comparing..."
   while a compare runs, "N differences" / "No differences" when it
@@ -838,19 +852,20 @@ Micromap section:
 Toolbar section (see the "Toolbar" chapter above for details):
 - differ.toolbar.show_toolbar: Show the compare-tab toolbar (default: on)
   A toolbar docked to the top of every compare tab: Recompare (Cancel
-  while a compare runs), Resize, Prev, Next, Copy to left, Copy to
-  right, the Ignore-options dropdown (multiple checkable options plus
+  while a compare runs), Prev, Next, Copy to left, Copy to right, the
+  Ignore-options dropdown (multiple checkable options plus
   "Uncheck all"), the Presets dropdown (algorithm / beautify-alignment
-  preset combinations), Config, and a status label on the right
+  preset combinations), Resize, the View dropdown (bars / gutters /
+  overview visibility), Config, and a status label on the right
   (compare state + difference count). Every button has a tooltip; the
   toolbar follows UI theme switches and is restored at startup for
   session-restored compare tabs.
 - differ.toolbar.show_btn_text: Show button texts in the toolbar
   (default: on)
-  When on, buttons show "↻ Recompare", "↔ Resize", "↑ Prev", "↓ Next",
-  "← Copy", "→ Copy", "≡ Ignore 2/5 ▾", "☰ Presets ▾", "⚙ Config"; when
-  off, only the UTF-8 icons are shown (the Ignore button keeps its
-  enabled-options counter).
+  When on, buttons show "↻ Recompare", "↑ Prev", "↓ Next", "← Copy",
+  "→ Copy", "≡ Ignore 2/5 ▾", "★ Preset ▾", "↔ Resize", "▦ View ▾",
+  "⚙ Config"; when off, only the UTF-8 icons are shown (the Ignore
+  button keeps its enabled-options counter).
 
 
 == Diff algorithms and best practices ==
