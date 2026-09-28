@@ -6,107 +6,140 @@ subdir=cuda_differ
 homepage=https://github.com/CudaText-addons/cuda_differ
 api=1.0.483
 
+
+[item1]
+section=events
+events=on_state~,on_state_ed~,on_caret~,on_change~,on_change_slow~,on_tab_menu,on_close_pre~,on_close~,on_save_pre~,on_exit_pre~
+
 [item2]
 section=commands
 caption=Differ\Compare current document with file...
 method=compare_with
 
-[item2b]
+[item3]
 section=commands
 caption=Differ\Compare current document with tab...
 method=compare_with_tab
 
-[item3]
-section=commands
-caption=Differ\Diff current document with file...
-method=diff_with
-
-[item3b]
-section=commands
-caption=Differ\Diff current document with tab...
-method=diff_with_tab
-
 [item4]
-section=commands
-caption=Differ\Recompare
-method=refresh_compare
-
-[item4b]
-section=commands
-caption=Differ\Cancel compare
-method=cancel_compare
-
-[item4c]
-section=commands
-caption=Differ\Cancel all compares
-method=cancel_all_compares
-
-[item4d]
-section=commands
-caption=Differ\Resize editors to equal width
-method=resize_equal_width
-
-[item4e]
 section=commands
 caption=Differ\Compare clipboard to selection
 method=compare_clip_sel
 
 [item5]
 section=commands
+caption=Differ\-
+method=_
+
+[item6]
+section=commands
+caption=Differ\Diff current document with file...
+method=diff_with
+
+[item7]
+section=commands
+caption=Differ\Diff current document with tab...
+method=diff_with_tab
+
+[item8]
+section=commands
+caption=Differ\-
+method=_
+
+[item9]
+section=commands
+caption=Differ\Recompare
+method=refresh_compare
+
+[item10]
+section=commands
+caption=Differ\Cancel compare
+method=cancel_compare
+
+[item11]
+section=commands
+caption=Differ\Cancel all compares
+method=cancel_all_compares
+
+[item12]
+section=commands
+caption=Differ\Resize editors to equal width
+method=resize_equal_width
+
+
+
+[item13]
+section=commands
 caption=Differ\Focus the opposite file
 method=set_focus_to_opposite_panel
 
-[item5b]
+[item14]
 section=commands
 caption=Differ\Swap compared editors
 method=swap_view
 
-[item6]
+[item15]
+section=commands
+caption=Differ\-
+method=_
+
+[item16]
 section=commands
 caption=Differ\Select current difference
 method=select_current
 
-[item7]
+[item17]
 section=commands
 caption=Differ\Select all differences
 method=select_all_diff
 
-[item10]
+[item18]
+section=commands
+caption=Differ\-
+method=_
+
+[item19]
 section=commands
 caption=Differ\Jump to next difference
 method=jump_next
 
-[item11]
+[item20]
 section=commands
 caption=Differ\Jump to previous difference
 method=jump_prev
 
-[item15]
+[item21]
+section=commands
+caption=Differ\-
+method=_
+
+[item22]
 section=commands
 caption=Differ\Copy current difference to the right
 method=copy_right
 
-[item16]
+[item23]
 section=commands
 caption=Differ\Copy current difference to the left
 method=copy_left
 
-[item17]
+[item24]
 section=commands
 caption=Differ\Copy current line to the right
 method=copy_line_right
 
-[item18]
+[item25]
 section=commands
 caption=Differ\Copy current line to the left
 method=copy_line_left
 
-[item40]
+[item26]
+section=commands
+caption=Differ\-
+method=_
+
+[item27]
 section=commands
 caption=Differ\Config...
 method=change_config
 menu=o
-
-[item100]
-section=events
-events=on_state~,on_state_ed~,on_caret~,on_change~,on_change_slow~,on_tab_menu,on_close_pre~,on_close~,on_save_pre~,on_exit_pre~
