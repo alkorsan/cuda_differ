@@ -1,4 +1,19 @@
 2026.09.28 (by @badrelmers)
+- add (command): new "Differ\Compare clipboard to selection" command
+  (install.inf item4e): opens a new compare tab with the clipboard
+  text on the left and the focused editor's selection on the right
+  ("Diff: clipboard | selection"). The texts travel through two
+  short-lived untitled scratch tabs which are closed again right
+  after the compare tab is created (set_files compares open tabs);
+  the selection half inherits the focused editor's lexer, the
+  clipboard half stays plain. Status hints when the clipboard has
+  no text or the focused editor has no selection.
+- add (tab context menu): the same command as a menu item right
+  below "Resize editors to equal width" (the new last entry),
+  enabled only while both sides exist: text on the clipboard AND a
+  selection in the focused editor.
+
+2026.09.28 (by @badrelmers)
 - fix (toolbar): "Show all" in the View dropdown no longer forces the
   side panel and the bottom panel open -- those host docked tool
   windows, so a bulk show leaves them untouched and their menu items

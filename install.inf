@@ -46,6 +46,11 @@ section=commands
 caption=Differ\Resize editors to equal width
 method=resize_equal_width
 
+[item4e]
+section=commands
+caption=Differ\Compare clipboard to selection
+method=compare_clip_sel
+
 [item5]
 section=commands
 caption=Differ\Focus the opposite file

@@ -76,6 +76,15 @@ Compare current document with file...
 Compare current document with tab...
     Compares the file in the active tab with another open tab.
 
+Compare clipboard to selection
+    Compares the text on the clipboard with the selection of the
+    focused editor, opening a new compare tab ("Diff: clipboard |
+    selection"): clipboard text on the left, selected text on the
+    right. The selection side keeps the focused editor's syntax
+    highlighting; the clipboard side is shown as plain text (its
+    origin is unknown). Also in the diff-tab context menu, right
+    below "Resize editors to equal width".
+
 Diff current document with file...
     Produces a unified diff (patch-style) of the active file and a file
     you pick. The result opens in a new read-only tab.
@@ -237,7 +246,12 @@ Right-clicking a tab title shows "Differ" submenu with:
 - "Cancel compare" / "Cancel all compares" -- stop in-flight background
   compares (enabled only while a compare is actually running).
 - Resize editors to equal width -- set the split back to 50/50 after
-  dragging the editor splitter. This is the last entry of the menu.
+  dragging the editor splitter.
+- Compare clipboard to selection -- open a new compare tab with the
+  clipboard text on the left and the focused editor's selection on
+  the right (same as the command; enabled only while both sides
+  exist: text on the clipboard and a selection). This is the last
+  entry of the menu.
 - Five checkable "ignore" options (below Recompare, after a separator):
   Ignore case, Ignore whitespace, Ignore blank lines, Ignore line endings,
   Ignore numbers. Shown only while a native algorithm is the effective

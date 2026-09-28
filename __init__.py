@@ -1804,6 +1804,72 @@ class Command:
         name = names[res]
         self.set_files(name0, name)
 
+    def compare_clip_sel(self):
+        """Command: compare the clipboard text with the focused
+        editor's selection -- a new compare tab ("Diff: clipboard |
+        selection"), the text twin of 'Compare with...'. Exposed as
+        'Differ\\Compare clipboard to selection' and in the diff-tab
+        context menu (right below 'Resize editors to equal width').
+
+        set_files compares two OPEN tabs, so the texts travel through
+        two short-lived untitled scratch tabs ('clipboard' /
+        'selection') which are closed again right after the compare
+        tab was created -- only the compare tab remains. The selection
+        half inherits the focused editor's lexer (syntax colors); the
+        clipboard half stays lexer-less (its origin is unknown).
+
+        ct.ed is the FOCUSED-editor sentinel (Editor(0): every call
+        resolves to whatever tab is focused AT THAT MOMENT), so the
+        selection and the lexer are read BEFORE the scratch tabs steal
+        the focus, and each scratch editor is re-bound to its STABLE
+        handle right after its file_open -- an alias of ct.ed saved
+        earlier would act on the wrong tab by the time it is used.
+        """
+        clip = ''
+        try:
+            clip = ct.app_proc(ct.PROC_GET_CLIP, '')
+        except Exception:
+            pass
+        if not clip:
+            ct.msg_status(_('Differ: clipboard is empty'))
+            return
+        sel = ct.ed.get_text_sel()
+        if not sel:
+            ct.msg_status(_('Differ: no selection in the focused editor'))
+            return
+        try:
+            lexer = ct.ed.get_prop(ct.PROP_LEXER_FILE, '')
+        except Exception:
+            lexer = ''
+
+        ct.file_open('')
+        a_ed = ct.Editor(ct.ed.get_prop(ct.PROP_HANDLE_SELF))
+        a_ed.set_text_all(clip)
+        a_ed.set_prop(ct.PROP_TAB_TITLE, 'clipboard')
+        ct.file_open('')
+        b_ed = ct.Editor(ct.ed.get_prop(ct.PROP_HANDLE_SELF))
+        b_ed.set_text_all(sel)
+        b_ed.set_prop(ct.PROP_TAB_TITLE, 'selection')
+        if lexer:
+            try:
+                b_ed.set_prop(ct.PROP_LEXER_FILE, lexer)
+            except Exception:
+                pass
+
+        self.set_files(self.format_untitled(a_ed),
+                       self.format_untitled(b_ed))
+
+        # Close the two scratch tabs: their content already lives in
+        # the compare halves. PROP_MODIFIED is cleared first so the
+        # close never shows the 'Save changes?' dialog (on_close_pre's
+        # own clearing only covers Differ compare tabs).
+        for e in (a_ed, b_ed):
+            try:
+                e.set_prop(ct.PROP_MODIFIED, False)
+                e.cmd(ct_cmd.cmd_FileClose)
+            except Exception:
+                pass
+
     def diff_with(self):
         """Create a unified-diff output (read-only tab) comparing current
         document with a file picked from a dialog."""
@@ -6418,6 +6484,29 @@ class Command:
             )
         ct.menu_proc(self.menuid_equal_width, ct.MENU_SET_ENABLED,
             command=is_compare)
+
+        # "Compare clipboard to selection" right after 'Resize editors
+        # to equal width': a new compare tab with the clipboard text
+        # on the left and the focused editor's selection on the right
+        # (the same method as the exposed 'Differ\Compare clipboard to
+        # selection' command). Enabled only while BOTH sides exist:
+        # text on the clipboard AND a selection in the focused editor
+        # -- the menu is rebuilt on every right-click, so the state is
+        # always fresh (an image-only clipboard disables the item).
+        self.menuid_clip_sel = ct.menu_proc(self.compare_menu, ct.MENU_ADD,
+            command='module=cuda_differ;cmd=compare_clip_sel;',
+            caption=_('Compare clipboard to selection')
+            )
+        try:
+            clip_txt = ct.app_proc(ct.PROC_GET_CLIP, '')
+        except Exception:
+            clip_txt = ''
+        try:
+            sel_txt = ct.ed.get_text_sel()
+        except Exception:
+            sel_txt = ''
+        ct.menu_proc(self.menuid_clip_sel, ct.MENU_SET_ENABLED,
+            command=bool(clip_txt) and bool(sel_txt))
 
     def tabmenu_chooser(self):
         """Launch 'Compare with...' via a 100ms timer (needed because menu
