@@ -1,4 +1,29 @@
 2026.09.28 (by @badrelmers)
+- change (command): "Compare clipboard to selection" now applies the
+  focused editor's lexer to BOTH compare halves -- the clipboard side
+  gets the same syntax highlighting as the selection side instead of
+  plain text.
+- remove (lifecycle): the on_exit handler and its install.inf event
+  registration are gone; nothing is cleaned up at app exit anymore.
+  The dead teardown helper (toolbar destroy_all) went with it; the
+  toolbar forms are owned by CudaText's main form and die with the
+  app. on_exit_pre stays (it sets the session-persistence flag for
+  the exit path).
+- add (compare): slow-compare offer. When a background compare is
+  still running after a minute and was not started in the fastest
+  combination (Native Myers + Beautify off), a dialog asks: keep
+  waiting, or switch to that faster combination for this compare?
+  "Switch to faster compare" cancels the running job and re-runs it
+  in the fast mode; the mode is temporary (per compare tab, until the
+  tab is closed -- the persisted settings are untouched). Compares
+  already running the fast combination, or with the native engine
+  unavailable, never ask; Continue/Esc just keeps waiting.
+- change (overview): the slider never takes more than 1/7 of the
+  overview track height anymore (the cap also wins over the 30px
+  grabbable minimum on short panels), so it can no longer dominate
+  the panel on small files.
+
+2026.09.28 (by @badrelmers)
 - add (command): new "Differ\Compare clipboard to selection" command
   (install.inf item4e): opens a new compare tab with the clipboard
   text on the left and the focused editor's selection on the right

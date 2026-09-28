@@ -133,13 +133,14 @@ Implementation notes:
   tab, so the toolbars come back at startup.
 
 * TEARDOWN: a toolbar is destroyed when its compare tab is REALLY
-  closed (on_close's non-exit branch) and at app exit -- in the
-  plugin's on_exit, AFTER all on_close events fired, never inside
-  on_close's exit branch: at app exit CudaText fires on_close
-  synthetically from its own exit loop and writes the session file
-  only afterwards, so GUI calls there re-enter the message loop
-  between the plugin's state-file writes (unregister / re-register)
-  and used to cost the compare tabs their persisted session entries.
+  closed (on_close's non-exit branch) -- and that is the ONLY teardown
+  there is: nothing is cleaned up at app exit. At app exit CudaText
+  fires on_close synthetically from its own exit loop and writes the
+  session file only afterwards, so GUI calls there re-enter the
+  message loop between the plugin's state-file writes (unregister /
+  re-register) and used to cost the compare tabs their persisted
+  session entries. The forms are owned by CudaText's main form and
+  are freed by it when the app terminates.
   destroy() also NEVER calls menu_proc(MENU_REMOVE) -- that frees the
   popup's ROOT menu item and leaves the (main-form-owned) popup
   dangling; MENU_CLEAR empties it safely.
@@ -1532,12 +1533,6 @@ def destroy_for(tab_id_str):
     tb = _TOOLBARS.pop(str(tab_id_str), None)
     if tb is not None:
         tb.destroy()
-
-
-def destroy_all():
-    """Destroy every toolbar (app exit)."""
-    for key in list(_TOOLBARS):
-        destroy_for(key)
 
 
 def on_compare_start(cmd, session):

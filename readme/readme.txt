@@ -80,10 +80,9 @@ Compare clipboard to selection
     Compares the text on the clipboard with the selection of the
     focused editor, opening a new compare tab ("Diff: clipboard |
     selection"): clipboard text on the left, selected text on the
-    right. The selection side keeps the focused editor's syntax
-    highlighting; the clipboard side is shown as plain text (its
-    origin is unknown). Also in the diff-tab context menu, right
-    below "Resize editors to equal width".
+    right. Both sides use the focused editor's syntax highlighting,
+    so the two halves render consistently. Also in the diff-tab
+    context menu, right below "Resize editors to equal width".
 
 Diff current document with file...
     Produces a unified diff (patch-style) of the active file and a file
@@ -360,13 +359,13 @@ dark themes too -- a bare label would take the OS's black; the border
 line's color re-reads SplitMain).
 
 The toolbar's lifetime follows the tab's: it is destroyed when the
-compare tab is really closed, and at app exit it is destroyed in the
-plugin's on_exit event -- AFTER all on_close events fired, before
-CudaText writes its session file. (It is deliberately NOT destroyed
-inside on_close's app-exit branch: that event fires synthetically
-from CudaText's own exit loop, and GUI calls there re-enter the
-message processing between the plugin's state-file writes, which
-could cost the compare tabs their persisted session entries.)
+compare tab is really closed. Nothing is cleaned up at app exit: the
+toolbar forms are owned by CudaText's main form, which frees them
+when the app terminates. (They are deliberately NOT destroyed inside
+on_close's app-exit branch: that event fires synthetically from
+CudaText's own exit loop, and GUI calls there re-enter the message
+processing between the plugin's state-file writes, which could cost
+the compare tabs their persisted session entries.)
 
 == Ignore options ==
 
@@ -460,6 +459,16 @@ files are.
   compare on the main thread and occupy the UI for the compare time;
   Python plugin code cannot move to a background thread. This is one
   more reason to prefer the native algorithms for big files.
+- Slow-compare offer: when a background compare has been running for
+  over a minute and is not already using the fastest combination
+  (Native Myers with Beautify alignment off), the plugin asks once:
+  keep waiting, or switch to that faster combination for this compare?
+  "Switch" cancels the running compare and re-runs it in the fast mode;
+  it is temporary -- it applies to that compare tab until the tab is
+  closed (every later re-compare of the tab stays fast) and the
+  configured algorithm / Beautify options in the settings are never
+  touched. "Continue" (or closing the dialog) just keeps waiting.
+  Compares already running the fast combination never ask.
 
 
 == Saving and syncing changes ==
@@ -853,7 +862,11 @@ Micromap section:
   its travel range (the track minus the thumb) maps onto the scrollable
   range, so dragging the slider to the very bottom of the track scrolls
   the text to the very end of the files, and dragging it to the top
-  scrolls to the beginning.
+  scrolls to the beginning. Its height is proportional to the visible
+  part of the text (like a real scrollbar thumb, with a 30px grabbable
+  minimum on big files), but it never takes more than 1/7 of the
+  overview's height, so it can never dominate the panel on small
+  files.
   Default: on.
 - differ.micromap.hide_builtin_scrollbars: Hide built-in scrollbars in
   compare tabs

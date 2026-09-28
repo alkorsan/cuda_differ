@@ -194,7 +194,8 @@ Architecture:
       smooth_pos     = current scroll position (pixels)
       smooth_pos_last = maximum scroll position (the END of the text)
     so:
-      thumb_h  = clamp(track_h * smooth_page / smooth_max, 30px, track_h)
+      thumb_h  = clamp(track_h * smooth_page / smooth_max, 30px,
+                       track_h), then capped at track_h/7
       usable   = track_h - thumb_h          (pixels the thumb-top travels)
       pos_last = smooth_pos_last
       forward:  thumb_top = track_y0 + usable * smooth_pos / pos_last
@@ -756,7 +757,8 @@ class PaintboxOverview:
         self._slider_grabber_thickness = 2
         self._slider_grabber_spacing = 6
         # Min slider height in pixels — keeps the slider grabbable even
-        # when the file is much taller than the viewport.
+        # when the file is much taller than the viewport. (The 1/7-of-
+        # track cap in _slider_metrics wins when the two conflict.)
         self._slider_min_height = 30
 
         # --- Background static painting (see the module docstring,
@@ -2149,17 +2151,26 @@ class PaintboxOverview:
 
         The thumb is proportional to page/max (like every real
         scrollbar), clamped to [_slider_min_height, track_h] so it stays
-        grabbable on big files; the USABLE travel is what remains of the
-        track — the pixel range the thumb's TOP moves over, mapped
-        linearly onto the scrollable range [0, smooth_pos_last] by
-        _paint_dynamic / _pixel_to_smooth_pos / _preview_y_for_pos.
+        grabbable on big files, and finally capped to at most 1/7 of
+        the track height (the cap wins over the minimum too, so a
+        short overview never shows a slider that dominates the panel);
+        the USABLE travel is what remains of the track -- the pixel
+        range the thumb's TOP moves over, mapped linearly onto the
+        scrollable range [0, smooth_pos_last] by _paint_dynamic /
+        _pixel_to_smooth_pos / _preview_y_for_pos.
         """
         min_h = self._slider_min_height
+        # The slider never takes more than 1/7 of the overview's track
+        # height (floor, at least 1px so a tiny panel keeps a slider).
+        max_h = track_h // 7
+        if max_h < 1:
+            max_h = 1
         if smooth_max > 0 and smooth_page > 0:
             thumb_h = int(track_h * smooth_page / smooth_max + 0.5)
             thumb_h = max(min_h, min(track_h, thumb_h))
         else:
             thumb_h = min(min_h, track_h)
+        thumb_h = min(thumb_h, max_h)
         return thumb_h, max(0, track_h - thumb_h)
 
     def _cached_scroll_info(self):
@@ -2202,7 +2213,8 @@ class PaintboxOverview:
         - Map to the track area between the ▲/▼ buttons:
             thumb_h  = track_h * smooth_page / smooth_max
                        (proportional, clamped to min 30px so it stays
-                       grabbable, and to the track height)
+                       grabbable, and never taller than 1/7 of the
+                       track height)
             usable   = track_h - thumb_h  (the thumb's travel range)
             thumb_top = track_y0 + usable * smooth_pos / smooth_pos_last
         - Draw via _paint_slider_solid: one CANVAS_RECT call (pen border
@@ -2287,7 +2299,7 @@ class PaintboxOverview:
                 py_top = track_y0 + int(usable * smooth_pos / pos_last + 0.5)
             else:
                 # Everything fits (no scrolling possible): thumb pinned
-                # at the top, full height.
+                # at the top, its capped height.
                 py_top = track_y0
 
             # Clamp slider within the track

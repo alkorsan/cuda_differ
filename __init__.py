@@ -247,6 +247,14 @@ UI_PUMP_INTERVAL = 0.05
 # the finished opcodes are picked up).
 PY_ENGINE_POLL_MS = 50
 
+# Slow-compare watchdog: when a BACKGROUND compare is still running
+# after this many seconds and was NOT started in the fast mode
+# (Native Myers + Beautify off), the plugin asks the user whether to
+# re-run it in the fast mode (temporarily, for that compare tab only).
+# Compares already running the fast mode never ask (there is nothing
+# faster to switch to).
+SLOW_COMPARE_SECONDS = 60
+
 # Re-entrancy guard: PROC_IDLE dispatches messages synchronously, and a
 # dispatched event handler that itself reaches a pump point must NOT
 # nest a second ProcessMessages pass inside ours (LCL tolerates nested
@@ -1278,6 +1286,7 @@ class _CompareJob:
         'editor_lock',      # whole-compare lock/RO state (see class docstring)
         'stale',            # job dropped (tab closed / app exiting)
         'in_flight',        # background engine call was started
+        'fast_mode',        # started as the fast mode (Native Myers, Beautify off): the slow-compare dialog never asks
         'py_poll_cb',       # Python-engine completion poll timer callback (to TIMER_STOP on cancel), None when off
         'py_engine_thread', # daemon thread running the Python engine (diagnostic ref), None when off
     )
@@ -1316,8 +1325,19 @@ class _CompareJob:
         self.editor_lock = None
         self.stale = False
         self.in_flight = False
+        self.fast_mode = False
         self.py_poll_cb = None
         self.py_engine_thread = None
+
+
+def _is_fast_mode(diff):
+    """True when the Differ is configured exactly as the slow-compare
+    dialog's 'faster mode': the NATIVE engine running Native Myers with
+    Beautify alignment off (the toolbar preset 1 combination). A job
+    started this way never arms the slow-compare watchdog."""
+    return (isinstance(diff, dfn.Differ)
+            and getattr(diff, 'diff_algorithm', '') == 'native_myers'
+            and not getattr(diff, 'beautify_alignment', False))
 
 
 class _TabSession:
@@ -1357,6 +1377,9 @@ class _TabSession:
                        tab is created)
       saved            cached 'no half dirty' flag (persisted 'saved')
       dirty            cached set of halves with unsaved edits
+      fast_temp        temporary fast mode accepted in the slow-compare
+                       dialog: this tab compares with Native Myers +
+                       Beautify off until closed (settings untouched)
     """
 
     __slots__ = (
@@ -1364,6 +1387,7 @@ class _TabSession:
         'diff', 'overview', 'job',
         'overview_timer', 'suppress_change',
         'saved', 'dirty',
+        'fast_temp',
         'scrollstyle_orig',
         'marks_micromap_a', 'marks_micromap_b',
         'marks_chars_a', 'marks_chars_b',
@@ -1381,6 +1405,12 @@ class _TabSession:
         self.suppress_change = 0
         self.saved = True
         self.dirty = set()
+        # Temporary fast mode (slow-compare dialog's 'Switch to faster
+        # compare'): while True, every compare of THIS tab runs Native
+        # Myers with Beautify off, regardless of the configured
+        # algorithm / beautify options. Dies with the session (tab
+        # close) -- the persisted settings are never touched.
+        self.fast_temp = False
         # Vertical scrollbar style the editors had before Differ hid it
         # (see _apply_scrollbar_visibility): None while Differ has not
         # hidden any scrollbar, otherwise the captured original value
@@ -1814,9 +1844,11 @@ class Command:
         set_files compares two OPEN tabs, so the texts travel through
         two short-lived untitled scratch tabs ('clipboard' /
         'selection') which are closed again right after the compare
-        tab was created -- only the compare tab remains. The selection
-        half inherits the focused editor's lexer (syntax colors); the
-        clipboard half stays lexer-less (its origin is unknown).
+        tab was created -- only the compare tab remains. BOTH halves
+        inherit the focused editor's lexer (syntax colors): the
+        selection comes from that editor, and the clipboard side is
+        rendered in the same language so the two halves look
+        consistent.
 
         ct.ed is the FOCUSED-editor sentinel (Editor(0): every call
         resolves to whatever tab is focused AT THAT MOMENT), so the
@@ -1851,10 +1883,11 @@ class Command:
         b_ed.set_text_all(sel)
         b_ed.set_prop(ct.PROP_TAB_TITLE, 'selection')
         if lexer:
-            try:
-                b_ed.set_prop(ct.PROP_LEXER_FILE, lexer)
-            except Exception:
-                pass
+            for e in (a_ed, b_ed):
+                try:
+                    e.set_prop(ct.PROP_LEXER_FILE, lexer)
+                except Exception:
+                    pass
 
         self.set_files(self.format_untitled(a_ed),
                        self.format_untitled(b_ed))
@@ -3101,6 +3134,88 @@ class Command:
             self._cancel_job(job)
         ct.msg_status(_('Differ: cancelled {} compare(s)').format(len(jobs)))
 
+    def _arm_slow_compare_watchdog(self, session, job):
+        """Arm the one-shot SLOW_COMPARE_SECONDS timer for a
+        just-started BACKGROUND compare (both background forms: the
+        native engine job and the Python engine thread). Skipped when
+        the compare already runs the fast mode (Native Myers + Beautify
+        off -- the mode the dialog would switch to; asking would be
+        pointless) or when the native engine is unavailable (the
+        switch would be impossible). The timer callback
+        (_slow_compare_timer) re-checks everything at fire time, so a
+        compare that finishes early, a tab that closes, or a newer
+        kick-off on the same tab all resolve to silent no-ops."""
+        if job.fast_mode or not dfn._HAS_NATIVE_DIFF:
+            return
+        try:
+            callback = ('module=cuda_differ;cmd=_slow_compare_timer;'
+                        'info={};').format(session.tab_id_str)
+            ct.timer_proc(ct.TIMER_START_ONE, callback,
+                          SLOW_COMPARE_SECONDS * 1000)
+        except Exception:
+            pass
+
+    def _slow_compare_timer(self, tag='', info=''):
+        """One-shot SLOW_COMPARE_SECONDS timer callback: a background
+        compare has been running for over a minute and was NOT started
+        in the fast mode -- ask the user whether to keep waiting or to
+        re-run this compare in the fast mode (Native Myers, Beautify
+        off).
+
+        Guards (each resolves to a silent no-op): the tab closed with
+        the timer in flight, the compare finished or was cancelled,
+        the running job is not old enough yet (this timer may be the
+        STALE one of an earlier compare on the same tab -- the elapsed
+        check uses the RUNNING job's own kick-off time, so only the
+        timer of the job that actually crossed the threshold acts), or
+        the job already runs the fast mode.
+
+        'Switch to faster compare' cancels the running job exactly
+        like the Cancel command, sets the session's temporary
+        fast-mode flag (every later compare of this tab runs Native
+        Myers + Beautify off until the tab closes; the persisted
+        settings are NOT touched) and re-runs the compare with the
+        same 'show identical' dialog policy the original compare had.
+        'Continue compare' (and Esc / closing the dialog) leaves the
+        running compare alone."""
+        if not info:
+            return
+        session = self._sessions.get(str(info))
+        if session is None:
+            return  # tab closed with the timer still in flight
+        job = session.job
+        if job is None or job.stale:
+            return  # compare finished / cancelled in the meantime
+        if time.perf_counter() - job.compare_start < \
+                SLOW_COMPARE_SECONDS - 0.5:
+            return  # the running job is younger: its own timer asks
+        if job.fast_mode:
+            return  # belt-and-braces: never armed for fast jobs
+        res = ct.msg_box_ex(
+            _('Differ: slow compare'),
+            _('The compare has been running for over a minute. Keep '
+              'waiting, or switch to the faster mode (Native Myers, '
+              'Beautify off) for this compare?'),
+            [_('Continue compare'), _('Switch to faster compare')],
+            ct.MB_ICONQUESTION, 0)
+        if res != 1:
+            return  # keep waiting (Esc / dialog closed included)
+        # The compare may have FINISHED while the modal dialog was open
+        # (its message pump delivers timers, so the completion callback
+        # can already have run and cleared the slot) -- then there is
+        # nothing left to re-run.
+        if session.job is not job:
+            return
+        session.job = None
+        self._cancel_job(job)
+        session.fast_temp = True
+        try:
+            ct.msg_status(_('Differ: re-comparing in the fast mode '
+                            '(Native Myers, Beautify off)'))
+        except Exception:
+            pass
+        self.refresh_compare(ed=job.a_ed, show_dialog=job.show_dialog)
+
     def resize_equal_width(self, ed=None):
         """Command: resize the split editors of the given tab to equal
         widths. Useful after the user drags the editor splitter and wants
@@ -3156,7 +3271,7 @@ class Command:
         'native_myers': 'myers',
     }
 
-    def _resolve_algorithm(self):
+    def _resolve_algorithm(self, session=None):
         """Return (effective_algo, use_native, fell_back).
 
         effective_algo is what the Differ instance should run.
@@ -3164,8 +3279,20 @@ class Command:
         cudatext.diff_proc is available.
         fell_back is True when the user configured a native algo but
         the native API is missing, so a Python equivalent is used.
+
+        A session whose temporary fast-mode flag is set (the slow-
+        compare dialog's 'Switch to faster compare') resolves to
+        Native Myers for the lifetime of that compare tab, without
+        touching the persisted settings -- and only when the native
+        engine is available (otherwise the switch would be
+        meaningless, so the configured algorithm stays).
         """
         algo = self.cfg.get('diff_algorithm', 'native_myers')
+        if (session is not None
+                and getattr(session, 'fast_temp', False)
+                and algo != 'native_myers'
+                and dfn._HAS_NATIVE_DIFF):
+            algo = 'native_myers'
         if algo in self._NATIVE_TO_PYTHON_FALLBACK:
             if dfn._HAS_NATIVE_DIFF:
                 return algo, True, False
@@ -3215,7 +3342,7 @@ class Command:
         'native_*' name it cannot run.
         """
         diff = self._session_diff(session)
-        algo, want_native, fell_back = self._resolve_algorithm()
+        algo, want_native, fell_back = self._resolve_algorithm(session)
         is_native = isinstance(diff, dfn.Differ)
         if want_native == is_native:
             # Still refresh the effective algorithm name (handles a
@@ -3575,16 +3702,23 @@ class Command:
 
             diff.withdetail = self.cfg.get('compare_with_details')
             # Use the resolved algorithm (native→Python mapping when
-            # cudatext.diff_proc is missing). Do not pass a 'native_*'
-            # name into the pure-Python Differ.
-            _algo, _use_native, _fell_back = self._resolve_algorithm()
+            # cudatext.diff_proc is missing; temporary fast-mode
+            # override while this tab's slow-compare switch is on).
+            # Do not pass a 'native_*' name into the pure-Python
+            # Differ.
+            _algo, _use_native, _fell_back = self._resolve_algorithm(session)
             diff.diff_algorithm = _algo
             if _fell_back:
                 ct.msg_status(
                     _('Differ: native API not available — falling back to Python algo {} '
                       '(configured: {})').format(
                         _algo, self.cfg.get('diff_algorithm', 'native_myers')))
-            diff.beautify_alignment = self.cfg.get('beautify_alignment')
+            if getattr(session, 'fast_temp', False):
+                # Temporary fast mode: Beautify alignment off for this
+                # compare tab, regardless of the configured option.
+                diff.beautify_alignment = False
+            else:
+                diff.beautify_alignment = self.cfg.get('beautify_alignment')
             # Ignore options -> diff_proc DIFF_IGN_* bitmask for the
             # native algorithms (applies to BOTH the line-level diff and
             # the char-level details). The pure-Python Differ simply
@@ -3659,6 +3793,13 @@ class Command:
             job.color_ignored_gap = color_ignored_gap
             job.show_dialog = show_dialog
             job.compare_start = _compare_start
+            # Fast mode = exactly what the slow-compare dialog would
+            # switch to: native engine, Native Myers, Beautify off.
+            # Jobs started this way never arm the watchdog (asking to
+            # switch would be pointless) and their session's temporary
+            # flag (set on switch) makes every later refresh of this
+            # tab re-run in the fast mode too.
+            job.fast_mode = _is_fast_mode(diff)
             job.profiling_enabled_here = _profiling_enabled_here
             job.cprofile = _cprof
             if isinstance(diff, dfn.Differ):
@@ -3717,6 +3858,7 @@ class Command:
                     # completion callback, not in the finally below.
                     _epilogue = False
                     ct.msg_status(_('Differ: comparing in background...'))
+                    self._arm_slow_compare_watchdog(session, job)
                     return
                 # Engine refused to start the background compare: report
                 # and stop (no synchronous fallback -- it would freeze
@@ -3804,6 +3946,7 @@ class Command:
                 self._lock_compare_editors(job)
                 _epilogue = False
                 ct.msg_status(_('Differ: comparing in background...'))
+                self._arm_slow_compare_watchdog(session, job)
                 return
             except Exception:
                 # Thread / timer unavailable (exotic host, test sandbox)
@@ -6673,9 +6816,10 @@ class Command:
         write at the top, the exit re-register write at the bottom).
         That interleaving is what used to cost compare tabs their
         persisted session entries after a restart. At exit the exit
-        branch below returns BEFORE any GUI teardown -- on_exit (which
-        fires after ALL on_close events, before the session write)
-        destroys the toolbars instead."""
+        branch below therefore returns BEFORE any GUI teardown -- the
+        toolbar forms are simply left to die with the app: they are
+        owned by CudaText's main form, which frees them when the app
+        terminates, and no cleanup of our own is needed there."""
         tab_id = ed_self.get_prop(ct.PROP_TAB_ID)
         session = self._session_for(tab_id)
         if session is None:
@@ -6776,17 +6920,3 @@ class Command:
         state = self._load_state()
         if not state['sessions'].get(session.state_key, {}):
             self._disable_autostart()
-
-    def on_exit(self, ed_self):
-        """App exit, AFTER every on_close event fired (CudaText's exit
-        sequence: exit loop of synthetic on_close per editor, then
-        on_exit, then the session file write). This is the ONE safe
-        place to tear down plugin UI during the exit -- the toolbar
-        forms are freed here, when no more state bookkeeping is in
-        flight, so no dialog interaction can ever interleave with the
-        state-file writes that keep compare tabs diff tabs across
-        restarts."""
-        try:
-            difftb.destroy_all()
-        except Exception:
-            pass
