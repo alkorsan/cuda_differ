@@ -1,4 +1,31 @@
 2026.09.28 (by @badrelmers)
+- add (command): new "Differ\Swap compared editors" command
+  (install.inf item5b): swaps the two sides of the current compare
+  tab -- texts, syntax highlighting and the other per-side display
+  settings move with the text, and side identity follows the content:
+  the tab title, which original file each side syncs back to on save,
+  and the unsaved-changes labels. The comparison re-runs automatically
+  with the sides traded. Cheap by design: no extra memory is kept
+  (both texts already exist; only a short-lived copy while rewriting
+  the halves) and the cost is one re-compare. Refused while a compare
+  is running in that tab.
+- fix (alignment): set_files no longer takes EDACTION_LOCK around the
+  whole setup. Locking the editors BEFORE the texts are loaded could
+  leave the word-wrap line table stale for the freshly loaded text
+  (the table is rebuilt inside the editor's paint cycle, which the
+  paint lock forbids), so the compare's inter-line alignment gaps
+  were sized from stale data and the two halves drifted apart
+  vertically on word-wrapped files -- only sometimes, exactly the
+  timing races where the fresh tab's editor handle wasn't allocated
+  in time. The lock around the running compare itself (the busy
+  placeholder) is safe and stays; the drift explanation now lives in
+  a comment where the removed lock used to be.
+- add (doc): readme's "closing a compare tab" chapter now explains
+  for end users why the tab's close button does nothing while a
+  comparison is running: stop the compare (toolbar x / Cancel
+  compare) or wait for it to finish, then close works again.
+
+2026.09.28 (by @badrelmers)
 - change (command): "Compare clipboard to selection" now applies the
   focused editor's lexer to BOTH compare halves -- the clipboard side
   gets the same syntax highlighting as the selection side instead of

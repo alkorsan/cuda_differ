@@ -393,6 +393,19 @@ METAJSONFILE = os.path.dirname(__file__) + os.sep + 'differ_opts.json'
 JSONFILE = 'cuda_differ.json'  # To store in settings/cuda_differ.json
 JSONPATH = ct.app_path(ct.APP_DIR_SETTINGS) + os.sep + JSONFILE
 
+# Editor properties copied from an original tab to its compare half
+# (set_files), and swapped between the two halves by swap_view. These
+# affect how text is displayed and interpreted; each half keeps the
+# properties of the text it shows.
+_PROPS_TO_COPY = [
+    ct.PROP_LEXER_FILE,
+    ct.PROP_NEWLINE,
+    ct.PROP_ENC,
+    ct.PROP_TAB_SPACES,
+    ct.PROP_TAB_SIZE,
+    ct.PROP_WRAP,
+]
+
 # Option metadata for the config dialog (Options Editor). Chapters ('chp')
 # group the options in the dialog tree; the order below is the display order:
 # theme -> algorithm -> advanced -> micromap. Every option name carries its
@@ -2008,16 +2021,7 @@ class Command:
         the option toggled on, ...), so an overview always exists by
         the time a compare paints its events."""
         files = [file0, file1]
-        # Properties to copy from originals to the compare halves.
-        # These affect how text is displayed and interpreted.
-        _PROPS_TO_COPY = [
-            ct.PROP_LEXER_FILE,
-            ct.PROP_NEWLINE,
-            ct.PROP_ENC,
-            ct.PROP_TAB_SPACES,
-            ct.PROP_TAB_SIZE,
-            ct.PROP_WRAP,
-        ]
+        # Properties to copy: the module-level _PROPS_TO_COPY list.
         orig_props = [None, None]  # list of prop-value dicts per half
         orig_tab_ids = [None, None]
         orig_texts = [None, None]
@@ -2065,159 +2069,180 @@ class Command:
         b_ed.set_prop(ct.PROP_GUTTER_FOLD, False)
         a_ed.set_prop(ct.PROP_GUTTER_STATES, False)
         b_ed.set_prop(ct.PROP_GUTTER_STATES, False)
+        # NOTE: deliberately NOT EDACTION_LOCKed (a lock used to wrap
+        # this whole setup, taken BEFORE the texts were loaded -- it
+        # is gone because of a line-alignment drift bug). EDACTION_LOCK
+        # is ATSynEdit.BeginUpdate: a counted PAINT lock (while it is
+        # held, an editor paints only its 'busy' placeholder, never
+        # text). The word-wrap line table (WrapInfo -- which visual
+        # rows each wrapped line occupies, the data the compare's
+        # alignment gaps are sized from) is rebuilt INSIDE the paint
+        # cycle (TATSynEdit.DoPaintMain -> UpdateWrapInfo), and
+        # set_text_all on a just-created, not-yet-shown control leaves
+        # that table empty or stale for the freshly loaded text (its
+        # own immediate rebuild is skipped when the control has no
+        # window handle yet). With the halves locked from BEFORE the
+        # text load, no paint could ever run between the load and the
+        # end of the first compare to repair the table, so the paint
+        # phase sized the inter-line alignment gaps from stale data
+        # and the two halves drifted apart vertically ("lines
+        # incorrectly aligned" -- word-wrapped files, only sometimes:
+        # exactly the races where the fresh tab's editor handle was
+        # not allocated in time). Locking only DURING the compare
+        # (_lock_compare_editors, see refresh_compare) is safe: by
+        # then the text was loaded while unlocked and the editor
+        # painted at least once, so the wrap table is already correct
+        # -- that lock freezes the screen, not the data. Unlocked
+        # here, the halves can paint between the text load and the
+        # compare's kick-off lock, so the pending wrap rebuild lands
+        # before any gap math reads it.
+
+        # Set a readable combined title (just the basenames/titles, no tab IDs).
+        title0 = os.path.basename(orig_names[0]) if orig_names[0] else _('Untitled')
+        title1 = os.path.basename(orig_names[1]) if orig_names[1] else _('Untitled')
+        ct.ed.set_prop(ct.PROP_TAB_TITLE, 'Diff: {} | {}'.format(title0, title1))
+
+        # Copy editor properties (lexer, newline, encoding, tabs, wrap) from
+        # each original to its corresponding compare half.
+        for ed, props in ((a_ed, orig_props[0]), (b_ed, orig_props[1])):
+            if not props:
+                continue
+            for prop, val in props.items():
+                if val is not None:
+                    try:
+                        ed.set_prop(prop, val)
+                    except Exception:
+                        pass  # some props may not be settable on untitled tabs
+
+        # --- Everything that changes the editors' WIDTH runs BEFORE
+        # the texts are loaded (see the method docstring): session
+        # registration, micromap setup, built-in scrollbar hiding,
+        # overview creation. The texts then wrap exactly once, at
+        # the editors' final width.
+
+        # Register the compare tab by its PROP_TAB_ID with the original
+        # tab IDs and names, plus the session key for grouping. The
+        # _TabSession is the tab's standalone world from here on.
+        # (Created BEFORE the texts are loaded: the session must
+        # exist when the spurious on_change events of set_text_all
+        # fire, and the overview is owned by the session.)
+        compare_tab_id = ct.ed.get_prop(ct.PROP_TAB_ID)
         try:
-            a_ed.action(ct.EDACTION_LOCK)
-            b_ed.action(ct.EDACTION_LOCK)
+            session_path = ct.app_path(ct.APP_FILE_SESSION) or ''
+        except Exception:
+            session_path = ''
+        session_key = self._session_key(session_path)
+        self._current_session_key = session_key
+        session = self._new_session(compare_tab_id, session_key)
+        self._register_compare_tab(
+            session,
+            orig_tab_ids[0], orig_tab_ids[1],
+            orig_names[0], orig_names[1],
+            saved=True)  # initial state: content matches originals = saved
+        # Suppress the next 2 on_change events (one per split half)
+        # because set_text_all triggers on_change, which would reset
+        # the green color to red. Armed BEFORE the texts are loaded
+        # (the session now exists earlier than in the old layout, so
+        # the spurious events must never find an unarmed session).
+        # The counter is decremented in on_change; real user edits
+        # after this will work normally.
+        session.suppress_change = 2
 
-            # Set a readable combined title (just the basenames/titles, no tab IDs).
-            title0 = os.path.basename(orig_names[0]) if orig_names[0] else _('Untitled')
-            title1 = os.path.basename(orig_names[1]) if orig_names[1] else _('Untitled')
-            ct.ed.set_prop(ct.PROP_TAB_TITLE, 'Diff: {} | {}'.format(title0, title1))
+        # Set up the micromap on both editors when enabled (its
+        # gutter columns also change the editors' width -- hence
+        # here, before the text load; refresh_compare's own setup
+        # call is idempotent).
+        micromap_on = self.cfg.get('enable_micromap', False)
+        if micromap_on:
+            self._setup_micromap(a_ed, b_ed)
 
-            # Copy editor properties (lexer, newline, encoding, tabs, wrap) from
-            # each original to its corresponding compare half.
-            for ed, props in ((a_ed, orig_props[0]), (b_ed, orig_props[1])):
-                if not props:
-                    continue
-                for prop, val in props.items():
-                    if val is not None:
-                        try:
-                            ed.set_prop(prop, val)
-                        except Exception:
-                            pass  # some props may not be settable on untitled tabs
+        # Create the compare TOOLBAR before loading the texts (like
+        # the overview below: docking the toolbar into the editor
+        # parent changes the tab's layout, and doing it after the
+        # text is loaded would trigger a needless re-layout with the
+        # texts in place). The toolbar spans the parent's top side
+        # ('T' dock); it is created EMPTY -- idle buttons, the theme's
+        # editor background, an empty status label -- and reflects
+        # the running compare as soon as refresh_compare (below)
+        # kicks it off.
+        difftb.ensure_for_session(self, session, a_ed)
 
-            # --- Everything that changes the editors' WIDTH runs BEFORE
-            # the texts are loaded (see the method docstring): session
-            # registration, micromap setup, built-in scrollbar hiding,
-            # overview creation. The texts then wrap exactly once, at
-            # the editors' final width.
+        # Hide the built-in vertical scrollbars while the overview
+        # (which has its own slider + arrow buttons) replaces them —
+        # BEFORE the text load, for the same no-re-wrap reason.
+        overview_on = self.cfg.get('enable_overview', True)
+        self._apply_scrollbar_visibility(
+            session, a_ed, b_ed,
+            overview_on and self.cfg.get('hide_builtin_scrollbars', True))
 
-            # Register the compare tab by its PROP_TAB_ID with the original
-            # tab IDs and names, plus the session key for grouping. The
-            # _TabSession is the tab's standalone world from here on.
-            # (Created BEFORE the texts are loaded: the session must
-            # exist when the spurious on_change events of set_text_all
-            # fire, and the overview is owned by the session.)
-            compare_tab_id = ct.ed.get_prop(ct.PROP_TAB_ID)
+        # Create the overview panel BEFORE loading the texts: docking
+        # it to the right of the editors changes their width, and
+        # doing that after set_text_all would re-wrap both halves
+        # (the "re-warp of text" the fix exists for). The panel is
+        # created EMPTY — the theme's editor background color, the
+        # ▲/▼ buttons and the separator — and the colored diff map
+        # is filled in when the compare that starts right below
+        # finishes. (refresh_compare also creates the overview when
+        # it is missing — Recompare, restored tabs, the option
+        # toggled on — so a compare can always fill a panel.)
+        if overview_on:
+            overview = PaintboxOverview()
+            overview.create(a_ed, b_ed)
+            session.overview = overview
+            # Colors from the theme + config so the empty panel
+            # matches the editors from the first frame on.
             try:
-                session_path = ct.app_path(ct.APP_FILE_SESSION) or ''
+                ui_theme = ct.app_proc(ct.PROC_THEME_UI_DICT_GET, '')
+                color_bg = ui_theme.get('EdTextBg', {}).get('color', 0xFFFFFF)
             except Exception:
-                session_path = ''
-            session_key = self._session_key(session_path)
-            self._current_session_key = session_key
-            session = self._new_session(compare_tab_id, session_key)
-            self._register_compare_tab(
-                session,
-                orig_tab_ids[0], orig_tab_ids[1],
-                orig_names[0], orig_names[1],
-                saved=True)  # initial state: content matches originals = saved
-            # Suppress the next 2 on_change events (one per split half)
-            # because set_text_all triggers on_change, which would reset
-            # the green color to red. Armed BEFORE the texts are loaded
-            # (the session now exists earlier than in the old layout, so
-            # the spurious events must never find an unarmed session).
-            # The counter is decremented in on_change; real user edits
-            # after this will work normally.
-            session.suppress_change = 2
+                color_bg = 0xFFFFFF
+            overview.set_colors(
+                color_bg,
+                self.cfg.get('color_deleted'),
+                self.cfg.get('color_added'),
+                self.cfg.get('color_changed'),
+                self.cfg.get('color_gaps'),
+                self.cfg.get('color_ignored_gap'))
+            overview.clear_data()
+            # Paint the empty overview right away: the default
+            # background, the ▲/▼ buttons, the separator. Cheap (no
+            # diff data yet) and already background-threaded inside
+            # the overview — this is the "default background color"
+            # state that stays visible until the compare finishes.
+            overview.repaint_static()
 
-            # Set up the micromap on both editors when enabled (its
-            # gutter columns also change the editors' width -- hence
-            # here, before the text load; refresh_compare's own setup
-            # call is idempotent).
-            micromap_on = self.cfg.get('enable_micromap', False)
-            if micromap_on:
-                self._setup_micromap(a_ed, b_ed)
+        # Load each original's content into the two split halves.
+        # The overview is docked, the scrollbars are hidden and the
+        # micromap columns are in place by now, so the editors
+        # already have their FINAL width and the text wraps only
+        # once.
+        a_ed.set_text_all(orig_texts[0])
+        b_ed.set_text_all(orig_texts[1])
 
-            # Create the compare TOOLBAR before loading the texts (like
-            # the overview below: docking the toolbar into the editor
-            # parent changes the tab's layout, and doing it after the
-            # text is loaded would trigger a needless re-layout with the
-            # texts in place). The toolbar spans the parent's top side
-            # ('T' dock); it is created EMPTY -- idle buttons, the theme's
-            # editor background, an empty status label -- and reflects
-            # the running compare as soon as refresh_compare (below)
-            # kicks it off.
-            difftb.ensure_for_session(self, session, a_ed)
+        # Color the tab title green to indicate 'synced' (no unsaved
+        # changes yet -- content is identical to the originals).
+        ct.ed.set_prop(ct.PROP_TAB_COLOR_FONT, 0x00A000)  # green
 
-            # Hide the built-in vertical scrollbars while the overview
-            # (which has its own slider + arrow buttons) replaces them —
-            # BEFORE the text load, for the same no-re-wrap reason.
-            overview_on = self.cfg.get('enable_overview', True)
-            self._apply_scrollbar_visibility(
-                session, a_ed, b_ed,
-                overview_on and self.cfg.get('hide_builtin_scrollbars', True))
+        # Persistently subscribe to on_start2 so the plugin auto-loads on
+        # next startup to restore compare tabs.
+        self._enable_autostart()
 
-            # Create the overview panel BEFORE loading the texts: docking
-            # it to the right of the editors changes their width, and
-            # doing that after set_text_all would re-wrap both halves
-            # (the "re-warp of text" the fix exists for). The panel is
-            # created EMPTY — the theme's editor background color, the
-            # ▲/▼ buttons and the separator — and the colored diff map
-            # is filled in when the compare that starts right below
-            # finishes. (refresh_compare also creates the overview when
-            # it is missing — Recompare, restored tabs, the option
-            # toggled on — so a compare can always fill a panel.)
-            if overview_on:
-                overview = PaintboxOverview()
-                overview.create(a_ed, b_ed)
-                session.overview = overview
-                # Colors from the theme + config so the empty panel
-                # matches the editors from the first frame on.
-                try:
-                    ui_theme = ct.app_proc(ct.PROC_THEME_UI_DICT_GET, '')
-                    color_bg = ui_theme.get('EdTextBg', {}).get('color', 0xFFFFFF)
-                except Exception:
-                    color_bg = 0xFFFFFF
-                overview.set_colors(
-                    color_bg,
-                    self.cfg.get('color_deleted'),
-                    self.cfg.get('color_added'),
-                    self.cfg.get('color_changed'),
-                    self.cfg.get('color_gaps'),
-                    self.cfg.get('color_ignored_gap'))
-                overview.clear_data()
-                # Paint the empty overview right away: the default
-                # background, the ▲/▼ buttons, the separator. Cheap (no
-                # diff data yet) and already background-threaded inside
-                # the overview — this is the "default background color"
-                # state that stays visible until the compare finishes.
-                overview.repaint_static()
+        # Track this tab for scroll sync.
+        self.scroll.tab_id.add(compare_tab_id)
+        self.scroll.toggle(self.cfg.get('sync_scroll'))
 
-            # Load each original's content into the two split halves.
-            # The overview is docked, the scrollbars are hidden and the
-            # micromap columns are in place by now, so the editors
-            # already have their FINAL width and the text wraps only
-            # once.
-            a_ed.set_text_all(orig_texts[0])
-            b_ed.set_text_all(orig_texts[1])
+        # app sets LastLineOnTop automatically on adding 'gaps', but if file
+        # don't have gaps, we must set it manually.
+        a_ed.set_prop(ct.PROP_LAST_LINE_ON_TOP, True)
+        b_ed.set_prop(ct.PROP_LAST_LINE_ON_TOP, True)
 
-            # Color the tab title green to indicate 'synced' (no unsaved
-            # changes yet -- content is identical to the originals).
-            ct.ed.set_prop(ct.PROP_TAB_COLOR_FONT, 0x00A000)  # green
+        # if file was in group-2, and now group-2 is empty, set "one group" mode
+        if ct.app_proc(ct.PROC_GET_GROUPING, '') in [ct.GROUPS_2VERT, ct.GROUPS_2HORZ]:
+            e = ct.ed_group(1)
+            if not e:
+                ct.app_proc(ct.PROC_SET_GROUPING, ct.GROUPS_ONE)
 
-            # Persistently subscribe to on_start2 so the plugin auto-loads on
-            # next startup to restore compare tabs.
-            self._enable_autostart()
-
-            # Track this tab for scroll sync.
-            self.scroll.tab_id.add(compare_tab_id)
-            self.scroll.toggle(self.cfg.get('sync_scroll'))
-
-            # app sets LastLineOnTop automatically on adding 'gaps', but if file
-            # don't have gaps, we must set it manually.
-            a_ed.set_prop(ct.PROP_LAST_LINE_ON_TOP, True)
-            b_ed.set_prop(ct.PROP_LAST_LINE_ON_TOP, True)
-
-            # if file was in group-2, and now group-2 is empty, set "one group" mode
-            if ct.app_proc(ct.PROC_GET_GROUPING, '') in [ct.GROUPS_2VERT, ct.GROUPS_2HORZ]:
-                e = ct.ed_group(1)
-                if not e:
-                    ct.app_proc(ct.PROC_SET_GROUPING, ct.GROUPS_ONE)
-
-            self.refresh_compare()
-        finally:
-            a_ed.action(ct.EDACTION_UNLOCK)
-            b_ed.action(ct.EDACTION_UNLOCK)
+        self.refresh_compare()
 
     def create_diff(self, txt0, txt1, fn0, fn1):
         """Create a read-only unified-diff tab from two text strings.
@@ -3260,6 +3285,135 @@ class Command:
         Falls back to the focused tab when the recorded tab is gone."""
         ed = self._editor_by_tab_id(info)
         self.resize_equal_width(ed)
+
+    def swap_view(self, ed=None):
+        """Command: swap the two compared editors of a compare tab
+        (left <-> right): the text the left half shows moves to the
+        right half and vice versa. Exposed as
+        'Differ\\Swap compared editors'.
+
+        The swap is a VIEW operation on the existing tab, not a fresh
+        compare of reversed files: each half is rewritten with the
+        OTHER half's current text (user edits included), and the
+        per-half properties move with the text (lexer, newline,
+        encoding, tab settings, wrap mode -- the same _PROPS_TO_COPY
+        list set_files copies from the originals), so each side keeps
+        looking and behaving like the text it now shows. Side identity
+        follows the CONTENT: the persisted registration is swapped too
+        -- which original tab/file each half syncs back to on Ctrl+S,
+        the dirty-half labels ('a' <-> 'b'), the session's caches --
+        and the tab title becomes 'Diff: <was-right> | <was-left>'.
+        A fresh compare is kicked off at the end (refresh_compare,
+        automatic -- no 'identical' dialog), which clears the old
+        markers / gaps / bookmarks / overview data and repaints them
+        for the swapped sides: deleted/added colors now land on the
+        opposite sides (a line 'deleted from A' reads as 'added in B'
+        once B is on the left), exactly like comparing the two files
+        in the other order.
+
+        Memory: nothing new is kept alive -- the two texts exist as
+        Python strings only for the moment of the rewrite (the editors
+        already hold both texts; these copies are dropped when the
+        method returns), so the swap itself costs transient memory
+        only, and the re-compare costs exactly one Recompare of CPU.
+        The undo history of each half does not survive the swap (a
+        half's undo entries belong to the text that just moved to the
+        other side; set_text_all never keeps undo anyway).
+
+        The two spurious on_change events of the set_text_all pair
+        are suppressed (session.suppress_change += 2, the same
+        mechanism set_files uses): the tab still holds the same PAIR
+        of texts, so a clean pair stays clean (green title) and the
+        dirty halves keep their dirty state -- with the labels
+        swapped so save still syncs each text to its own original.
+
+        'ed' is any editor of the compare tab (None = the focused
+        editor, used by the exposed command). A running compare for
+        the tab is refused with the same hint refresh_compare gives
+        (its halves are locked read-only under its snapshot); a
+        non-compare tab is refused too. Swapping twice restores the
+        original arrangement.
+        """
+        if ed is None:
+            ed = ct.ed
+        tab_id = ed.get_prop(ct.PROP_TAB_ID)
+        session = self._session_for(tab_id)
+        if session is None:
+            return ct.msg_status(_('Differ: not a compare tab'))
+        if session.job is not None:
+            return ct.msg_status(_('Differ: compare already running'))
+        a_ed = ct.Editor(ed.get_prop(ct.PROP_HANDLE_PRIMARY))
+        b_ed = ct.Editor(ed.get_prop(ct.PROP_HANDLE_SECONDARY))
+
+        # Snapshot both halves first: texts (each feeds the OTHER's
+        # rewrite) and the per-half properties to move with them.
+        text_a = a_ed.get_text_all(ends=True)
+        text_b = b_ed.get_text_all(ends=True)
+        props_a = {p: a_ed.get_prop(p) for p in _PROPS_TO_COPY}
+        props_b = {p: b_ed.get_prop(p) for p in _PROPS_TO_COPY}
+
+        # Swap the persisted registration (and the session's caches):
+        # the editor handles stay, but which ORIGINAL each half belongs
+        # to follows the content after the swap. Dirty labels swap
+        # with them -- a dirty left half becomes a dirty right half
+        # (both-dirty and both-clean are swap-invariant).
+        state = self._load_state()
+        group = state['sessions'].get(session.state_key, {})
+        entry = group.get(session.tab_id_str)
+        entry = entry if isinstance(entry, dict) else {}
+        orig_a_id = entry.get('primary_orig_tab_id')
+        orig_b_id = entry.get('secondary_orig_tab_id')
+        orig_a_name = entry.get('primary_orig_name', '') or ''
+        orig_b_name = entry.get('secondary_orig_name', '') or ''
+        dirty = {('b' if h == 'a' else 'a')
+                 for h in self._get_dirty_halves(session)}
+        self._register_compare_tab(
+            session, orig_b_id, orig_a_id,
+            orig_b_name, orig_a_name,
+            dirty=dirty)
+
+        # Retitle: 'Diff: <was-right> | <was-left>' (basenames/titles,
+        # the same fallback to 'Untitled' set_files uses).
+        title_a = (os.path.basename(orig_a_name)
+                   if orig_a_name else _('Untitled'))
+        title_b = (os.path.basename(orig_b_name)
+                   if orig_b_name else _('Untitled'))
+        ed.set_prop(ct.PROP_TAB_TITLE,
+                    'Diff: {} | {}'.format(title_b, title_a))
+
+        # The swap itself. Suppress the two spurious on_change events
+        # FIRST (set_text_all fires them synchronously; the pair of
+        # texts in the tab is unchanged, clean stays clean), then
+        # rewrite each half with the other's text and move the props.
+        session.suppress_change += 2
+        a_ed.set_text_all(text_b)
+        b_ed.set_text_all(text_a)
+        for ed_x, props in ((a_ed, props_b), (b_ed, props_a)):
+            for prop, val in props.items():
+                if val is not None:
+                    try:
+                        ed_x.set_prop(prop, val)
+                    except Exception:
+                        pass  # same guard as set_files' prop copy
+
+        # Both halves to the top: set_text_all resets the carets, and
+        # the old scroll positions may point past the (possibly
+        # shorter) new texts -- a common top is the predictable start
+        # for the re-compare. Equal positions also mean no sync-scroll
+        # mirror cascade on the first paint.
+        for e in (a_ed, b_ed):
+            try:
+                e.set_prop(ct.PROP_SCROLL_VERT_INFO,
+                           {'smooth_pos': 0.0})
+            except Exception:
+                pass
+
+        # Re-compare with the swapped sides (markers, gaps, bookmarks
+        # and the overview are all rebuilt by the same Recompare path;
+        # the two texts themselves did not change, so for identical
+        # sides the status bar just reports the compare as before).
+        self.refresh_compare(ed, show_dialog=False)
+        ct.msg_status(_('Differ: compared editors swapped'))
 
     # native_histogram / native_myers only work when cudatext.diff_proc
     # is present. On older CudaText builds the plugin falls back to the

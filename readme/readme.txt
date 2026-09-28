@@ -114,6 +114,25 @@ Recompare
 Focus the opposite file
     Moves the cursor to the other side of the split.
 
+Swap compared editors
+    Swaps the two sides of the current compare tab: the text on the
+    left moves to the right and vice versa, together with its syntax
+    highlighting and the other per-side display settings. Everything
+    that belongs to a side follows its text: the tab title, which
+    original file each side syncs back to when you save, and unsaved
+    changes (a side with unsaved edits stays unsaved after the
+    swap). The comparison is re-run automatically, so the difference
+    colors simply trade sides -- what was "deleted on the left"
+    becomes "added on the right", exactly as if you had compared the
+    two files in the opposite order. Swapping twice restores the
+    original arrangement. The swap is cheap: it holds no extra memory
+    (both texts already exist; only a short-lived copy is made while
+    rewriting the two halves) and costs one re-compare. Each side's
+    undo history does not survive the swap (undo entries belong to
+    the text that just moved to the other side). Not available while
+    a comparison is running in that tab -- stop it or let it finish
+    first.
+
 Select current difference
     Selects the difference block under the cursor.
 
@@ -518,6 +537,11 @@ Compare tabs survive CudaText restarts:
   default).
 
 When you close a compare tab manually (not via app exit):
+- While a comparison is running, the tab is busy and cannot be closed
+  yet: clicking its close button (the x on the tab) does nothing.
+  Stop the comparison first -- the x (Cancel) button on the compare
+  toolbar, or the "Cancel compare" command -- or simply wait for it
+  to finish; the close button works again right after.
 - If you have unsaved changes, CudaText asks whether to save or discard.
 - If you save, your changes are synced to the original files.
 - If you discard, the originals keep their last-saved content.

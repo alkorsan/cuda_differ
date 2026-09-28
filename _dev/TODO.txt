@@ -1,33 +1,21 @@
 
-___
-for the new Differ\Compare clipboard to selection command, you made the selection side keeps my editor's syntax highlighting, put the same syntax to the clipboard side too
 
-remove on_exit code everywhere, we don t need to clean anything when app exit , so remove it from inf file and all its dead code 
+add swap view to the toolbar ,so buttons become like that 
+[↻ Recompare or × Cancel] | [↑ Prev][↓ Next] | [← Copy][→ Copy] | [≡ Ignore 2/5 ▾] [★ Preset ▾] | [⇋ Swap] [↔ Resize] [▦ View ▾] [⚙ Config]
+  
 
-if a compare take more than 1min and it s not using 'native myers+disabled beautifier' then show to the user a dialog to ask him if he want to switch to the faster mode 'native myers+disabled beautifier' temporarly for this compare, and show button to continue compare or switch to the faster compare temporary which should re-run the compare using 'native myers+disabled beautifier'
-if 'native myers+disabled beautifier' is already used then show nothing
+bug:vscode algorithm have a bug with space, it does not consider space as a difference , see picture
 
-the overview slider height must not use more than 1/7 off all the overview heigt
-___
+move "compare clipboard to selection" menu to below "compare with tab" in diff tab context menu
 
-add info to doc of why when i click the diff tab close button while a compare is running it s not closed and user need to stop compare to close, but don t be technical, write it for end user which is not interested for technical details
-
-remove EDACTION_LOCK and unlock from  set_files , it create a drift bug, sometimes lines are incorrectly aligned when i load text while EDACTION_LOCK is used, it work fine when i enable EDACTION_LOCK while it compare the problem happen only when i use EDACTION_LOCK before loading the text, why? explain to me and add explination in the place of the current EDACTION_LOCK in set_files
-
-___
-
-
-if there is a diff tab then i switch session, the session manager ask to save the diff tab, if i respond no, the diff tab gets deleted from differ json; think in a better fix
 
 _______________________
 
 for unifdiff use the choosed algo instead of the python buitin one
 
 
-add Swap View
+if there is a diff tab then i switch session, the session manager ask to save the diff tab, if i respond no, the diff tab gets deleted from differ json; think in a better fix
 ___
-
-
 
 move block or text or line between editors is broken
 
@@ -35,7 +23,6 @@ split beautifier to blocks/modules
 
 put python algorithm _realign_opcodes inside  beautifier only, i mean realign opcode must run only when beautifier is choosed
 
-bug:vscode algo have a bug with space it does not considere it
 
 add _realign_opcodes to native algo too like it was before, but is it necesary, i still need to study this carefully
 
