@@ -59,11 +59,15 @@ Implementation notes:
   anchored (a_l) to the RIGHT side (']') of the previous control with
   sp_l spacing, so the whole row re-flows automatically whenever a
   button's width changes (Recompare <-> Cancel swap, Ignore counter,
-  show_btn_text toggle). Tops are anchored to the form (a_t), bottoms
-  to the TOP of the bottom-border strip; the status label is anchored
-  to the form's right edge (a_r) and vertically centered (a_t '-')
-  on the last real button, i.e. on the button row's height rather
-  than the (border-including) form height. 'x'/'w' are never set.
+  show_btn_text toggle). The sp_l gap is roomy between two
+  neighboring buttons of one group (_BTN_GAP_INNER, DPI-scaled) and
+  tight at the row's start / after a separator (_BTN_GAP); the
+  separators' own spacing is unchanged. Tops are anchored to the form
+  (a_t), bottoms to the TOP of the bottom-border strip; the status
+  label is anchored to the form's right edge (a_r) and vertically
+  centered (a_t '-') on the last real button, i.e. on the button
+  row's height rather than the (border-including) form height.
+  'x'/'w' are never set.
 
 * The status LABEL on the right side carries the compare state
   ("Comparing...", "Cancelled", "N differences") -- the feedback the
@@ -97,7 +101,9 @@ Implementation notes:
   this tab on the 100ms timer, like the ignore items.
 
 * The VIEW dropdown toggles the surrounding UI from the compare tab:
-  "Hide all" / "Show all" flip every item at once; the checkable items
+  "Hide all" flips every item at once; "Show all" everything EXCEPT
+  the side and bottom panels (a bulk show must not force those docked
+  tool windows open, so their items stay unchecked); the checkable items
   are CudaText's status bar, toolbar, sidebar, side panel, bottom
   panel and tab bar (the PROC_SHOW_* app-proc pairs -- the app's own
   View-menu toggles), the gutter's numbers / bookmarks columns (an
@@ -315,6 +321,13 @@ _VIEW_GUTTERS = (
     ('gutter_bm',  _('Gutter bookmarks'), ct.PROP_GUTTER_BM),
 )
 
+# 'Show all' restores the main chrome only: the side and bottom panels
+# host docked tool windows (Console / Output / TODO...), so the bulk
+# show must not force them open -- their menu items stay untouched
+# (unchecked when hidden) and are toggled one by one. 'Hide all'
+# still hides them (hiding everything keeps meaning everything).
+_SHOW_ALL_SKIP = frozenset(('sidepanel', 'bottompanel'))
+
 
 def _get_overview_opt():
     """The gap-aware overview panel option
@@ -340,9 +353,15 @@ def _set_overview_opt(val):
 # real UI-theme font, DPI-scaled), and positions come from anchors.
 # ---------------------------------------------------------------------------
 
-# Spacing to the LEFT of every button (anchor sp_l; visual gap between
-# two neighboring buttons).
+# Tight sp_l spacing at the row's start and after a separator (the
+# outer sides of the groups; the separators' own spacing is untouched).
 _BTN_GAP = 2
+# Roomy sp_l spacing BETWEEN two neighboring buttons of one group (a
+# button whose left neighbor is also a button) -- the user asked for
+# breathing room between buttons, not around the separators. Logical
+# px, DPI-scaled (like _TEXT_SLACK; the tight gaps stay raw: they are
+# already fine).
+_BTN_GAP_INNER = 8
 # Extra spacing to the left of a separator (in addition to _BTN_GAP),
 # so groups breathe a little more than single buttons.
 _SEP_GAP = 6
@@ -388,6 +407,16 @@ def _scaled(px):
     """Logical (96-DPI) pixels -> physical pixels at the current OS DPI
     (at least 1, so a strip is never zero-sized)."""
     return max(1, int(px) * _dpi_percent() // 100)
+
+
+def _button_gap(prev_kind):
+    """sp_l of a button: the roomy _BTN_GAP_INNER (DPI-scaled) when its
+    left neighbor is also a button -- two buttons inside one group;
+    the tight _BTN_GAP at the row's start and after a separator (the
+    separator sides keep their own spacing, _SEP_GAP / _BTN_GAP)."""
+    if prev_kind == 'btn':
+        return _scaled(_BTN_GAP_INNER)
+    return _BTN_GAP
 
 
 # Height of the bottom-border strip, DEVICE px -- never scaled: the
@@ -503,13 +532,14 @@ class CompareToolbar:
         # re-flows by itself whenever any button's auto-sized width
         # changes. No 'x'/'w' is ever set on buttons.
         prev = None
+        prev_kind = None
         for name, kind, icon, text in self._BTNS:
             if kind == 'sep':
                 self._add_separator(name, prev)
-                prev = name
             else:
-                self._add_button(name, icon, text, prev)
-                prev = name
+                self._add_button(name, icon, text, prev, prev_kind)
+            prev = name
+            prev_kind = kind
 
         # Status label on the right: the compare state / diff count.
         self._add_status_label()
@@ -552,7 +582,7 @@ class CompareToolbar:
         previous control ('' = the form for the first one)."""
         return (prev, ']') if prev else ('', '[')
 
-    def _add_button(self, name, icon, text, prev):
+    def _add_button(self, name, icon, text, prev, prev_kind=None):
         n = ct.dlg_proc(self.h_dlg, ct.DLG_CTL_ADD, 'button_ex')
         self.ctl[name] = n
         # Dict order matters: 'cap' BEFORE 'autosize' -- the auto-size
@@ -567,7 +597,7 @@ class CompareToolbar:
             'a_l': self._anchor_left(prev),
             'a_t': ('', '['),
             'a_b': ('brd', '['),
-            'sp_l': _BTN_GAP,
+            'sp_l': _button_gap(prev_kind),
             'sp_t': _BTN_V_PAD,
             'sp_b': _BTN_V_PAD,
             'tab_stop': False,
@@ -1299,11 +1329,13 @@ class CompareToolbar:
         return False
 
     def on_view_action(self, action):
-        """View-dropdown item executed: 'hide_all' / 'show_all' flip
-        EVERY item at once (the bars via their SET procs, both halves'
-        gutters, the overview option); any other key toggles ONE
-        element. The overview writes differ.micromap.enable_overview
-        (the config dialog's store) and re-compares this tab on the
+        """View-dropdown item executed: 'hide_all' flips EVERY item at
+        once, 'show_all' every item EXCEPT the side and bottom panels
+        (_SHOW_ALL_SKIP: a bulk show must not force those docked tool
+        windows open, so their items stay unchecked); any other key
+        toggles ONE element. The overview writes
+        differ.micromap.enable_overview (the config dialog's store)
+        and re-compares this tab on the
         100ms timer -- the refresh creates or destroys the panel,
         exactly like the preset items; hide/show-all schedule the same
         refresh once for their overview part. The menu is rebuilt on
@@ -1312,6 +1344,8 @@ class CompareToolbar:
         if action in ('hide_all', 'show_all'):
             show = (action == 'show_all')
             for key in self._view_state():
+                if show and key in _SHOW_ALL_SKIP:
+                    continue    # side/bottom panels: not force-shown
                 self._set_view_item(key, show)
             try:
                 ct.msg_status(

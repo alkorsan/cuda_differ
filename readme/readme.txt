@@ -300,9 +300,11 @@ into the compare view):
 - ↔ Resize -- resize the two editors to equal width (50/50) after
   dragging the splitter.
 - ▦ View ▾ -- dropdown to show / hide the surrounding UI from the
-  compare tab: "Hide all" and "Show all" flip everything at once,
-  and CHECKABLE items toggle CudaText's status bar, toolbar, sidebar,
-  side panel, bottom panel, tab bar, the gutter's numbers / bookmarks
+  compare tab: "Hide all" flips everything at once, "Show all"
+  restores everything EXCEPT the side and bottom panels (a bulk show
+  must not force those docked tool windows open, so their items stay
+  unchecked), and CHECKABLE items toggle CudaText's status bar,
+  toolbar, sidebar, side panel, bottom panel, tab bar, the gutter's
   columns (both halves of the tab always change together) and the
   gap-aware overview panel. The checkmarks are re-derived from the
   live state on every menu open (the bars can be toggled from
@@ -323,9 +325,11 @@ Every button has a tooltip (with the hotkey hint where one exists).
 Buttons size themselves to their captions (auto-sized with the real
 UI-theme font, DPI-scaled -- nothing can be cut off horizontally) and
 are chained with anchors, so the row re-flows by itself whenever a
-caption changes. The bar ends in a thin full-width border line that
-separates it from the editor below: exactly 1 device pixel at any
-DPI (a height-1 panel strip filled with the theme's SplitMain color;
+caption changes; neighboring buttons inside one group are separated
+by a roomy gap (DPI-scaled -- the spacing around the separators and
+at the row's edges stays tight). The bar ends in a thin full-width
+border line that separates it from the editor below: exactly 1 device
+pixel at any DPI (a height-1 panel strip filled with the theme's SplitMain color;
 dlg_proc never scales control sizes). The toolbar's height = the OS GUI
 button height plus a little extra room for the captions' descenders (on
 some systems the OS font is taller than the OS 'button' metrics and

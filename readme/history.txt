@@ -1,4 +1,15 @@
 2026.09.28 (by @badrelmers)
+- fix (toolbar): "Show all" in the View dropdown no longer forces the
+  side panel and the bottom panel open -- those host docked tool
+  windows, so a bulk show leaves them untouched and their menu items
+  stay unchecked (they are still hidden by "Hide all" and can be
+  toggled one by one).
+- change (toolbar): more horizontal breathing room between buttons:
+  neighboring buttons inside one group are separated by a roomy gap
+  (8 logical px, DPI-scaled) instead of the old 2 px; the gaps around
+  the separators and at the row's outer edges are unchanged.
+
+2026.09.28 (by @badrelmers)
 - add (toolbar): new "▦ View ▾" dropdown between Resize and Config:
   "Hide all" / "Show all" flip every item at once, then (after a
   separator) CHECKABLE items for CudaText's status bar, toolbar,
