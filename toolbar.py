@@ -4,7 +4,7 @@ A small toolbar docked to the TOP of every compare tab (the editor
 parent's top side), built with dlg_proc:
 
   [↻ Recompare or × Cancel] | [↑ Prev][↓ Next] | [← Copy][→ Copy] |
-  [≡ Ignore 2/5 ▾] [★ Preset ▾] | [↔ Resize] [▦ View ▾] [⚙ Config]
+  [≡ Ignore 2/5 ▾] [★ Preset ▾] | [⇋ Swap] [↔ Resize] [▦ View ▾] [⚙ Config]
   ...status label
 
 Everything the toolbar does goes through the Command object of
@@ -452,11 +452,11 @@ class CompareToolbar:
 
     # (name, kind, icon, text) in visual order -- five groups:
     # [Recompare/Cancel] | [Prev][Next] | [Copy][Copy] |
-    # [Ignore][Preset] | [Resize][View][Config]. The 'ignore' caption
-    # is assembled dynamically (see _ignore_caption), the 'presets' and
-    # 'view' captions carry the dropdown arrow (see _presets_caption /
-    # _view_caption), the recompare button swaps icon/text with
-    # '× Cancel' while a compare runs.
+    # [Ignore][Preset] | [Swap][Resize][View][Config]. The 'ignore'
+    # caption is assembled dynamically (see _ignore_caption), the
+    # 'presets' and 'view' captions carry the dropdown arrow (see
+    # _presets_caption / _view_caption), the recompare button swaps
+    # icon/text with '× Cancel' while a compare runs.
     _BTNS = (
         ('recompare', 'btn', '\u21bb', 'Recompare'),
         ('sep1',       'sep', None, None),
@@ -469,6 +469,7 @@ class CompareToolbar:
         ('ignore',     'btn', '\u2261', 'Ignore'),
         ('presets',    'btn', '\u2605', 'Preset'),
         ('sep4',       'sep', None, None),
+        ('swap',       'btn', '\u21cb', 'Swap'),
         ('resize',     'btn', '\u2194', 'Resize'),
         ('view',       'btn', '\u25a6', 'View'),
         ('config',     'btn', '\u2699', 'Config'),
@@ -748,6 +749,8 @@ class CompareToolbar:
             return _('Recompare both sides (F5)')
         if name == 'resize':
             return _('Resize the two editors to equal width')
+        if name == 'swap':
+            return _('Swap the compared editors (left and right)')
         if name == 'prev':
             return _('Jump to previous difference (Alt+Up)')
         if name == 'next':
@@ -1401,6 +1404,9 @@ class CompareToolbar:
                     self.cmd.refresh_compare(self.a_ed)
             elif name == 'resize':
                 self.cmd.resize_equal_width(self.a_ed)
+            elif name == 'swap':
+                self._focus_tab()
+                self.cmd.swap_view(self.a_ed)
             elif name == 'prev':
                 self._focus_tab()
                 self.cmd.jump_prev()

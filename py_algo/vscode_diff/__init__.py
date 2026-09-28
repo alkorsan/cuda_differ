@@ -16,7 +16,9 @@ Files ported:
   - defaultLinesDiffComputer/heuristicSequenceOptimizations.ts
       (optimizeSequenceDiffs, removeVeryShortMatchingLinesBetweenDiffs)
   - defaultLinesDiffComputer/defaultLinesDiffComputer.ts
-      (algorithm selection: DP for small files, Myers for large)
+      (algorithm selection: DP for small files, Myers for large;
+       scanForWhitespaceChanges -- lines that differ only in
+       leading/trailing whitespace are reported as changes)
 
 Why this exists instead of using difflib or patience:
   1. difflib's SequenceMatcher uses the Ratcliff/Obershelp algorithm
@@ -182,7 +184,11 @@ class _LineSequence:
     1. **Trimmed-line perfect hashing**: lines are hashed by their trimmed
        content (whitespace stripped from both ends). This means lines that
        differ only in indentation are treated as equal for alignment
-       purposes, so indentation changes don't disrupt the diff.
+       purposes, so indentation changes don't disrupt the diff -- but they
+       are still REPORTED as changes afterwards, by
+       _report_whitespace_only_changes (VS Code's
+       scanForWhitespaceChanges): the trimmed hashing only decides WHERE
+       the equal/changed regions fall, never hides a difference.
 
        IMPORTANT: the hash map must be SHARED between both sequences
        (seq1 and seq2), so that the same trimmed line gets the same hash
@@ -831,6 +837,72 @@ def _remove_very_short_matching_lines_between_diffs(
     return diffs
 
 
+def _report_whitespace_only_changes(
+    seq1: _LineSequence,
+    seq2: _LineSequence,
+    diffs: List[_SequenceDiff],
+) -> List[_SequenceDiff]:
+    """Report whitespace-only line changes inside the EQUAL regions.
+
+    Ported from VS Code's scanForWhitespaceChanges
+    (defaultLinesDiffComputer.ts). The line-level diff aligns lines by
+    their TRIMMED content (see _LineSequence), so an aligned pair of
+    lines that differs only in leading/trailing whitespace counts as
+    'equal' to the alignment algorithms -- without this pass it would
+    never be reported at all and a trailing-space change would make
+    the two files look identical. VS Code walks every equal region
+    AFTER the heuristic optimizations and emits a one-line-by-one-line
+    diff for each aligned pair whose ORIGINAL (untrimmed) lines
+    differ; VS Code refines those at char level right away, while here
+    the plain line diff is what the consumer sees (the differ plugin
+    computes its own char-level details for replaced lines).
+
+    In an equal region the two sequences advance in lockstep (the
+    region before/after/between diffs aligns seq1[p:p+n] with
+    seq2[q:q+n] pairwise -- the invariant VS Code asserts in its
+    walk), so each whitespace-changed pair is exactly (i, i+1) vs
+    (j, j+1). Emitted diffs that touch each other -- consecutive
+    whitespace-changed lines, or a whitespace-changed line right at
+    an existing diff's edge -- are joined, keeping the list sorted
+    and unfragmented; the opcode conversion then reports them as
+    'replace' blocks exactly like any other changed lines.
+    """
+    result: List[_SequenceDiff] = []
+    pos1 = 0
+    pos2 = 0
+
+    def scan_equal_region(start1: int, end1: int, start2: int) -> None:
+        for k in range(end1 - start1):
+            i = start1 + k
+            j = start2 + k
+            if seq1.lines[i] != seq2.lines[j]:
+                result.append(_SequenceDiff(
+                    _OffsetRange(i, i + 1),
+                    _OffsetRange(j, j + 1),
+                ))
+
+    for d in diffs:
+        scan_equal_region(pos1, d.seq1_range.start, pos2)
+        result.append(d)
+        pos1 = d.seq1_range.end
+        pos2 = d.seq2_range.end
+    scan_equal_region(pos1, seq1.length, pos2)
+
+    # Join touching diffs: joining uses min/max on both ranges
+    # (_OffsetRange.join), so touching (and any hypothetical overlap
+    # from the heuristics) is safe.
+    merged: List[_SequenceDiff] = []
+    for d in result:
+        if merged:
+            last = merged[-1]
+            if (last.seq1_range.end >= d.seq1_range.start and
+                    last.seq2_range.end >= d.seq2_range.start):
+                merged[-1] = last.join(d)
+                continue
+        merged.append(d)
+    return merged
+
+
 # ---------------------------------------------------------------------------
 # Main class: VS Code sequence matcher with difflib-compatible interface
 # ---------------------------------------------------------------------------
@@ -855,6 +927,8 @@ class VSCodeSequenceMatcher:
     After the core algorithm, heuristic optimizations are applied:
     - optimizeSequenceDiffs (shift/join adjacent diffs)
     - removeVeryShortMatchingLinesBetweenDiffs (absorb tiny equal blocks)
+    - reportWhitespaceOnlyChanges (scan the equal regions: lines that
+      differ only in leading/trailing whitespace become real diffs)
     """
 
     # VS Code's threshold for switching from DP to Myers
@@ -947,6 +1021,10 @@ class VSCodeSequenceMatcher:
         # Apply heuristic optimizations
         diffs = _optimize_sequence_diffs(seq1, seq2, diffs)
         diffs = _remove_very_short_matching_lines_between_diffs(seq1, seq2, diffs)
+        # Whitespace-only line changes are real changes: walk the equal
+        # regions and emit a diff for every aligned pair whose original
+        # (untrimmed) lines differ (VS Code's scanForWhitespaceChanges).
+        diffs = _report_whitespace_only_changes(seq1, seq2, diffs)
 
         # Convert SequenceDiff list to difflib-style opcodes
         return self._diffs_to_opcodes(diffs, seq1.length, seq2.length)

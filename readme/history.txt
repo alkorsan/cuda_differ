@@ -1,4 +1,26 @@
 2026.09.28 (by @badrelmers)
+- add (toolbar): new Swap button (harpoon icon) as the first button
+  of the toolbar's last group (Swap, Resize, View, Config): one
+  click runs the existing "Differ\Swap compared editors" command on
+  the button's own compare tab. The command's own guard refuses it
+  with a status hint while a compare is running in that tab (same
+  as from the command palette).
+- fix (vscode algorithm): lines that differ only in leading or
+  trailing whitespace were reported as equal, so e.g. a trailing
+  space made two files compare identical. The port used VS Code's
+  trimmed-line alignment but had skipped VS Code's
+  scanForWhitespaceChanges pass, which walks the equal regions
+  after the alignment and reports every aligned line pair whose
+  original lines differ. That pass is ported now (runs after the
+  heuristic optimizations, exactly VS Code's order, and joins
+  touching diff blocks), for both the DP path and the Myers
+  (large files) path.
+- change (menu): "Compare clipboard to selection" moved in the
+  diff-tab context menu from the very bottom (below "Resize
+  editors to equal width") up to right below "Compare with tab",
+  next to the other compare starters.
+
+2026.09.28 (by @badrelmers)
 - add (command): new "Differ\Swap compared editors" command
   (install.inf item5b): swaps the two sides of the current compare
   tab -- texts, syntax highlighting and the other per-side display

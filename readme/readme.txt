@@ -82,7 +82,7 @@ Compare clipboard to selection
     selection"): clipboard text on the left, selected text on the
     right. Both sides use the focused editor's syntax highlighting,
     so the two halves render consistently. Also in the diff-tab
-    context menu, right below "Resize editors to equal width".
+    context menu, right below "Compare with tab".
 
 Diff current document with file...
     Produces a unified diff (patch-style) of the active file and a file
@@ -131,7 +131,7 @@ Swap compared editors
     undo history does not survive the swap (undo entries belong to
     the text that just moved to the other side). Not available while
     a comparison is running in that tab -- stop it or let it finish
-    first.
+    first. Also on the compare-tab toolbar (the ⇋ Swap button).
 
 Select current difference
     Selects the difference block under the cursor.
@@ -260,16 +260,15 @@ Right-clicking a tab title shows "Differ" submenu with:
 - Compare with tab -- submenu listing all open tabs; click one to compare.
   If the list is too long, the first entry "More tabs..." opens a dialog
   with a scrollbar to pick any open tab.
+- Compare clipboard to selection -- open a new compare tab with the
+  clipboard text on the left and the focused editor's selection on
+  the right (same as the command; enabled only while both sides
+  exist: text on the clipboard and a selection).
 - Recompare -- re-run the compare on both sides of the compare tab.
 - "Cancel compare" / "Cancel all compares" -- stop in-flight background
   compares (enabled only while a compare is actually running).
 - Resize editors to equal width -- set the split back to 50/50 after
-  dragging the editor splitter.
-- Compare clipboard to selection -- open a new compare tab with the
-  clipboard text on the left and the focused editor's selection on
-  the right (same as the command; enabled only while both sides
-  exist: text on the clipboard and a selection). This is the last
-  entry of the menu.
+  dragging the editor splitter. This is the last entry of the menu.
 - Five checkable "ignore" options (below Recompare, after a separator):
   Ignore case, Ignore whitespace, Ignore blank lines, Ignore line endings,
   Ignore numbers. Shown only while a native algorithm is the effective
@@ -291,7 +290,7 @@ the editor text background color of the current UI theme, so it blends
 into the compare view):
 
     [↻ Recompare or × Cancel] | [↑ Prev][↓ Next] | [← Copy][→ Copy] |
-    [≡ Ignore 2/5 ▾] [★ Preset ▾] | [↔ Resize] [▦ View ▾] [⚙ Config]
+    [≡ Ignore 2/5 ▾] [★ Preset ▾] | [⇋ Swap] [↔ Resize] [▦ View ▾] [⚙ Config]
     ...status
 
 - ↻ Recompare -- re-runs the compare (same as F5 / the menu's
@@ -329,6 +328,12 @@ into the compare view):
   compare immediately. The button is disabled while a compare runs
   (like the Ignore dropdown); its tooltip shows the current
   algorithm / beautify combination.
+- ⇋ Swap -- swap the two sides of this compare tab (same as the
+  "Swap compared editors" command): the texts trade places together
+  with their syntax highlighting and per-side settings, and the
+  compare re-runs automatically. Not available while a compare is
+  running in this tab (the command's own guard refuses it with a
+  status hint).
 - ↔ Resize -- resize the two editors to equal width (50/50) after
   dragging the splitter.
 - ▦ View ▾ -- dropdown to show / hide the surrounding UI from the
@@ -910,7 +915,7 @@ Toolbar section (see the "Toolbar" chapter above for details):
   while a compare runs), Prev, Next, Copy to left, Copy to right, the
   Ignore-options dropdown (multiple checkable options plus
   "Uncheck all"), the Presets dropdown (algorithm / beautify-alignment
-  preset combinations), Resize, the View dropdown (bars / gutters /
+  preset combinations), Swap, Resize, the View dropdown (bars / gutters /
   overview visibility), Config, and a status label on the right
   (compare state + difference count). Every button has a tooltip; the
   toolbar follows UI theme switches and is restored at startup for
@@ -918,8 +923,8 @@ Toolbar section (see the "Toolbar" chapter above for details):
 - differ.toolbar.show_btn_text: Show button texts in the toolbar
   (default: on)
   When on, buttons show "↻ Recompare", "↑ Prev", "↓ Next", "← Copy",
-  "→ Copy", "≡ Ignore 2/5 ▾", "★ Preset ▾", "↔ Resize", "▦ View ▾",
-  "⚙ Config"; when off, only the UTF-8 icons are shown (the Ignore
+  "→ Copy", "≡ Ignore 2/5 ▾", "★ Preset ▾", "⇋ Swap", "↔ Resize",
+  "▦ View ▾", "⚙ Config"; when off, only the UTF-8 icons are shown (the Ignore
   button keeps its enabled-options counter).
 
 

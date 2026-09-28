@@ -6698,6 +6698,29 @@ class Command:
         ct.menu_proc(self.menuid_withfocused, ct.MENU_SET_ENABLED,
             command=cur_ok and not cur_is_focused and not focused_is_diff)
 
+        # "Compare clipboard to selection" right below 'Compare with
+        # tab': a new compare tab with the clipboard text on the left
+        # and the focused editor's selection on the right (the same
+        # method as the exposed 'Differ\Compare clipboard to
+        # selection' command). Enabled only while BOTH sides exist:
+        # text on the clipboard AND a selection in the focused editor
+        # -- the menu is rebuilt on every right-click, so the state is
+        # always fresh (an image-only clipboard disables the item).
+        self.menuid_clip_sel = ct.menu_proc(self.compare_menu, ct.MENU_ADD,
+            command='module=cuda_differ;cmd=compare_clip_sel;',
+            caption=_('Compare clipboard to selection')
+            )
+        try:
+            clip_txt = ct.app_proc(ct.PROC_GET_CLIP, '')
+        except Exception:
+            clip_txt = ''
+        try:
+            sel_txt = ct.ed.get_text_sel()
+        except Exception:
+            sel_txt = ''
+        ct.menu_proc(self.menuid_clip_sel, ct.MENU_SET_ENABLED,
+            command=bool(clip_txt) and bool(sel_txt))
+
         # Add a separator and "Recompare" entry at the end of the context
         # menu. Only enabled when the current tab is a compare tab managed
         # by Differ.
@@ -6781,29 +6804,6 @@ class Command:
             )
         ct.menu_proc(self.menuid_equal_width, ct.MENU_SET_ENABLED,
             command=is_compare)
-
-        # "Compare clipboard to selection" right after 'Resize editors
-        # to equal width': a new compare tab with the clipboard text
-        # on the left and the focused editor's selection on the right
-        # (the same method as the exposed 'Differ\Compare clipboard to
-        # selection' command). Enabled only while BOTH sides exist:
-        # text on the clipboard AND a selection in the focused editor
-        # -- the menu is rebuilt on every right-click, so the state is
-        # always fresh (an image-only clipboard disables the item).
-        self.menuid_clip_sel = ct.menu_proc(self.compare_menu, ct.MENU_ADD,
-            command='module=cuda_differ;cmd=compare_clip_sel;',
-            caption=_('Compare clipboard to selection')
-            )
-        try:
-            clip_txt = ct.app_proc(ct.PROC_GET_CLIP, '')
-        except Exception:
-            clip_txt = ''
-        try:
-            sel_txt = ct.ed.get_text_sel()
-        except Exception:
-            sel_txt = ''
-        ct.menu_proc(self.menuid_clip_sel, ct.MENU_SET_ENABLED,
-            command=bool(clip_txt) and bool(sel_txt))
 
     def tabmenu_chooser(self):
         """Launch 'Compare with...' via a 100ms timer (needed because menu
