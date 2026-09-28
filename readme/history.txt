@@ -1,4 +1,21 @@
 2026.09.28 (by @badrelmers)
+- add (toolbar): new "☰ Presets ▾" dropdown between Ignore and Config:
+  two mutually exclusive presets ("Preset 1: Fastest comparison -
+  Myers, Beautify Off" sets Native Myers + Beautify off; "Preset 2:
+  Better readability (slower) - Histogram, Beautify On" sets Native
+  Histogram + Beautify on), a separator, the two native algorithms
+  ("Algorithm 1: Native Histogram" / "Algorithm 2: Native Myers",
+  also mutually exclusive) and the independent "Beautify alignment"
+  toggle (works with either algorithm). The menu is rebuilt on every
+  open and the preset checkmarks are DERIVED from
+  settings/cuda_differ.json: native Myers + beautify off checks
+  Preset 1, native Histogram + beautify on checks Preset 2, any other
+  combination checks NEITHER -- a custom selection is visible at a
+  glance. Items persist differ.algorithm.diff_algorithm /
+  differ.algorithm.beautify_alignment (the config dialog's store) and
+  re-run this tab's compare on the 100ms menu-close-first timer.
+
+2026.09.28 (by @badrelmers)
 - change (toolbar): the 1px bottom border's color is now the theme's
   SplitMain (was EdBlockSepLine) and apply_theme() re-feeds it on
   every UI theme switch -- a plain prop re-set on the 'brd' panel,

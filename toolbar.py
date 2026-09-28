@@ -4,7 +4,7 @@ A small toolbar docked to the TOP of every compare tab (the editor
 parent's top side), built with dlg_proc:
 
   [↻ Recompare or × Cancel][↔ Resize] | [↑ Prev][↓ Next] |
-  [← Copy][→ Copy] | [≡ Ignore 2/5 ▾] [⚙ Config]        ...status label
+  [← Copy][→ Copy] | [≡ Ignore 2/5 ▾] [☰ Presets ▾] [⚙ Config] ...status label
 
 Everything the toolbar does goes through the Command object of
 cuda_differ/__init__.py, which passes itself to every module-level
@@ -80,6 +80,20 @@ Implementation notes:
   context menu write there too). While a pure-Python algorithm is the
   effective one, the items disable themselves and an explanatory
   item appears -- same guard as the tab context menu / config dialog.
+
+* The PRESETS dropdown is the quick way to set the algorithm +
+  beautify combination: two mutually exclusive presets ("Preset 1:
+  Fastest comparison - Myers, Beautify Off", "Preset 2: Better
+  readability (slower) - Histogram, Beautify On"), a separator, the
+  two native algorithms (also mutually exclusive) and the
+  independent Beautify alignment toggle. It is REBUILT on every
+  open, so the checkmarks always mirror settings/cuda_differ.json,
+  and the preset checkmarks are DERIVED from it: native Myers +
+  beautify off checks Preset 1, native Histogram + beautify on
+  checks Preset 2, any other combination checks NEITHER (a custom
+  selection is visible at a glance). Clicks persist
+  'differ.algorithm.*' (the config dialog's store) and re-compare
+  this tab on the 100ms timer, like the ignore items.
 
 * CALLBACKS: dlg event handlers (on_change) are live callables
   (dlg_proc cleans them up on DLG_FREE); menu item commands and timers
@@ -205,6 +219,59 @@ def _set_ignore_opt(key, val):
                        user_json=_JSON_FILE)
 
 
+# The Presets dropdown's items: two mutually exclusive preset
+# combinations, a separator, the two native algorithms (also mutually
+# exclusive) and the independent Beautify alignment toggle. Each entry:
+# (menu key, menu caption); None = the separator. Toolbar-only -- the
+# config dialog / tab context menu keep their own algorithm UIs.
+_PRESET_ITEMS = (
+    ('preset1',  _('Preset 1: Fastest comparison - Myers, Beautify Off')),
+    ('preset2',  _('Preset 2: Better readability (slower) - Histogram, '
+                   'Beautify On')),
+    (None, None),
+    ('algo1',    _('Algorithm 1: Native Histogram')),
+    ('algo2',    _('Algorithm 2: Native Myers')),
+    ('beautify', _('Beautify alignment')),
+)
+
+# Values written to 'differ.algorithm.diff_algorithm' by the preset /
+# algorithm items (the same values the config dialog writes; on older
+# CudaText builds without diff_proc the plugin falls back to the closest
+# pure-Python algorithm).
+_ALGO_MYERS = 'native_myers'
+_ALGO_HIST = 'native_histogram'
+
+
+def _get_diff_algo():
+    """The configured algorithm ('differ.algorithm.diff_algorithm'),
+    read live from the plugin's settings (mtime-cached by cudax_lib,
+    so config-dialog / tab-menu writes are picked up at once)."""
+    return ctx.get_opt('differ.algorithm.diff_algorithm', 'native_myers',
+                       user_json=_JSON_FILE)
+
+
+def _set_diff_algo(val):
+    """Write 'differ.algorithm.diff_algorithm' to the plugin's settings
+    (same store the config dialog uses)."""
+    return ctx.set_opt('differ.algorithm.diff_algorithm', val,
+                       user_json=_JSON_FILE)
+
+
+def _get_beautify():
+    """The Beautify alignment flag
+    ('differ.algorithm.beautify_alignment'), read live from the
+    settings."""
+    return bool(ctx.get_opt('differ.algorithm.beautify_alignment', False,
+                            user_json=_JSON_FILE))
+
+
+def _set_beautify(val):
+    """Write 'differ.algorithm.beautify_alignment' to the plugin's
+    settings (same store the config dialog uses)."""
+    return ctx.set_opt('differ.algorithm.beautify_alignment', bool(val),
+                       user_json=_JSON_FILE)
+
+
 # ---------------------------------------------------------------------------
 # Layout constants.
 #
@@ -294,8 +361,9 @@ class CompareToolbar:
     """
 
     # (name, kind, icon, text) in visual order; the 'ignore' caption is
-    # assembled dynamically (see _ignore_caption), the recompare button
-    # swaps icon/text with '× Cancel' while a compare runs.
+    # assembled dynamically (see _ignore_caption), the 'presets' caption
+    # carries the dropdown arrow (see _presets_caption), the recompare
+    # button swaps icon/text with '× Cancel' while a compare runs.
     _BTNS = (
         ('recompare', 'btn', '\u21bb', 'Recompare'),
         ('resize',     'btn', '\u2194', 'Resize'),
@@ -307,6 +375,7 @@ class CompareToolbar:
         ('copy_right', 'btn', '\u2192', 'Copy'),
         ('sep3',       'sep', None, None),
         ('ignore',     'btn', '\u2261', 'Ignore'),
+        ('presets',    'btn', '\u2630', 'Presets'),
         ('config',     'btn', '\u2699', 'Config'),
     )
 
@@ -317,6 +386,7 @@ class CompareToolbar:
         self.a_ed = a_ed
         self.h_dlg = None
         self.h_menu = None
+        self.h_pmenu = None
         self.ctl = {}          # name -> control index
         self.hbtn = {}         # name -> button_ex handle (button_proc)
         self.menu_items = {}   # ignore key -> popup menu item id
@@ -521,6 +591,14 @@ class CompareToolbar:
             return '\u2261 ' + _('Ignore') + counter + arrow
         return '\u2261' + counter + arrow
 
+    def _presets_caption(self):
+        """'☰ Presets ▾' -- the trailing arrow marks it as a dropdown
+        (the Ignore twin's convention); with button texts off only the
+        glyph and the arrow remain."""
+        if self.show_text:
+            return '\u2630 ' + _('Presets') + ' \u25be'
+        return '\u2630 \u25be'
+
     def _layout_buttons(self):
         """(Re)assign the captions of all buttons -- called whenever a
         caption changes (Recompare <-> Cancel swap, Ignore counter,
@@ -541,6 +619,8 @@ class CompareToolbar:
                 continue
             if name == 'ignore':
                 cap = self._ignore_caption()
+            elif name == 'presets':
+                cap = self._presets_caption()
             elif name == 'recompare' and self.comparing:
                 cap = self._caption('\u00d7', 'Cancel')
             else:
@@ -573,6 +653,8 @@ class CompareToolbar:
             return _('Differ options...')
         if name == 'ignore':
             return self._ignore_tooltip()
+        if name == 'presets':
+            return self._presets_tooltip()
         return ''
 
     def _ignore_tooltip(self):
@@ -584,6 +666,19 @@ class CompareToolbar:
         else:
             lines.append(_('None enabled'))
         return '\r'.join(lines)
+
+    def _presets_tooltip(self):
+        """Two-line tooltip: what the menu sets + the LIVE combination
+        (read from the settings file, so it is always current -- the
+        same 'know the current state without opening it' feedback the
+        Ignore tooltip's enabled-list gives)."""
+        beautify = _get_beautify()
+        return '\r'.join((
+            _('Comparison presets: algorithm and Beautify alignment'),
+            '{}: {} / {} {}'.format(_('Current'), _get_diff_algo(),
+                                    _('Beautify alignment'),
+                                    _('on') if beautify else _('off')),
+        ))
 
     def _set_hint(self, name, hint):
         hb = self.hbtn.get(name)
@@ -612,6 +707,7 @@ class CompareToolbar:
         for name in ('prev', 'next', 'copy_left', 'copy_right'):
             self._set_enabled(name, on)
         self._set_enabled('ignore', not self.comparing)
+        self._set_enabled('presets', not self.comparing)
 
     # -- compare state ------------------------------------------------------
 
@@ -860,6 +956,118 @@ class CompareToolbar:
         except Exception:
             pass
 
+    # -- presets popup menu -------------------------------------------------
+
+    def rebuild_preset_menu(self):
+        """(Re)build the Presets dropdown: the two mutually exclusive
+        presets, a separator, the two native algorithms (also mutually
+        exclusive) and the independent Beautify alignment toggle.
+
+        The checkmarks are DERIVED from the settings file: native
+        Myers + beautify off -> Preset 1 checked; native Histogram +
+        beautify on -> Preset 2 checked; any other combination ->
+        NEITHER preset checked, so a custom selection is visible at a
+        glance. Called on every open (popup_preset_menu); the whole
+        body is guarded like the ignore twin's."""
+        if self.h_dlg is None:
+            return
+        try:
+            self._rebuild_preset_menu_inner()
+        except Exception:
+            pass
+
+    def _rebuild_preset_menu_inner(self):
+        if self.h_pmenu is None:
+            self.h_pmenu = ct.menu_proc(0, ct.MENU_CREATE)
+        ct.menu_proc(self.h_pmenu, ct.MENU_CLEAR)
+
+        algo = _get_diff_algo()
+        beautify = _get_beautify()
+        marks = {
+            'preset1': algo == _ALGO_MYERS and not beautify,
+            'preset2': algo == _ALGO_HIST and beautify,
+            'algo1': algo == _ALGO_HIST,
+            'algo2': algo == _ALGO_MYERS,
+            'beautify': beautify,
+        }
+        for key, caption in _PRESET_ITEMS:
+            if key is None:
+                ct.menu_proc(self.h_pmenu, ct.MENU_ADD, caption='-')
+                continue
+            mi = ct.menu_proc(
+                self.h_pmenu, ct.MENU_ADD,
+                caption=caption,
+                # 'cmd=' form (a Command method): CudaText passes this
+                # form's info to the method as the RAW string, so the
+                # '<tab id>|<preset key>' payload survives -- the same
+                # convention as the ignore items.
+                command='module=cuda_differ;cmd=toolbar_menu_preset;'
+                        'info={}|{};'.format(self.tab_id_str, key))
+            try:
+                ct.menu_proc(mi, ct.MENU_SET_CHECKED, command=marks[key])
+            except Exception:
+                pass
+
+    def popup_preset_menu(self):
+        """Show the Presets dropdown right under its button. The menu is
+        rebuilt FIRST, so the checkmarks always mirror the settings
+        file (config-dialog / tab-menu / hand-edited changes included)
+        -- the preset checkmarks are re-derived on every open."""
+        if self.h_dlg is None:
+            return
+        self.rebuild_preset_menu()
+        if self.h_pmenu is None:
+            return
+        try:
+            props = ct.dlg_proc(self.h_dlg, ct.DLG_CTL_PROP_GET,
+                                name='presets')
+            x = int(props.get('x', 0))
+            y = int(props.get('y', 0)) + int(props.get('h', 0))
+            sx, sy = ct.dlg_proc(self.h_dlg, ct.DLG_COORD_LOCAL_TO_SCREEN,
+                                 index=x, index2=y)
+            ct.menu_proc(self.h_pmenu, ct.MENU_SHOW, command=(sx, sy))
+        except Exception:
+            # Fallback: show at the mouse cursor.
+            try:
+                ct.menu_proc(self.h_pmenu, ct.MENU_SHOW, command='')
+            except Exception:
+                pass
+
+    def on_preset_action(self, action):
+        """Preset-dropdown item executed: persist the combination to
+        settings/cuda_differ.json (the config dialog's store), then
+        re-compare this tab on the 100ms timer (the menu-close-first
+        convention) -- refresh_compare re-reads the settings file (its
+        mtime cache), so this very refresh already uses the new
+        algorithm / beautify flags. The menu is rebuilt on every open,
+        so the new checkmarks show up the next time it pops."""
+        algo = None          # None = leave the option unchanged
+        beautify = None
+        if action == 'preset1':
+            algo, beautify = _ALGO_MYERS, False
+        elif action == 'preset2':
+            algo, beautify = _ALGO_HIST, True
+        elif action == 'algo1':
+            algo = _ALGO_HIST
+        elif action == 'algo2':
+            algo = _ALGO_MYERS
+        elif action == 'beautify':
+            beautify = not _get_beautify()
+        else:
+            return
+        if algo is not None:
+            _set_diff_algo(algo)
+        if beautify is not None:
+            _set_beautify(beautify)
+        try:
+            ct.msg_status('{}: {} / {} {}'.format(
+                _('Differ presets'), _get_diff_algo(),
+                _('Beautify alignment'),
+                _('on') if _get_beautify() else _('off')))
+        except Exception:
+            pass
+        self._schedule_refresh()
+
     # -- button actions -----------------------------------------------------
 
     def _focus_tab(self):
@@ -904,6 +1112,8 @@ class CompareToolbar:
                 self.cmd.copy_right()
             elif name == 'ignore':
                 self.popup_ignore_menu()
+            elif name == 'presets':
+                self.popup_preset_menu()
             elif name == 'config':
                 self.cmd.change_config()
         except Exception:
@@ -914,7 +1124,7 @@ class CompareToolbar:
 
     def destroy(self):
         """Undock and free the form (+ its live on_change callbacks --
-        DLG_FREE cleans them) and empty the popup menu.
+        DLG_FREE cleans them) and empty the popup menus.
 
         The popup menu is NOT disposed with menu_proc(MENU_REMOVE):
         that Pascal handler frees the menu ITEM it is given -- meant
@@ -943,6 +1153,12 @@ class CompareToolbar:
             except Exception:
                 pass
             self.h_menu = None
+        if self.h_pmenu is not None:
+            try:
+                ct.menu_proc(self.h_pmenu, ct.MENU_CLEAR)
+            except Exception:
+                pass
+            self.h_pmenu = None
         self.ctl = {}
         self.hbtn = {}
         self.menu_items = {}
@@ -1084,12 +1300,13 @@ def sync_all(cmd):
 # ---------------------------------------------------------------------------
 # String-callback entry points.
 #
-# Menu items use the 'module=cuda_differ;cmd=toolbar_menu_ignore;
-# info=<tab id>|<action>;' form (Command method -- info arrives as the
-# RAW string). The module-level entry below is the belt-and-braces twin
-# for any 'module=cuda_differ.toolbar;func=_menu_click;
-# info="<tab id>|<action>;"' callback (info QUOTED: the engine's
-# ValueFromString turns an unquoted non-numeric value into None).
+# Menu items use the 'module=cuda_differ;cmd=toolbar_menu_ignore /
+# toolbar_menu_preset; info=<tab id>|<action>;' form (Command methods
+# -- info arrives as the RAW string). The module-level entries below
+# are the belt-and-braces twins for any 'module=cuda_differ.toolbar;
+# func=_menu_click; info="<tab id>|<action>;"' callback (info QUOTED:
+# the engine's ValueFromString turns an unquoted non-numeric value
+# into None).
 # ---------------------------------------------------------------------------
 
 def menu_action(info):
@@ -1106,6 +1323,23 @@ def menu_action(info):
     if tb is None:
         return False
     tb.on_menu_action(action)
+    return True
+
+
+def preset_menu_action(info):
+    """'info' is '<tab_id_str>|<preset key>': route the click to the
+    toolbar of that compare tab. Returns True when a toolbar handled
+    it (False: unknown tab / no toolbar / bad payload)."""
+    if not info or not isinstance(info, str) or '|' not in info:
+        return False
+    try:
+        tab_id_str, action = info.split('|', 1)
+    except ValueError:
+        return False
+    tb = _TOOLBARS.get(tab_id_str)
+    if tb is None:
+        return False
+    tb.on_preset_action(action)
     return True
 
 

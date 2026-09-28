@@ -2355,6 +2355,21 @@ class Command:
         except Exception:
             pass
 
+    def toolbar_menu_preset(self, info=''):
+        """Presets-dropdown click from a compare tab's toolbar: info is
+        '<PROP_TAB_ID>|<preset key>' (raw string, same 'cmd=' callback
+        convention as toolbar_menu_ignore). Routed to the toolbar that
+        built the menu item; it persists the algorithm / beautify
+        options to settings/cuda_differ.json (the config dialog's
+        store) and re-compares on the 100ms timer. Unknown tab (closed
+        since the menu was built) is a no-op."""
+        if not info:
+            return
+        try:
+            difftb.preset_menu_action(str(info))
+        except Exception:
+            pass
+
     def on_caret(self, ed_self):
         """Mirror caret to opposite editor when sync_caret is enabled."""
         if self.cfg.get('enable_sync_caret', False):

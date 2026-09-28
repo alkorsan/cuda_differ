@@ -259,7 +259,8 @@ the editor text background color of the current UI theme, so it blends
 into the compare view):
 
     [↻ Recompare or × Cancel][↔ Resize] | [↑ Prev][↓ Next] |
-    [← Copy][→ Copy] | [≡ Ignore 2/5 ▾] [⚙ Config]      ...status
+    [← Copy][→ Copy] | [≡ Ignore 2/5 ▾] [☰ Presets ▾] [⚙ Config]
+    ...status
 
 - ↻ Recompare -- re-runs the compare (same as F5 / the menu's
   Recompare). While a compare runs, the button becomes × Cancel and
@@ -282,6 +283,22 @@ into the compare view):
   While a pure-Python algorithm is the effective one, the items
   disable themselves and an explanatory item heads the menu (same
   guard as the tab context menu).
+- ☰ Presets ▾ -- dropdown with quick "preset" combinations: "Preset 1:
+  Fastest comparison - Myers, Beautify Off" and "Preset 2: Better
+  readability (slower) - Histogram, Beautify On"; only one of the two
+  presets can be checked at a time. After a separator, "Algorithm 1:
+  Native Histogram" and "Algorithm 2: Native Myers" (also mutually
+  exclusive) and the independent "Beautify alignment" toggle (works
+  with either algorithm). The preset checkmarks are DERIVED from the
+  current settings on every menu open: Native Myers + Beautify off
+  checks Preset 1, Native Histogram + Beautify on checks Preset 2, any
+  other combination checks NEITHER -- so a custom selection is
+  visible at a glance. Picking an item writes
+  differ.algorithm.diff_algorithm / differ.algorithm.beautify_alignment
+  (the same settings the config dialog edits) and re-runs this tab's
+  compare immediately. The button is disabled while a compare runs
+  (like the Ignore dropdown); its tooltip shows the current
+  algorithm / beautify combination.
 - ⚙ Config -- opens the Differ options dialog.
 - status label (right side) -- shows the compare state: "Comparing..."
   while a compare runs, "N differences" / "No differences" when it
@@ -823,16 +840,17 @@ Toolbar section (see the "Toolbar" chapter above for details):
   A toolbar docked to the top of every compare tab: Recompare (Cancel
   while a compare runs), Resize, Prev, Next, Copy to left, Copy to
   right, the Ignore-options dropdown (multiple checkable options plus
-  "Uncheck all"), Config, and a status label on the right (compare
-  state + difference count). Every button has a tooltip; the toolbar
-  follows UI theme switches and is restored at startup for
+  "Uncheck all"), the Presets dropdown (algorithm / beautify-alignment
+  preset combinations), Config, and a status label on the right
+  (compare state + difference count). Every button has a tooltip; the
+  toolbar follows UI theme switches and is restored at startup for
   session-restored compare tabs.
 - differ.toolbar.show_btn_text: Show button texts in the toolbar
   (default: on)
   When on, buttons show "↻ Recompare", "↔ Resize", "↑ Prev", "↓ Next",
-  "← Copy", "→ Copy", "≡ Ignore 2/5 ▾", "⚙ Config"; when off, only the
-  UTF-8 icons are shown (the Ignore button keeps its enabled-options
-  counter).
+  "← Copy", "→ Copy", "≡ Ignore 2/5 ▾", "☰ Presets ▾", "⚙ Config"; when
+  off, only the UTF-8 icons are shown (the Ignore button keeps its
+  enabled-options counter).
 
 
 == Diff algorithms and best practices ==
