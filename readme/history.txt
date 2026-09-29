@@ -1,4 +1,45 @@
 2026.09.29 (by @badrelmers)
++ add: the char-level tokenizer of the native diff engine is now
+  configurable -- the new option differ.algorithm.break_chars (config
+  dialog, "algorithm" chapter, right after "Detailed comparison")
+  holds the word-break characters the engine was hard-wired to until
+  now (WinMerge's default ",.;:": comma, period, semicolon, colon).
+  Every character of the string is its own token and a word boundary
+  inside the char-level highlights: with the default, "v1.2.3" splits
+  into "v1" "." "2" "." "3" so a version bump highlights only the
+  changed digit; an empty string disables punctuation breaking
+  ("v1.2.3" is one token, words split on whitespace only); adding
+  characters (e.g. ".,;:-_/\\" for paths/URLs/dates/kebab-case, or
+  ".,;:!?()" for prose) breaks words on more punctuation. Whitespace,
+  CR/LF and (with "Ignore numbers" on) digits are classified before
+  the break-char check, so listing them has no effect; non-ASCII
+  characters always break words regardless. The value flows from
+  settings/cuda_differ.json through Command.get_config (sanitized by
+  the new differ_native.normalize_break_chars -- a hand-edited
+  non-string value falls back to the default instead of failing every
+  compare, since the engine accepts strings only) onto the Differ
+  (diff.break_chars, set by refresh_compare next to diff.ignore_flags),
+  and from there into ALL THREE DIF_CHARS call forms: the batched
+  background job (differ_native.start_async_char_diff), its
+  synchronous fallback (sync_char_diff) and the legacy single-pair
+  path (Differ._char_diff) -- one value per whole batch, exactly like
+  the ignore bitmask. The line-level diff (DIF_TEXTS) is not affected:
+  break chars only tune which characters the char-level details
+  highlight inside already-changed lines, never which lines are
+  changed. The option is native-only like the five ignore options
+  (the pure-Python algorithms break words at every punctuation
+  character, so the setting means nothing to them): its OPTS_META
+  entry carries the new generic 'native_only' flag, and
+  _visible_opts_meta hides such options from the config dialog while a
+  Python algorithm is the effective one (configured Python algo, or a
+  native one that fell back because cudatext.diff_proc is missing),
+  next to the existing whole-'ignoreopt'-chapter filter. Requires a
+  CudaText build whose diff_proc API takes the break_chars parameter
+  (the 5_add_differ_api branch with the break-chars patch); no
+  backward compatibility is kept -- older builds lack the parameter
+  and the DIF_CHARS calls fail, the engine and the plugin are updated
+  together.
+2026.09.29 (by @badrelmers)
 * change: the unified-diff engine code (the "Diff current document
   with file... / tab..." commands) moved out of __init__.py into a
   new unidiff.py module: the opcode-driven difflib.unified_diff

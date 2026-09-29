@@ -475,6 +475,11 @@ Notes:
 - These options are passed to CudaText's diff_proc API as the
   DIFF_IGN_* bitmask (see the diff_proc documentation in the CudaText
   wiki).
+- The related "Word-break characters" option (differ.algorithm.
+  break_chars, "algorithm" chapter of the config dialog) tunes the
+  same native char-level engine: the characters words are split at for
+  the highlights inside changed lines. It is passed to diff_proc as
+  the break_chars parameter.
 
 
 == Background comparing ==
@@ -743,6 +748,41 @@ Algorithm section:
   When disabled, modified lines are highlighted as a whole.
   Disabling this speeds up the compare of big files.
   Default: on.
+- differ.algorithm.break_chars: Word-break characters (default: ",.;:")
+  Characters that split words for the character-level highlights inside
+  modified lines -- the word tokenizer of the native char-diff engine
+  (the same setting WinMerge calls "break chars"). Every character of
+  the string is its own token and a word boundary, so words break at
+  it: with the default ",.;:" the line "v1.2.3, done" tokenizes as
+  "v1" "." "2" "." "3" "," " done", so a version bump "v1.2.3" ->
+  "v1.2.4" highlights only the changed digit instead of the whole
+  version string.
+  Examples:
+    * ",.;:" -- WinMerge's default (recommended).
+    * "" (empty string) -- punctuation never breaks words: "v1.2.3" is
+      one token, so any change inside it highlights the whole string;
+      words are then split on whitespace only.
+    * ".,;:-_/\\" -- add characters to also break on paths, URLs,
+      dates, kebab-case and snake_case identifiers.
+    * ".,;:!?()" -- for prose, also break on sentence punctuation.
+  Notes:
+    * Whitespace, CR/LF and (with "Ignore numbers" enabled) digits are
+      classified before the break-char check, so listing them has no
+      effect.
+    * Non-ASCII characters always break words regardless of this
+      option.
+    * One set applies to every line pair of a compare; the line-level
+      diff (which lines are changed) is not affected by it, only the
+      char-level highlights inside the changed lines.
+    * A hand-edited non-string value in settings/cuda_differ.json
+      falls back to the default (the engine accepts strings only).
+  Only used by the native algorithms (Native Histogram and Native
+  Myers) with "Detailed comparison" enabled -- the pure-Python
+  algorithms break words at every punctuation character and ignore
+  this option, so it is hidden from the config dialog while a Python
+  algorithm is the effective one. Requires a CudaText build whose
+  diff_proc API supports the break_chars parameter (the 5_add_differ_api
+  branch with the break-chars patch).
 - differ.algorithm.beautify_alignment: Improve line alignment
   Beautify line alignment inside REPLACE blocks where the two sides have
   DIFFERENT line counts.

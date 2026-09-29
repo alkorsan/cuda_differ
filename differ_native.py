@@ -57,6 +57,17 @@ line-level diff (diff_proc DIF_TEXTS) and the char-level detail diff
 differ_python.py do NOT support ignore options — they always compare
 strictly.
 
+Break chars: the word-break characters of the DIF_CHARS tokenizer are
+configurable via the plugin's 'algorithm.break_chars' setting (default
+',.;:' -- WinMerge's default; see DEFAULT_BREAK_CHARS /
+normalize_break_chars). The configured string is carried on the Differ
+(diff.break_chars, set next to diff.ignore_flags by
+Command.refresh_compare) and threaded into EVERY DIF_CHARS call of a
+compare -- one value per whole batch, exactly like the ignore bitmask.
+Only the char-level tokenizer reads it; the line-level DIF_TEXTS diff
+ignores it. The pure-Python algorithms do not use it either: their
+tokenizer breaks words at EVERY punctuation character.
+
 Code is intentionally duplicated from differ_python.py to allow
 independent evolution of the native and Python codepaths. As more
 diff logic moves into the Pascal native engine, this file will shrink
@@ -91,6 +102,15 @@ DIFF_IGN_EOL         = _ct.DIFF_IGN_EOL if _HAS_NATIVE_DIFF else 4
 DIFF_IGN_NUMBERS     = _ct.DIFF_IGN_NUMBERS if _HAS_NATIVE_DIFF else 8
 DIFF_IGN_BLANK_LINES = _ct.DIFF_IGN_BLANK_LINES if _HAS_NATIVE_DIFF else 16
 
+# Default word-break characters of the DIF_CHARS tokenizer -- WinMerge's
+# default (stringdiffs.cpp). Exposed as the plugin option
+# 'differ.algorithm.break_chars' (config dialog, 'algorithm' chapter);
+# the configured value is sanitized by normalize_break_chars() and
+# threaded into every diff_proc(DIF_CHARS) call: every character of the
+# string is its own token and a word boundary, an EMPTY string disables
+# punctuation breaking (words split on whitespace/EOL only).
+DEFAULT_BREAK_CHARS = ',.;:'
+
 
 def build_ignore_flags(cfg):
     """Build the diff_proc DIFF_IGN_* bitmask from a Differ config dict.
@@ -112,6 +132,23 @@ def build_ignore_flags(cfg):
     if cfg.get('ignore_numbers'):
         flags |= DIFF_IGN_NUMBERS
     return flags
+
+
+def normalize_break_chars(value):
+    """Sanitize a configured break-chars value into a str.
+
+    The option lives in settings/cuda_differ.json, so a hand-edited
+    file could hold a non-string (number, list, null...) -- and the
+    native engine's diff_proc(DIF_CHARS) accepts a str only (any other
+    type is an API error, which would fail EVERY compare). Returns the
+    value unchanged when it is a str (including the empty string -- a
+    legitimate setting meaning "punctuation never breaks words");
+    anything else (None, a wrong type) falls back to
+    DEFAULT_BREAK_CHARS so one broken value never kills the plugin.
+    """
+    if isinstance(value, str):
+        return value
+    return DEFAULT_BREAK_CHARS
 
 
 class CudaDiffNativeMatcher:
@@ -282,7 +319,7 @@ def cancel_async_line_diff(job):
     return bool(_ct.diff_proc(_ct.DIF_CANCEL, job))
 
 
-def start_async_char_diff(pairs, flags, callback):
+def start_async_char_diff(pairs, flags, callback, break_chars=DEFAULT_BREAK_CHARS):
     """Start a BATCHED char-level compare of ALL line pairs in ONE
     background engine job: the asynchronous form of
     cudatext.diff_proc(DIF_CHARS) (the `callback` argument).
@@ -293,6 +330,12 @@ def start_async_char_diff(pairs, flags, callback):
     its own OS thread (it re-checks the job's cancel flag between
     pairs, so a batch of hundreds of thousands of small pairs also
     stops promptly on DIF_CANCEL).
+
+    'break_chars' is the tokenizer's word-break characters (see
+    DEFAULT_BREAK_CHARS): the value of the plugin's
+    'differ.algorithm.break_chars' setting, carried on the Differ as
+    diff.break_chars. ONE value for the whole batch -- the engine
+    applies the same set to every pair (exactly like 'flags').
 
     Returns the engine's job handle (a positive int) when the
     background compare was started: the engine invokes
@@ -315,7 +358,8 @@ def start_async_char_diff(pairs, flags, callback):
     if not _HAS_NATIVE_DIFF or not pairs:
         return 0
     result = _ct.diff_proc(
-        _ct.DIF_CHARS, pairs, None, 0, flags, callback)
+        _ct.DIF_CHARS, pairs, None, 0, flags, callback,
+        break_chars=break_chars)
     if isinstance(result, int) and result > 0:
         return result
     return 0
@@ -337,7 +381,7 @@ def cancel_async_char_diff(job):
     return bool(_ct.diff_proc(_ct.DIF_CANCEL, job))
 
 
-def sync_char_diff(pairs, flags):
+def sync_char_diff(pairs, flags, break_chars=DEFAULT_BREAK_CHARS):
     """Synchronous BATCHED char-level compare: the whole 'pairs' list
     in ONE blocking diff_proc(DIF_CHARS) call.
 
@@ -347,6 +391,9 @@ def sync_char_diff(pairs, flags):
     it blocks the main thread for the whole batch time -- acceptable
     only as an emergency path, never the normal flow.
 
+    'break_chars' -- see start_async_char_diff (ONE value for the
+    whole batch, from the 'differ.algorithm.break_chars' setting).
+
     Returns the per-pair opcode list (same format as
     start_async_char_diff's callback argument), or None on engine
     error (the caller then paints every pair as a full REPLACE via the
@@ -354,7 +401,8 @@ def sync_char_diff(pairs, flags):
     """
     if not _HAS_NATIVE_DIFF or not pairs:
         return None
-    return _ct.diff_proc(_ct.DIF_CHARS, pairs, None, 0, flags)
+    return _ct.diff_proc(
+        _ct.DIF_CHARS, pairs, None, 0, flags, break_chars=break_chars)
 
 
 def algo_id(algorithm_name):
@@ -504,22 +552,35 @@ class Differ:
         compare(); it is applied to BOTH the line-level diff
         (DIF_TEXTS) and the char-level detail diff (DIF_CHARS).
 
+        self.break_chars is the DIF_CHARS tokenizer's word-break
+        characters ('differ.algorithm.break_chars' config setting,
+        sanitized by normalize_break_chars). Command.refresh_compare
+        sets it next to ignore_flags; it is threaded into every
+        DIF_CHARS call (batched and legacy) and ignored by DIF_TEXTS.
+        The default is DEFAULT_BREAK_CHARS (',.;:', WinMerge's
+        default) -- identical to the engine's own default, so an
+        unset value and an explicitly-set default behave the same.
+
         The Differ holds NO text between compares — neither raw text
         nor line lists. a_text / b_text are passed directly to
         compare() by the caller (Command.refresh_compare), used as locals
         inside compare() to drive the engine + painting, and dropped
         when compare() returns. Between compares, the Differ holds
         only config (withdetail / diff_algorithm / beautify_alignment /
-        ignore_flags) and the diffmap (line-index tuples, small). The
-        text itself stays in the editor tabs' Pascal-side buffers
-        (a_ed / b_ed), which are the source of truth; the Python-side
-        copy is built fresh on each compare via a_ed.get_text_all() /
-        b_ed.get_text_all().
+        ignore_flags / break_chars) and the diffmap (line-index
+        tuples, small). The text itself stays in the editor tabs'
+        Pascal-side buffers (a_ed / b_ed), which are the source of
+        truth; the Python-side copy is built fresh on each compare via
+        a_ed.get_text_all() / b_ed.get_text_all().
         """
         self.withdetail = True
         self.diff_algorithm = 'native_myers'
         self.beautify_alignment = False
         self.ignore_flags = 0  # DIFF_IGN_* bitmask (see build_ignore_flags)
+        # Word-break chars of the DIF_CHARS tokenizer (see
+        # normalize_break_chars); set by Command.refresh_compare from
+        # cfg['break_chars'] next to ignore_flags.
+        self.break_chars = DEFAULT_BREAK_CHARS
         self.diffmap = []
         # --- two-phase char-diff state (see the module docstring) ---
         # Active pair-collection list of the COLLECT pass, or None when
@@ -638,6 +699,8 @@ class Differ:
                 None,                  # param2: unused for DIF_CHARS
                 0,                     # algo: unused for DIF_CHARS
                 self.ignore_flags,     # bitmask of DIFF_IGN_*
+                None,                  # callback: synchronous call
+                self.break_chars,      # tokenizer word-break chars
             )
             if result and result[0] is not None:
                 return result[0]

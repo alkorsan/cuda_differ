@@ -789,6 +789,42 @@ OPTS_META = [
      'frm': 'bool',
      'chp': 'algorithm',
      },
+    {'opt': 'differ.algorithm.break_chars',
+     'cmt': _('Word-break characters\n'
+              'Characters that split words for the character-level '
+              'highlights inside modified lines (the word tokenizer of '
+              'the native char-diff engine -- WinMerge\'s break-chars '
+              'setting).\n'
+              'Every character of the string is its own token and a word '
+              'boundary, so words break at it: with the default ",.;:" the '
+              'line "v1.2.3, done" tokenizes as "v1" "." "2" "." "3" "," '
+              '" done" -- a version bump "v1.2.3" -> "v1.2.4" then '
+              'highlights only the changed digit, not the whole version '
+              'string.\n'
+              '- ",.;:" -- WinMerge\'s default (recommended).\n'
+              '- "" (empty) -- punctuation never breaks words: "v1.2.3" is '
+              'ONE token, so a change inside it highlights the whole '
+              'string; words are then split on whitespace only.\n'
+              '- Add characters to break on more punctuation, e.g. '
+              '".,;:-_/\\\\" for paths, URLs, dates and kebab-case '
+              'identifiers, or ".,;:!?()" for prose.\n'
+              'Notes: whitespace, CR/LF and (with "Ignore numbers" on) '
+              'digits are classified before the break-char check, so '
+              'listing them has no effect; non-ASCII characters always '
+              'break words regardless of this option. One set for every '
+              'line pair of a compare; the line-level diff (which lines '
+              'are changed) is not affected by it.\n'
+              'Only used by the native algorithms (Native Histogram / '
+              'Native Myers) with "Detailed comparison" enabled -- the '
+              'pure-Python algorithms break words at every punctuation '
+              'character and ignore this option (hidden while a Python '
+              'algorithm is selected).\n'
+              'Default: ",.;:".'),
+     'def': ',.;:',
+     'frm': 'str',
+     'chp': 'algorithm',
+     'native_only': True,
+     },
     {'opt': 'differ.algorithm.beautify_alignment',
      'cmt': _('Improve line alignment\n'
               'Beautify line alignment inside REPLACE blocks where the two '
@@ -1749,13 +1785,16 @@ class Command:
     def _visible_opts_meta(self):
         """OPTS_META filtered for what the current algorithm can use.
 
-        The five 'ignore' options (chapter 'ignoreopt') are implemented by
-        the native diff engines only -- the pure-Python algorithms compare
-        strictly and ignore the flags bitmask. While a Python algorithm is
-        the effective one (configured Python algo, or a native algo that
-        fell back to Python because cudatext.diff_proc is missing), the
-        options do nothing, so they are hidden from the config dialog and
-        the compare-tab context menu instead of sitting there inert.
+        The five 'ignore' options (chapter 'ignoreopt') and the
+        'break_chars' option (flagged 'native_only') are implemented by
+        the native diff engines only -- the pure-Python algorithms
+        compare strictly (and break words at every punctuation
+        character, so the break-char set means nothing to them). While
+        a Python algorithm is the effective one (configured Python
+        algo, or a native algo that fell back to Python because
+        cudatext.diff_proc is missing), the options do nothing, so
+        they are hidden from the config dialog and the compare-tab
+        context menu instead of sitting there inert.
 
         The dialog is static (the Options Editor cannot show/hide items
         while it is open), so switching the algorithm takes effect the
@@ -1764,7 +1803,9 @@ class Command:
         use_native = self._resolve_algorithm()[1]
         if use_native:
             return OPTS_META
-        return [m for m in OPTS_META if m.get('chp') != 'ignoreopt']
+        return [m for m in OPTS_META
+                if m.get('chp') != 'ignoreopt'
+                and not m.get('native_only')]
 
     def change_config(self):
         """Open the options dialog (cuda_options_editor (Options Editor plugin)
@@ -1816,6 +1857,13 @@ class Command:
     # They are ALSO exposed as checkable items in the diff-tab right-click
     # context menu, right below 'Recompare' -- see tabmenu_init() and
     # tabmenu_ignore().
+    #
+    # The char-level tokenizer's word-break characters live in the same
+    # settings file under 'differ.algorithm.break_chars' (chapter
+    # 'algorithm', flagged 'native_only' -- see OPTS_META); they are NOT
+    # context-menu checkable items (a string, not toggles) and reach the
+    # engine as the diff_proc(DIF_CHARS) break_chars argument, carried on
+    # the Differ as diff.break_chars (see refresh_compare).
 
     def on_cli(self, fn1, fn2):
         """Called when CudaText gets command-line param -p=cuda_differ#file1#file2.
@@ -4001,6 +4049,18 @@ class Command:
             # ignores this attribute -- Python algorithms compare
             # strictly by design.
             diff.ignore_flags = dfn.build_ignore_flags(self.cfg)
+            # Word-break chars of the native char-level tokenizer
+            # (differ.algorithm.break_chars), threaded into every
+            # diff_proc(DIF_CHARS) call of this compare -- batched
+            # background job, synchronous fallback and the legacy
+            # single-pair path alike. DIF_TEXTS ignores it (it only
+            # tunes the char-level highlights inside already-changed
+            # lines); the pure-Python Differ ignores it too (its
+            # tokenizer breaks words at every punctuation character).
+            # Normalized again here so a stale/partial cfg dict can
+            # never push a non-string into the engine call.
+            diff.break_chars = dfn.normalize_break_chars(
+                self.cfg.get('break_chars'))
 
             # Detect word-wrap on either side. When wrap is on, gaps must be
             # sized by the actual number of visual rows on the opposite side
@@ -5258,7 +5318,10 @@ class Command:
           are dropped after the split.
         - With at least one collected pair, ONE background batched
           diff_proc(DIF_CHARS) job runs them all (dfn.
-          start_async_char_diff); the completion callback
+          start_async_char_diff; the batch carries the Differ's
+          ignore_flags AND break_chars -- the configured word-break
+          chars of the char-level tokenizer, ONE value per whole
+          batch); the completion callback
           (_on_char_diff_done, marshalled to the main thread) paints
           with the precomputed per-pair opcodes. This method RETURNS at
           kick-off with the session's job slot STILL TAKEN (the compare
@@ -5383,7 +5446,8 @@ class Command:
                         cb = functools.partial(self._on_char_diff_done,
                                                job, opcodes)
                         handle = dfn.start_async_char_diff(
-                            pairs, diff.ignore_flags, cb)
+                            pairs, diff.ignore_flags, cb,
+                            diff.break_chars)
                         if handle:
                             job.char_job_handle = handle
                             job.char_profiler_token = _async_pair
@@ -5403,7 +5467,7 @@ class Command:
                         msg('diff_proc failed to start the background '
                             'char compare', level=1)
                         char_ops = dfn.sync_char_diff(
-                            pairs, diff.ignore_flags)
+                            pairs, diff.ignore_flags, diff.break_chars)
                         if char_ops is None:
                             # Engine failed the batch as well: paint
                             # every pair as a full REPLACE (the replay
@@ -6347,6 +6411,14 @@ class Command:
                 get_opt('algorithm.diff_algorithm', 'native_myers'),
             'compare_with_details':
                 get_opt('algorithm.compare_with_details', True),
+            # Word-break chars of the native char-level tokenizer
+            # (diff_proc DIF_CHARS break_chars parameter; see
+            # differ_native.DEFAULT_BREAK_CHARS). Sanitized: a
+            # hand-edited non-string value in the JSON falls back to
+            # the default instead of failing every native compare.
+            'break_chars':
+                dfn.normalize_break_chars(
+                    get_opt('algorithm.break_chars', dfn.DEFAULT_BREAK_CHARS)),
             'beautify_alignment':
                 get_opt('algorithm.beautify_alignment', False),
             # --- ignore options (diff_proc DIFF_IGN_* flags; collected
