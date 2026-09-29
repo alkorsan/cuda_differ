@@ -20,7 +20,12 @@ Implementation notes:
   docking mechanism the gap-aware overview panel uses for the right
   side ('R'). PROP_HANDLE_PARENT returns the stable grouping panel
   that parents the two split editors, so the toolbar sits exactly on
-  top of the compare view and is destroyed with it.
+  top of the compare view. It is NOT freed when that panel is freed
+  at tab close: DLG_DOCK only sets the form's Parent, while its OWNER
+  stays CudaText's main form (dlg_proc DLG_CREATE does
+  TFormDummy.Create(fmMain)), and LCL's TWinControl.Destroy only
+  unparents child controls ("controls are freed by the owner") -- so
+  the plugin must free the form itself in on_close (see destroy()).
 
 * BUTTONS are 'button_ex' controls (application-themed, CudaText's own
   button look) in flat mode with kind=BTNKIND_TEXT_ONLY, so UTF-8 icon
@@ -1434,8 +1439,9 @@ class CompareToolbar:
     # -- teardown -----------------------------------------------------------
 
     def destroy(self):
-        """Undock and free the form (+ its live on_change callbacks --
-        DLG_FREE cleans them) and empty the popup menus.
+        """Free the form (+ its live on_change callbacks -- DLG_FREE
+        cleans them) and empty the popup menus. No DLG_UNDOCK: see the
+        comment below.
 
         The popup menu is NOT disposed with menu_proc(MENU_REMOVE):
         that Pascal handler frees the menu ITEM it is given -- meant
@@ -1450,10 +1456,20 @@ class CompareToolbar:
         h = self.h_dlg
         self.h_dlg = None
         if h is not None:
-            try:
-                ct.dlg_proc(h, ct.DLG_UNDOCK)
-            except Exception:
-                pass
+            # NO DLG_UNDOCK before DLG_FREE. DLG_UNDOCK does
+            # Form.Parent := nil, and LCL's TCustomForm.SetParent
+            # immediately allocates a native floating top-level window
+            # for a form unparented while Visible
+            #   if (Parent = nil) and Visible then HandleNeeded;
+            # the window manager maps that window -- the whole screen
+            # repaints (the flash that dismissed open menus on tab
+            # close) -- and DLG_FREE then hides and frees it a few
+            # microseconds later. Freeing the DOCKED form directly is
+            # safe and flash-free: DLG_FREE hides it while it is still
+            # a child of the (hidden) editor frame -- no screen change
+            # -- and TControl.Destroy unparents it itself with
+            # Visible=False, so HandleNeeded never runs and no
+            # floating window is ever created.
             try:
                 ct.dlg_proc(h, ct.DLG_FREE)
             except Exception:

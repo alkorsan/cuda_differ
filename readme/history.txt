@@ -61,6 +61,27 @@
   backward compatibility is kept -- older builds lack the parameter
   and the DIF_CHARS calls fail, the engine and the plugin are updated
   together.
+* fix: closing a compare tab caused a screen flash (a full repaint
+  that also dismissed any open menu). The toolbar's and the overview
+  panel's destroy() ran dlg_proc(DLG_UNDOCK) before DLG_FREE, and
+  CudaText's DLG_UNDOCK does Form.Parent := nil -- LCL's
+  TCustomForm.SetParent then immediately allocates a native floating
+  top-level window for a form that is unparented while its Visible
+  flag is still True ("if (Parent = nil) and Visible then
+  HandleNeeded"), the window manager maps that transient window
+  (the flash), and DLG_FREE hides and frees it microseconds later.
+  The forms are now freed directly while still docked into the
+  (hidden) editor frame: DLG_FREE hides them as children of a hidden
+  parent (no screen change) and TControl.Destroy unparents them
+  itself with Visible=False, so no floating window is ever created.
+  Verified from CudaText + LCL sources that the explicit destruction
+  itself must stay: dlg_proc forms are OWNED by CudaText's main form
+  (TFormDummy.Create(fmMain)) and only PARENTED into the tab's editor
+  frame, and LCL's TWinControl.Destroy only unparents child controls
+  ("controls are freed by the owner") -- so CudaText does NOT free
+  them at tab close, and without the destroy calls every closed
+  compare tab would leak its toolbar + overview forms until app
+  exit.
 2026.09.29 (by @badrelmers)
 * change: the unified-diff engine code (the "Diff current document
   with file... / tab..." commands) moved out of __init__.py into a

@@ -7278,7 +7278,8 @@ class Command:
         # editor parent: the parent control goes away with the tab, but
         # the toolbar form itself is OWNED by CudaText's main form and
         # would survive the tab as an invisible orphan -- it must be
-        # undocked/freed explicitly.
+        # freed explicitly (DLG_FREE alone -- no DLG_UNDOCK, which
+        # flashes a transient floating window; see toolbar.destroy).
         try:
             difftb.destroy_for(session.tab_id_str)
         except Exception:

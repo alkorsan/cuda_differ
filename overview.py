@@ -921,8 +921,9 @@ class PaintboxOverview:
         self.paint()
 
     def destroy(self):
-        """Undock and free the overview dialog, the static bitmap and
-        the background painting machinery."""
+        """Free the overview dialog (docked -- freed directly, no
+        DLG_UNDOCK; see the comment at the DLG_FREE call), the static
+        bitmap and the background painting machinery."""
         # Stop the worker thread and the apply timer FIRST (they must
         # never touch the dialog/bitmap handles freed below).
         self._shutdown_async_paint()
@@ -940,7 +941,20 @@ class PaintboxOverview:
         if self.h_dlg is not None:
             try:
                 if self._owns_dlg:
-                    ct.dlg_proc(self.h_dlg, ct.DLG_UNDOCK)
+                    # NO DLG_UNDOCK before DLG_FREE: DLG_UNDOCK does
+                    # Form.Parent := nil, and LCL's TCustomForm.SetParent
+                    # immediately allocates a native floating top-level
+                    # window for a form unparented while Visible
+                    #   if (Parent = nil) and Visible then HandleNeeded;
+                    # the window manager maps that window -- the screen
+                    # repaints (the flash that dismissed open menus on
+                    # tab close) -- and DLG_FREE then hides and frees it
+                    # microseconds later. Freeing the DOCKED form directly
+                    # is safe and flash-free: DLG_FREE hides it while it is
+                    # still a child of the (hidden) editor frame, and
+                    # TControl.Destroy unparents it itself with
+                    # Visible=False, so HandleNeeded never runs. (Same
+                    # change as CompareToolbar.destroy in toolbar.py.)
                     ct.dlg_proc(self.h_dlg, ct.DLG_FREE)
                 else:
                     ct.dlg_proc(self.h_dlg, ct.DLG_CTL_DELETE, index=self._ctl_index)
