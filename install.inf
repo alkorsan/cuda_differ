@@ -23,122 +23,127 @@ method=compare_with_tab
 
 [item4]
 section=commands
+caption=Differ\Compare current document with next tab
+method=compare_with_next_tab
+
+[item5]
+section=commands
 caption=Differ\Compare clipboard to selection
 method=compare_clip_sel
 
-[item5]
+[item6]
 section=commands
 caption=Differ\-
 method=_
 
-[item6]
+[item7]
 section=commands
 caption=Differ\Diff current document with file...
 method=diff_with
 
-[item7]
+[item8]
 section=commands
 caption=Differ\Diff current document with tab...
 method=diff_with_tab
 
-[item8]
+[item9]
 section=commands
 caption=Differ\-
 method=_
 
-[item9]
+[item10]
 section=commands
 caption=Differ\Recompare
 method=refresh_compare
 
-[item10]
+[item11]
 section=commands
 caption=Differ\Cancel compare
 method=cancel_compare
 
-[item11]
+[item12]
 section=commands
 caption=Differ\Cancel all compares
 method=cancel_all_compares
 
-[item12]
+[item13]
 section=commands
 caption=Differ\Resize editors to equal width
 method=resize_equal_width
 
 
 
-[item13]
+[item14]
 section=commands
 caption=Differ\Focus the opposite file
 method=set_focus_to_opposite_panel
 
-[item14]
+[item15]
 section=commands
 caption=Differ\Swap compared editors
 method=swap_view
 
-[item15]
+[item16]
 section=commands
 caption=Differ\-
 method=_
 
-[item16]
+[item17]
 section=commands
 caption=Differ\Select current difference
 method=select_current
 
-[item17]
+[item18]
 section=commands
 caption=Differ\Select all differences
 method=select_all_diff
 
-[item18]
+[item19]
 section=commands
 caption=Differ\-
 method=_
 
-[item19]
+[item20]
 section=commands
 caption=Differ\Jump to next difference
 method=jump_next
 
-[item20]
+[item21]
 section=commands
 caption=Differ\Jump to previous difference
 method=jump_prev
 
-[item21]
+[item22]
 section=commands
 caption=Differ\-
 method=_
 
-[item22]
+[item23]
 section=commands
 caption=Differ\Copy current difference to the right
 method=copy_right
 
-[item23]
+[item24]
 section=commands
 caption=Differ\Copy current difference to the left
 method=copy_left
 
-[item24]
+[item25]
 section=commands
 caption=Differ\Copy current line to the right
 method=copy_line_right
 
-[item25]
+[item26]
 section=commands
 caption=Differ\Copy current line to the left
 method=copy_line_left
 
-[item26]
+[item27]
 section=commands
 caption=Differ\-
 method=_
 
-[item27]
+[item28]
 section=commands
 caption=Differ\Config...
 method=change_config

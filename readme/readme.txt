@@ -78,6 +78,16 @@ Compare current document with file...
 Compare current document with tab...
     Compares the file in the active tab with another open tab.
 
+Compare current document with next tab
+    Compares the file in the active tab with the tab to its right in
+    the same tab bar (no tab picker). Also in the tab context menu,
+    right below "Compare with focused tab" -- there it acts on the
+    right-clicked tab instead. The last tab of a group has no next
+    tab: the menu item shows disabled and the command prints a status
+    hint. The usual candidate rules apply (the next tab must be a
+    text tab, not a Differ compare tab, not a two-files-in-one-tab);
+    there is no wrap-around to the group's first tab by design.
+
 Compare clipboard to selection
     Compares the text on the clipboard with the selection of the
     focused editor, opening a new compare tab ("Diff: clipboard |
@@ -282,6 +292,10 @@ and the remaining gap shrinks by one line.
 Right-clicking a tab title shows "Differ" submenu with:
 - Compare with... -- pick a file to compare against this tab
 - Compare with focused tab -- compare this tab with the currently focused tab
+- Compare with next tab -- compare this tab with the tab to its right
+  in the same tab bar (one click, no picker; disabled when this is
+  the last tab of its group or the next tab cannot be compared).
+  Same as the command, but acting on the right-clicked tab.
 - Compare with tab -- submenu listing all open tabs; click one to compare.
   If the list is too long, the first entry "More tabs..." opens a dialog
   with a scrollbar to pick any open tab.
@@ -323,7 +337,16 @@ into the compare view):
 - ↻ Recompare -- re-runs the compare (same as F5 / the menu's
   Recompare). While a compare runs, the button becomes × Cancel and
   cancels that tab's running compare; when the compare finishes or is
-  cancelled it becomes ↻ Recompare again.
+  cancelled it becomes ↻ Recompare again. The swap to × Cancel is
+  DELAYED by one second after the compare starts, and a click landing
+  inside that second is swallowed: a double-click (or a late
+  button-up) on Recompare can no longer cancel the compare it just
+  kicked off -- the accidental second click hits a Recompare that
+  ignores it, not a Cancel. A genuine cancel is available one second
+  later, or immediately via the "Cancel compare" command / the tab
+  context menu. If the compare finishes within the delay (small
+  files compare in well under a second), the button simply stays
+  ↻ Recompare with the result.
 - ↑ Prev / ↓ Next -- jump to the previous/next difference (same as
   Alt+Up / Alt+Down). Disabled while there are no differences or a
   compare is running.

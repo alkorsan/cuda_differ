@@ -378,6 +378,15 @@ _SEP_W = 2
 _BTN_W_MIN = 26
 # Vertical inset of buttons/separators from the form's top/bottom.
 _BTN_V_PAD = 1
+# Delay before the toolbar's Recompare button swaps to '× Cancel' after
+# a compare is kicked off (see set_comparing / _cancel_swap_tick). Its
+# only job is to absorb the accidental second click that follows the
+# kick-off click: a click landing inside this window is swallowed
+# entirely, so a double-click (or a late button-up) can never cancel a
+# compare that just started. One second is long enough to cover any
+# realistic double-click yet short enough that a genuine cancel is
+# never more than a second away.
+_CANCEL_DELAY_MS = 1000
 # Spacing between the status label and the form's right edge.
 _STATUS_SP_R = 10
 
@@ -461,7 +470,9 @@ class CompareToolbar:
     # caption is assembled dynamically (see _ignore_caption), the
     # 'presets' and 'view' captions carry the dropdown arrow (see
     # _presets_caption / _view_caption), the recompare button swaps
-    # icon/text with '× Cancel' while a compare runs.
+    # icon/text with '× Cancel' while a compare runs -- but DELAYED by
+    # _CANCEL_DELAY_MS (the swap must not be live at the moment the
+    # kick-off click's double-click twin lands on the button).
     _BTNS = (
         ('recompare', 'btn', '\u21bb', 'Recompare'),
         ('sep1',       'sep', None, None),
@@ -494,6 +505,13 @@ class CompareToolbar:
         self.menu_items = {}   # ignore key -> popup menu item id
         self.menu_guard_item = None
         self.comparing = False
+        # Cancel-button state machine (see set_comparing):
+        # _cancel_shown -- the '× Cancel' caption is CURRENTLY on the
+        #   button (False during the _CANCEL_DELAY_MS grace window, so
+        #   the button still reads Recompare right after kick-off);
+        # _cancel_swap_pending -- the one-shot swap timer is armed.
+        self._cancel_shown = False
+        self._cancel_swap_pending = False
         self.n_diffs = 0
         self.show_text = True
         self.status = ''
@@ -734,7 +752,8 @@ class CompareToolbar:
                 cap = self._presets_caption()
             elif name == 'view':
                 cap = self._view_caption()
-            elif name == 'recompare' and self.comparing:
+            elif name == 'recompare' and self.comparing \
+                    and self._cancel_shown:
                 cap = self._caption('\u00d7', 'Cancel')
             else:
                 cap = self._caption(icon, text)
@@ -749,7 +768,7 @@ class CompareToolbar:
     def _tooltip(self, name):
         """Tooltip of a button (hotkey hints included)."""
         if name == 'recompare':
-            if self.comparing:
+            if self.comparing and self._cancel_shown:
                 return _('Cancel the running compare')
             return _('Recompare both sides (F5)')
         if name == 'resize':
@@ -855,10 +874,32 @@ class CompareToolbar:
     # -- compare state ------------------------------------------------------
 
     def set_comparing(self, running):
-        """Compare kick-off: swap Recompare -> Cancel, disable the
-        navigation buttons, rebuild the ignore dropdown (auto-refresh
-        each compare start) and set the status label."""
+        """Compare kick-off: put the toolbar into the running state --
+        disable the navigation buttons, rebuild the ignore dropdown
+        (auto-refresh each compare start), set the status label -- but
+        DELAY the Recompare -> '× Cancel' caption swap by
+        _CANCEL_DELAY_MS (see _cancel_swap_tick): a click that lands in
+        that window is the accidental double-click of the kick-off
+        click, and it must hit a Recompare that swallows it (see
+        _on_button), not a Cancel that kills the just-started compare.
+        """
         self.comparing = bool(running)
+        # Any state change disarms a pending swap timer first (the old
+        # compare's timer must never fire into the new state).
+        self._stop_cancel_swap_timer()
+        self._cancel_shown = False
+        if self.comparing:
+            self._cancel_swap_pending = True
+            try:
+                ct.timer_proc(ct.TIMER_START_ONE, self._cancel_swap_tick,
+                              _CANCEL_DELAY_MS)
+            except Exception:
+                # Timer API unavailable (should not happen in the app):
+                # degrade to the old instant swap -- Cancel stays
+                # clickable, the delay guard in _on_button is skipped
+                # by _cancel_shown being True.
+                self._cancel_swap_pending = False
+                self._cancel_shown = True
         if self.h_dlg is None:
             return
         self._layout_buttons()
@@ -869,11 +910,42 @@ class CompareToolbar:
         if self.comparing:
             self.set_status(_('Comparing...'))
 
+    def _stop_cancel_swap_timer(self):
+        """Disarm the pending Cancel-swap timer (idempotent; stopping a
+        timer that is not running is a harmless no-op anyway)."""
+        if not self._cancel_swap_pending:
+            return
+        self._cancel_swap_pending = False
+        try:
+            ct.timer_proc(ct.TIMER_STOP, self._cancel_swap_tick,
+                          _CANCEL_DELAY_MS)
+        except Exception:
+            pass
+
+    def _cancel_swap_tick(self, tag=''):
+        """One-shot timer callback (_CANCEL_DELAY_MS after kick-off):
+        swap the Recompare caption to '× Cancel' NOW. The compare may
+        already have finished before the delay ran out (small files
+        compare in well under a second) -- then Recompare is the
+        correct button and nothing happens here."""
+        self._cancel_swap_pending = False
+        if not self.comparing:
+            return
+        self._cancel_shown = True
+        if self.h_dlg is None:
+            return
+        self._layout_buttons()
+        self._set_hint('recompare', self._tooltip('recompare'))
+
     def compare_finished(self, n_diffs, cancelled=False):
         """Compare end (finished / cancelled): swap Cancel ->
-        Recompare, re-enable the navigation buttons when there are
-        differences, update the status label."""
+        Recompare (a still-pending delayed swap is disarmed -- the
+        compare ended inside the grace window, Recompare is correct),
+        re-enable the navigation buttons when there are differences,
+        update the status label."""
         self.comparing = False
+        self._stop_cancel_swap_timer()
+        self._cancel_shown = False
         self.n_diffs = int(n_diffs or 0)
         if self.h_dlg is None:
             return
@@ -1404,6 +1476,16 @@ class CompareToolbar:
             if name == 'recompare':
                 self._focus_tab()
                 if self.comparing:
+                    if not self._cancel_shown:
+                        # Grace window (see set_comparing / _CANCEL_DELAY_MS):
+                        # this click landed within the Cancel-swap delay of
+                        # the kick-off click -- the accidental double-click
+                        # (or a late button-up). Swallow it: the compare just
+                        # started must survive, and starting another one on
+                        # top of the running job is not sensible either. A
+                        # genuine cancel is available one second later (or
+                        # immediately via the 'Cancel compare' command).
+                        return
                     self.cmd.cancel_compare(self.a_ed)
                 else:
                     self.cmd.refresh_compare(self.a_ed)
@@ -1453,6 +1535,12 @@ class CompareToolbar:
         is the safe way to empty the menu; the emptied popup itself is
         owned by the main form and dies safely with the app (the same
         convention CudaText's own plugins use for their popups)."""
+        # Disarm the pending Cancel-swap timer FIRST: a one-shot that
+        # fires after the form is freed would call _cancel_swap_tick on
+        # a destroyed toolbar (harmless today -- it checks h_dlg -- but
+        # the timer also holds a bound-method reference to this object
+        # that must not outlive its session).
+        self._stop_cancel_swap_timer()
         h = self.h_dlg
         self.h_dlg = None
         if h is not None:

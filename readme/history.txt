@@ -1,3 +1,37 @@
+2026.09.30 (by @badrelmers)
++ add: command "Compare current document with next tab" (Plugins /
+  Differ menu) and the tab context-menu item "Compare with next tab",
+  right below "Compare with focused tab" (where it acts on the
+  right-clicked tab -- the same cur-side convention every tabmenu
+  item follows): compares a tab with the tab to its right in the
+  same tab bar, one click, no tab picker. The next tab is located by
+  the stable group/tab indexes (PROP_INDEX_GROUP / PROP_INDEX_TAB),
+  not by titles, and there is NO wrap-around by design (the last tab
+  of a group shows the menu item disabled; the command prints a
+  status hint). The usual candidate rules apply (text kind, linked
+  editors, not the current tab itself, not a Differ compare tab --
+  the same tabmenu_editor_ok gate the "Compare with tab" list uses),
+  and the compare travels the same 100ms let-the-menu-close timer
+  route as the focused-tab item (tabmenu_files 'fn0::fn1').
+* fix: clicking the toolbar's Recompare button and then immediately
+  clicking again (double-click / late button-up) could cancel the
+  just-started compare: the button swapped to "× Cancel" at once, the
+  accidental second click hit Cancel, and the compare never ran. The
+  Recompare -> Cancel caption swap is now delayed by one second
+  (toolbar _CANCEL_DELAY_MS, one-shot timer; set_comparing /
+  _cancel_swap_tick), and a click landing inside that window is
+  swallowed entirely -- the compare must survive its own kick-off
+  click. Everything else reacts at kick-off as before (navigation
+  buttons disable, status label shows "Comparing..."); a compare that
+  finishes within the delay (small files) leaves the button as
+  Recompare -- a pending swap timer is disarmed on compare end and
+  the late tick checks the state again, so it can never fire Cancel
+  into a finished compare. Cancelling stays possible after the delay,
+  and immediately via the "Cancel compare" command, the tab context
+  menu or "Cancel all compares". The pending timer is also disarmed
+  when the toolbar is destroyed (tab closed / toolbar hidden) and
+  when a new compare is kicked off (state change resets the guard).
+
 2026.09.29 (by @badrelmers)
 + add: the char-level tokenizer of the native diff engine is now
   configurable -- the new option differ.algorithm.break_chars (config

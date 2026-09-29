@@ -1933,6 +1933,53 @@ class Command:
         name = names[res]
         self.set_files(name0, name)
 
+    def _next_tab_editor(self, ed):
+        """The editor of the tab right after 'ed's tab in the same tab
+        group (one step to the right in the tab bar), or None when 'ed'
+        is the last tab of its group. Located by the stable group/tab
+        indexes (PROP_INDEX_GROUP / PROP_INDEX_TAB), not by titles, so
+        a title change between menu build and click cannot redirect
+        it; there is deliberately NO wrap-around (comparing the last
+        tab with the group's first tab would be a surprise, not a
+        feature). Both halves of a split tab share the tab index, so
+        the next tab of a compare tab resolves normally too."""
+        try:
+            grp = ed.get_prop(ct.PROP_INDEX_GROUP)
+            idx = ed.get_prop(ct.PROP_INDEX_TAB)
+        except Exception:
+            return None
+        if grp is None or idx is None:
+            return None
+        for h in ct.ed_handles():
+            e = ct.Editor(h)
+            try:
+                if (e.get_prop(ct.PROP_INDEX_GROUP) == grp
+                        and e.get_prop(ct.PROP_INDEX_TAB) == idx + 1):
+                    return e
+            except Exception:
+                continue
+        return None
+
+    def compare_with_next_tab(self):
+        """Command: compare the focused document with the NEXT tab in
+        its tab group (one step to the right in the tab bar; the last
+        tab of a group has no next one). Exposed as 'Differ\\Compare
+        current document with next tab' and in the tab context menu
+        right below 'Compare with focused tab' (where it acts on the
+        right-clicked tab -- the same cur-side convention every
+        tabmenu item follows). One click, no tab picker: made for the
+        'compare this with the tab next to it' workflow."""
+        cur = ct.ed
+        next_ed = self._next_tab_editor(cur)
+        if next_ed is None:
+            ct.msg_status(_('Differ: no next tab to compare with'))
+            return
+        if (not self.tabmenu_editor_ok(next_ed, self.get_name(cur))
+                or self._is_compare_tab(next_ed.get_prop(ct.PROP_TAB_ID))):
+            ct.msg_status(_('Differ: the next tab cannot be compared'))
+            return
+        self.set_files(self.get_name(cur), self.get_name(next_ed))
+
     def compare_clip_sel(self):
         """Command: compare the clipboard text with the focused
         editor's selection -- a new compare tab ("Diff: clipboard |
@@ -6847,10 +6894,16 @@ class Command:
 
     def tabmenu_init(self, cur_ed: ct.Editor):
         """Build the right-click tab context menu: 'Compare with...',
-        'Compare with focused tab', 'Compare with tab' (submenu of all
-        open tabs), and 'Recompare'. Only shown for valid compare candidates."""
+        'Compare with focused tab', 'Compare with next tab', 'Compare
+        with tab' (submenu of all open tabs), and 'Recompare'. Only
+        shown for valid compare candidates."""
         cur_fn = self.get_name(cur_ed)
         path_focused = self.get_name(ct.ed)
+        # Validity of the right-clicked tab itself -- needed by the
+        # 'with next tab' item below (its enabled state combines it
+        # with the next tab's own validity) and by every item's
+        # SET_ENABLED at the end of the menu build.
+        cur_ok = self.tabmenu_editor_ok(cur_ed, '')
 
         if self.menuid_sep is None:
             self.menuid_sep = ct.menu_proc('tab', ct.MENU_ADD,
@@ -6869,6 +6922,31 @@ class Command:
             command='module=cuda_differ;cmd=tabmenu_files;info='+cur_fn+'::'+path_focused+';',
             caption=_('Compare with focused tab')
             )
+        # 'Compare with next tab', right below 'Compare with focused
+        # tab': the RIGHT-CLICKED tab vs the tab one step to its right
+        # in the same tab bar (no picker -- the one-click twin of the
+        # 'Differ\\Compare current document with next tab' command,
+        # which acts on the focused tab instead). The pair travels the
+        # same tabmenu_files 'fn0::fn1' route as the focused-tab item,
+        # so the compare starts on the same 100ms let-the-menu-close
+        # timer. Enabled only while the next tab EXISTS and is a valid
+        # candidate (same rules as the focused-tab item: text kind,
+        # linked editors, not the cur tab itself, not a Differ compare
+        # tab); the last tab of a group shows it disabled. The menu is
+        # rebuilt on every right-click, so a tab moved/added/closed
+        # since the last right-click is picked up automatically.
+        next_ed = self._next_tab_editor(cur_ed)
+        path_next = self.get_name(next_ed) if next_ed is not None else ''
+        self.menuid_withnext = ct.menu_proc(self.compare_menu, ct.MENU_ADD,
+            command='module=cuda_differ;cmd=tabmenu_files;info='+cur_fn+'::'+path_next+';',
+            caption=_('Compare with next tab')
+            )
+        next_ok = (next_ed is not None
+                   and self.tabmenu_editor_ok(next_ed, cur_fn)
+                   and not self._is_compare_tab(
+                       next_ed.get_prop(ct.PROP_TAB_ID)))
+        ct.menu_proc(self.menuid_withnext, ct.MENU_SET_ENABLED,
+            command=cur_ok and next_ok)
         self.menuid_withtab = ct.menu_proc(self.compare_menu, ct.MENU_ADD,
             caption=_('Compare with tab')
             )
@@ -6900,7 +6978,6 @@ class Command:
                         caption=collapse_filename(path)
                         )
 
-        cur_ok = self.tabmenu_editor_ok(cur_ed, '')
         cur_is_focused = cur_ed.get_prop(ct.PROP_HANDLE_PRIMARY) == \
                          ct.ed.get_prop(ct.PROP_HANDLE_PRIMARY)
 
