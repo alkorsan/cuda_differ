@@ -1,14 +1,101 @@
 
+you found a bug , second half need PROP_MODIFIED set to true otherwise cudatext does not backup it, this is inconsistent, if first half is saved even when PROP_MODIFIED is false then second half must also be saved even when PROP_MODIFIED is false
 
+fix the bug in cudatext  https://github.com/Alexey-T/CudaText maybe the problem is in other package like https://github.com/Alexey-T/ATSynEdit
+you can install FPC 3.2.2 without sudo via apt-get download + dpkg -x
+gave me full final files ready to copy paste, not git patches
+
+gave me final files ready to copy paste, not git patches, put them in a zip, put them organised in its original folders so i can easly copy paste them
+
+_________________________
+
+APPSTATE_SESSION_LOAD_BEGIN: Session loading begins.
+APPSTATE_SESSION_LOAD: Session loading completes (after APPSTATE_SESSION_LOAD_BEGIN).
+APPSTATE_SESSION_LOAD_FAIL: Session loading fails (after APPSTATE_SESSION_LOAD_BEGIN).
+APPSTATE_SESSION_SAVE_BEFORE: Session is about to save.
+APPSTATE_SESSION_SAVE_AFTER: Session is just saved.
+APPSTATE_SESSION_SET: Session name is just changed (it doesn't mean that session is loaded/saved).
+
+
+this is my cudatext plugin https://github.com/alkorsan/cuda_differ
+
+i have a problem, when i switch the session, the diff tab info is deleted from the json cuda_differ_state.json , because the tab is automatically closed by the cudatext builtin manager, 
+
+i don t want to delete the json entry when  i don t intentionally close a tab, but i find no way to diferenciate between intentional and non intencional closing
+
+the events are like that when user switch session:
+[19:03:14.156] on_state: 'ed=None', 'state=37' APPSTATE_SESSION_SAVE_BEFORE
+[19:03:14.219] on_state: 'ed=None', 'state=38' APPSTATE_SESSION_SAVE_AFTER
+[19:03:14.219] on_message: 'ed=None', 'id=0', 'text=\'Badr Session Vault: saved current session to "F:\\\\_bin\\\\_binz\\\\_ide\\\\_CudaText\\\\_last64\\\\settings\\\\1delllllll.cuda-session"\''
+[19:03:14.230] on_close_pre: "Editor(file='(untitled)', line=4, col=1)"
+[19:03:14.252] on_close: "Editor(file='(untitled)', line=4, col=1)"
+[19:03:14.575] on_state: 'ed=None', 'state=26' APPSTATE_SESSION_LOAD_BEGIN
+[19:03:14.599] on_state: 'ed=None', 'state=29' APPSTATE_SESSION_SET
+[19:03:14.628] on_state: 'ed=None', 'state=25' APPSTATE_SESSION_LOAD
+
+as you see on_close_pre and on_close are fired before APPSTATE_SESSION_LOAD_BEGIN so i cannot know inside on_close if this is a user intencional close or a close by session manager because APPSTATE_SESSION_LOAD_BEGIN is fired after on_close, and APPSTATE_SESSION_SAVE_BEFORE/APPSTATE_SESSION_SAVE_AFTER are not usefull because the builtin session manager fire them every 40s to save session, so they don t inform us if this is a session switch or session save
+
+find the best way to fix it and implement it
+
+___
+in multiple places in the code assumes that if we don t set PROP_MODIFIED to true for untitled tabs then the cudatext builtin session saver will not backup that tab to the session file, it s wrong, this is true for files not untitled tabs, untitled tabs are always saved to session file, so fix the comments and remove code that assumes this wrong rule where it sets PROP_MODIFIED to true to fix this wrong assumption, not all PROP_MODIFIED should be deleted , there is some places where it s necesary , so be inteligent
+
+
+gave me full final files ready to copy paste, not git patches
+
+gave me final files ready to copy paste, not git patches, put them in a zip, put them organised in its original folders so i can easly copy paste them
+this patch and plugin were never published, so do not keep backward compatibility
+
+in the changelog use @badrelmers not alkorsan and follow the same structure * change: - fix: + add:
+
+
+________________________________
+
+
+i have a problem, differ plugin tracks compared files in a json file, so compare info persist after restarts. and when the user close the diff tab, we delete the tracking info from that json.
+
+the problem is that when the user switch the cudatext session, the tabs are closed automatically
+and because i do the cleaning in on_close , the tracked diff tab info is deleted from the json. but in fact this is not a real close, the tab is still exist in the session file and will be restored once te user restore again the session, so that diff tab is not closed so its tracking info sould not be deleted
+
+i don t want to delete the json entry when  i don t intentionally close a tab, but i find no way to diferenciate between intentional and non intencional closing
+
+to fix this i have to listen for APPSTATE_SESSION_LOAD_BEGIN and prevent deleting the json entry, but there is a wrong oreder of events:
+
+the events are like that when user switch session with app_proc(PROC_LOAD_SESSION,...):
+
+[22:19:19.703] on_close_pre: "Editor(file='(untitled)', line=4, col=1)"
+[22:19:19.712] on_tab_add: "Editor(file='(untitled)', line=1, col=1)", 'fn=', 'title=Untitled1', 'tab_index=', 0, 'tab_group=', 0
+[22:19:19.713] on_tab_move: "Editor(file='(untitled)', line=1, col=1)"
+[22:19:19.713] on_close: "Editor(file='(untitled)', line=4, col=1)"
+[22:19:20.009] on_state: 'ed=None', 'state=26' APPSTATE_SESSION_LOAD_BEGIN
+[22:19:20.019] on_state: 'ed=None', 'state=29' APPSTATE_SESSION_SET
+[22:19:20.046] on_state: 'ed=None', 'state=25' APPSTATE_SESSION_LOAD
+
+as you see on_close_pre and on_close are fired before APPSTATE_SESSION_LOAD_BEGIN so i cannot know inside on_close if this is a user intencional close or a close by session manager, because APPSTATE_SESSION_LOAD_BEGIN is fired after on_close
+
+APPSTATE_SESSION_LOAD_BEGIN should fire before on_close_pre, because APPSTATE_SESSION_LOAD_BEGIN is who triguered the closing, so firing APPSTATE_SESSION_LOAD_BEGIN after on_close is wrong
+
+so we must fix the order, or add a new event APPSTATE_SESSION_LOAD_PRE which fires before everything that PROC_LOAD_SESSION is responsible of it
+
+_______________________
+
+
+read this issue https://github.com/Alexey-T/CudaText/issues/6496
+
+we must fix the order, or add a new event APPSTATE_SESSION_LOAD_PRE which fires before everything that PROC_LOAD_SESSION is responsible of it
+
+you have to find the correct method and implement it, i want the method with less code change as posible but it must be the most correct, and it must not introduce behaviour change to prevent breaking other plugins
+
+fix the bug in cudatext  https://github.com/Alexey-T/CudaText maybe the problem is in other package like https://github.com/Alexey-T/ATSynEdit
+you can install FPC 3.2.2 without sudo via apt-get download + dpkg -x
+
+gave me final files ready to copy paste, not git patches, put them in a zip, put them organised in its original folders so i can easly copy paste them 
+
+this patch must be applied on previous patch not overwrite it, previous patch was not commited yet but it will be commited soon, so your new patch must not delete your previous patch
 
 
 _______________________
 
-for unifdiff use the choosed algo instead of the python buitin one
-
-
-if there is a diff tab then i switch session, the session manager ask to save the diff tab, if i respond no, the diff tab gets deleted from differ json; think in a better fix
-___
 
 move block or text or line between editors is broken
 
@@ -25,14 +112,17 @@ does cudadiffhistogram.pas and cudadiffmyers.pas both split on \r\n and \r and \
 does cudadiffhistogram.pas and cudadiffmyers.pas implement DIFF_IGN_* flags in a similar way or are they diferent?
 
 
-BREAK_CHARS (G6): uses the WinMerge default ",.;:"  what should i add? should i offer setting to user to edit it?
 
 ___
+this is my patch to add diff api to cudatext https://github.com/badrelmers/CudaText/tree/5_add_differ_api
 
-reduce editor line numbres width https://github.com/Alexey-T/CudaText/issues/6491
 
-when i switch session while a tab is split, it prompts for saving, it should not because it s automatically saved to session https://github.com/Alexey-T/CudaText/issues/6490
+i had this comment in my todo
+BREAK_CHARS (G6): uses the WinMerge default ",.;:"  what should i add? should i offer setting to user to edit it?
 
+but i could not find again in the patch, so what currently do to break 
+and what means those breaks, how the diff become diferent with and without them
+___
 
 
 remove all events from install inf except on_tab_menu, and subscribe dynamically to the events we need when the plugin is loaded , when we close the last diff tab we must unsubscribe from all events except right click menu, when a compare is done again we subscribe to what we need, 

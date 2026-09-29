@@ -9,19 +9,58 @@
   rendering had to be made engine-independent: Command.create_diff
   resolves the algorithm exactly like the side-by-side compare (same
   _resolve_algorithm call, same native-to-Python fallback:
-  native_histogram -> hybrid, native_myers -> myers), runs the engine
-  (new Command._unidiff_opcodes helper) and feeds its opcodes to the
-  new utils.unified_diff_opcodes. The native call is synchronous but
-  strictly faster than the difflib run it replaces (10-30x), so the
-  UI-block window only shrinks. The engine runs with
-  flags=DIFF_IGN_NONE: under the ignore options 'equal' opcodes can
-  cover byte-different lines (e.g. CR vs LF endings), which would be
-  rendered as context and make the patch unapplicable for patch /
-  git apply -- the ignore options keep their meaning in the
-  side-by-side compare only. The 'difflib' algorithm choice now runs
-  with autojunk=False (engine_opcodes' behavior), so the old
-  "unified diff always used autojunk=True" caveat is gone. Readme's
-  Commands note and the option's comment/text updated accordingly.
+  native_histogram -> hybrid, native_myers -> myers) and feeds the
+  engine's opcodes to utils.unified_diff_opcodes. The single
+  exception is the 'difflib' choice: it calls stdlib
+  difflib.unified_diff DIRECTLY, keeping its classic behavior
+  (autojunk=True included) instead of going through the opcode
+  renderer. The engine runs with flags=DIFF_IGN_NONE: under the
+  ignore options 'equal' opcodes can cover byte-different lines
+  (e.g. CR vs LF endings), which would be rendered as context and
+  make the patch unapplicable for patch / git apply -- the ignore
+  options keep their meaning in the side-by-side compare only.
+  Readme's Commands note and the option's comment/text updated
+  accordingly.
+- fix: the "Diff current document with..." commands no longer open an
+  empty "Diff N" tab when the two inputs have no differences -- the
+  status line's "0 differences" report is the whole result (an empty
+  diff tab carries no information).
+- fix: readme.txt still claimed the pure-Python algorithms "compare on
+  the main thread and occupy the UI" and that "Python plugin code
+  cannot move to a background thread" -- stale ever since the
+  Python-engine compare moved to a background daemon thread with a
+  poll-timer pickup; the two passages now describe the actual
+  behavior.
++ add: the native algorithms now ALWAYS run the unified-diff commands'
+  line-level diff through the callback (asynchronous) form of
+  diff_proc(DIF_TEXTS), whatever the file sizes -- the same form the
+  side-by-side compare uses. The command returns at once (the status
+  bar shows "diffing in background..."), the engine computes on its
+  own background OS thread, and the completion callback -- marshalled
+  to the main thread, carrying its job context through a
+  functools.partial -- renders the diff and opens the tab. Should the
+  engine refuse to start the background job, the command falls back to
+  the synchronous native call (a one-shot user command must still
+  produce its diff).
++ add: the pure-Python engines and the difflib choice run the
+  unified-diff commands' engine on a background daemon thread with a
+  poll-timer pickup on the main thread (the compare view's
+  Python-background form) when the inputs are huge: total line count
+  (A + B combined) over the new differ.advanced.unidiff_async_lines
+  option (default 20000), so no algorithm can freeze the UI on big
+  files. Below the threshold they run inline -- there the background
+  round-trip would only add latency. A background unified diff still
+  running at app exit is cancelled cooperatively (diff_proc DIF_CANCEL
+  for the native jobs, stopped poll timer + dropped result for the
+  Python workers), exactly like the compare view's jobs.
++ add: a finished unified diff prints ONE status-bar line with the
+  total time from command start to the diff tab opening (adaptive
+  ms / s / min formatting, like the compare view's "compared in ..."
+  epilogue), the number of difference regions, and the algorithm that
+  actually ran -- e.g. "Differ: diffed in 250ms, 7 differences, algo
+  native_myers" (the reported algorithm is the EFFECTIVE one, so a
+  native->Python fallback on builds without diff_proc names the Python
+  engine that really ran).
 + add: utils.py gained grouped_opcodes() and unified_diff_opcodes(),
   an opcode-driven difflib.unified_diff work-alike: a line-for-line
   port of SequenceMatcher.get_grouped_opcodes operating on a plain
