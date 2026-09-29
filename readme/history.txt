@@ -1,4 +1,49 @@
 2026.09.29 (by @badrelmers)
+* change: the unified-diff engine code (the "Diff current document
+  with file... / tab..." commands) moved out of __init__.py into a
+  new unidiff.py module: the opcode-driven difflib.unified_diff
+  work-alike (unified_diff_opcodes + grouped_opcodes, moved verbatim
+  from utils.py, which is back to its upstream content), the engine
+  compute functions, the background runner (UnidiffRunner) with its
+  job registry, and the status-line report. __init__.py keeps only
+  the UI glue: a thin create_diff that resolves the configured
+  algorithm (exactly like the compare view) and hands the run to the
+  runner, plus the completion callback that opens the read-only
+  "Diff N" tab and prints the report.
+* change: every algorithm now runs the unified diff in the background
+  whatever the file sizes -- the differ.advanced.unidiff_async_lines
+  threshold is GONE (the option is removed). The pure-Python engines
+  and the difflib choice always run on the background daemon thread
+  with the poll-timer pickup; the native algorithms always run
+  through the async callback form of diff_proc. "Differ: diffing in
+  background..." prints at kick-off and the one-line time /
+  differences / algorithm report at completion, for every input
+  size.
+- fix: the unified-diff commands could block the UI before and
+  around the engine run: the line split of the two inputs ran on the
+  main thread at kick-off, and below the old threshold the whole
+  engine ran synchronously. The split now runs on the background
+  worker (the Python-side paths) or overlaps the native engine's own
+  background run, and no path computes on the main thread anymore
+  (except the rare fallbacks for hosts without threads / a refusing
+  engine, where a one-shot user command must still produce its
+  diff).
++ add: the "Cancel compare" / "Cancel all compares" commands now
+  also stop in-flight background unified diffs -- previously there
+  was no way to cancel a running diff at all. The native engine jobs
+  are told to stop cooperatively through diff_proc(DIF_CANCEL)
+  (their diff loops unwind within a couple of seconds), and a Python
+  worker's poll timer is stopped and its result dropped (a Python
+  thread cannot be interrupted mid-computation safely -- the same
+  policy the side-by-side compare applies to its own Python-engine
+  jobs). Unified-diff jobs are not bound to any tab (their result
+  tab does not exist until the diff finishes), so both commands stop
+  them whatever tab they run from; the status bar reports what was
+  cancelled ("unified diff cancelled", "cancelled N unified
+  diff(s)", or the combined compare + unified-diff wording). App
+  exit (on_exit_pre) cancels them the same way.
+
+2026.09.29 (by @badrelmers)
 * change: the "Diff current document with file..." / "Diff current
   document with tab..." commands now generate their unified-diff
   output with the CONFIGURED algorithm

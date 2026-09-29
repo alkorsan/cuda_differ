@@ -1,4 +1,3 @@
-import difflib
 import functools
 import gc
 import os
@@ -35,8 +34,9 @@ from . import toolbar as difftb
 from .profiling import (Profiler, enable_profiling, profiling_report,
                         reset_profiling, start_profiling, stop_profiling,
                         cancel_profiling)
-from .utils import (split_lines_safe, ScrollSplittedTab,
-                    unified_diff_opcodes)
+from .utils import split_lines_safe, ScrollSplittedTab
+from .unidiff import (UnidiffRunner, report_status,
+                      unified_diff_opcodes)
 from cudax_lib import get_translation
 _ = get_translation(__file__)  # I18N
 
@@ -255,22 +255,6 @@ PY_ENGINE_POLL_MS = 50
 # Compares already running the fast mode never ask (there is nothing
 # faster to switch to).
 SLOW_COMPARE_SECONDS = 60
-
-# Unified-diff commands ("Diff current document with file.../tab..."):
-# total line count of the two inputs (A + B combined) above which the
-# Python-side engine paths ('difflib' included) run on the background
-# form, so a huge input cannot freeze the UI. The native algorithms do
-# NOT consult this threshold -- they ALWAYS use the callback
-# (asynchronous) form of diff_proc, whatever the file sizes (same form
-# the side-by-side compare uses). User-configurable as
-# differ.advanced.unidiff_async_lines.
-DEFAULT_UNIDIFF_ASYNC_LINES = 20000
-
-# In-flight unified-diff background jobs (native engine jobs and
-# Python-engine worker threads). App-exit cancellation walks this list:
-# the result tab cannot be opened anymore, so the engine threads are
-# told to stop / their results dropped (see _cancel_unidiff_job).
-_UNIDIFF_JOBS = []
 
 # Re-entrancy guard: PROC_IDLE dispatches messages synchronously, and a
 # dispatched event handler that itself reaches a pump point must NOT
@@ -1003,27 +987,6 @@ OPTS_META = [
      'frm': 'int',
      'chp': 'advanced',
      },
-    {'opt': 'differ.advanced.unidiff_async_lines',
-     'cmt': _('Background unified diff above this many lines\n'
-              'Total line count of the two inputs (A + B combined) above '
-              'which the "Diff current document with file.../tab..." '
-              'commands run the diff engine in the background, keeping '
-              'CudaText responsive while the diff computes: a status-bar '
-              'message ("diffing in background...") shows the run, and '
-              'the one-line time/differences/algo report prints when it '
-              'finishes. The native algorithms always run in the '
-              'background (the callback form of the diff_proc API) '
-              'whatever the size -- this threshold gates the '
-              'pure-Python engines and the difflib choice only. A '
-              'background diff still running at app exit is stopped '
-              'cooperatively. Raise the value to keep more Python-side '
-              'diffs fully synchronous (their result arrives without '
-              'the background round-trip).\n'
-              'Default: 20000.'),
-     'def': 20000,
-     'frm': 'int',
-     'chp': 'advanced',
-     },
     {'opt': 'differ.advanced.enable_profiling',
      'cmt': _('Enable profiling\n'
               'Enable profiling to trace where compare time is consumed.\n'
@@ -1399,55 +1362,6 @@ def _is_fast_mode(diff):
             and not getattr(diff, 'beautify_alignment', False))
 
 
-class _UnidiffJob:
-    """Context of one in-flight (or just-finished) unified-diff command
-    run -- the light-weight sibling of the compare view's _CompareJob:
-    no editors to lock, no overview, no paint events; just the inputs,
-    the engine mode, and where the result lands.
-
-    Which fields carry the result depends on the engine path:
-      * native / pure-Python engines -> 'opcodes' (rendered later by
-        _finish_unidiff through utils.unified_diff_opcodes);
-      * the 'difflib' choice -> 'uni_text' + 'n_diffs' straight from
-        stdlib difflib.unified_diff (computed fully inside the engine
-        phase, so the difflib-direct behavior is identical whether the
-        run was inline or on the background worker thread).
-
-    Slots keep it allocation-cheap; the _UNIDIFF_JOBS registry holds a
-    reference for the whole background run so app-exit can cancel it.
-    'start' is the KICK-OFF time (create_diff entry), so the status
-    report covers the whole command wall time, background engine phase
-    included -- the same accounting the compare view's epilogue uses.
-    """
-
-    __slots__ = ('txt0', 'txt1', 'a', 'b', 'fn0', 'fn1', 'n_ctx',
-                 'algo', 'start', 'job_handle', 'py_poll_cb',
-                 'py_engine_thread', 'done', 'opcodes', 'uni_text',
-                 'n_diffs', 'error', 'cancelled')
-
-    def __init__(self, txt0='', txt1='', a=None, b=None, fn0='', fn1='',
-                 n_ctx=3, algo='', start=0.0):
-        self.txt0 = txt0            # raw text A (native engine input)
-        self.txt1 = txt1            # raw text B (native engine input)
-        self.a = a if a is not None else []
-        self.b = b if b is not None else []
-        self.fn0 = fn0              # '---' header name
-        self.fn1 = fn1              # '+++' header name
-        self.n_ctx = n_ctx          # context lines (diff_context option)
-        self.algo = algo            # EFFECTIVE algorithm name (what runs)
-        self.start = start          # kick-off time.perf_counter()
-        self.job_handle = 0         # native engine job handle (0 = none)
-        self.py_poll_cb = None      # poll-timer callback (Python bg mode)
-        self.py_engine_thread = None
-        self.done = False           # Python worker thread finished
-        self.opcodes = None         # engine result (opcode paths)
-        self.uni_text = None        # rendered diff text (difflib path /
-                                    # set by _finish_unidiff after render)
-        self.n_diffs = None         # difference-region count
-        self.error = None           # engine exception / failure marker
-        self.cancelled = False      # dropped (app exit / fallback race)
-
-
 class _TabSession:
     """Standalone per-tab session: EVERY piece of runtime state that
     belongs to one compare tab lives here, and nothing is shared between
@@ -1554,6 +1468,13 @@ class Command:
         # on_close (which fires next, once per closing tab) can skip
         # temp-file deletion and let compare tabs persist across restarts.
         self._app_exiting = False
+        # The unified-diff commands' background runner (see unidiff.py):
+        # all their engine / rendering / cancellation machinery lives in
+        # that module; the Command only supplies the completion callback
+        # (open the 'Diff N' tab + print the status report) and the
+        # console-log sink.
+        self.unidiff = UnidiffRunner(on_finish=self._finish_unidiff,
+                                     log=msg)
         # THE session registry: one _TabSession per compare tab, keyed by
         # str(PROP_TAB_ID). Each diff tab is a standalone world -- its
         # Differ/diffmap, overview panel, in-flight job, timers and
@@ -2339,238 +2260,29 @@ class Command:
 
         self.refresh_compare()
 
-    @staticmethod
-    def _unidiff_py_opcodes(algo, a, b):
-        """Run one pure-Python engine ('hybrid', 'myers', 'vscode',
-        'patience' -- NOT 'difflib': create_diff routes that choice
-        through stdlib difflib.unified_diff directly) on the pre-split
-        keepends line lists and return its opcodes.
-
-        The SAME entry point the side-by-side compare's background
-        thread runs (matcher construction + get_opcodes + the
-        _realign_opcodes post-pass), so the unified diff shows exactly
-        the hunk structure the compare view paints for the configured
-        algorithm. Safe to call from the unified-diff background worker
-        thread: pure Python, no CudaText API, no shared state.
-        """
-        diff = dfp.Differ()
-        diff.diff_algorithm = algo
-        return diff.engine_opcodes(a, b)
-
-    @staticmethod
-    def _unidiff_difflib_direct(a, b, fn0, fn1, n):
-        """The 'difflib' algorithm choice: stdlib difflib.unified_diff
-        DIRECTLY -- the classic pre-algorithm-wiring behavior, including
-        its internal SequenceMatcher(None, a, b) with autojunk=True (the
-        autojunk heuristic only triggers on files with >200 occurrences
-        of a single line at >1% of the file, and even then the produced
-        patch stays valid for patch / git apply).
-
-        Returns (diff_text, n_diffs). The difference count comes from a
-        SequenceMatcher configured EXACTLY like unified_diff's internal
-        one (autojunk=True default), so the number always matches what
-        unified_diff itself rendered: non-'equal' opcodes are the
-        difference REGIONS -- the same 'total differences' notion the
-        compare view's toolbar reports, and the same count every other
-        algorithm's path prints. This does run the matcher twice (once
-        here, once inside unified_diff) -- the price of 'unified_diff
-        directly' plus an exact count; on huge inputs the whole call
-        already sits on the background worker thread (see
-        _start_unidiff_py_thread), so only CPU is doubled, never the UI
-        wait.
-        """
-        sm = difflib.SequenceMatcher(None, a, b)
-        n_diffs = 0
-        for tag, _i1, _i2, _j1, _j2 in sm.get_opcodes():
-            if tag != 'equal':
-                n_diffs += 1
-        text = ''.join(difflib.unified_diff(a, b, fn0, fn1, n=n))
-        return text, n_diffs
-
-    def _unidiff_status(self, elapsed, n_diffs, algo):
-        """ONE status-bar line for a finished unified-diff command: the
-        total wall time (kick-off -> diff tab opened / report printed),
-        the number of difference regions, and the algorithm that
-        actually ran -- the unified-diff twin of the compare view's
-        'compared in ...' epilogue (_compare_epilogue), with the count
-        and the algorithm riding the SAME line (one line only).
-        Adaptive time units: ms below 1s, tenths of a second below a
-        minute, minutes + seconds above."""
-        if elapsed < 1.0:
-            t_str = _('{:.0f}ms').format(elapsed * 1000.0)
-        elif elapsed < 60.0:
-            t_str = _('{:.1f}s').format(elapsed)
-        else:
-            _mins = int(elapsed // 60)
-            t_str = _('{}m {:.0f}s').format(_mins,
-                                            elapsed - _mins * 60)
-        if n_diffs == 1:
-            d_str = _('1 difference')
-        else:
-            d_str = _('{} differences').format(n_diffs)
-        ct.msg_status(_('Differ: diffed in {}, {}, algo {}').format(
-            t_str, d_str, algo))
-
-    def _on_unidiff_native_done(self, job, opcodes):
-        """diff_proc completion callback for the unified-diff commands'
-        background line-level compare (native algorithms -- which ALWAYS
-        use the callback form, whatever the file sizes).
-
-        The engine invokes this on the MAIN thread when its background
-        thread finishes, passing one argument: the opcode list -- the
-        same list the synchronous diff_proc form returns -- or None when
-        the compare failed. The callback arrives through the
-        functools.partial(self._on_unidiff_native_done, job) created at
-        kick-off, so the job context travels with it. A job cancelled
-        through diff_proc(DIF_CANCEL) never reaches this callback at all
-        (the engine drops the result instead); the cancelled /
-        _app_exiting checks below are belt-and-braces for the finishing
-        race, exactly like the compare view's _on_native_diff_done.
-        """
-        if self._app_exiting or job.cancelled:
-            return
-        job.job_handle = 0
-        if opcodes is None:
-            job.error = RuntimeError('diff_proc returned None')
-        else:
-            job.opcodes = opcodes
-        self._finish_unidiff(job)
-
-    def _start_unidiff_py_thread(self, job):
-        """Kick the unified-diff engine onto a background daemon thread
-        (the pure-Python algorithms and the 'difflib' choice on huge
-        inputs) -- the same two-phase shape the compare view's
-        Python-engine background mode uses: kick-off -> worker thread ->
-        poll timer on the main thread -> finish. The worker is PURE
-        Python (no CudaText API, no shared state; the GIL interleaves it
-        with the main thread's message loop), so the app stays
-        responsive for the whole engine run.
-
-        The poll timer (PY_ENGINE_POLL_MS) is only a completion pickup:
-        the main thread is idle while the worker computes, so the period
-        paces nothing but how quickly the finished result is consumed.
-        """
-        def _worker(_job=job,
-                    _difflib_direct=Command._unidiff_difflib_direct,
-                    _py_opcodes=Command._unidiff_py_opcodes):
-            try:
-                if _job.algo == 'difflib':
-                    (_job.uni_text,
-                     _job.n_diffs) = _difflib_direct(
-                        _job.a, _job.b, _job.fn0, _job.fn1, _job.n_ctx)
-                else:
-                    _job.opcodes = _py_opcodes(_job.algo,
-                                               _job.a, _job.b)
-            except Exception as _ex:
-                _job.error = _ex
-            finally:
-                _job.done = True
-
-        def _poll(tag='', info=''):
-            # MAIN-thread pickup: finish when the worker is done; simply
-            # return while it runs (the repeating timer stays armed). A
-            # cancelled job (app exit) is detected here too -- a stopped
-            # timer cannot fire anymore, this covers the dispatch race.
-            if not job.done:
-                return
-            try:
-                ct.timer_proc(ct.TIMER_STOP, _poll, PY_ENGINE_POLL_MS)
-            except Exception:
-                pass
-            if job.py_poll_cb is _poll:
-                job.py_poll_cb = None
-            if job.cancelled or self._app_exiting:
-                return
-            self._finish_unidiff(job)
-
-        try:
-            thread = threading.Thread(
-                target=_worker,
-                name='cuda_differ_unidiff',
-                daemon=True)
-            thread.start()
-            ct.timer_proc(ct.TIMER_START, _poll, PY_ENGINE_POLL_MS)
-            job.py_poll_cb = _poll
-            job.py_engine_thread = thread
-            _UNIDIFF_JOBS.append(job)
-            ct.msg_status(_('Differ: diffing in background...'))
-        except Exception:
-            # Thread / timer unavailable (exotic host, test sandbox) or a
-            # raise in the kick-off tail: disarm whatever half-started
-            # (the daemon worker finishes on its own and its result is
-            # simply never consumed -- job.cancelled keeps a straggling
-            # poll from double-finishing) and run the engine INLINE on a
-            # fresh job instead, like the compare view's legacy inline
-            # fallback. The fresh job keeps the ORIGINAL kick-off time,
-            # so the reported duration still covers the whole command.
-            if job.py_poll_cb is _poll:
-                job.py_poll_cb = None
-            job.py_engine_thread = None
-            job.cancelled = True
-            msg('unified diff could not run in the background -- '
-                'running synchronously', level=1)
-            inline = _UnidiffJob(job.txt0, job.txt1, job.a, job.b,
-                                 job.fn0, job.fn1, job.n_ctx, job.algo,
-                                 job.start)
-            try:
-                if job.algo == 'difflib':
-                    (inline.uni_text,
-                     inline.n_diffs) = Command._unidiff_difflib_direct(
-                        job.a, job.b, job.fn0, job.fn1, job.n_ctx)
-                else:
-                    inline.opcodes = Command._unidiff_py_opcodes(
-                        job.algo, job.a, job.b)
-            except Exception as ex:
-                inline.error = ex
-            self._finish_unidiff(inline)
-
-    def _cancel_unidiff_job(self, job):
-        """Drop one in-flight unified-diff background job: mark it
-        cancelled (so a straggling completion -- the engine's finishing
-        race -- cannot open a tab / print a report), stop its poll timer
-        (Python background mode), and tell the native engine to stop its
-        thread cooperatively (diff_proc DIF_CANCEL; the completion
-        callback of a cancelled job is never invoked). The Python worker
-        thread is a daemon: it finishes on its own and its result is
-        simply never consumed."""
-        job.cancelled = True
-        if job.py_poll_cb is not None:
-            try:
-                ct.timer_proc(ct.TIMER_STOP, job.py_poll_cb,
-                              PY_ENGINE_POLL_MS)
-            except Exception:
-                pass
-            job.py_poll_cb = None
-        job.py_engine_thread = None
-        if job.job_handle:
-            dfn.cancel_async_line_diff(job.job_handle)
-            job.job_handle = 0
-        if job in _UNIDIFF_JOBS:
-            _UNIDIFF_JOBS.remove(job)
-
     # _gc_quiet_method: the render's ''.join over the hunk generator and
     # the tab creation allocate the whole diff text at once (megabytes
     # on big inputs) -- the same reason the compare pipeline suppresses
     # gen-0 GC around its synchronous stretches.
     @_gc_quiet_method
     def _finish_unidiff(self, job):
-        """Main-thread completion of a unified-diff command run: render
-        (when the engine returned opcodes), open the read-only 'Diff N'
-        tab (skipped when the inputs have no differences -- an empty
-        'Diff N' tab carries no information; the status line's
-        '0 differences' is the whole report), and print the ONE-line
-        status report (total wall time, difference count, algorithm).
+        """Main-thread completion of a unified-diff command run -- the
+        unidiff.UnidiffRunner's on_finish callback, invoked inline for
+        the synchronous fallbacks and from the completion callbacks
+        (the diff_proc callback / the poll-timer pickup) for the
+        background ones: render (when the engine returned opcodes),
+        open the read-only 'Diff N' tab (skipped when the inputs have
+        no differences -- an empty 'Diff N' tab carries no information;
+        the status line's '0 differences' is the whole report), and
+        print the ONE-line status report (total wall time, difference
+        count, algorithm).
 
-        Runs inline for the synchronous modes and inside the completion
-        callbacks (the diff_proc callback / the poll timer) for the
-        background ones; 'job.start' is the kick-off time, so the
-        reported duration covers the WHOLE command -- background engine
-        phase included -- the wall time the user waited, exactly like
-        the compare view's epilogue.
+        'job.start' is the kick-off time (Command.create_diff entry),
+        so the reported duration covers the WHOLE command -- background
+        engine phase included -- the wall time the user waited, exactly
+        like the compare view's epilogue.
         """
         try:
-            if job.job_handle:
-                job.job_handle = 0
             if (job.uni_text is None and job.opcodes is None
                     and job.error is None):
                 # Defensive: no completion path may arrive empty-handed;
@@ -2609,130 +2321,49 @@ class Command:
             # else: no differences -> NO empty tab; the status line's
             # '0 differences' is the whole report.
         finally:
-            if job in _UNIDIFF_JOBS:
-                _UNIDIFF_JOBS.remove(job)
             # Timing line -- printed for every completed run (also the
             # 'no differences' one). Skipped on error (already reported
             # above) and on an incomplete render (a mid-try exception
             # propagates to CudaText's dispatcher after this finally).
             if job.error is None and job.n_diffs is not None:
-                self._unidiff_status(time.perf_counter() - job.start,
-                                     job.n_diffs, job.algo)
+                report_status(time.perf_counter() - job.start,
+                              job.n_diffs, job.algo)
 
     def create_diff(self, txt0, txt1, fn0, fn1):
         """Create a read-only unified-diff tab from two text strings.
         Used by diff_with and diff_with_tab commands.
 
-        The engine is the CONFIGURED one (differ.algorithm.
-        diff_algorithm), resolved exactly like the side-by-side compare
-        (_resolve_algorithm, including the native-to-Python fallback on
-        builds without the diff_proc API: native_histogram -> hybrid,
-        native_myers -> myers):
+        Everything the command runs lives in unidiff.py (see that
+        module's docstring); this method only resolves the engine the
+        same way the side-by-side compare does (_resolve_algorithm,
+        including the native-to-Python fallback on builds without the
+        diff_proc API: native_histogram -> hybrid, native_myers ->
+        myers) and hands the run to the background runner:
         * 'difflib' -> stdlib difflib.unified_diff DIRECTLY (the
-          classic behavior, autojunk=True included -- see
-          _unidiff_difflib_direct);
+          classic behavior, autojunk=True included);
         * native algorithms -> the callback (asynchronous) form of
-          diff_proc(DIF_TEXTS) ALWAYS, whatever the file sizes -- the
-          same form the side-by-side compare uses (_on_unidiff_native_
-          done completes the command on the main thread);
+          diff_proc(DIF_TEXTS), ALWAYS, whatever the file sizes;
         * every other algorithm -> its opcodes drive
-          utils.unified_diff_opcodes, the opcode-driven
+          unidiff.unified_diff_opcodes, the opcode-driven
           difflib.unified_diff work-alike (hunk selection therefore
           follows the configured algorithm).
-        The Python-side paths ('difflib' included) run the engine on a
-        background thread + poll timer when the inputs are huge (total
-        line count over differ.advanced.unidiff_async_lines -- see
-        _start_unidiff_py_thread), so no algorithm can freeze the UI on
-        big files; below the threshold they run inline, where the
-        thread/timer round-trip would only add latency.
+        Whichever the algorithm, the diff ALWAYS runs in the background
+        -- the engine's own OS thread for the native ones, a daemon
+        worker thread + poll-timer pickup for the Python-side ones
+        ('difflib' included) -- so the command returns at once and no
+        file size can freeze the UI.
 
-        The engine runs strictly -- flags=DIFF_IGN_NONE for the native
-        call: under the ignore options 'equal' opcodes can cover lines
-        that differ byte-wise (e.g. 'abc\\r\\n' vs 'abc\\n' under
-        DIFF_IGN_EOL), which the renderer would emit as context lines --
-        producing a patch patch / git apply reject. The ignore options
-        keep their meaning in the side-by-side compare view only. (The
-        CudaText 'ignore' opcode is still handled defensively inside
-        utils.unified_diff_opcodes -- rendered like 'replace' -- so even
-        a future engine run WITH flags could never yield an invalid
-        patch from this path.)
-
-        Completion -- inline here or from the background callbacks --
-        prints ONE status-bar line: total wall time, number of
-        difference regions, algorithm used. Inputs with no differences
-        open NO tab (see _finish_unidiff).
+        Completion -- the runner's on_finish callback, _finish_unidiff
+        above -- opens the 'Diff N' tab and prints ONE status-bar line:
+        total wall time, number of difference regions, algorithm used.
+        Inputs with no differences open NO tab. A diff still running
+        when the user invokes "Cancel compare" / "Cancel all
+        compares" -- or exits CudaText -- is stopped through
+        unidiff.UnidiffRunner.cancel / cancel_all.
         """
-        a = split_lines_safe(txt0)
-        b = split_lines_safe(txt1)
         algo, use_native, _fell_back = self._resolve_algorithm()
-        n_ctx = self.cfg.get('diff_context')
-        # Huge-input gate for the Python-side paths ('difflib' included);
-        # native ALWAYS runs in the background, so the gate never
-        # applies to it.
-        huge = (len(a) + len(b)) > self.cfg.get(
-            'unidiff_async_lines', DEFAULT_UNIDIFF_ASYNC_LINES)
-        job = _UnidiffJob(txt0, txt1, a, b, fn0, fn1, n_ctx, algo,
-                          time.perf_counter())
-
-        if algo == 'difflib':
-            # 'difflib' choice: stdlib unified_diff DIRECTLY.
-            if not huge:
-                try:
-                    (job.uni_text,
-                     job.n_diffs) = self._unidiff_difflib_direct(
-                        a, b, fn0, fn1, n_ctx)
-                except Exception as ex:
-                    job.error = ex
-                self._finish_unidiff(job)
-            else:
-                self._start_unidiff_py_thread(job)
-            return
-
-        if use_native:
-            # Native: ALWAYS the async callback form of diff_proc. The
-            # raw texts go to the engine VERBATIM (no split/join
-            # round-trip): it splits them into lines internally on
-            # CRLF/CR/LF -- exactly the split split_lines_safe produces
-            # -- so the returned line indices address the a / b lists
-            # directly. flags=DIFF_IGN_NONE: see the docstring above.
-            handle = dfn.start_async_line_diff(
-                txt0, txt1,
-                dfn.algo_id(algo),
-                dfn.DIFF_IGN_NONE,
-                functools.partial(self._on_unidiff_native_done, job))
-            if handle:
-                job.job_handle = handle
-                _UNIDIFF_JOBS.append(job)
-                ct.msg_status(_('Differ: diffing in background...'))
-                return
-            # Engine refused to start the background job (rare): fall
-            # back to the SYNCHRONOUS native call. The command is a
-            # one-shot user action -- leaving the user without a diff
-            # (the compare view's choice, which has refresh-retries to
-            # lean on) would be worse than a blocking run here.
-            msg('diff_proc failed to start the background unified diff '
-                '-- running synchronously', level=1)
-            try:
-                matcher = dfn.CudaDiffNativeMatcher(
-                    None, txt0, txt1,
-                    algo=dfn.algo_id(algo),
-                    flags=dfn.DIFF_IGN_NONE)
-                job.opcodes = matcher.get_opcodes()
-            except Exception as ex:
-                job.error = ex
-            self._finish_unidiff(job)
-            return
-
-        # Pure-Python engine ('hybrid' / 'myers' / 'vscode' /
-        # 'patience'): opcodes drive utils.unified_diff_opcodes.
-        if not huge:
-            try:
-                job.opcodes = self._unidiff_py_opcodes(algo, a, b)
-            except Exception as ex:
-                job.error = ex
-            self._finish_unidiff(job)
-            return
-        self._start_unidiff_py_thread(job)
+        self.unidiff.start(txt0, txt1, fn0, fn1,
+                           self.cfg.get('diff_context'), algo, use_native)
 
     def on_state(self, ed_self, state):
         """App-level state changes: reload the config when a UI or syntax
@@ -3395,8 +3026,8 @@ class Command:
         # cancelled job is never invoked) and the Python workers'
         # results are dropped (they are daemons; they finish on their
         # own and nothing consumes them).
-        for job in list(_UNIDIFF_JOBS):
-            self._cancel_unidiff_job(job)
+        self.unidiff.notify_app_exiting()
+        self.unidiff.cancel_all()
 
     '''
     def on_tab_change(self, ed_self):
@@ -3590,40 +3221,65 @@ class Command:
 
     def cancel_compare(self, ed=None):
         """Command: cancel the in-flight background compare for the
-        current compare tab, if any is running. Does not close the tab
-        or touch its existing diff markers -- it only stops a compare
-        that is still in progress (e.g. one kicked off by auto-refresh
-        or a prior manual refresh on a large file). Same effect as
-        on_close's cancellation, but callable directly without closing
-        the tab, and without needing on_save_pre's close-then-save
-        path. 'ed' (any editor of the compare tab, used by the
-        toolbar's Cancel button) defaults to the focused editor."""
+        current compare tab, if any is running -- and every in-flight
+        background unified diff (the "Diff current document with..."
+        commands), which is stopped whatever tab the command runs
+        from: a unified-diff job is not bound to any tab (its result
+        tab does not even exist until the diff finishes), so it has no
+        "current tab" of its own to be cancelled from. Does not close
+        any tab or touch its existing diff markers -- it only stops
+        work that is still in progress (e.g. a compare kicked off by
+        auto-refresh or a prior manual refresh on a large file, or a
+        unified diff on a huge file). Same effect as on_close's
+        cancellation, but callable directly without closing the tab,
+        and without needing on_save_pre's close-then-save path. 'ed'
+        (any editor of the compare tab, used by the toolbar's Cancel
+        button) defaults to the focused editor."""
+        n_uni = self.unidiff.cancel_all()
         if ed is None:
             ed = ct.ed
         tab_id = ed.get_prop(ct.PROP_TAB_ID)
         session = self._session_for(tab_id)
         if session is None:
+            if n_uni:
+                return ct.msg_status(_('Differ: unified diff cancelled'))
             return ct.msg_status(_('Differ: not a compare tab'))
         job = session.job
         session.job = None
         if job is None:
+            if n_uni:
+                return ct.msg_status(_('Differ: unified diff cancelled'))
             return ct.msg_status(_('Differ: no compare running'))
         self._cancel_job(job)
-        ct.msg_status(_('Differ: compare cancelled'))
+        if n_uni:
+            ct.msg_status(_('Differ: compare and unified diff cancelled'))
+        else:
+            ct.msg_status(_('Differ: compare cancelled'))
 
     def cancel_all_compares(self):
         """Command: cancel every in-flight background compare across all
-        compare tabs (not just the current one). Same cancellation as
-        on_exit_pre, but triggerable on demand instead of only at app
-        exit -- e.g. after refreshing several large-file compares at
-        once and deciding none of the results are needed."""
+        compare tabs (not just the current one) AND every in-flight
+        background unified diff. Same cancellation as on_exit_pre, but
+        triggerable on demand instead of only at app exit -- e.g. after
+        refreshing several large-file compares at once, or starting
+        unified diffs of several huge files, and deciding none of the
+        results are needed."""
         jobs = [s.job for s in self._sessions.values() if s.job is not None]
-        if not jobs:
+        n_uni = self.unidiff.cancel_all()
+        if not jobs and not n_uni:
             return ct.msg_status(_('Differ: no compares running'))
         for job in jobs:
             job.session.job = None
             self._cancel_job(job)
-        ct.msg_status(_('Differ: cancelled {} compare(s)').format(len(jobs)))
+        if jobs and n_uni:
+            ct.msg_status(_('Differ: cancelled {} compare(s), {} unified '
+                            'diff(s)').format(len(jobs), n_uni))
+        elif jobs:
+            ct.msg_status(
+                _('Differ: cancelled {} compare(s)').format(len(jobs)))
+        else:
+            ct.msg_status(
+                _('Differ: cancelled {} unified diff(s)').format(n_uni))
 
     def _arm_slow_compare_watchdog(self, session, job):
         """Arm the one-shot SLOW_COMPARE_SECONDS timer for a
@@ -6717,9 +6373,6 @@ class Command:
                 get_opt('advanced.enable_keyboard_capture', True),
             'diff_context':
                 get_opt('advanced.diff_context', 3),
-            'unidiff_async_lines':
-                get_opt('advanced.unidiff_async_lines',
-                        DEFAULT_UNIDIFF_ASYNC_LINES),
             'enable_profiling':
                 get_opt('advanced.enable_profiling', False),
             'enable_cprofile':
