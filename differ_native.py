@@ -59,8 +59,16 @@ strictly.
 
 Break chars: the word-break characters of the DIF_CHARS tokenizer are
 configurable via the plugin's 'algorithm.break_chars' setting (default
-',.;:' -- WinMerge's default; see DEFAULT_BREAK_CHARS /
-normalize_break_chars). The configured string is carried on the Differ
+".,:;?[](){}<=>`'!\"#$%&^~\\|@+-*/" -- WinMerge's "Word break
+characters" options default; see DEFAULT_BREAK_CHARS /
+normalize_break_chars). WinMerge research behind that default: the
+engine's stringdiffs.cpp Init() hard-codes only a small ",.;:" fallback
+that runs until SetBreakChars() is called, but WinMerge's Options
+dialog stores the long list above as the setting's default and pushes
+it into the engine on every compare -- so the long list is the
+effective default, and the plugin mirrors it (an earlier unreleased
+draft of this option used ",.;:" under the assumption it was
+WinMerge's default). The configured string is carried on the Differ
 (diff.break_chars, set next to diff.ignore_flags by
 Command.refresh_compare) and threaded into EVERY DIF_CHARS call of a
 compare -- one value per whole batch, exactly like the ignore bitmask.
@@ -103,13 +111,21 @@ DIFF_IGN_NUMBERS     = _ct.DIFF_IGN_NUMBERS if _HAS_NATIVE_DIFF else 8
 DIFF_IGN_BLANK_LINES = _ct.DIFF_IGN_BLANK_LINES if _HAS_NATIVE_DIFF else 16
 
 # Default word-break characters of the DIF_CHARS tokenizer -- WinMerge's
-# default (stringdiffs.cpp). Exposed as the plugin option
-# 'differ.algorithm.break_chars' (config dialog, 'algorithm' chapter);
-# the configured value is sanitized by normalize_break_chars() and
-# threaded into every diff_proc(DIF_CHARS) call: every character of the
-# string is its own token and a word boundary, an EMPTY string disables
-# punctuation breaking (words split on whitespace/EOL only).
-DEFAULT_BREAK_CHARS = ',.;:'
+# "Word break characters" OPTIONS default:
+#     .,:;?[](){}<=>`'!"#$%&^~\|@+-*/
+# (WinMerge research: stringdiffs.cpp's Init() hard-codes only the small
+# fallback ",.;:" that runs until SetBreakChars() is called, but the
+# WinMerge Options dialog stores the long list above as the setting's
+# default and calls SetBreakChars() with it on every compare -- so the
+# long list is what the engine effectively runs with in normal use; the
+# plugin and the CudaText diff_proc default mirror it). Exposed as the
+# plugin option 'differ.algorithm.break_chars' (config dialog,
+# 'algorithm' chapter); the configured value is sanitized by
+# normalize_break_chars() and threaded into every diff_proc(DIF_CHARS)
+# call: every character of the string is its own token and a word
+# boundary, an EMPTY string disables punctuation breaking (words split
+# on whitespace/EOL only).
+DEFAULT_BREAK_CHARS = ".,:;?[](){}<=>`'!\"#$%&^~\\|@+-*/"
 
 
 def build_ignore_flags(cfg):
@@ -557,9 +573,10 @@ class Differ:
         sanitized by normalize_break_chars). Command.refresh_compare
         sets it next to ignore_flags; it is threaded into every
         DIF_CHARS call (batched and legacy) and ignored by DIF_TEXTS.
-        The default is DEFAULT_BREAK_CHARS (',.;:', WinMerge's
-        default) -- identical to the engine's own default, so an
-        unset value and an explicitly-set default behave the same.
+        The default is DEFAULT_BREAK_CHARS (WinMerge's "Word break
+        characters" options list) -- identical to the engine's own
+        default, so an unset value and an explicitly-set default behave
+        the same.
 
         The Differ holds NO text between compares — neither raw text
         nor line lists. a_text / b_text are passed directly to

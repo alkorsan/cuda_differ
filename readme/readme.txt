@@ -748,40 +748,59 @@ Algorithm section:
   When disabled, modified lines are highlighted as a whole.
   Disabling this speeds up the compare of big files.
   Default: on.
-- differ.algorithm.break_chars: Word-break characters (default: ",.;:")
+- differ.algorithm.break_chars: Word-break characters
   Characters that split words for the character-level highlights inside
   modified lines -- the word tokenizer of the native char-diff engine
-  (the same setting WinMerge calls "break chars"). Every character of
-  the string is its own token and a word boundary, so words break at
-  it: with the default ",.;:" the line "v1.2.3, done" tokenizes as
-  "v1" "." "2" "." "3" "," " done".
+  (the same setting WinMerge calls "Word break characters"). Every
+  character of the string is its own token and a word boundary, so
+  words break at it: with the default
+  ".,:;?[](){}<=>`'!"#$%&^~\|@+-*/" the line "v1.2.3, done" tokenizes
+  as "v1" "." "2" "." "3" "," " done".
   How it changes the highlights: after the word-level compare, the
   engine refines every changed region by trimming its common prefix
   and suffix, so a SINGLE change inside a word always highlights only
   the changed characters -- no matter which break chars are set.
   "v1.2.3" vs "v1.2.4" gives exactly the same "3" / "4" highlight with
-  ",.;:", with "!" and with "" (this is expected, not a bug). The set
-  matters when one region contains SEVERAL separated changes or the
-  separators themselves changed, because equal break chars become
+  the default, with "!" and with "" (this is expected, not a bug). The
+  set matters when one region contains SEVERAL separated changes or
+  the separators themselves changed, because equal break chars become
   anchors that split the region into separate highlights:
-    * "v1.2.3" vs "v1.9.4" -- with ",.;:" two highlights, "2"->"9" and
-      "3"->"4", and the dots between them stay unhighlighted; with ""
-      (or any set without the dot, e.g. "!") one continuous highlight
-      "2.3" -> "9.4" that includes the dots.
-    * "v1.2.3" vs "v1-2-3" -- with the default "-" is not a break char,
-      so the dash-side is the single word "v1-2-3" and the whole
-      ".2." -> "-2-" gets highlighted; with ".,;:-" (dash added) both
+    * "v1.2.3" vs "v1.9.4" -- with the default (dot breaks) two
+      highlights, "2"->"9" and "3"->"4", and the dots between them
+      stay unhighlighted; with "" (or any set without the dot, e.g.
+      "!") one continuous highlight "2.3" -> "9.4" that includes the
+      dots.
+    * "v1.2.3" vs "v1-2-3" -- with the default (dash breaks too) both
       sides tokenize the same way, the digits anchor the compare, and
-      only the two "." -> "-" swaps are highlighted.
+      only the two "." -> "-" swaps are highlighted; with a set that
+      has no dash, e.g. ",.;:" (or "!"), the dash-side is the single
+      word "v1-2-3" and the whole ".2." -> "-2-" gets highlighted.
   Examples:
-    * ",.;:" -- WinMerge's default (recommended).
+    * ".,:;?[](){}<=>`'!"#$%&^~\|@+-*/" -- the default: WinMerge's
+      "Word break characters" options list (recommended; it is what
+      WinMerge itself runs with -- see the note below).
+    * ",.;:" -- the four separators (comma, period, semicolon, colon)
+      the WinMerge engine source hard-codes as its internal fallback:
+      a coarser set -- dash, slash, brackets, quotes and other
+      punctuation no longer break words.
     * "" (empty string) -- punctuation never breaks words: words are
       then split on whitespace only, and a region with several changes
       is painted as one block that includes the unchanged punctuation
       between them.
-    * ".,;:-_/\\" -- add characters to also break on paths, URLs,
-      dates, kebab-case and snake_case identifiers.
-    * ".,;:!?()" -- for prose, also break on sentence punctuation.
+    * Add characters that are NOT in the default, e.g. "_" for
+      snake_case identifiers ("a_b_c" vs "a_x_y" then highlights the
+      two letters separately instead of one "b_c"/"x_y" block) --
+      paths, URLs, dates and kebab-case are already covered by the
+      default's "/" and "-".
+  A note on the default (WinMerge research): the engine's
+  stringdiffs.cpp Init() hard-codes only the small fallback ",.;:"
+  that runs until SetBreakChars() is called, but WinMerge's Options
+  dialog (Compare / "Whitespace & breaks") stores the long list above
+  as the "Word break characters" setting's default, and on every
+  compare WinMerge reads the saved setting and calls SetBreakChars()
+  with it -- so the long list is what the engine effectively runs
+  with in normal use. This plugin (and the CudaText diff_proc default)
+  mirror that effective default, not the never-used fallback.
   Notes:
     * Whitespace, CR/LF and (with "Ignore numbers" enabled) digits are
       classified before the break-char check, so listing them has no
@@ -804,13 +823,16 @@ Algorithm section:
   A = "v1.2.3" / "v1.2.3" / "v1.2.3" and B = "v1.2.4" / "v1.9.4" /
   "v1-2-3", and compare them. With the default: line 1 highlights only
   "3"/"4"; line 2 highlights "2"->"9" and "3"->"4" with the dots
-  unhighlighted; line 3 highlights the whole ".2." -> "-2-". Now set
-  the option to "!" and re-compare: lines 1 and 3 are unchanged
-  (expected -- "!" does not occur in the text), but line 2 becomes ONE
-  block "2.3" -> "9.4" with the dots included. Set the option to
-  ".,;:-" and re-compare: line 3 becomes the two small "." -> "-"
-  swaps with the "2" unhighlighted, and line 2 is back to the two
-  separate digits. (All expected results verified against the engine.)
+  unhighlighted; line 3 highlights only the two "." -> "-" swaps with
+  the "2" unhighlighted. Now set the option to "!" and re-compare:
+  line 1 is unchanged (expected -- a single change is always trimmed
+  to the changed chars), but line 2 becomes ONE block "2.3" -> "9.4"
+  with the dots included and line 3 becomes the whole ".2." -> "-2-"
+  (the dot and the dash no longer break words). Set the option to
+  ",.;:" and re-compare: line 2 is back to the two separate digits
+  (the dot is in the set), line 3 stays the whole ".2." -> "-2-"
+  (the dash is not). (All expected results verified against the
+  engine.)
 - differ.algorithm.beautify_alignment: Improve line alignment
   Beautify line alignment inside REPLACE blocks where the two sides have
   DIFFERENT line counts.

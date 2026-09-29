@@ -46,6 +46,18 @@ semicolon, colon), overridable via `SetBreakChars()`. This is process-global
 mutable state in the original (`static tchar_t *BreakChars`) — port it as
 whatever config-scoping makes sense for you (global, per-instance, whatever).
 
+> **Porting note (default value research, verified in the WinMerge UI):**
+> the `",.;:"` above is only the hard-coded fallback `Init()` installs
+> until something calls `SetBreakChars()`. WinMerge's Options dialog
+> (Compare / "Whitespace & breaks") has a "Word break characters" setting
+> whose DEFAULT is the much longer list
+> `.,:;?[](){}<=>`'!"#$%&^~\|@+-*/`, and WinMerge reads the saved setting
+> and calls `SetBreakChars()` with it on every compare — so in normal use
+> the engine runs with the long list, never with the fallback. Ports that
+> want WinMerge-equivalent default behavior (CudaText's `diff_proc`
+> `break_chars`, this plugin's `differ.algorithm.break_chars`) default to
+> the long list.
+
 ```
 struct Word {
     start:  int      // index of first code unit of this token, in the ORIGINAL string
