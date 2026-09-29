@@ -1,3 +1,41 @@
+2026.09.29 (by @badrelmers)
+* change: the "Diff current document with file..." / "Diff current
+  document with tab..." commands now generate their unified-diff
+  output with the CONFIGURED algorithm
+  (differ.algorithm.diff_algorithm) instead of always running
+  stdlib difflib.unified_diff. Every engine the plugin can run -- the
+  native diff_proc(DIF_TEXTS) ones and all the pure-Python matchers --
+  returns the same difflib-compatible opcode format, so only the
+  rendering had to be made engine-independent: Command.create_diff
+  resolves the algorithm exactly like the side-by-side compare (same
+  _resolve_algorithm call, same native-to-Python fallback:
+  native_histogram -> hybrid, native_myers -> myers), runs the engine
+  (new Command._unidiff_opcodes helper) and feeds its opcodes to the
+  new utils.unified_diff_opcodes. The native call is synchronous but
+  strictly faster than the difflib run it replaces (10-30x), so the
+  UI-block window only shrinks. The engine runs with
+  flags=DIFF_IGN_NONE: under the ignore options 'equal' opcodes can
+  cover byte-different lines (e.g. CR vs LF endings), which would be
+  rendered as context and make the patch unapplicable for patch /
+  git apply -- the ignore options keep their meaning in the
+  side-by-side compare only. The 'difflib' algorithm choice now runs
+  with autojunk=False (engine_opcodes' behavior), so the old
+  "unified diff always used autojunk=True" caveat is gone. Readme's
+  Commands note and the option's comment/text updated accordingly.
++ add: utils.py gained grouped_opcodes() and unified_diff_opcodes(),
+  an opcode-driven difflib.unified_diff work-alike: a line-for-line
+  port of SequenceMatcher.get_grouped_opcodes operating on a plain
+  opcode list (copied first -- difflib's own version mutates the
+  first/last opcode in place, and an engine's returned list must stay
+  untouched) plus the hunk renderer itself, with difflib's
+  _format_range_unified and _check_types ported verbatim (the header
+  date format included). Byte-identical to difflib.unified_diff for
+  equal opcode input (verified against the stdlib on randomized
+  texts); the single extension: the CudaText 'ignore' opcode tag is
+  rendered like 'replace' (A lines as '-', B lines as '+') so even a
+  future engine run with ignore flags can never produce an invalid
+  patch from this path.
+
 2026.09.28 (by @badrelmers)
 + add: new Swap button (harpoon icon) as the first button
   of the toolbar's last group (Swap, Resize, View, Config): one

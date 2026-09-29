@@ -34,8 +34,8 @@ from . import toolbar as difftb
 from .profiling import (Profiler, enable_profiling, profiling_report,
                         reset_profiling, start_profiling, stop_profiling,
                         cancel_profiling)
-from .utils import split_lines_safe, ScrollSplittedTab
-from difflib import unified_diff
+from .utils import (split_lines_safe, ScrollSplittedTab,
+                    unified_diff_opcodes)
 from cudax_lib import get_translation
 _ = get_translation(__file__)  # I18N
 
@@ -703,7 +703,9 @@ OPTS_META = [
     # is rendered ----------------------------------------------------------
     {'opt': 'differ.algorithm.diff_algorithm',
      'cmt': _('Diff algorithm\n'
-              'Selects the diff algorithm used by the side-by-side compare.\n'
+              'Selects the diff algorithm used by the side-by-side compare '
+              'and by the unified-diff commands ("Diff current document '
+              'with file... / with tab...").\n'
               '\n'
               'Native algorithms run in compiled Pascal code and are 10-30x '
               'faster than the pure-Python implementations on large files. '
@@ -2244,27 +2246,89 @@ class Command:
 
         self.refresh_compare()
 
+    def _unidiff_opcodes(self, txt0, txt1, a, b):
+        """Run the CONFIGURED diff algorithm on the two raw texts and
+        return its line-level opcodes, for the unified-diff commands
+        (create_diff).
+
+        The algorithm resolution is the SAME one the side-by-side
+        compare uses (_resolve_algorithm), including the
+        native-to-Python fallback when cudatext.diff_proc is missing
+        on this CudaText build: native_histogram -> hybrid,
+        native_myers -> myers.
+
+        a / b are the pre-split keepends line lists of txt0 / txt1
+        (split_lines_safe): the Python engines take line lists, and
+        the split is shared with the renderer (create_diff) so it is
+        paid once for both.
+
+        The native engine runs with flags=DIFF_IGN_NONE deliberately.
+        Under the ignore options the engine's 'equal' opcodes can
+        cover lines that differ byte-wise (e.g. 'abc\r\n' vs 'abc\n'
+        under DIFF_IGN_EOL), which the renderer would emit as context
+        lines -- producing a patch that patch / git apply reject. The
+        ignore options keep their meaning in the side-by-side compare
+        view only. (The CudaText 'ignore' opcode itself is handled
+        defensively inside utils.unified_diff_opcodes -- rendered
+        like 'replace' -- so even an engine run WITH flags would
+        never yield an invalid patch from this path.)
+        """
+        algo, use_native, _fell_back = self._resolve_algorithm()
+        if use_native:
+            # Raw texts go to the engine VERBATIM (no split/join
+            # round-trip): it splits them into lines internally on
+            # CRLF/CR/LF -- exactly the split split_lines_safe
+            # produces -- so the returned line indices address the
+            # caller's a / b lists directly. Synchronous call: the
+            # difflib.unified_diff run this replaces was synchronous
+            # too, and the native engine is 10-30x faster than
+            # difflib, so the UI-block window only shrinks.
+            matcher = dfn.CudaDiffNativeMatcher(
+                None, txt0, txt1,
+                algo=dfn.algo_id(algo),
+                flags=dfn.DIFF_IGN_NONE)
+            return matcher.get_opcodes()
+        # Python engine: the SAME entry point the side-by-side
+        # compare's background thread runs (matcher construction +
+        # get_opcodes + the _realign_opcodes post-pass), so the
+        # unified diff shows exactly the hunk structure the compare
+        # view paints for the configured algorithm. Note the 'difflib'
+        # choice runs DefaultSequenceMatcher with autojunk=False
+        # (engine_opcodes' hardcoded behavior) -- the old
+        # difflib.unified_diff path always used autojunk=True.
+        diff = dfp.Differ()
+        diff.diff_algorithm = algo
+        return diff.engine_opcodes(a, b)
+
     def create_diff(self, txt0, txt1, fn0, fn1):
         """Create a read-only unified-diff tab from two text strings.
         Used by diff_with and diff_with_tab commands.
 
-        The unified-diff output is always produced with Python's stdlib
-        difflib.unified_diff, never the chosen
-        differ.algorithm.diff_algorithm --
-        the algorithm only affects side-by-side line pairing, not the
-        patch format itself, and unified diff is a machine-consumed patch
-        stream (patch / git apply / CI / code-review bots). difflib's
-        default autojunk=True is left in place here: the autojunk
-        heuristic only triggers on files with >200 occurrences of a
-        single line at >1% of file size (rare in real source files),
-        and even when it triggers the patch is still valid for `patch`/
-        `git apply`. See readme.txt ("Diff current document with
-        file..." section) for the user-facing note.
+        The unified-diff output is generated by the CONFIGURED
+        algorithm (differ.algorithm.diff_algorithm): its line-level
+        opcodes drive utils.unified_diff_opcodes, a
+        difflib.unified_diff work-alike that renders a precomputed
+        opcode list (all the plugin's engines -- the native diff_proc
+        engines and every pure-Python matcher -- return the same
+        difflib-compatible opcode format) instead of running
+        SequenceMatcher. differ.advanced.diff_context still controls
+        the context-line count (n), as before.
+
+        The engine runs strictly -- no ignore options (see
+        _unidiff_opcodes) -- so the output stays a valid patch for
+        patch / git apply: 'equal' opcodes computed under the ignore
+        flags can cover byte-different lines, which would be rendered
+        as context and break the patch. The 'difflib' algorithm
+        choice now runs with autojunk=False (engine_opcodes'
+        behavior), so the old "unified diff always used
+        autojunk=True" caveat is gone as well.
         """
         a = split_lines_safe(txt0)
         b = split_lines_safe(txt1)
-        r = ''.join(unified_diff(a, b, fn0, fn1,
-                                 n=self.cfg.get('diff_context')))
+        opcodes = self._unidiff_opcodes(txt0, txt1, a, b)
+        r = ''.join(unified_diff_opcodes(
+            a, b, opcodes, fn0, fn1,
+            n=self.cfg.get('diff_context')))
 
         global DIFF_TAB_COUNT
         tab = 'Diff ' + str(DIFF_TAB_COUNT)
