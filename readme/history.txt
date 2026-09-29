@@ -6,11 +6,20 @@
   now (WinMerge's default ",.;:": comma, period, semicolon, colon).
   Every character of the string is its own token and a word boundary
   inside the char-level highlights: with the default, "v1.2.3" splits
-  into "v1" "." "2" "." "3" so a version bump highlights only the
-  changed digit; an empty string disables punctuation breaking
-  ("v1.2.3" is one token, words split on whitespace only); adding
-  characters (e.g. ".,;:-_/\\" for paths/URLs/dates/kebab-case, or
-  ".,;:!?()" for prose) breaks words on more punctuation. Whitespace,
+  into "v1" "." "2" "." "3". The engine refines every changed region
+  by trimming its common prefix/suffix, so a SINGLE change inside a
+  word highlights only the changed characters no matter the set
+  ("v1.2.3" vs "v1.2.4" gives the same "3"/"4" highlight with any
+  break chars); the set decides whether equal punctuation inside a
+  region with SEVERAL changes acts as an anchor that splits it:
+  "v1.2.3" vs "v1.9.4" highlights the two digits separately with the
+  dots unpainted by default, but as one "2.3"/"9.4" block (dots
+  included) with an empty set; "v1.2.3" vs "v1-2-3" paints the whole
+  ".2."/"-2-" by default but only the two "."/"-" swaps with "-"
+  added. An empty string disables punctuation breaking (words split
+  on whitespace only); adding characters (e.g. ".,;:-_/\\" for
+  paths/URLs/dates/kebab-case, or ".,;:!?()" for prose) breaks words
+  on more punctuation. Whitespace,
   CR/LF and (with "Ignore numbers" on) digits are classified before
   the break-char check, so listing them has no effect; non-ASCII
   characters always break words regardless. The value flows from

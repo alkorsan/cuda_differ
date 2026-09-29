@@ -754,14 +754,31 @@ Algorithm section:
   (the same setting WinMerge calls "break chars"). Every character of
   the string is its own token and a word boundary, so words break at
   it: with the default ",.;:" the line "v1.2.3, done" tokenizes as
-  "v1" "." "2" "." "3" "," " done", so a version bump "v1.2.3" ->
-  "v1.2.4" highlights only the changed digit instead of the whole
-  version string.
+  "v1" "." "2" "." "3" "," " done".
+  How it changes the highlights: after the word-level compare, the
+  engine refines every changed region by trimming its common prefix
+  and suffix, so a SINGLE change inside a word always highlights only
+  the changed characters -- no matter which break chars are set.
+  "v1.2.3" vs "v1.2.4" gives exactly the same "3" / "4" highlight with
+  ",.;:", with "!" and with "" (this is expected, not a bug). The set
+  matters when one region contains SEVERAL separated changes or the
+  separators themselves changed, because equal break chars become
+  anchors that split the region into separate highlights:
+    * "v1.2.3" vs "v1.9.4" -- with ",.;:" two highlights, "2"->"9" and
+      "3"->"4", and the dots between them stay unhighlighted; with ""
+      (or any set without the dot, e.g. "!") one continuous highlight
+      "2.3" -> "9.4" that includes the dots.
+    * "v1.2.3" vs "v1-2-3" -- with the default "-" is not a break char,
+      so the dash-side is the single word "v1-2-3" and the whole
+      ".2." -> "-2-" gets highlighted; with ".,;:-" (dash added) both
+      sides tokenize the same way, the digits anchor the compare, and
+      only the two "." -> "-" swaps are highlighted.
   Examples:
     * ",.;:" -- WinMerge's default (recommended).
-    * "" (empty string) -- punctuation never breaks words: "v1.2.3" is
-      one token, so any change inside it highlights the whole string;
-      words are then split on whitespace only.
+    * "" (empty string) -- punctuation never breaks words: words are
+      then split on whitespace only, and a region with several changes
+      is painted as one block that includes the unchanged punctuation
+      between them.
     * ".,;:-_/\\" -- add characters to also break on paths, URLs,
       dates, kebab-case and snake_case identifiers.
     * ".,;:!?()" -- for prose, also break on sentence punctuation.
@@ -783,6 +800,17 @@ Algorithm section:
   algorithm is the effective one. Requires a CudaText build whose
   diff_proc API supports the break_chars parameter (the 5_add_differ_api
   branch with the break-chars patch).
+  How to verify it in 30 seconds: create two 3-line files,
+  A = "v1.2.3" / "v1.2.3" / "v1.2.3" and B = "v1.2.4" / "v1.9.4" /
+  "v1-2-3", and compare them. With the default: line 1 highlights only
+  "3"/"4"; line 2 highlights "2"->"9" and "3"->"4" with the dots
+  unhighlighted; line 3 highlights the whole ".2." -> "-2-". Now set
+  the option to "!" and re-compare: lines 1 and 3 are unchanged
+  (expected -- "!" does not occur in the text), but line 2 becomes ONE
+  block "2.3" -> "9.4" with the dots included. Set the option to
+  ".,;:-" and re-compare: line 3 becomes the two small "." -> "-"
+  swaps with the "2" unhighlighted, and line 2 is back to the two
+  separate digits. (All expected results verified against the engine.)
 - differ.algorithm.beautify_alignment: Improve line alignment
   Beautify line alignment inside REPLACE blocks where the two sides have
   DIFFERENT line counts.
