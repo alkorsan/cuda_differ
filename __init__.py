@@ -360,15 +360,14 @@ _HOTKEYS = {
 # the map so a new hotkey can never be left out of the filter.
 _HOTKEY_KEY_FILTER = ','.join(str(k) for k in sorted(_HOTKEYS))
 
-# HARD-CODED MODULE CONSTANT — deliberately NOT a config option. Flips
-# the whole-compare editor lock for background compares (BOTH the native
-# flow and the Python-engine flow):
+# HARD-CODED MODULE CONSTANTS — deliberately NOT config options. They
+# govern the whole-compare editor lock for background compares (BOTH
+# the native flow and the Python-engine flow):
 #
-#   True  (default): from kick-off until the result is fully rendered,
-#          both compare-tab editors are
+#   True  (default): while a compare runs, both compare-tab editors are
 #            - EDACTION_LOCKed: the paint lock makes each half repaint
 #              the 'busy' placeholder (hourglass) — the user-visible
-#              "a compare is running" signal, for the whole engine run;
+#              "a compare is running" signal;
 #            - PROP_RO: typing is blocked — EDACTION_LOCK alone does
 #              NOT block input, the user could still write blind.
 #          The lock/RO pair is released ONLY after the compare finished
@@ -377,17 +376,32 @@ _HOTKEY_KEY_FILTER = ','.join(str(k) for k in sorted(_HOTKEYS))
 #          safe: the input they dispatch cannot modify the locked
 #          halves, and each editor call under the lock costs no repaint
 #          (the single EDACTION_UNLOCK at the end repaints once).
+#          BUT the lock is DEFERRED: it engages only when the compare
+#          is STILL running EDITOR_LOCK_DELAY_MS (5 s) after kick-off
+#          (_arm_editor_lock_timer / _editor_lock_timer — the same
+#          one-shot-timer + fire-time re-check pattern as the
+#          slow-compare watchdog). A compare that finishes inside the
+#          grace window never locks the halves at all: they stay fully
+#          editable (and paintable) for the whole run — a fast compare
+#          must not freeze the editors and flash the busy placeholder
+#          for a split second. Only a compare that actually runs long
+#          enough needs the busy signal and the snapshot protection.
+#
+#   EDITOR_LOCK_DELAY_MS (5000): the grace window above.
 #
 #   False: pre-lock behavior — the editors stay fully editable (and
-#          paintable) for the whole compare: no kick-off lock, no
-#          read-only. The paint phase runs unlocked too.
+#          paintable) for the whole compare: no lock, no read-only,
+#          no deferred timer. The paint phase runs unlocked too.
 #
 # The legacy INLINE fallback path (Python algorithms when threads are
-# unavailable) takes the SAME lock around its paint: its pump
-# checkpoints dispatch real input, and without RO a keystroke could
-# land mid-compare and desync the colors from the snapshot being
-# painted.
+# unavailable) takes the SAME lock around its paint, but IMMEDIATELY at
+# kick-off (not the deferred form — its whole engine+paint stretch is
+# synchronous, so a deferred timer could only ever fire after it is all
+# over): its pump checkpoints dispatch real input, and without RO a
+# keystroke could land mid-compare and desync the colors from the
+# snapshot being painted.
 LOCK_EDITORS_WHILE_COMPARING = True
+EDITOR_LOCK_DELAY_MS = 5000
 
 PLG_NAME = _('Differ')
 METAJSONFILE = os.path.dirname(__file__) + os.sep + 'differ_opts.json'
@@ -1327,14 +1341,18 @@ class _CompareJob:
     and the job is just a carrier for the same data.
 
     The snapshot fields (a_text/b_text, lines_a/lines_b) are the texts
-    the engine was kicked off with. While a background compare runs,
-    LOCK_EDITORS_WHILE_COMPARING keeps both halves locked + read-only,
-    so the live editors cannot drift from these snapshots; a refresh
-    that arrives anyway is dropped (see refresh_compare), never queued.
+    the engine was kicked off with. Once a background compare runs past
+    EDITOR_LOCK_DELAY_MS, LOCK_EDITORS_WHILE_COMPARING keeps both
+    halves locked + read-only, so the live editors cannot drift from
+    these snapshots (inside the grace window the halves stay editable);
+    a refresh that arrives anyway is dropped (see refresh_compare),
+    never queued.
 
     'editor_lock' carries the whole-compare editor lock state while
     LOCK_EDITORS_WHILE_COMPARING is on and a background compare is
-    running: None while nothing is held, otherwise a dict
+    running past the EDITOR_LOCK_DELAY_MS grace window (the deferred
+    lock of _editor_lock_timer; immediate on the legacy inline path):
+    None while nothing is held, otherwise a dict
     {'a': original_ro, 'b': original_ro} recording per half the
     PROP_RO value the lock replaced, so _release_compare_editors can
     restore exactly that (and only once -- the release is idempotent).
@@ -2227,8 +2245,8 @@ class Command:
         # painted at least once, so the wrap table is already correct
         # -- that lock freezes the screen, not the data. Unlocked
         # here, the halves can paint between the text load and the
-        # compare's kick-off lock, so the pending wrap rebuild lands
-        # before any gap math reads it.
+        # compare's deferred editor lock, so the pending wrap rebuild
+        # lands before any gap math reads it.
 
         # Set a readable combined title (just the basenames/titles, no tab IDs).
         title0 = os.path.basename(orig_names[0]) if orig_names[0] else _('Untitled')
@@ -3159,7 +3177,10 @@ class Command:
     def _lock_compare_editors(self, job):
         """Take the whole-compare editor lock for a background compare
         (only when the hardcoded module constant
-        LOCK_EDITORS_WHILE_COMPARING is on; no-op otherwise).
+        LOCK_EDITORS_WHILE_COMPARING is on; no-op otherwise). Called
+        either by the deferred EDITOR_LOCK_DELAY_MS timer
+        (_editor_lock_timer) once a background compare has outlived the
+        grace window, or immediately by the legacy inline path.
 
         For BOTH halves of the compare tab, in this order:
           - save the current PROP_RO value and set PROP_RO=True — typing
@@ -3236,6 +3257,61 @@ class Command:
                     pass  # dead handle: the tab is already gone
         finally:
             Profiler.stop('refresh:release_editors')
+
+    def _arm_editor_lock_timer(self, session, job):
+        """Arm the one-shot EDITOR_LOCK_DELAY_MS timer that engages the
+        whole-compare editor lock for a background compare that is
+        STILL running when the grace window closes (see the module
+        constant block). Fast compares -- the overwhelming majority --
+        finish inside the window and their halves are never locked at
+        all: fully editable, no busy placeholder, exactly the behavior
+        a sub-second compare should have. The timer callback
+        (_editor_lock_timer) re-checks everything at fire time, so a
+        compare that finished, a cancellation, a closed tab or a newer
+        kick-off on the same tab all resolve to silent no-ops. If
+        timers are unavailable the lock is taken immediately (safe
+        fallback: never worse than the old always-locked behavior)."""
+        if not LOCK_EDITORS_WHILE_COMPARING:
+            return
+        try:
+            callback = ('module=cuda_differ;cmd=_editor_lock_timer;'
+                        'info={};').format(session.tab_id_str)
+            ct.timer_proc(ct.TIMER_START_ONE, callback,
+                          EDITOR_LOCK_DELAY_MS)
+        except Exception:
+            self._lock_compare_editors(job)
+
+    def _editor_lock_timer(self, tag='', info=''):
+        """One-shot EDITOR_LOCK_DELAY_MS timer callback: the background
+        compare on this tab has outlived the grace window -- NOW take
+        the whole-compare editor lock (busy placeholder + read-only)
+        for whatever remains of its engine run, its char batch and its
+        paint.
+
+        Guards (each resolves to a silent no-op -- the same
+        fire-time re-validation as the slow-compare watchdog): the
+        tab closed with the timer in flight, the compare finished or
+        was cancelled inside the window, the lock already held
+        (inline fallback path / belt-and-braces), or the running job
+        is younger than the window (this timer may be the STALE one
+        of an earlier compare on the same tab -- the elapsed check
+        uses the RUNNING job's own kick-off time, so only the timer
+        of the job that actually crossed the threshold locks it; the
+        younger job's own timer will handle that one)."""
+        if not info:
+            return
+        session = self._sessions.get(str(info))
+        if session is None:
+            return  # tab closed with the timer still in flight
+        job = session.job
+        if job is None or job.stale:
+            return  # finished / cancelled inside the grace window
+        if job.editor_lock:
+            return  # already locked (inline fallback / belt-and-braces)
+        if (time.perf_counter() - job.compare_start) * 1000.0 < \
+                EDITOR_LOCK_DELAY_MS - 500:
+            return  # the running job is younger: its own timer locks it
+        self._lock_compare_editors(job)
 
     def _cancel_job(self, job):
         """Cancel one in-flight background compare job: mark it stale (so
@@ -3569,7 +3645,8 @@ class Command:
         'ed' is any editor of the compare tab (None = the focused
         editor, used by the exposed command). A running compare for
         the tab is refused with the same hint refresh_compare gives
-        (its halves are locked read-only under its snapshot); a
+        (its halves turn read-only under its snapshot once the
+        deferred lock engages); a
         non-compare tab is refused too. Swapping twice restores the
         original arrangement.
         """
@@ -4251,14 +4328,17 @@ class Command:
                     job.in_flight = True
                     job.profiler_async_token = _async_pair
                     session.job = job
-                    # Editors are locked + read-only for the whole engine
-                    # run (kick-off -> fully-rendered result / cancel,
-                    # covering BOTH engine jobs -- the line compare and
+                    # Editors are locked + read-only only once this
+                    # compare outlives EDITOR_LOCK_DELAY_MS (deferred
+                    # lock -- kick-off -> fully-rendered result / cancel,
+                    # covering BOTH engine jobs, the line compare and
                     # the char batch): the paint lock shows the 'busy'
                     # placeholder in both halves and PROP_RO blocks
-                    # typing. Released in _on_char_diff_done /
-                    # _finish_native_compare / _cancel_job.
-                    self._lock_compare_editors(job)
+                    # typing; a compare that finishes inside the grace
+                    # window never locks the halves. Released in
+                    # _on_char_diff_done / _finish_native_compare /
+                    # _cancel_job.
+                    self._arm_editor_lock_timer(session, job)
                     # The timing/profiling epilogue runs in the
                     # completion callback, not in the finally below.
                     _epilogue = False
@@ -4345,10 +4425,11 @@ class Command:
                 job.py_poll_cb = _py_poll_tick
                 job.py_engine_thread = _py_thread
                 session.job = job
-                # Editors are locked + read-only for the whole run, like
-                # the native kick-off (released in _on_python_diff_done /
+                # Editors are locked + read-only only past the
+                # EDITOR_LOCK_DELAY_MS grace window, like the native
+                # kick-off (released in _on_python_diff_done /
                 # _cancel_job).
-                self._lock_compare_editors(job)
+                self._arm_editor_lock_timer(session, job)
                 _epilogue = False
                 ct.msg_status(_('Differ: comparing in background...'))
                 self._arm_slow_compare_watchdog(session, job)
@@ -4378,8 +4459,11 @@ class Command:
             # LEGACY inline compare (Python path fallback / tests): the
             # paint phase runs inline; the Differ's generator runs the
             # engine itself while being consumed (opcodes=None). The
-            # session's job slot is held and the editors locked for the
-            # whole paint -- the pump checkpoints inside dispatch real
+            # session's job slot is held and the editors locked --
+            # IMMEDIATELY, not via the deferred timer (this whole
+            # engine+paint stretch is synchronous, a deferred timer
+            # could only ever fire after it is all over) -- for the
+            # whole paint: the pump checkpoints inside dispatch real
             # events, and the slot/RO pair is what makes those events
             # safe (a mid-paint refresh is dropped as 'already
             # running', typing is blocked, a mid-paint close cancels
@@ -4442,14 +4526,17 @@ class Command:
 
         Locking: this method takes NO lock of its own. Both background
         modes hold the whole-compare lock (job.editor_lock -- the
-        kick-off lock, see _lock_compare_editors) for the whole paint,
-        and the single EDACTION_UNLOCK that releases it repaints
+        deferred lock of _editor_lock_timer, engaged only when the
+        compare outlived EDITOR_LOCK_DELAY_MS) for the rest of the
+        paint, and the single EDACTION_UNLOCK that releases it repaints
         everything in one pass; the legacy inline mode (Python fallback /
         tests) takes the same lock around the call in refresh_compare.
-        With LOCK_EDITORS_WHILE_COMPARING off the paint runs unlocked:
-        every attr/gap/decor call repaints by itself, and the bookmark
-        appends -- which do NOT repaint on their own -- are followed by
-        an explicit EDACTION_UPDATE pair (see the end of this method).
+        A background paint whose compare finished inside the grace
+        window -- and any paint with LOCK_EDITORS_WHILE_COMPARING off --
+        runs unlocked: every attr/gap/decor call repaints by itself,
+        and the bookmark appends -- which do NOT repaint on their own --
+        are followed by an explicit EDACTION_UPDATE pair (see the end
+        of this method).
 
         ANTI-HANG: the dispatch loop, the bookmark flush and the marker
         array builds are CHUNKED with UI pump checkpoints (see the
@@ -6698,12 +6785,13 @@ class Command:
         """True while a background compare is in flight for the compare
         tab the given halves belong to (THIS tab's session job -- another
         tab's running compare never blocks editing here). Text-changing
-        hunk commands (copy / copy_line) are refused then: with
-        LOCK_EDITORS_WHILE_COMPARING the halves are read-only for the
-        whole run, and the running compare would paint its kick-off
-        snapshots -- any text edit now would end up misaligned. Also
-        works with the constant off, where editing IS possible but the
-        running compare would still paint stale snapshots."""
+        hunk commands (copy / copy_line) are refused then: the running
+        compare would paint its kick-off snapshots, so any text edit
+        now would end up misaligned -- with LOCK_EDITORS_WHILE_COMPARING
+        the halves also turn read-only once the deferred lock has
+        engaged. The refusal is lock-independent either way: with the
+        constant off, editing IS possible but the running compare would
+        still paint stale snapshots."""
         if not eds:
             return False
         try:
@@ -6721,7 +6809,11 @@ class Command:
         hunk is also found from the line next to its gap, so copying works
         right after a jump. Copying the text side over the gap fills the
         gap in; copying the gap side's (empty) text over the other side
-        deletes the difference."""
+        deletes the difference. Both halves' carets are parked at the hunk
+        start BEFORE the text change -- CudaText snapshots the caret
+        position into the undo/redo items when the change is made, so
+        this is what keeps undo/redo from jumping the caret away from
+        the hunk (see the comment at the set_caret pair below)."""
         fc, eds = self.focused
         if self._compare_running_here(eds):
             return ct.msg_status(_('Differ: cannot edit while compare is running'))
@@ -6730,6 +6822,21 @@ class Command:
             return ct.msg_status(_('Differ: caret is not on a difference'))
         else:
             a0, a1, b0, b1 = current
+        # Park BOTH carets at the hunk BEFORE the delete/insert. CudaText
+        # records the caret position INTO each undo/redo item at the
+        # moment the text change is made, and undo/redo replays the caret
+        # from the item it restores. If the delete/insert below ran with
+        # the carets wherever the user happened to leave them (usually
+        # only ONE half was ever focused -- after a jump, a toolbar
+        # click, or simply editing in the other editor), the edited
+        # half's undo items would store that stale position, and every
+        # later undo/redo would yank the caret far away from the hunk
+        # that was copied -- a jump to a wrong, often far-off line.
+        # Setting the carets first anchors both halves' undo data to
+        # the hunk start (a0 / b0), so undo/redo lands the caret right
+        # where the copy happened.
+        eds[0].set_caret(0, a0)
+        eds[1].set_caret(0, b0)
         if to_right:
             text = eds[0].get_text_substr(0, a0, 0, a1)
             eds[1].delete(0, b0, 0, b1)
@@ -6740,6 +6847,8 @@ class Command:
             eds[0].delete(0, a0, 0, a1)
             if text:
                 eds[0].insert(0, a0, text)
+        # Re-assert the hunk-start carets after the edit (the insert can
+        # push the edited half's caret past the copied text).
         eds[0].set_caret(0, a0)
         eds[1].set_caret(0, b0)
         self.refresh_compare()

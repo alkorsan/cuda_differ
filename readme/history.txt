@@ -1,3 +1,43 @@
+2026.10.01 (by @badrelmers)
+* change: toolbar copy buttons reordered -- "→ Copy" (copy current
+  difference to the right) now comes first, "← Copy" (copy to the
+  left) second, matching the left-to-right reading direction of the
+  compare view.
+* fix: the toolbar's Recompare / Swap / Prev / Next / Copy buttons no
+  longer focus the compare tab's LEFT editor before running their
+  command (the _focus_tab helper and all its call sites are removed).
+  The forced focus jump stole the caret: clicking a Copy button while
+  working in the right half moved focus into the left editor, so the
+  copy command read the hunk from the wrong side's caret and the
+  caret position was lost. The commands resolve the tab session and
+  the focused half from CudaText's own focus tracking, exactly like
+  the hotkey and menu paths do, and the toolbar buttons now never
+  move the editor focus at all.
+* fix: "Copy current difference" (both directions, toolbar buttons,
+  Alt+Left / Alt+Right and the menu items) now parks both halves'
+  carets at the hunk start (a0 / b0) BEFORE the delete/insert runs.
+  CudaText records the caret position into the undo/redo items at
+  the moment each text change is made; with the carets wherever the
+  user happened to leave them (usually only one half was ever
+  focused), the edited half's undo items stored that stale position
+  and every later undo/redo yanked the caret far away from the hunk
+  that was copied. Anchoring the carets first makes undo/redo land
+  the caret right at the copied block.
+* change: the compare-tab editors are no longer locked read-only the
+  moment a compare starts. The whole-compare editor lock (EDACTION
+  paint lock -- the 'busy' placeholder in both halves -- plus
+  read-only) now engages only when a compare is STILL running 5
+  seconds after kick-off (new module constant EDITOR_LOCK_DELAY_MS =
+  5000, deferred via a one-shot timer with the same fire-time
+  re-checks as the slow-compare watchdog: finished / cancelled /
+  closed tab / newer kick-off on the same tab all resolve to no-ops).
+  Compares that finish inside the grace window -- the overwhelming
+  majority -- never lock the halves, so the editors stay fully
+  editable while a fast compare runs (no busy placeholder flash
+  either). Cancelling or finishing still releases the lock exactly
+  as before, and the legacy inline fallback path (threads
+  unavailable / tests) keeps its immediate lock.
+
 2026.09.30 (by @badrelmers)
 + add: command "Compare current document with next tab" (Plugins /
   Differ menu) and the tab context-menu item "Compare with next tab",

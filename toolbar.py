@@ -3,7 +3,7 @@
 A small toolbar docked to the TOP of every compare tab (the editor
 parent's top side), built with dlg_proc:
 
-  [↻ Recompare or × Cancel] | [↑ Prev][↓ Next] | [← Copy][→ Copy] |
+  [↻ Recompare or × Cancel] | [↑ Prev][↓ Next] | [→ Copy][← Copy] |
   [≡ Ignore 2/5 ▾] [★ Preset ▾] | [⇋ Swap] [↔ Resize] [▦ View ▾] [⚙ Config]
   ...status label
 
@@ -460,12 +460,11 @@ class CompareToolbar:
     'cmd' is the Command instance of cuda_differ (all actions are its
     methods); 'session' is the tab's _TabSession (the toolbar's
     lifetime is the session's lifetime); 'a_ed' is any editor of that
-    tab (used for the parent handle, for focusing the tab before
-    commands, and for refreshes).
+    tab (used for the parent handle and for refreshes).
     """
 
     # (name, kind, icon, text) in visual order -- five groups:
-    # [Recompare/Cancel] | [Prev][Next] | [Copy][Copy] |
+    # [Recompare/Cancel] | [Prev][Next] | [→ Copy][← Copy] |
     # [Ignore][Preset] | [Swap][Resize][View][Config]. The 'ignore'
     # caption is assembled dynamically (see _ignore_caption), the
     # 'presets' and 'view' captions carry the dropdown arrow (see
@@ -479,8 +478,8 @@ class CompareToolbar:
         ('prev',       'btn', '\u2191', 'Prev'),
         ('next',       'btn', '\u2193', 'Next'),
         ('sep2',       'sep', None, None),
-        ('copy_left',  'btn', '\u2190', 'Copy'),
         ('copy_right', 'btn', '\u2192', 'Copy'),
+        ('copy_left',  'btn', '\u2190', 'Copy'),
         ('sep3',       'sep', None, None),
         ('ignore',     'btn', '\u2261', 'Ignore'),
         ('presets',    'btn', '\u2605', 'Preset'),
@@ -1453,15 +1452,6 @@ class CompareToolbar:
 
     # -- button actions -----------------------------------------------------
 
-    def _focus_tab(self):
-        """Focus the tab's left editor before running a command, so the
-        focused-session-based commands (jump / copy / cancel) act on
-        THIS tab even if the click focused the toolbar form."""
-        try:
-            self.a_ed.focus()
-        except Exception:
-            pass
-
     def _on_button(self, id_dlg, id_ctl, data='', info=''):
         """on_change dispatcher of all toolbar buttons (id_ctl is the
         control index)."""
@@ -1474,7 +1464,6 @@ class CompareToolbar:
             return
         try:
             if name == 'recompare':
-                self._focus_tab()
                 if self.comparing:
                     if not self._cancel_shown:
                         # Grace window (see set_comparing / _CANCEL_DELAY_MS):
@@ -1492,19 +1481,14 @@ class CompareToolbar:
             elif name == 'resize':
                 self.cmd.resize_equal_width(self.a_ed)
             elif name == 'swap':
-                self._focus_tab()
                 self.cmd.swap_view(self.a_ed)
             elif name == 'prev':
-                self._focus_tab()
                 self.cmd.jump_prev()
             elif name == 'next':
-                self._focus_tab()
                 self.cmd.jump_next()
             elif name == 'copy_left':
-                self._focus_tab()
                 self.cmd.copy_left()
             elif name == 'copy_right':
-                self._focus_tab()
                 self.cmd.copy_right()
             elif name == 'ignore':
                 self.popup_ignore_menu()

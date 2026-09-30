@@ -330,7 +330,7 @@ Every compare tab gets a toolbar docked to the top of the compare view
 the editor text background color of the current UI theme, so it blends
 into the compare view):
 
-    [↻ Recompare or × Cancel] | [↑ Prev][↓ Next] | [← Copy][→ Copy] |
+    [↻ Recompare or × Cancel] | [↑ Prev][↓ Next] | [→ Copy][← Copy] |
     [≡ Ignore 2/5 ▾] [★ Preset ▾] | [⇋ Swap] [↔ Resize] [▦ View ▾] [⚙ Config]
     ...status
 
@@ -347,11 +347,21 @@ into the compare view):
   context menu. If the compare finishes within the delay (small
   files compare in well under a second), the button simply stays
   ↻ Recompare with the result.
+  While a compare runs, the two editors lock read-only (busy
+  placeholder in both halves) -- but only once the compare has been
+  running for over 5 seconds: a compare that finishes inside those
+  5 seconds never locks the editors at all, they stay fully
+  editable for its whole duration. The lock is released as before
+  the moment the compare finishes or is cancelled.
 - ↑ Prev / ↓ Next -- jump to the previous/next difference (same as
   Alt+Up / Alt+Down). Disabled while there are no differences or a
   compare is running.
-- ← Copy / → Copy -- copy the current difference hunk to the left /
-  right side (same as Alt+Left / Alt+Right).
+- → Copy / ← Copy -- copy the current difference hunk to the right /
+  left side (same as Alt+Right / Alt+Left). Both halves' carets are
+  parked at the hunk start before the text change, so undo/redo
+  lands the caret at the copied hunk instead of jumping to a far-off
+  line, and the buttons never move the editor focus: the caret stays
+  where the user left it.
 - ≡ Ignore 2/5 ▾ -- dropdown with the five "ignore" options as
   CHECKABLE items -- multiple options can be checked at once (they
   combine; see "Ignore options" below). The counter shows how many of

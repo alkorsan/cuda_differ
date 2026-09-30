@@ -94,7 +94,7 @@ gave me final files ready to copy paste, not git patches, put them in a zip, put
 this patch must be applied on previous patch not overwrite it, previous patch was not commited yet but it will be commited soon, so your new patch must not delete your previous patch
 
 
-_______________________
+====================================================
 
 
 move block or text or line between editors is broken
@@ -106,34 +106,39 @@ put python algorithm _realign_opcodes inside  beautifier only, i mean realign op
 
 add _realign_opcodes to native algo too like it was before, but is it necesary, i still need to study this carefully
 
-__________________________
-
-does cudadiffhistogram.pas and cudadiffmyers.pas both split on \r\n and \r and \n or not?
-does cudadiffhistogram.pas and cudadiffmyers.pas implement DIFF_IGN_* flags in a similar way or are they diferent?
 
 
+_________________
 
-___
-this is my patch to add diff api to cudatext https://github.com/badrelmers/CudaText/tree/5_add_differ_api
+in toolbar, change copy buttons to this order  [→ Copy][← Copy]
 
+remove _focus_tab from toolbar.py and all its dead code and comments, it s not necesary and it introduce a bug where when i copy hunk to left or right, the focus focus editor 1 and stole the caret position 
 
-i had this comment in my todo
-BREAK_CHARS (G6): uses the WinMerge default ",.;:"  what should i add? should i offer setting to user to edit it?
-
-but i could not find again in the patch, so what currently do to break 
-and what means those breaks, how the diff become diferent with and without them
-___
-
+add this
+        eds[0].set_caret(0, a0)
+        eds[1].set_caret(0, b0)
+to copy() in __init__.py before delete and insert otherwise undo redo data do not save caret position then when user undo redo , the jumps gave a bad user experience
+and add comment of why it s important to set caret there
+        
+when we move hunk , move gap too so we don t need to refresh 
 
 remove all events from install inf except on_tab_menu, and subscribe dynamically to the events we need when the plugin is loaded , when we close the last diff tab we must unsubscribe from all events except right click menu, when a compare is done again we subscribe to what we need, 
 
 
 cleanup doc and changelog
 
+the undo redo is strange because of gaps
+move 231 to 235,undo you get empty  then next undo restore originalo, empty text should noy have happened
+
+
+293 288 caret is not on a difference, when i click on move to left, it work fine when done from command, problem only in toollbar
 ===============================
-canceled: make overview height same as default scrollbar, canceled: it s not necesary
-canceled: reduce overview slider min-height to 5px, canceled: i prefer 30px so i can move it always 
+ 
+
+this is my cudatext plugin https://github.com/alkorsan/cuda_differ which implement the https://github.com/badrelmers/CudaText/tree/5_add_differ_api patch
 
 
+gave me final files ready to copy paste, not git patches, put them in a zip, put them organised in its original folders so i can easly copy paste them
+this code were never published, so do not keep backward compatibility
 
 
