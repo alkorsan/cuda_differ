@@ -92,15 +92,15 @@ Implementation notes:
   item appears -- same guard as the tab context menu / config dialog.
 
 * The PRESETS dropdown is the quick way to set the algorithm +
-  beautify combination: two mutually exclusive presets ("Preset 1:
-  Fastest comparison - Myers, Beautify Off", "Preset 2: Better
-  readability (slower) - Histogram, Beautify On"), a separator, the
-  two native algorithms (also mutually exclusive) and the
-  independent Beautify alignment toggle. It is REBUILT on every
+  align-by-similarity combination: two mutually exclusive presets
+  ("Preset 1: Fastest comparison - Myers, Align Off", "Preset 2:
+  Better readability (slower) - Histogram, Align On"), a separator,
+  the two native algorithms (also mutually exclusive) and the
+  independent "Align by similarity" toggle. It is REBUILT on every
   open, so the checkmarks always mirror settings/cuda_differ.json,
   and the preset checkmarks are DERIVED from it: native Myers +
-  beautify off checks Preset 1, native Histogram + beautify on
-  checks Preset 2, any other combination checks NEITHER (a custom
+  align off checks Preset 1, native Histogram + align
+  on checks Preset 2, any other combination checks NEITHER (a custom
   selection is visible at a glance). Clicks persist
   'differ.algorithm.*' (the config dialog's store) and re-compare
   this tab on the 100ms timer, like the ignore items.
@@ -249,17 +249,18 @@ def _set_ignore_opt(key, val):
 
 # The Presets dropdown's items: two mutually exclusive preset
 # combinations, a separator, the two native algorithms (also mutually
-# exclusive) and the independent Beautify alignment toggle. Each entry:
+# exclusive) and the independent "Align by similarity" toggle (the
+# 'differ.algorithm.beautify.align_by_similarity' option). Each entry:
 # (menu key, menu caption); None = the separator. Toolbar-only -- the
 # config dialog / tab context menu keep their own algorithm UIs.
 _PRESET_ITEMS = (
-    ('preset1',  _('Preset 1: Fastest comparison - Myers, Beautify Off')),
+    ('preset1',  _('Preset 1: Fastest comparison - Myers, Align Off')),
     ('preset2',  _('Preset 2: Better readability (slower) - Histogram, '
-                   'Beautify On')),
+                   'Align On')),
     (None, None),
     ('algo1',    _('Algorithm 1: Native Histogram')),
     ('algo2',    _('Algorithm 2: Native Myers')),
-    ('beautify', _('Beautify alignment')),
+    ('beautify', _('Align by similarity')),
 )
 
 # Values written to 'differ.algorithm.diff_algorithm' by the preset /
@@ -286,18 +287,20 @@ def _set_diff_algo(val):
 
 
 def _get_beautify():
-    """The Beautify alignment flag
-    ('differ.algorithm.beautify_alignment'), read live from the
-    settings."""
-    return bool(ctx.get_opt('differ.algorithm.beautify_alignment', False,
-                            user_json=_JSON_FILE))
+    """The Align-by-similarity flag
+    ('differ.algorithm.beautify.align_by_similarity'), read live from
+    the settings."""
+    return bool(ctx.get_opt(
+        'differ.algorithm.beautify.align_by_similarity', False,
+        user_json=_JSON_FILE))
 
 
 def _set_beautify(val):
-    """Write 'differ.algorithm.beautify_alignment' to the plugin's
-    settings (same store the config dialog uses)."""
-    return ctx.set_opt('differ.algorithm.beautify_alignment', bool(val),
-                       user_json=_JSON_FILE)
+    """Write 'differ.algorithm.beautify.align_by_similarity' to the
+    plugin's settings (same store the config dialog uses)."""
+    return ctx.set_opt(
+        'differ.algorithm.beautify.align_by_similarity', bool(val),
+        user_json=_JSON_FILE)
 
 
 # The View dropdown's checkable items, in the user's order: CudaText's
@@ -809,9 +812,9 @@ class CompareToolbar:
         Ignore tooltip's enabled-list gives)."""
         beautify = _get_beautify()
         return '\r'.join((
-            _('Comparison presets: algorithm and Beautify alignment'),
+            _('Comparison presets: algorithm and Align by similarity'),
             '{}: {} / {} {}'.format(_('Current'), _get_diff_algo(),
-                                    _('Beautify alignment'),
+                                    _('Align by similarity'),
                                     _('on') if beautify else _('off')),
         ))
 
@@ -1175,11 +1178,11 @@ class CompareToolbar:
     def rebuild_preset_menu(self):
         """(Re)build the Presets dropdown: the two mutually exclusive
         presets, a separator, the two native algorithms (also mutually
-        exclusive) and the independent Beautify alignment toggle.
+        exclusive) and the independent "Align by similarity" toggle.
 
         The checkmarks are DERIVED from the settings file: native
-        Myers + beautify off -> Preset 1 checked; native Histogram +
-        beautify on -> Preset 2 checked; any other combination ->
+        Myers + align off -> Preset 1 checked; native Histogram +
+        align on -> Preset 2 checked; any other combination ->
         NEITHER preset checked, so a custom selection is visible at a
         glance. Called on every open (popup_preset_menu); the whole
         body is guarded like the ignore twin's."""
@@ -1276,7 +1279,7 @@ class CompareToolbar:
         try:
             ct.msg_status('{}: {} / {} {}'.format(
                 _('Differ presets'), _get_diff_algo(),
-                _('Beautify alignment'),
+                _('Align by similarity'),
                 _('on') if _get_beautify() else _('off')))
         except Exception:
             pass

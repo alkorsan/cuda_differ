@@ -1,74 +1,74 @@
+2026.10.02 (by @badrelmers)
+* change: the opcode realignment pass is renamed
+  _absorb_trivial_equal_blocks and reworked into an OPT-IN beautify
+  option: differ.algorithm.beautify.absorb_trivial_equal_blocks
+  (chapter 'algorithm', default OFF). When off -- the default -- every
+  engine's RAW opcode stream is rendered exactly as the engine
+  produced it (GNU diffutils / WinMerge faithful); when on, the
+  finished opcodes go through the pass, which merges
+  INSERT+EQUAL(trivial)+DELETE into one REPLACE and absorbs short
+  trivial EQUAL blocks (<= 4 non-whitespace characters) stranded
+  between large changed blocks into single REPLACEs (the VS Code
+  heuristicSequenceOptimizations port; guards unchanged: matched real
+  content is never absorbed, small neighboring changes stay separate,
+  'ignore' hunks -- DIFF_IGN_BLANK_LINES suppressed differences -- are
+  barriers). The pass runs for every algorithm, native and
+  pure-Python alike, in exactly one place per flow so no phase ever
+  sees different opcodes than its neighbors: differ_python gates it
+  inside engine_opcodes; differ_native gates it inside
+  collect_char_pairs (in place, before the char-pair walk, preserving
+  the collect/replay pairing invariant) and inside compare_lists's
+  fresh-split branch (synchronous engine run / withdetail-off
+  delivery). Measured why it is offered for the native engines too:
+  on the _dev/__tests corpus GNU-diffutils Myers emits the Step-1
+  pattern once and 91 fragmented replaces, JGit Histogram 1+101, JGit
+  Myers 3+62 -- more fragmentation than any pure-Python engine
+  (difflib 2+22, myers 1+61, hybrid 1+3, patience 1+3; the old
+  comments claiming patience was immune were wrong, and even vscode's
+  DP path emits the Step-1 pattern on crafted small inputs).
+* change: the beautify_alignment option is renamed align_by_similarity
+  and moved into the new 'beautify' option group:
+  differ.algorithm.beautify.align_by_similarity (was
+  differ.algorithm.beautify_alignment; both old names are migrated by
+  _OLD_OPT_NAMES). Behavior unchanged: similarity-anchored re-pairing
+  of lines inside unequal-count REPLACE blocks, off by default. The
+  toolbar's toggle is re-captioned "Align by similarity" and the
+  preset captions read "Myers, Align Off" / "Histogram, Align On".
+* change: the shared module py_algo/realign.py is DISSOLVED. Each
+  differ now carries its own private copy of
+  _absorb_trivial_equal_blocks at the END of its file
+  (differ_python.py / differ_native.py) -- deliberate duplication so
+  the native and Python codepaths can evolve independently (the same
+  reason the rest of the two modules is already duplicated). Both
+  copies' docstrings carry small worked examples of what each of the
+  two steps does (raw opcodes in, absorbed opcodes out, with the
+  side-by-side rendering each produces), so the pass can be
+  understood without running anything.
+* change: the unified-diff commands now use the RAW algorithms. The
+  native completion callback and its synchronous fallback take the
+  engine's opcodes verbatim, and the Python path (_py_opcodes) forces
+  the absorb pass off -- so a unified diff always shows the
+  algorithm's own hunk structure, exactly what GNU diff / WinMerge
+  would print for that algorithm, while the side-by-side view may
+  paint a beautified structure when the option is on (by design).
++ add: _dev/__tests/test_absorb_trivial_equal_blocks.py -- the
+  standalone test suite for the pass (runs with plain python3, no
+  CudaText: cudatext / cudax_lib are stubbed and the differ modules
+  are imported through a dummy package without executing the plugin's
+  real __init__.py). 16 tests: crafted Step-1 / Step-2 inputs with the
+  full expected before/after opcode lists and printed side-by-side
+  renderings, all the guard cases (meaningful equal blocks never
+  absorbed, same-tag neighbors stay, small neighbors stay separate,
+  'ignore' hunks are barriers), idempotency, coverage invariants,
+  engine-level checks on the real difflib / myers / patience / vscode
+  matchers, BOTH-COPIES agreement (differ_python's and
+  differ_native's pass must produce identical output), option-gating
+  tests (engine_opcodes raw/absorbed per algorithm, native
+  collect_char_pairs in-place contract, native compare_lists diffmap
+  under both option states), a unidiff-must-be-raw check, and the
+  test_2 corpus smoke test. Replaces the former
+  test_realign_opcodes.py.
 2026.10.01 (by @badrelmers)
-+ add: the native algorithms (native_myers, native_histogram) now run
-  their finished opcodes through the same opcode realignment the
-  pure-Python algorithms always ran (new shared module py_algo/realign.py,
-  imported by both differs -- the pass used to live as
-  Differ._realign_opcodes inside differ_python.py only). Investigation
-  summary: all three native engines DO emit the patterns the pass fixes
-  -- measured on the _dev/__tests corpus, GNU-diffutils Myers emits the
-  INSERT+EQUAL(trivial)+DELETE pattern (the one that shows identical
-  lines as one added + one deleted instead of paired) and 91 fragmented
-  replace regions split by matched trivial lines; JGit Histogram 1+101,
-  JGit Myers 3+62 -- the native path was actually MORE affected by the
-  fragmentation than the Python engines (Python myers 1+61, difflib
-  2+22, hybrid 1+3, patience 1+3). GNU diffutils' shift_boundaries
-  cannot merge an insert and a delete separated by a matched trivial
-  line (they are non-adjacent in the change-script walk), so the
-  artifact survives the engine. The pass runs in exactly ONE place per
-  flow so no phase ever sees different opcodes than its neighbors:
-  collect_char_pairs realigns in place right after its line split,
-  BEFORE the char-pair walk (the collect and paint passes must walk
-  identical opcodes -- the char-ops pop order depends on it), and the
-  in-place mutation is what carries the realigned list to the char
-  callback and the paint pass; compare_lists realigns in its fresh-split
-  branch (covers the synchronous engine run and the background
-  withdetail-off delivery) and skips it in the cached-lines replay
-  branch (already realigned by the collect pass). The unified-diff
-  commands realign their native results too (unidiff._on_native_done /
-  the sync fallback), keeping the stated contract that the unified diff
-  shows exactly the hunk structure the compare view paints.
-* change: opcode realignment stays ALWAYS-ON for every algorithm and is
-  NOT moved under the beautify_alignment option. The two live on
-  different layers: beautify_alignment is a RENDERING choice (how lines
-  inside one replace block are paired -- similarity-anchored vs
-  positional top-down, off by default), while realign_opcodes normalizes
-  the STRUCTURE of the opcode stream itself (which lines belong to which
-  hunk). VS Code -- the source of the ported heuristics -- runs the
-  equivalent optimizations (heuristicSequenceOptimizations:
-  optimizeSequenceDiffs + removeVeryShortMatchingLinesBetweenDiffs)
-  unconditionally INSIDE its diff algorithm, not as a display option,
-  and the plugin's own vscode port does the same inside get_opcodes --
-  which is why its output never contains these patterns on the test
-  corpus. Since beautify_alignment defaults to OFF, moving the pass
-  under it would re-introduce, in the default configuration, the very
-  artifacts it exists to fix.
-* fix: the opcode realignment no longer merges across 'ignore' hunks
-  (DIFF_IGN_BLANK_LINES suppressed all-blank differences): an 'ignore'
-  hunk between two changed blocks is a barrier for the absorb pass, so a
-  suppressed blank-line region can never be resurrected into a shown
-  REPLACE by a merge around it. Pure-Python engines never emit 'ignore'
-  (no ignore options on that path), so this only affects the native
-  engines the pass was just added to.
-* fix: corrected the stale claims in the realignment docs: patience and
-  hybrid DO emit the INSERT+EQUAL(trivial)+DELETE and fragmented-replace
-  patterns (1x + 3x on the test corpus -- the old comment said the pass
-  was a no-op for patience), and the vscode engine is not exempt either
-  (its DP path emits the insert/delete pattern on crafted small inputs,
-  e.g. "head/alpha/beta/blank/tail" vs "head/blank/alpha2/beta2/tail"),
-  so every engine -- native and pure-Python -- goes through the same
-  shared pass now. The dead experimental edge-absorption code block
-  (the disabled Pass-3 sketch inside the old method) is removed with
-  the method.
-+ add: _dev/__tests/test_realign_opcodes.py -- a standalone test suite
-  for the realignment pass (runs with plain python3, no CudaText
-  needed): crafted Pass-1 / Pass-2 inputs with the full expected
-  before/after opcode lists, guard tests (meaningful equal blocks are
-  never absorbed, small changes stay separate, 'ignore' hunks are
-  barriers), an idempotency test, engine-level tests that run the real
-  difflib / myers / patience / vscode matchers and verify the pattern
-  is fixed, and a smoke test on the test_2 corpus files. Every case
-  prints a readable side-by-side rendering so the effect is visible,
-  not just asserted.
 * change: toolbar copy buttons reordered -- "→ Copy" (copy current
   difference to the right) now comes first, "← Copy" (copy to the
   left) second, matching the left-to-right reading direction of the

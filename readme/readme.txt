@@ -373,21 +373,22 @@ into the compare view):
   disable themselves and an explanatory item heads the menu (same
   guard as the tab context menu).
 - ★ Preset ▾ -- dropdown with quick "preset" combinations: "Preset 1:
-  Fastest comparison - Myers, Beautify Off" and "Preset 2: Better
-  readability (slower) - Histogram, Beautify On"; only one of the two
+  Fastest comparison - Myers, Align Off" and "Preset 2: Better
+  readability (slower) - Histogram, Align On"; only one of the two
   presets can be checked at a time. After a separator, "Algorithm 1:
   Native Histogram" and "Algorithm 2: Native Myers" (also mutually
-  exclusive) and the independent "Beautify alignment" toggle (works
+  exclusive) and the independent "Align by similarity" toggle (works
   with either algorithm). The preset checkmarks are DERIVED from the
-  current settings on every menu open: Native Myers + Beautify off
-  checks Preset 1, Native Histogram + Beautify on checks Preset 2, any
+  current settings on every menu open: Native Myers + Align off
+  checks Preset 1, Native Histogram + Align on checks Preset 2, any
   other combination checks NEITHER -- so a custom selection is
   visible at a glance. Picking an item writes
-  differ.algorithm.diff_algorithm / differ.algorithm.beautify_alignment
+  differ.algorithm.diff_algorithm /
+  differ.algorithm.beautify.align_by_similarity
   (the same settings the config dialog edits) and re-runs this tab's
   compare immediately. The button is disabled while a compare runs
   (like the Ignore dropdown); its tooltip shows the current
-  algorithm / beautify combination.
+  algorithm / align combination.
 - ⇋ Swap -- swap the two sides of this compare tab (same as the
   "Swap compared editors" command): the texts trade places together
   with their syntax highlighting and per-side settings, and the
@@ -866,7 +867,7 @@ Algorithm section:
   (the dot is in the set), line 3 stays the whole ".2." -> "-2-"
   (the dash is not). (All expected results verified against the
   engine.)
-- differ.algorithm.beautify_alignment: Improve line alignment
+- differ.algorithm.beautify.align_by_similarity: Align by similarity
   Beautify line alignment inside REPLACE blocks where the two sides have
   DIFFERENT line counts.
   - When OFF (algo-faithful): lines are paired top-down by position for
@@ -888,6 +889,40 @@ Algorithm section:
   Applies to both native and Python algorithms.
   Equal-count REPLACE blocks (da == db) are positional in BOTH modes, so
   this option only affects unequal-count REPLACE blocks.
+  Default: off.
+- differ.algorithm.beautify.absorb_trivial_equal_blocks: Absorb
+  trivial equal blocks
+  Opcode beautify pass on the engine's finished result, applied in the
+  side-by-side compare view only (the unified-diff commands always use
+  the raw algorithms):
+  - merges the INSERT + EQUAL(trivial) + DELETE pattern (or its
+    DELETE-first mirror) into a single REPLACE. Engines sometimes match
+    a trivial line (a blank, a lone '}') across a change instead of a
+    meaningful one; the raw opcodes then show the same content as one
+    added + one deleted line instead of a paired change;
+  - absorbs a short trivial EQUAL block (at most 4 non-whitespace
+    characters) stranded between two changed blocks into a single
+    REPLACE when at least one of the two changed blocks is large --
+    without this, one big changed region can come out fragmented into
+    several pieces that read as several unrelated changes and pair a
+    line with the wrong line of the other file.
+  Ported from VS Code's heuristicSequenceOptimizations (VS Code runs
+  the equivalent optimizations unconditionally inside its own diff
+  algorithm).
+  Guards: only EQUAL blocks with at most 4 non-whitespace characters
+  are ever absorbed (matched real content is never merged away); two
+  small changes separated by a matched blank stay separate; suppressed
+  blank-line differences ("Ignore blank lines") are barriers and are
+  never resurrected into a shown change.
+  - When OFF (default): the engine's raw opcode stream is rendered
+    exactly as the engine produced it -- GNU diffutils / WinMerge
+    faithful.
+  - When ON: every algorithm's opcodes (the native engines included)
+    go through the pass, so switching algorithms changes tie-breaking,
+    not hunk structure.
+  See _dev/__tests/test_absorb_trivial_equal_blocks.py for worked
+  examples (before/after opcode lists and side-by-side renderings of
+  both steps).
   Default: off.
 
 Advanced section:
@@ -937,7 +972,7 @@ Advanced section:
     'calls' is the number of produced chunks.
   - compare:find_best_pairs -- the same event production in the
     beautify mode's anchor / prefix-suffix pairing (present only
-    when beautify_alignment produced unequal-count blocks):
+    when align_by_similarity produced unequal-count blocks):
     'calls' is the number of such blocks. One row per producer, so
     the report always shows WHICH pairing mode the time went to.
   - refresh:wrapinfo_api -- the ed.get_wrapinfo() calls (one per
@@ -1109,8 +1144,10 @@ also the default configuration except for the two detail options:
 - Set differ.algorithm.diff_algorithm to "native_myers" (the default).
 - Disable differ.algorithm.compare_with_details (no
   character-by-character comparison inside changed lines).
-- Disable differ.algorithm.beautify_alignment (off by default: no
-  similarity-based re-pairing of changed blocks).
+- Disable differ.algorithm.beautify.align_by_similarity (off by
+  default: no similarity-based re-pairing of changed blocks).
+- Disable differ.algorithm.beautify.absorb_trivial_equal_blocks (off
+  by default: the engine's raw opcodes are rendered as produced).
 - Disable differ.micromap.enable_overview (no overview panel painting).
 This combination gives the fastest compare and the smallest memory
 footprint. The output is rendered exactly the way GNU diffutils /
@@ -1120,8 +1157,12 @@ Best human-readable compare:
 - Set differ.algorithm.diff_algorithm to "native_histogram".
 - Enable differ.algorithm.compare_with_details (highlights the exact
   changed characters inside each modified line).
-- Enable differ.algorithm.beautify_alignment (re-pairs similar lines
-  inside changed blocks so they appear aligned, like VS Code does).
+- Enable differ.algorithm.beautify.align_by_similarity (re-pairs
+  similar lines inside changed blocks so they appear aligned, like VS
+  Code does).
+- Enable differ.algorithm.beautify.absorb_trivial_equal_blocks
+  (merges hunks that the engine split on a matched blank/brace line,
+  so one change reads as one change).
 This combination produces the most readable side-by-side compare, with
 better results than WinMerge, VS Code, Meld and Beyond Compare.
 

@@ -83,7 +83,6 @@ import cudatext as ct
 
 from . import differ_native as dfn
 from . import differ_python as dfp
-from .py_algo.realign import realign_opcodes
 from .utils import split_lines_safe
 from cudax_lib import get_translation
 _ = get_translation(__file__)  # I18N
@@ -304,15 +303,23 @@ def _py_opcodes(algo, a, b):
     """Run one pure-Python engine ('hybrid', 'myers', 'vscode',
     'patience' -- NOT 'difflib': start routes that choice through
     stdlib difflib.unified_diff directly) on the pre-split keepends
-    line lists and return its opcodes.
+    line lists and return its opcodes -- RAW.
 
-    The SAME entry point the side-by-side compare's background thread
-    runs (matcher construction + get_opcodes + the realign_opcodes
-    post-pass), so the unified diff shows exactly the hunk structure
-    the compare view paints for the configured algorithm.
+    The unified-diff commands deliberately use the RAW algorithms:
+    the beautify passes of the side-by-side view (the
+    'differ.algorithm.beautify.*' options, absorb_trivial_equal_blocks
+    included) are NOT applied here, so what you get is the engine's
+    own hunk structure, exactly what GNU diff / WinMerge would show
+    for that algorithm. (The compare view can therefore paint a
+    slightly different hunk structure than the unified diff when a
+    beautify option is on -- by design.)
     """
     diff = dfp.Differ()
     diff.diff_algorithm = algo
+    # Hard guarantee of 'raw': a fresh Differ defaults to no absorb
+    # pass, and the flag is forced off explicitly so a future config
+    # read here can never silently change the unified-diff output.
+    diff.absorb_trivial_equal_blocks = False
     return diff.engine_opcodes(a, b)
 
 
@@ -515,10 +522,8 @@ class UnidiffRunner:
                     None, job.txt0, job.txt1,
                     algo=dfn.algo_id(job.algo),
                     flags=dfn.DIFF_IGN_NONE)
-                # Same realign as the async native path -- see
-                # _on_native_done.
-                job.opcodes = realign_opcodes(
-                    job.a, matcher.get_opcodes())
+                # RAW engine output -- see _on_native_done.
+                job.opcodes = matcher.get_opcodes()
             except Exception as ex:
                 job.error = ex
             self._on_finish(job)
@@ -555,16 +560,13 @@ class UnidiffRunner:
         if opcodes is None:
             job.error = RuntimeError('diff_proc returned None')
         else:
-            # Opcode realignment (the shared py_algo/realign.py pass):
-            # the native engines emit the same INSERT+EQUAL(trivial)+
-            # DELETE / fragmented-replace patterns the pure-Python
-            # engines emit, and the Python path above already realigns
-            # (inside engine_opcodes) -- without this the unified diff
-            # would show a DIFFERENT hunk structure than the compare
-            # view paints for the same native algorithm. job.a was
-            # split at kick-off (overlapping the engine's run), so the
-            # pass reads it without another split.
-            job.opcodes = realign_opcodes(job.a, opcodes)
+            # RAW engine output: the unified-diff commands deliberately
+            # do NOT run the compare view's beautify passes (the
+            # 'differ.algorithm.beautify.*' options,
+            # absorb_trivial_equal_blocks included) -- the unified diff
+            # shows the algorithm's own hunk structure, exactly what the
+            # engine produced.
+            job.opcodes = opcodes
         self._on_finish(job)
 
     # -- Python path (pure-Python engines + the 'difflib' choice) ------

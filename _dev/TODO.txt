@@ -99,31 +99,60 @@ this patch must be applied on previous patch not overwrite it, previous patch wa
 
 move block or text or line between editors is broken
 
+
+
+
+
+beautifier option is used in native algo and python algorithms, its code is some experiments i ported from several compare apps specially and mostly from vscode, so they are experimental , i want to organise them in an easy way so i can continue expanding and fixing them over time, i want the best way to organise it, i have some ideas like move its code to a dedicated file called beautifier.py, but i don t want to make things more complicated, so i don t know what will be the best way to choose
+beautifier code is maybe duplicated for python and native algorithms, check if both same code or code diverged between them then gaveme a report and what is the best way to continue, if there is only one way then implement it directly if there is multiple ways then ask me to choose
+
+
+python algorithm have _realign_opcodes, do i need it for native algo? don t trust comments in the code they may e wrong, investigate your self by reading code and pascal code to see if it s necesary
+do you think it would be better to put _realign_opcodes under beautifier option or keep it as is now which i think it run always for all python algo?
+
+
 split beautifier to blocks/modules
+
+
+
 
 put python algorithm _realign_opcodes inside  beautifier only, i mean realign opcode must run only when beautifier is choosed
 
 
 add _realign_opcodes to native algo too like it was before, but is it necesary, i still need to study this carefully
 
+_________________
+
+this is my cudatext plugin https://github.com/alkorsan/cuda_differ which implement this cudatext patch to add diff api https://github.com/badrelmers/CudaText/tree/5_add_differ_api 
+
+python algorithm have _realign_opcodes, do i need it for native algo? don t trust comments in the code they may be wrong, investigate your self by reading python code and pascal code to see if it s necesary
+do you think it would be better to put _realign_opcodes under beautifier option or keep it as is now which i think it run always for all python algorithms?
+
+based on your answer implement your choices 
+
+gave me final files ready to copy paste, not git patches, put them in a zip, put them organised in its original folders so i can easly copy paste them
+this code were never published, so do not keep backward compatibility
+
+gave me also example to test and understand what _realign_opcodes does, i need tests and what is expected
+
 
 
 _________________
 
-in toolbar, change copy buttons to this order  [→ Copy][← Copy]
+rename  plugin to Differ 2, and remove backward-compatible to move old config
 
-remove _focus_tab from toolbar.py and all its dead code and comments, it s not necesary and it introduce a bug where when i copy hunk to left or right, the focus focus editor 1 and stole the caret position 
+rename config beautify_alignment to align_by_similarity, and put it inside beautify category: differ.algorithm.beautify.align_by_similarity
+rename _realign_opcodes to _absorb_trivial_equal_blocks
+add new config absorb_trivial_equal_blocks default false, and put it inside beautify category: differ.algorithm.beautify.absorb_trivial_equal_blocks , and when true run _absorb_trivial_equal_blocks
 
-add this
-        eds[0].set_caret(0, a0)
-        eds[1].set_caret(0, b0)
-to copy() in __init__.py before delete and insert otherwise undo redo data do not save caret position then when user undo redo , the jumps gave a bad user experience
-and add comment of why it s important to set caret there
-        
-when we move hunk , move gap too so we don t need to refresh 
+add _absorb_trivial_equal_blocks to differ_native.py like differ_python.py
+
+add compare folder
 
 remove all events from install inf except on_tab_menu, and subscribe dynamically to the events we need when the plugin is loaded , when we close the last diff tab we must unsubscribe from all events except right click menu, when a compare is done again we subscribe to what we need, 
 
+
+add to doc that python algos are not suported and not maintained except bug fixes, they will not receive speed or readibility enhancments, they are keept just as experimental to track divergence overtime of native algos, so any issue opened to speedup them or improv their output readibility will not be accepted, only native algos are maintained and will receive improvments overtime if God wills
 
 cleanup doc and changelog
 
@@ -135,7 +164,7 @@ move 231 to 235,undo you get empty  then next undo restore originalo, empty text
 ===============================
  
 
-this is my cudatext plugin https://github.com/alkorsan/cuda_differ which implement the https://github.com/badrelmers/CudaText/tree/5_add_differ_api patch
+this is my cudatext plugin https://github.com/alkorsan/cuda_differ which implement this cudatext patch to add diff api https://github.com/badrelmers/CudaText/tree/5_add_differ_api 
 
 
 gave me final files ready to copy paste, not git patches, put them in a zip, put them organised in its original folders so i can easly copy paste them

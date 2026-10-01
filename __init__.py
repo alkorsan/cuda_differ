@@ -861,8 +861,8 @@ OPTS_META = [
      'chp': 'algorithm',
      'native_only': True,
      },
-    {'opt': 'differ.algorithm.beautify_alignment',
-     'cmt': _('Improve line alignment\n'
+    {'opt': 'differ.algorithm.beautify.align_by_similarity',
+     'cmt': _('Align by similarity\n'
               'Beautify line alignment inside REPLACE blocks where the two '
               'sides have DIFFERENT line counts.\n'
               '- When OFF (algo-faithful): lines are paired top-down by '
@@ -886,6 +886,41 @@ OPTS_META = [
               'Equal-count REPLACE blocks (da == db) are positional in BOTH '
               'modes, so this option only affects unequal-count REPLACE '
               'blocks.\n'
+              'Default: off.'),
+     'def': False,
+     'frm': 'bool',
+     'chp': 'algorithm',
+     },
+    {'opt': 'differ.algorithm.beautify.absorb_trivial_equal_blocks',
+     'cmt': _('Absorb trivial equal blocks\n'
+              'Opcode beautify pass (structure): merge the INSERT + '
+              'EQUAL(trivial) + DELETE pattern into a single REPLACE, and '
+              'absorb short trivial EQUAL blocks (at most 4 non-whitespace '
+              'characters: blank lines, lone braces) stranded between '
+              'large changed blocks into one REPLACE.\n'
+              'Diff engines can match a trivial line (an empty line, a '
+              'lone \'}\') across a change instead of a meaningful one; the '
+              'raw opcodes then show the same content as one added + one '
+              'deleted line instead of a paired change, or fragment one '
+              'big changed region into several pieces -- the fragments '
+              'read as several unrelated changes and can pair a line with '
+              'the wrong line of the other file.\n'
+              'Ported from VS Code\'s heuristicSequenceOptimizations (VS '
+              'Code runs the equivalent optimizations unconditionally '
+              'inside its own diff algorithm).\n'
+              '- When OFF (default): the engine\'s raw opcode stream is '
+              'rendered exactly as the engine produced it -- GNU '
+              'diffutils / WinMerge faithful.\n'
+              '- When ON: every algorithm\'s opcodes (the native engines '
+              'included) go through the pass, so switching algorithms '
+              'changes tie-breaking, not hunk structure.\n'
+              'Only EQUAL blocks with at most 4 non-whitespace characters '
+              'are ever absorbed -- matched real content is never merged '
+              'away. Suppressed blank-line differences ("Ignore blank '
+              'lines") are barriers and are never resurrected into a '
+              'shown change.\n'
+              'Applies to the side-by-side compare view only -- the '
+              'unified-diff commands always use the raw algorithms.\n'
               'Default: off.'),
      'def': False,
      'frm': 'bool',
@@ -1064,7 +1099,8 @@ OPTS_META = [
               'Enable profiling to trace where compare time is consumed.\n'
               'When enabled, prints a detailed timing report to the console '
               'after each compare, breaking down time spent in the diff '
-              'algorithm, opcode realignment, event generation, char-level '
+              'algorithm, the optional opcode beautify pass, event '
+              'generation, char-level '
               'diffing (native vs Python), and UI painting (bookmarks, '
               'decor, gaps, attributes). Use for debugging performance '
               'issues only -- adds small overhead (~1-2us per timing '
@@ -1257,7 +1293,9 @@ _OLD_OPT_NAMES = {
     # algorithm
     'differ.diff_algorithm': 'differ.algorithm.diff_algorithm',
     'differ.compare_with_details': 'differ.algorithm.compare_with_details',
-    'differ.beautify_alignment': 'differ.algorithm.beautify_alignment',
+    'differ.beautify_alignment': 'differ.algorithm.beautify.align_by_similarity',
+    'differ.algorithm.beautify_alignment':
+        'differ.algorithm.beautify.align_by_similarity',
     # advanced
     'differ.sync_scroll': 'differ.advanced.sync_scroll',
     'differ.enable_sync_caret': 'differ.advanced.enable_sync_caret',
@@ -1431,11 +1469,11 @@ class _CompareJob:
 def _is_fast_mode(diff):
     """True when the Differ is configured exactly as the slow-compare
     dialog's 'faster mode': the NATIVE engine running Native Myers with
-    Beautify alignment off (the toolbar preset 1 combination). A job
+    Align-by-similarity off (the toolbar preset 1 combination). A job
     started this way never arms the slow-compare watchdog."""
     return (isinstance(diff, dfn.Differ)
             and getattr(diff, 'diff_algorithm', '') == 'native_myers'
-            and not getattr(diff, 'beautify_alignment', False))
+            and not getattr(diff, 'align_by_similarity', False))
 
 
 class _TabSession:
@@ -3799,7 +3837,8 @@ class Command:
         (per compare tab -- each session owns its Differ, so an algorithm
         switch never disturbs another tab's records) so the Differ is
         always the right type before a compare runs. Preserves the
-        options (withdetail, beautify_alignment) but NOT the sequences:
+        options (withdetail, align_by_similarity,
+        absorb_trivial_equal_blocks) but NOT the sequences:
         neither Differ holds sequences between compares — both
         the native Differ (compare(a_text, b_text)) and the Python
         Differ (compare(lines_a, lines_b)) take their inputs as
@@ -3831,10 +3870,12 @@ class Command:
         # diffmap mid-swap sees either the old map or the new empty one,
         # both consistent states.
         old_withdetail = getattr(diff, 'withdetail', True)
-        old_beautify_alignment = getattr(diff, 'beautify_alignment', False)
+        old_align_by_similarity = getattr(diff, 'align_by_similarity', False)
+        old_absorb = getattr(diff, 'absorb_trivial_equal_blocks', False)
         diff = dfn.Differ() if want_native else dfp.Differ()
         diff.withdetail = old_withdetail
-        diff.beautify_alignment = old_beautify_alignment
+        diff.align_by_similarity = old_align_by_similarity
+        diff.absorb_trivial_equal_blocks = old_absorb
         diff.diff_algorithm = algo
         session.diff = diff
         # Fallback status is reported once in refresh_compare when the
@@ -3890,7 +3931,8 @@ class Command:
         state.
 
         With the PYTHON algorithms the same two-phase shape applies:
-        the engine (matcher + get_opcodes + realign) runs on a daemon
+        the engine (matcher + get_opcodes + the optional absorb pass)
+        runs on a daemon
         thread, a repeating poll timer marshals the finished opcodes
         back to the main thread (_on_python_diff_done), and the paint
         runs from the precomputed opcodes. Only when threads are
@@ -4184,11 +4226,16 @@ class Command:
                       '(configured: {})').format(
                         _algo, self.cfg.get('diff_algorithm', 'native_myers')))
             if getattr(session, 'fast_temp', False):
-                # Temporary fast mode: Beautify alignment off for this
+                # Temporary fast mode: Align-by-similarity off for this
                 # compare tab, regardless of the configured option.
-                diff.beautify_alignment = False
+                diff.align_by_similarity = False
             else:
-                diff.beautify_alignment = self.cfg.get('beautify_alignment')
+                diff.align_by_similarity = self.cfg.get(
+                    'align_by_similarity')
+            # Opcode beautify pass option -- follows the config in fast
+            # mode too (the pass is O(n), not a slow-compare risk).
+            diff.absorb_trivial_equal_blocks = self.cfg.get(
+                'absorb_trivial_equal_blocks')
             # Ignore options -> diff_proc DIFF_IGN_* bitmask for the
             # native algorithms (applies to BOTH the line-level diff and
             # the char-level details). The pure-Python Differ simply
@@ -4369,7 +4416,8 @@ class Command:
                 return
 
             # PYTHON-ALGORITHM compare: the engine (matcher +
-            # get_opcodes + realign -- minutes on big files for the slow
+            # get_opcodes + the optional absorb pass -- minutes on big
+            # files for the slow
             # matchers) runs on a daemon THREAD, and a repeating poll
             # timer on the main thread picks the finished opcodes up and
             # paints -- the exact two-phase shape of the native flow
@@ -6575,8 +6623,11 @@ class Command:
             'break_chars':
                 dfn.normalize_break_chars(
                     get_opt('algorithm.break_chars', dfn.DEFAULT_BREAK_CHARS)),
-            'beautify_alignment':
-                get_opt('algorithm.beautify_alignment', False),
+            'align_by_similarity':
+                get_opt('algorithm.beautify.align_by_similarity', False),
+            'absorb_trivial_equal_blocks':
+                get_opt('algorithm.beautify.absorb_trivial_equal_blocks',
+                        False),
             # --- ignore options (diff_proc DIFF_IGN_* flags; collected
             # into the bitmask for the native algorithms by
             # differ_native.build_ignore_flags -- see refresh_compare) ---
@@ -6873,7 +6924,7 @@ class Command:
         the current caret line, not the whole hunk: the caret must be ON a
         changed line of the hunk (a gap has no line to copy -- jumping to
         a one-sided difference puts the caret on the changed line). With
-        beautify_alignment the intra-hunk pairing can be anchored instead
+        align_by_similarity the intra-hunk pairing can be anchored instead
         of positional; the diffmap-based formula below is then the closest
         line-index approximation."""
         fc, eds = self.focused
