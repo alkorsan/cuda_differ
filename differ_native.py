@@ -84,6 +84,7 @@ to a thin wrapper around cudatext.diff_proc if God wills.
 
 import time
 from .py_algo.char_diff import char_diff
+from .py_algo.realign import realign_opcodes
 from .profiling import Profiler
 from .utils import split_lines_safe
 from collections import Counter
@@ -735,15 +736,26 @@ class Differ:
 
         Splits the two raw texts into line lists (cached on the Differ
         for the following replay pass -- compare() takes them over
-        instead of splitting again), then drives the EXACT pairing walk
-        the replay/paint pass will run later: every opcode of the
-        replace family goes through _replace_block_chunks ->
-        _positional_pairs_events / _find_best_pairs_events, whose
-        _char_diff calls RECORD their pairs (collect mode) instead of
-        touching the engine. The yielded event lists are drained and
-        discarded -- only the pair order matters, and it is identical
-        to the replay pass's request order because both passes run the
-        same code on the same inputs (the walk is deterministic).
+        instead of splitting again), REALIGNS the opcodes (the shared
+        py_algo/realign.py pass -- see the NOTE in compare_lists), then
+        drives the EXACT pairing walk the replay/paint pass will run
+        later: every opcode of the replace family goes through
+        _replace_block_chunks -> _positional_pairs_events /
+        _find_best_pairs_events, whose _char_diff calls RECORD their
+        pairs (collect mode) instead of touching the engine. The
+        yielded event lists are drained and discarded -- only the pair
+        order matters, and it is identical to the replay pass's request
+        order because both passes run the same code on the SAME
+        REALIGNED opcodes (the walk is deterministic).
+
+        The realignment mutates the CALLER's opcode list IN PLACE
+        (opcodes[:] = ...): _on_native_diff_done hands the SAME list
+        object to the char batch's callback (functools.partial) and to
+        the paint pass (_finish_native_compare), so every later phase
+        walks the realigned structure this pass recorded its pairs
+        against -- the collect/replay pairing invariant (char result k
+        answers the k-th recorded pair) REQUIRES both passes to see
+        identical opcodes.
 
         Returns the collected pairs as a list of (line_a, line_b)
         string tuples, in walk order. The caller (Command.
@@ -792,6 +804,26 @@ class Differ:
         self._lines_a = split_lines_safe(a_text)
         self._lines_b = split_lines_safe(b_text)
         Profiler.stop('compare:split_lines')
+
+        # Opcode realignment -- the SAME py_algo/realign.py pass the
+        # pure-Python engines' opcodes go through (see the NOTE in
+        # compare_lists for why the native engines need it). Runs
+        # here, once, on the engine's finished result: this pass's
+        # pair walk AND the replay pass's paint walk must both use the
+        # realigned structure (the char-ops pop order depends on it),
+        # and the line lists the trivial-content check reads were
+        # just split above -- no second split anywhere. In-place slice
+        # assignment so the caller's list object -- the one that
+        # travels to _on_char_diff_done / _finish_native_compare --
+        # BECOMES the realigned list. (The engine always delivers a
+        # plain Python list; the isinstance guard is belt-and-braces
+        # for any future caller passing a tuple.)
+        if not isinstance(opcodes, list):
+            opcodes = list(opcodes)
+        realigned = realign_opcodes(self._lines_a, opcodes)
+        if realigned is not opcodes:
+            opcodes[:] = realigned
+
         pairs = []
         aborted = False
         self._char_pairs_pending = pairs
@@ -935,17 +967,38 @@ class Differ:
                 ALIGN appends, never the pops), so the collect/replay
                 alignment invariant is unaffected.
 
-        NOTE: _realign_opcodes (the VS Code-style post-pass in
-        differ_python.py) is NOT applied to native opcodes. Native engines
-        CAN occasionally emit the INSERT+EQUAL(trivial)+DELETE pattern it
-        fixes (GNU diffutils Myers is not immune to the LCS tie-breaking
-        issue) — but the native path is deliberately algo-faithful: the
-        engine's hunks are rendered as-is, the way WinMerge / GNU
-        diffutils side-by-side output does, with no re-pairing. If the
-        misalignment artifact ever becomes a problem here, port
-        _realign_opcodes over — it operates on plain opcode lists and
-        transfers as-is (feed it the local a_lines for the trivial-EQUAL
-        content check).
+        NOTE: opcode realignment. The engine's finished opcodes go
+        through the shared py_algo/realign.py pass -- the SAME
+        normalization every pure-Python engine's opcodes go through in
+        differ_python.engine_opcodes (the VS Code
+        heuristicSequenceOptimizations equivalent: it merges
+        INSERT+EQUAL(trivial)+DELETE into one REPLACE and absorbs
+        trivial EQUAL blocks stranded inside large replace regions).
+        The native engines DO emit both patterns -- measured on the
+        plugin's _dev/__tests corpus: GNU-diffutils Myers 1x Pass-1 +
+        91x Pass-2, JGit Histogram 1+101, JGit Myers 3+62, i.e. MORE
+        Pass-2 fragmentation than the pure-Python engines -- so
+        without the pass, switching between native and Python
+        algorithms changes hunk structure, and the fragmented hunks
+        break positional pairing (a changed line pairs with the wrong
+        line of the other file). This is structure normalization, not
+        beautification: the beautify_alignment rendering option is a
+        different layer (intra-hunk pairing) and stays independent --
+        see py_algo/realign.py's module docstring.
+
+        WHERE it runs (exactly one place per flow, so no phase ever
+        sees different opcodes than the phases around it):
+        - two-phase background flow (withdetail on): inside
+          collect_char_pairs, right after its line split, BEFORE the
+          pair walk -- the collect pass and the paint replay MUST
+          walk identical opcodes (the char-ops pop order depends on
+          it), and the realigned list is mutated in place so the
+          callback and the paint pass receive it.
+        - synchronous engine run and background withdetail-off
+          delivery: in the fresh-split branch below, right after the
+          line split.
+        - the cached-lines replay branch skips it (collect already
+          realigned those opcodes).
         """
         # Benchmark: when _BENCHMARK is True, measure the total time from
         # when the generator starts executing until it is fully consumed
@@ -1026,8 +1079,12 @@ class Differ:
         # the kick-off -> callback wall time instead of the wait being
         # miscounted as refresh's own work.
 
-        # No _realign_opcodes call — the native path renders the engine's
-        # hunks faithfully (algo-faithful mode). See docstring for details.
+        # Opcode realignment happens in exactly ONE place per flow (see
+        # the NOTE in the docstring above): collect_char_pairs realigned
+        # the two-phase background flow's opcodes before recording the
+        # char pairs; the fresh-split branch below realigns the two
+        # remaining flows (synchronous engine run, and the background
+        # engine's withdetail-off delivery). Nothing runs here.
 
         # Build the line lists LOCALLY for painting — split_lines_safe is
         # O(N) per call, so we split once here and pass the lists to
@@ -1063,7 +1120,9 @@ class Differ:
         # refresh_compare under the SAME tag, so the row is comparable
         # across algorithms.
         if self._lines_a is not None:
-            # replay pass: cached by collect_char_pairs()
+            # replay pass: cached by collect_char_pairs() -- those
+            # opcodes were REALIGNED by the collect pass already (the
+            # collect/replay invariant), so no realign runs here.
             a_lines = self._lines_a
             self._lines_a = None
             b_lines = self._lines_b
@@ -1076,6 +1135,16 @@ class Differ:
             b_lines = split_lines_safe(b_text)
             del b_text
             Profiler.stop('compare:split_lines')
+
+            # Opcode realignment (see the docstring NOTE): this branch
+            # covers BOTH fresh-engine flows -- the synchronous engine
+            # run above (opcodes computed inside this generator) AND
+            # the background engine's withdetail-off delivery
+            # (opcodes precomputed, no collect pass ran, raw texts
+            # passed). The line lists the pass reads were just split;
+            # on a 1M-line compare the pass costs ~0.5s -- two cheap
+            # tuple sweeps, no engine call.
+            opcodes = realign_opcodes(a_lines, opcodes)
 
         # Event production for REPLACE blocks is instrumented per chunk
         # ('compare:positional_pairs' / 'compare:find_best_pairs' open

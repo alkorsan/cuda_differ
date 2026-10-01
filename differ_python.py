@@ -7,7 +7,11 @@ For native algorithms (native_histogram, native_myers), use
 differ_native.py instead — the native engine is 10-30x faster.
 
 Code is intentionally duplicated from differ_native.py to allow
-independent evolution of the native and Python codepaths.
+independent evolution of the native and Python codepaths. The ONE
+shared piece is py_algo/realign.py (opcode realignment): native and
+Python engines must produce the SAME hunk structure for the same tie-
+breaking artifacts, so the normalization lives in one module both
+differs import.
 
 Alignment modes (self.beautify_alignment):
   True  = 'beautified' alignment: similar lines inside a changed block are
@@ -17,6 +21,12 @@ Alignment modes (self.beautify_alignment):
           way WinMerge / diffutils side-by-side (sdiff) output does —
           positional top-down pairing, leftovers as plain add/delete.
           Nothing is re-paired, re-ordered or split. Default.
+
+Note that beautify_alignment is a RENDERING choice (how lines inside a
+replace block are paired) and is deliberately independent of the
+opcode realignment every engine's output goes through in
+engine_opcodes() — see py_algo/realign.py for why that pass is not a
+beautifier option.
 """
 
 import time
@@ -25,6 +35,7 @@ from .py_algo.myers_onp_diff import MyersSequenceMatcher, InlineMyersSequenceMat
 from .py_algo.patience_diff.patiencediff import PatienceSequenceMatcher
 from .py_algo.vscode_diff import VSCodeSequenceMatcher
 from .py_algo.char_diff import char_diff
+from .py_algo.realign import realign_opcodes
 from .profiling import Profiler
 from collections import Counter
 import cudatext as _ct
@@ -270,167 +281,10 @@ class Differ:
         # per-pair sections made the report lie on 1M-line files.
         return char_diff(line_a, line_b)
 
-    # Threshold for the "trivial equal block" check in _realign_opcodes.
-    # If the EQUAL block between an INSERT and a DELETE (or vice versa)
-    # has this many or fewer non-whitespace characters total, it is
-    # absorbed into a single REPLACE block. The value 4 matches VS Code's
-    # removeVeryShortMatchingLinesBetweenDiffs threshold.
-    _REALIGN_TRIVIAL_THRESHOLD = 4
-    # Minimum combined size for a REPLACE block to be considered "large
-    # enough" to absorb a short EQUAL block between it and the next
-    # REPLACE. Matches VS Code's
-    # removeVeryShortMatchingLinesBetweenDiffs threshold (line 350):
-    # before.seq1Range.length + before.seq2Range.length > 5
-    _REALIGN_MIN_LARGE_REPLACE = 6
-
-    def _realign_opcodes(self, a, opcodes):
-        """Post-process opcodes to match VS Code's alignment quality.
-
-        Two transformations (both ported from VS Code's
-        heuristicSequenceOptimizations.ts):
-
-        1. Merge INSERT+EQUAL(trivial)+DELETE (or DELETE+EQUAL(trivial)+
-           INSERT) into a single REPLACE. This fixes the LCS tie-breaking
-           issue where Myers matches a trivial line (empty, whitespace)
-           instead of a meaningful line, causing identical lines to show
-           as one added + one deleted instead of paired.
-
-        2. Absorb short EQUAL blocks (<= 4 non-whitespace chars) between
-           two REPLACE blocks into a single REPLACE, if at least one of
-           the REPLACE blocks is "large" (combined lines > 5). This is
-           VS Code's removeVeryShortMatchingLinesBetweenDiffs (line 325).
-           It prevents Myers from fragmenting a large REPLACE region into
-           multiple pieces by matching short trivial lines (like '\n' or
-           '}') inside it. Without this, A[272] in test_2a.py would be
-           in a separate REPLACE block from the lines around it, causing
-           positional pairing to misalign it with the wrong B line.
-
-        Both are no-ops for VS Code's own algorithm (it doesn't produce
-        these patterns) and for patience (same).
-        """
-        if len(opcodes) < 3:
-            return opcodes
-        result = list(opcodes)
-
-        # Pass 1: merge INSERT+EQUAL(trivial)+DELETE patterns
-        i = 1
-        while i < len(result) - 1:
-            prev = result[i - 1]
-            cur = result[i]
-            nxt = result[i + 1]
-            if (cur[0] == 'equal' and
-                    prev[0] in ('insert', 'delete') and
-                    nxt[0] in ('insert', 'delete') and
-                    prev[0] != nxt[0]):
-                _, ei1, ei2, ej1, ej2 = cur
-                equal_text = ''.join(a[ei1:ei2])
-                non_ws = equal_text.replace(' ', '').replace('\t', '')
-                non_ws = non_ws.replace('\n', '').replace('\r', '')
-                if len(non_ws) <= self._REALIGN_TRIVIAL_THRESHOLD:
-                    merged = ('replace',
-                              prev[1], nxt[2],
-                              prev[3], nxt[4])
-                    result[i - 1:i + 2] = [merged]
-                    if i > 1:
-                        i -= 1
-                    continue
-            i += 1
-
-        # Pass 2: absorb short EQUAL blocks between two non-EQUAL blocks
-        # (VS Code's removeVeryShortMatchingLinesBetweenDiffs, line 325).
-        # If a short EQUAL (<= 4 non-whitespace chars) sits between two
-        # non-EQUAL blocks and at least one of them is "large" (> 5
-        # combined lines), join the two non-EQUAL blocks into one REPLACE,
-        # absorbing the EQUAL. Iterate until no more changes (VS Code
-        # repeats up to 10 times).
-        changed = True
-        iterations = 0
-        while changed and iterations < 10:
-            changed = False
-            iterations += 1
-            i = 1
-            while i < len(result) - 1:
-                prev = result[i - 1]
-                cur = result[i]
-                nxt = result[i + 1]
-                if (cur[0] == 'equal' and
-                        prev[0] != 'equal' and
-                        nxt[0] != 'equal'):
-                    _, ei1, ei2, ej1, ej2 = cur
-                    equal_text = ''.join(a[ei1:ei2])
-                    non_ws = equal_text.replace(' ', '').replace('\t', '')
-                    non_ws = non_ws.replace('\n', '').replace('\r', '')
-                    if len(non_ws) <= self._REALIGN_TRIVIAL_THRESHOLD:
-                        prev_size = (prev[2] - prev[1]) + (prev[4] - prev[3])
-                        nxt_size = (nxt[2] - nxt[1]) + (nxt[4] - nxt[3])
-                        if prev_size > 5 or nxt_size > 5:
-                            # Join prev and nxt into one REPLACE,
-                            # absorbing the EQUAL
-                            merged = ('replace',
-                                      prev[1], nxt[2],
-                                      prev[3], nxt[4])
-                            result[i - 1:i + 2] = [merged]
-                            changed = True
-                            if i > 1:
-                                i -= 1
-                            continue
-                i += 1
-
-        """
-        # Pass 3: absorb trivial lines from the edges of an EQUAL block
-        # that sits between a REPLACE and the next non-EQUAL block.
-        # In difflib opcodes, an EQUAL block can contain multiple lines,
-        # some trivial (e.g. '}', '\n') and some meaningful (e.g.
-        # 'self._save_state(state)'). VS Code's algorithm works on
-        # changed regions only, so it treats the gap as one unit and
-        # absorbs it if the total non-ws is <= 4. We need to be smarter:
-        # split the EQUAL block and absorb only the trivial prefix/suffix
-        # lines, keeping the meaningful middle as EQUAL.
-        #
-        # Example: EQUAL = ['}', 'self._save_state(state)']
-        #   non_ws = '}self._save_state(state)' = 25 chars (> 4, not trivial)
-        #   But the first line '}' is trivial (1 non-ws char).
-        #   We split into: absorb '}' into prev REPLACE, keep
-        #   'self._save_state(state)' as EQUAL.
-        i = 1
-        while i < len(result):
-            prev = result[i - 1]
-            cur = result[i]
-            if cur[0] == 'equal' and prev[0] == 'replace':
-                _, ei1, ei2, ej1, ej2 = cur
-                prev_size = (prev[2] - prev[1]) + (prev[4] - prev[3])
-                if prev_size <= 5:
-                    i += 1
-                    continue
-                # Check if the first line of the EQUAL block is trivial
-                if ei2 - ei1 == 0:
-                    i += 1
-                    continue
-                first_line = a[ei1]
-                first_non_ws = first_line.replace(' ', '').replace('\t', '')
-                first_non_ws = first_non_ws.replace('\n', '').replace('\r', '')
-                if len(first_non_ws) == 0:
-                    # Only absorb truly trivial lines (empty or
-                    # whitespace-only). Don't absorb short words like
-                    # 'end' (3 non-ws chars) -- those are meaningful
-                    # matches that should stay as EQUAL.
-                    merged = ('replace',
-                              prev[1], ei1 + 1,
-                              prev[3], ej1 + 1)
-                    remaining = ('equal', ei1 + 1, ei2, ej1 + 1, ej2)
-                    result[i - 1:i + 1] = [merged, remaining]
-                    # Don't advance i -- the remaining EQUAL might have
-                    # more trivial lines to absorb
-                    continue
-            i += 1
-
-        """
-        return result
-
     def engine_opcodes(self, a, b):
         """Run ONLY the Python diff engine on the two line sequences and
         return the final opcode list: matcher construction + get_opcodes
-        + the _realign_opcodes post-pass -- everything compare() does
+        + the realign_opcodes post-pass -- everything compare() does
         before its event walk starts.
 
         This is the BACKGROUND-THREAD half of a Python compare (see
@@ -474,22 +328,32 @@ class Differ:
         # matcher state holding the peak up unnecessarily.
         del diff
 
-        # _realign_opcodes fixes LCS tie-breaking issues where Myers
-        # matches trivial lines (empty, whitespace) instead of meaningful
-        # ones. This is needed for Python Myers/difflib (which produce
-        # INSERT+EQUAL(trivial)+DELETE patterns). The line list `a` is
-        # passed in so _realign_opcodes can read the EQUAL block's text
-        # without storing it on the instance.
-        return self._realign_opcodes(a, opcodes)
+        # Opcode realignment (the shared py_algo/realign.py pass --
+        # the VS Code heuristicSequenceOptimizations equivalent):
+        # fixes LCS tie-breaking issues where an engine matches a
+        # trivial line (empty, whitespace, lone brace) instead of a
+        # meaningful one, emitting INSERT+EQUAL(trivial)+DELETE, and
+        # merges replace regions fragmented by matched trivial lines.
+        # Measured on the _dev/__tests corpus, EVERY pure-Python engine
+        # emits these patterns (difflib 2xP1+22xP2, myers 1+61, hybrid
+        # 1+3, patience 1+3 -- the old comment claiming patience was
+        # immune was wrong -- and even vscode's DP path emits Pass-1
+        # patterns on crafted small inputs), so no engine is exempt.
+        # The native engines go through the SAME pass -- see
+        # differ_native.collect_char_pairs / compare_lists. The line
+        # list `a` is passed so the pass can read the EQUAL blocks'
+        # text without storing it on the instance.
+        return realign_opcodes(a, opcodes)
 
     def compare(self, a, b, opcodes=None):
         """Generator that yields diff events for side-by-side display.
 
         Runs the selected Python diff algorithm on the two line
-        sequences, applies _realign_opcodes to fix LCS tie-breaking
-        issues, then walks the opcodes and yields events (A_LINE_DEL,
-        B_LINE_ADD, A_GAP, B_GAP, ALIGN, A_SYMBOL_DEL, etc.) that
-        __init__.py consumes to paint the compare view.
+        sequences, applies realign_opcodes (the shared VS Code-style
+        structure normalization -- see py_algo/realign.py) to fix LCS
+        tie-breaking issues, then walks the opcodes and yields events
+        (A_LINE_DEL, B_LINE_ADD, A_GAP, B_GAP, ALIGN, A_SYMBOL_DEL,
+        etc.) that __init__.py consumes to paint the compare view.
 
         The alignment mode (beautify_alignment) only affects how
         unequal-count REPLACE blocks are laid out — see
@@ -533,7 +397,8 @@ class Differ:
         # booked into the generator's section -- the flaw that made the
         # old report show replace_block:positional_pair as a fake giant
         # bottleneck. Only sections that close before a yield remain
-        # (compare:algorithm, compare:realign_opcodes, per-chunk
+        # (compare:algorithm -- which folds the realign pass on the
+        # legacy synchronous path -- and the per-chunk
         # compare:positional_pairs / compare:find_best_pairs).
 
         self.diffmap = []

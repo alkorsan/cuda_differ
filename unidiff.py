@@ -83,6 +83,7 @@ import cudatext as ct
 
 from . import differ_native as dfn
 from . import differ_python as dfp
+from .py_algo.realign import realign_opcodes
 from .utils import split_lines_safe
 from cudax_lib import get_translation
 _ = get_translation(__file__)  # I18N
@@ -306,7 +307,7 @@ def _py_opcodes(algo, a, b):
     line lists and return its opcodes.
 
     The SAME entry point the side-by-side compare's background thread
-    runs (matcher construction + get_opcodes + the _realign_opcodes
+    runs (matcher construction + get_opcodes + the realign_opcodes
     post-pass), so the unified diff shows exactly the hunk structure
     the compare view paints for the configured algorithm.
     """
@@ -514,7 +515,10 @@ class UnidiffRunner:
                     None, job.txt0, job.txt1,
                     algo=dfn.algo_id(job.algo),
                     flags=dfn.DIFF_IGN_NONE)
-                job.opcodes = matcher.get_opcodes()
+                # Same realign as the async native path -- see
+                # _on_native_done.
+                job.opcodes = realign_opcodes(
+                    job.a, matcher.get_opcodes())
             except Exception as ex:
                 job.error = ex
             self._on_finish(job)
@@ -551,7 +555,16 @@ class UnidiffRunner:
         if opcodes is None:
             job.error = RuntimeError('diff_proc returned None')
         else:
-            job.opcodes = opcodes
+            # Opcode realignment (the shared py_algo/realign.py pass):
+            # the native engines emit the same INSERT+EQUAL(trivial)+
+            # DELETE / fragmented-replace patterns the pure-Python
+            # engines emit, and the Python path above already realigns
+            # (inside engine_opcodes) -- without this the unified diff
+            # would show a DIFFERENT hunk structure than the compare
+            # view paints for the same native algorithm. job.a was
+            # split at kick-off (overlapping the engine's run), so the
+            # pass reads it without another split.
+            job.opcodes = realign_opcodes(job.a, opcodes)
         self._on_finish(job)
 
     # -- Python path (pure-Python engines + the 'difflib' choice) ------
