@@ -46,16 +46,43 @@ _ = get_translation(__file__)  # I18N
 # Command._create_differ below.
 df = dfn
 
-DIFF_TAG = 148
+# --- Cross-plugin namespace isolation (vs the original cuda_differ) --
+# This plugin runs side by side with the original cuda_differ in the
+# same CudaText, and CudaText has TWO pieces of state a plugin cannot
+# privately own:
+#
+# 1) BOOKMARK KIND COLORS. AppBookmarkSetup[1..63] is ONE app-global
+#    array: bookmark(BOOKMARK_SETUP, nkind, ncolor) overwrites the
+#    color of that kind for the WHOLE app, and ATSynEdit resolves the
+#    background color of every line carrying a bookmark2 through it
+#    (EditorOnCalcBookmarkColor -> AppBookmarkSetup[kind].Color).
+#    The original cuda_differ registers kinds 24/25/26 with ITS theme
+#    colors on every compare it runs. Sharing those kind numbers made
+#    the two plugins fight over the same global slots: a fork compare
+#    run after an original compare painted the ORIGINAL's colors,
+#    because the fork's config cache (file mtime / theme names) had no
+#    reason to re-run its own BOOKMARK_SETUP calls. Kinds are clamped
+#    by CudaText to 1..63; we take the top of the range, far from the
+#    small numbers plugins usually pick. The colors are additionally
+#    re-applied before every compare (Command.config ->
+#    _register_bookmark_kinds), so even a future kind collision with
+#    yet another plugin is self-healing on the next compare.
+NKIND_DELETED = 61
+NKIND_ADDED = 62
+NKIND_CHANGED = 63
+# 2) EDITOR TAGS (attr markers / gaps / decor / bookmark2 'tag').
+#    Tags live per editor, but both differs can paint the same editor
+#    (e.g. comparing a tab the original plugin compared earlier): with
+#    one shared tag value each plugin's clear-by-tag wiped the other's
+#    marks. Tags are plain ints -- a high, distinctive pair the
+#    original's 148/149 can never collide with.
+DIFF_TAG = 4082
 # Gap tag for ignored-difference gaps (DIFF_IGN_BLANK_LINES suppressed
 # hunks). Separate from DIFF_TAG so the compensating gaps WinMerge-style
 # "ignored differences" insert are identifiable (and deletable) on
 # their own — they are also painted with the ignored color instead of
 # the regular gap color.
-IGN_GAP_TAG = 149
-NKIND_DELETED = 24
-NKIND_ADDED = 25
-NKIND_CHANGED = 26
+IGN_GAP_TAG = 4083
 GAP_WIDTH = 5000
 DEFAULT_SYNC_SCROLL = '1'
 U_PREFIX = 'untitled:'
@@ -1513,6 +1540,10 @@ class Command:
     def __init__(self):
         self.scroll = ScrollSplittedTab(__name__)
         self.cfg = self.get_config()
+        # Register our (namespaced) bookmark kinds with the loaded
+        # colors; config() re-applies them before every compare -- see
+        # the constants block above for why this is never cached.
+        self._register_bookmark_kinds()
         # Subscribe to the on_key event when keyboard capture is enabled
         # (runtime subscription -- install.inf no longer lists on_key).
         self._sync_on_key_subscription()
@@ -6445,22 +6476,53 @@ class Command:
 
     def config(self):
         """Reload config from disk if the JSON file or a theme has changed.
-        Caches the result in self.cfg to avoid repeated disk reads."""
+        Caches the result in self.cfg to avoid repeated disk reads.
+
+        ALWAYS re-registers the bookmark kinds afterwards (three cheap
+        BOOKMARK_SETUP calls): AppBookmarkSetup[] is app-global shared
+        state, and the cache key (file mtime / theme names) cannot see
+        foreign plugins rewriting our kind slots between two of our
+        compares. Skipping the re-registration on a cache hit was the
+        bug that made a fork compare run after an original compare
+        paint the original's colors."""
         opt_time = os.path.getmtime(JSONPATH) if os.path.exists(JSONPATH) else 0
         theme_name = ct.app_proc(ct.PROC_THEME_SYNTAX_GET, '')
         ui_theme_name = _ui_theme_name()
-        if self.cfg.get('opt_time') == opt_time and \
-           self.cfg.get('theme_name') == theme_name and \
-           self.cfg.get('ui_theme_name') == ui_theme_name:
-            return
-        self.cfg = self.get_config()
-        # Keep the runtime on_key subscription in step with the (possibly
-        # changed) enable_keyboard_capture setting -- takes effect at
-        # once, without a restart.
-        self._sync_on_key_subscription()
-        # (No menu re-sync needed anymore: the diff-tab context menu is
-        # rebuilt from the settings file by tabmenu_init on every
-        # right-click, so it always mirrors the current values.)
+        if self.cfg.get('opt_time') != opt_time or \
+           self.cfg.get('theme_name') != theme_name or \
+           self.cfg.get('ui_theme_name') != ui_theme_name:
+            self.cfg = self.get_config()
+            # Keep the runtime on_key subscription in step with the
+            # (possibly changed) enable_keyboard_capture setting --
+            # takes effect at once, without a restart.
+            self._sync_on_key_subscription()
+            # (No menu re-sync needed anymore: the diff-tab context menu
+            # is rebuilt from the settings file by tabmenu_init on every
+            # right-click, so it always mirrors the current values.)
+        # AppBookmarkSetup[kind] may have been overwritten by another
+        # plugin since our last call -- unconditionally re-apply OUR
+        # colors so the kinds always match self.cfg.
+        self._register_bookmark_kinds()
+
+    def _register_bookmark_kinds(self):
+        """(Re)register the plugin's bookmark kinds with self.cfg's colors.
+
+        bookmark(BOOKMARK_SETUP) writes the app-global
+        AppBookmarkSetup[kind] slots, and CudaText resolves the
+        background color of every bookmarked line through those slots:
+        they must match OUR config before any compare paints. Cheap
+        (three API calls) and idempotent; called from __init__ and
+        every config() (compares, refreshes, options dialog, theme
+        switches, tab menu)."""
+        for kind, color in (
+                (NKIND_DELETED, self.cfg.get('color_deleted')),
+                (NKIND_ADDED, self.cfg.get('color_added')),
+                (NKIND_CHANGED, self.cfg.get('color_changed')),
+                ):
+            ct.ed.bookmark(ct.BOOKMARK_SETUP, 0,
+                           nkind=kind,
+                           ncolor=color,
+                           text='')
 
     def _apply_scrollbar_visibility(self, session, a_ed, b_ed, hide):
         """Hide or restore the built-in vertical scrollbars of a compare
@@ -6526,15 +6588,11 @@ class Command:
     @staticmethod
     def get_config():
         """Read all differ2.* options from JSON + current theme, and return
-        a config dict. Also registers bookmark kinds (NKIND_*) with their
-        colors so CudaText can render them."""
-
-        def new_nkind(val, color):
-            ct.ed.bookmark(ct.BOOKMARK_SETUP, 0,
-                           nkind=val,
-                           ncolor=color,
-                           text=''
-                           )
+        a config dict. (Bookmark kinds are NOT registered here -- that
+        moved to Command._register_bookmark_kinds, which runs on every
+        config() call, not only on config cache misses: the kinds live
+        in the app-global AppBookmarkSetup[] that foreign plugins can
+        rewrite at any time.)"""
 
         def get_theme():
             """Resolve the six compare colors from the 'color_theme'
@@ -6658,10 +6716,6 @@ class Command:
             'show_btn_text':
                 get_opt('toolbar.show_btn_text', True),
         }
-
-        new_nkind(NKIND_DELETED, config.get('color_deleted'))
-        new_nkind(NKIND_ADDED, config.get('color_added'))
-        new_nkind(NKIND_CHANGED, config.get('color_changed'))
 
         return config
 
