@@ -24,7 +24,7 @@ Why this exists instead of using difflib or patience:
   1. difflib's SequenceMatcher uses the Ratcliff/Obershelp algorithm
      which, without VS Code's equality scoring and consecutive-diagonal
      bonus, can produce suboptimal alignment on files with many similar
-     or duplicated lines. (Note: the differ plugin always passes
+     or duplicated lines. (Note: Differ 2 always passes
      autojunk=False to difflib, so the autojunk 'popular line' heuristic
      is not the issue here -- the issue is the underlying algorithm
      itself.)
@@ -46,7 +46,7 @@ difflib.SequenceMatcher: it exposes get_opcodes() returning the same
 list of (tag, i1, i2, j1, j2) tuples.
 
 Performance:
-  - DP is O(M*N) in time and space. For the differ plugin's typical
+  - DP is O(M*N) in time and space. For Differ 2's typical
     use case (comparing two source files), M+N < 1700 so DP is used
     and takes a few milliseconds.
   - Myers is O(N*D) where D is the number of differences. It is used
@@ -854,7 +854,7 @@ def _report_whitespace_only_changes(
     AFTER the heuristic optimizations and emits a one-line-by-one-line
     diff for each aligned pair whose ORIGINAL (untrimmed) lines
     differ; VS Code refines those at char level right away, while here
-    the plain line diff is what the consumer sees (the differ plugin
+    the plain line diff is what the consumer sees (Differ 2
     computes its own char-level details for replaced lines).
 
     In an equal region the two sequences advance in lockstep (the

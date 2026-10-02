@@ -1,4 +1,4 @@
-"""Utility helpers shared across the Differ plugin modules.
+"""Utility helpers shared across the Differ 2 plugin modules.
 
 This module exists so that `differ_native.py` and `differ_python.py` can
 import common helpers at the top of the file (no lazy imports, no

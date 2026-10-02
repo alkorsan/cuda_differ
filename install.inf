@@ -1,9 +1,9 @@
 [info]
-title=Differ
+title=Differ 2
 desc=Plugin to compare two files and show compare results side by side
 type=cudatext-plugin
-subdir=cuda_differ
-homepage=https://github.com/CudaText-addons/cuda_differ
+subdir=cuda_differ2
+homepage=https://github.com/badrelmers/cuda_differ2
 api=1.0.483
 
 
@@ -13,138 +13,138 @@ events=on_state~,on_state_ed~,on_caret~,on_change~,on_change_slow~,on_tab_menu,o
 
 [item2]
 section=commands
-caption=Differ\Compare current document with file...
+caption=Differ 2\Compare current document with file...
 method=compare_with
 
 [item3]
 section=commands
-caption=Differ\Compare current document with tab...
+caption=Differ 2\Compare current document with tab...
 method=compare_with_tab
 
 [item4]
 section=commands
-caption=Differ\Compare current document with next tab
+caption=Differ 2\Compare current document with next tab
 method=compare_with_next_tab
 
 [item5]
 section=commands
-caption=Differ\Compare clipboard to selection
+caption=Differ 2\Compare clipboard to selection
 method=compare_clip_sel
 
 [item6]
 section=commands
-caption=Differ\-
+caption=Differ 2\-
 method=_
 
 [item7]
 section=commands
-caption=Differ\Diff current document with file...
+caption=Differ 2\Diff current document with file...
 method=diff_with
 
 [item8]
 section=commands
-caption=Differ\Diff current document with tab...
+caption=Differ 2\Diff current document with tab...
 method=diff_with_tab
 
 [item9]
 section=commands
-caption=Differ\-
+caption=Differ 2\-
 method=_
 
 [item10]
 section=commands
-caption=Differ\Recompare
+caption=Differ 2\Recompare
 method=refresh_compare
 
 [item11]
 section=commands
-caption=Differ\Cancel compare
+caption=Differ 2\Cancel compare
 method=cancel_compare
 
 [item12]
 section=commands
-caption=Differ\Cancel all compares
+caption=Differ 2\Cancel all compares
 method=cancel_all_compares
 
 [item13]
 section=commands
-caption=Differ\Resize editors to equal width
+caption=Differ 2\Resize editors to equal width
 method=resize_equal_width
 
 
 
 [item14]
 section=commands
-caption=Differ\Focus the opposite file
+caption=Differ 2\Focus the opposite file
 method=set_focus_to_opposite_panel
 
 [item15]
 section=commands
-caption=Differ\Swap compared editors
+caption=Differ 2\Swap compared editors
 method=swap_view
 
 [item16]
 section=commands
-caption=Differ\-
+caption=Differ 2\-
 method=_
 
 [item17]
 section=commands
-caption=Differ\Select current difference
+caption=Differ 2\Select current difference
 method=select_current
 
 [item18]
 section=commands
-caption=Differ\Select all differences
+caption=Differ 2\Select all differences
 method=select_all_diff
 
 [item19]
 section=commands
-caption=Differ\-
+caption=Differ 2\-
 method=_
 
 [item20]
 section=commands
-caption=Differ\Jump to next difference
+caption=Differ 2\Jump to next difference
 method=jump_next
 
 [item21]
 section=commands
-caption=Differ\Jump to previous difference
+caption=Differ 2\Jump to previous difference
 method=jump_prev
 
 [item22]
 section=commands
-caption=Differ\-
+caption=Differ 2\-
 method=_
 
 [item23]
 section=commands
-caption=Differ\Copy current difference to the right
+caption=Differ 2\Copy current difference to the right
 method=copy_right
 
 [item24]
 section=commands
-caption=Differ\Copy current difference to the left
+caption=Differ 2\Copy current difference to the left
 method=copy_left
 
 [item25]
 section=commands
-caption=Differ\Copy current line to the right
+caption=Differ 2\Copy current line to the right
 method=copy_line_right
 
 [item26]
 section=commands
-caption=Differ\Copy current line to the left
+caption=Differ 2\Copy current line to the left
 method=copy_line_left
 
 [item27]
 section=commands
-caption=Differ\-
+caption=Differ 2\-
 method=_
 
 [item28]
 section=commands
-caption=Differ\Config...
+caption=Differ 2\Config...
 method=change_config
 menu=o

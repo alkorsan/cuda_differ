@@ -1,4 +1,4 @@
-"""Image-based overview panel for the Differ plugin.
+"""Image-based overview panel for the Differ 2 plugin.
 
 Replaces the micromap with a custom image control docked to the right side
 of the editor's parent form (PROP_HANDLE_PARENT). Unlike the micromap, the
@@ -15,7 +15,8 @@ Architecture:
     CudaText author added a grouping panel-control for EdFirst/EdSecond/
     Splitter, so they now are parented by that additional panel.
     PROP_HANDLE_PARENT now returns that stable grouping panel and is the
-    recommended docking target. See:
+    recommended docking target. See the upstream Differ plugin's issue
+    that motivated the CudaText change:
     https://github.com/CudaText-addons/cuda_differ/issues/29)
   - The 'image' control has an embedded bitmap that handles resize/minimize/
     restore automatically — no need for on_act/on_resize/on_show handlers.
@@ -294,7 +295,8 @@ Architecture:
     mirror would re-write the lagging half and force a synchronous
     EDACTION_UPDATE full repaint of it.
 
-  See: https://github.com/CudaText-addons/cuda_differ/issues/29
+  See the upstream Differ plugin's issue that motivated the CudaText
+  change: https://github.com/CudaText-addons/cuda_differ/issues/29
 """
 
 import threading
@@ -1864,7 +1866,7 @@ class PaintboxOverview:
         try:
             self._worker = threading.Thread(
                 target=self._worker_loop,
-                name='cuda_differ_overview',
+                name='cuda_differ2_overview',
                 daemon=True)
             self._worker.start()
         except Exception:

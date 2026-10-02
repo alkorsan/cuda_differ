@@ -1,7 +1,6 @@
 import functools
 import gc
 import os
-import re
 import json
 import threading
 import time
@@ -42,7 +41,7 @@ _ = get_translation(__file__)  # I18N
 
 # df is used as a namespace for event constants (A_LINE_DEL, B_LINE_ADD, etc.).
 # Both differ_native and differ_python define identical constants, so we alias
-# df to differ_native for backwards-compatible constant access. The Differ
+# df to differ_native for shared constant access. The Differ
 # class itself is chosen at runtime based on the configured algorithm — see
 # Command._create_differ below.
 df = dfn
@@ -403,9 +402,9 @@ _HOTKEY_KEY_FILTER = ','.join(str(k) for k in sorted(_HOTKEYS))
 LOCK_EDITORS_WHILE_COMPARING = True
 EDITOR_LOCK_DELAY_MS = 5000
 
-PLG_NAME = _('Differ')
-METAJSONFILE = os.path.dirname(__file__) + os.sep + 'differ_opts.json'
-JSONFILE = 'cuda_differ.json'  # To store in settings/cuda_differ.json
+PLG_NAME = _('Differ 2')
+METAJSONFILE = os.path.dirname(__file__) + os.sep + 'differ2_opts.json'
+JSONFILE = 'cuda_differ2.json'  # To store in settings/cuda_differ2.json
 JSONPATH = ct.app_path(ct.APP_DIR_SETTINGS) + os.sep + JSONFILE
 
 # Editor properties copied from an original tab to its compare half
@@ -424,9 +423,9 @@ _PROPS_TO_COPY = [
 # Option metadata for the config dialog (Options Editor). Chapters ('chp')
 # group the options in the dialog tree; the order below is the display order:
 # theme -> algorithm -> advanced -> micromap. Every option name carries its
-# category, so 'differ.X' became 'differ.<category>.X'. Note that
+# category ('differ2.<category>.<name>'). Note that
 # cudax_lib.get_opt()/set_opt() only treat '/' as a nested-path separator --
-# dotted names are stored as flat keys in settings/cuda_differ.json, so the
+# dotted names are stored as flat keys in settings/cuda_differ2.json, so the
 # category is purely a grouping/naming convention.
 # --- diff_algorithm dropdown ------------------------------------------------
 # Method 1 (used here): value/label pairs via 'str2s' + 'dct'.
@@ -440,7 +439,7 @@ _PROPS_TO_COPY = [
 # 'strs' + 'lst'. The combobox is populated straight from 'lst'; on save
 # the raw string itself is stored. Minimal, no separate labels.
 #
-#     {'opt': 'differ.diff_algorithm',
+#     {'opt': 'differ2.diff_algorithm',
 #      'cmt': _('Diff algorithm to use. Patience anchors on unique matching '
 #               'lines and often produces more human-readable diffs when '
 #               'blocks of code are moved; difflib is Python\'s stdlib '
@@ -451,11 +450,11 @@ _PROPS_TO_COPY = [
 #      'chp': 'config',
 #      },
 # ----------------------------------------------------------------------------
-# Compare-color themes (option 'differ.theme.color_theme'):
+# Compare-color themes (option 'differ2.theme.color_theme'):
 #   auto   detect the light family of the current UI theme and use its
 #          preset (the default)
 #   white/black/grey   use that family's preset unconditionally
-#   custom   use the six differ.theme.*_color options; empty slots are
+#   custom   use the six differ2.theme.*_color options; empty slots are
 #          filled from the auto-detected preset
 # ----------------------------------------------------------------------------
 # UI-theme name -> light family the preset colors are tuned for ('' is
@@ -609,7 +608,7 @@ def _preset_colors(theme_type):
 # ----------------------------------------------------------------------------
 OPTS_META = [
     # --- chapter "theme": colors used to paint the compare view ----------
-    {'opt': 'differ.theme.color_theme',
+    {'opt': 'differ2.theme.color_theme',
      'cmt': _('Color theme\n'
               'Which compare colors to use. The six color options below '
               'only apply in the "Custom" mode.\n'
@@ -633,7 +632,7 @@ OPTS_META = [
              ('custom', _('Custom (use the color options below)'))],
      'chp': 'theme',
      },
-    {'opt': 'differ.theme.changed_color',
+    {'opt': 'differ2.theme.changed_color',
      'cmt': _('Color of changed lines\n'
               'Background color for lines that were modified (replaced with '
               'different content).\n'
@@ -646,7 +645,7 @@ OPTS_META = [
      'frm': '#rgb-e',
      'chp': 'theme',
      },
-    {'opt': 'differ.theme.added_color',
+    {'opt': 'differ2.theme.added_color',
      'cmt': _('Color of added lines\n'
               'Background color for lines that exist only in the right file '
               '(added).\n'
@@ -659,7 +658,7 @@ OPTS_META = [
      'frm': '#rgb-e',
      'chp': 'theme',
      },
-    {'opt': 'differ.theme.deleted_color',
+    {'opt': 'differ2.theme.deleted_color',
      'cmt': _('Color of deleted lines\n'
               'Background color for lines that exist only in the left file '
               '(removed).\n'
@@ -672,7 +671,7 @@ OPTS_META = [
      'frm': '#rgb-e',
      'chp': 'theme',
      },
-    {'opt': 'differ.theme.gap_color',
+    {'opt': 'differ2.theme.gap_color',
      'cmt': _('Color of inter-line gap background\n'
               'Background color for the blank gap inserted to keep the two '
               'sides visually aligned when one side has fewer lines.\n'
@@ -683,7 +682,7 @@ OPTS_META = [
      'frm': '#rgb-e',
      'chp': 'theme',
      },
-    {'opt': 'differ.theme.ignored_color',
+    {'opt': 'differ2.theme.ignored_color',
      'cmt': _('Color of ignored differences\n'
               'Background color for lines whose difference is suppressed '
               'by the "Ignore blank lines" option (WinMerge-style '
@@ -697,7 +696,7 @@ OPTS_META = [
      'frm': '#rgb-e',
      'chp': 'theme',
      },
-    {'opt': 'differ.theme.ignored_gap_color',
+    {'opt': 'differ2.theme.ignored_gap_color',
      'cmt': _('Color of ignored difference gaps\n'
               'Background color for the compensating inter-line gap '
               'inserted next to a suppressed blank-line difference '
@@ -716,7 +715,7 @@ OPTS_META = [
      },
     # --- chapter "algorithm": which diff engine runs and how the result
     # is rendered ----------------------------------------------------------
-    {'opt': 'differ.algorithm.diff_algorithm',
+    {'opt': 'differ2.algorithm.diff_algorithm',
      'cmt': _('Diff algorithm\n'
               'Selects the diff algorithm used by the side-by-side compare '
               'and by the unified-diff commands ("Diff current document '
@@ -790,7 +789,7 @@ OPTS_META = [
              ('difflib',          _('Python difflib stdlib'))],
      'chp': 'algorithm',
      },
-    {'opt': 'differ.algorithm.compare_with_details',
+    {'opt': 'differ2.algorithm.compare_with_details',
      'cmt': _('Detailed comparison\n'
               'When enabled, modified lines are compared character-by-character, '
               'highlighting specific differences within the line. This uses a ported '
@@ -803,7 +802,7 @@ OPTS_META = [
      'frm': 'bool',
      'chp': 'algorithm',
      },
-    {'opt': 'differ.algorithm.break_chars',
+    {'opt': 'differ2.algorithm.break_chars',
      'cmt': _('Word-break characters\n'
               'Characters that split words for the character-level '
               'highlights inside modified lines (the word tokenizer of '
@@ -861,7 +860,7 @@ OPTS_META = [
      'chp': 'algorithm',
      'native_only': True,
      },
-    {'opt': 'differ.algorithm.beautify.align_by_similarity',
+    {'opt': 'differ2.algorithm.beautify.align_by_similarity',
      'cmt': _('Align by similarity\n'
               'Beautify line alignment inside REPLACE blocks where the two '
               'sides have DIFFERENT line counts.\n'
@@ -891,7 +890,7 @@ OPTS_META = [
      'frm': 'bool',
      'chp': 'algorithm',
      },
-    {'opt': 'differ.algorithm.beautify.absorb_trivial_equal_blocks',
+    {'opt': 'differ2.algorithm.beautify.absorb_trivial_equal_blocks',
      'cmt': _('Absorb trivial equal blocks\n'
               'Opcode beautify pass (structure): merge the INSERT + '
               'EQUAL(trivial) + DELETE pattern into a single REPLACE, and '
@@ -929,7 +928,7 @@ OPTS_META = [
     # --- chapter "ignoreopt": comparison ignore options (the diff_proc
     # DIFF_IGN_* flags of the native engines; also exposed as checkable
     # items in the diff-tab right-click context menu, below 'Recompare') ---
-    {'opt': 'differ.ignoreopt.ignore_case',
+    {'opt': 'differ2.ignoreopt.ignore_case',
      'cmt': _('Ignore case\n'
               'Case-insensitive comparison for the native diff algorithms '
               '(Native Histogram / Native Myers).\n'
@@ -949,7 +948,7 @@ OPTS_META = [
      'frm': 'bool',
      'chp': 'ignoreopt',
      },
-    {'opt': 'differ.ignoreopt.ignore_whitespace',
+    {'opt': 'differ2.ignoreopt.ignore_whitespace',
      'cmt': _('Ignore whitespace\n'
               'All whitespace ignored by the native diff algorithms '
               '(Native Histogram / Native Myers).\n'
@@ -967,7 +966,7 @@ OPTS_META = [
      'frm': 'bool',
      'chp': 'ignoreopt',
      },
-    {'opt': 'differ.ignoreopt.ignore_blank_lines',
+    {'opt': 'differ2.ignoreopt.ignore_blank_lines',
      'cmt': _('Ignore blank lines\n'
               'Changes that only insert or delete blank lines are ignored '
               'by the native diff algorithms (Native Histogram / Native '
@@ -998,7 +997,7 @@ OPTS_META = [
      'frm': 'bool',
      'chp': 'ignoreopt',
      },
-    {'opt': 'differ.ignoreopt.ignore_eol',
+    {'opt': 'differ2.ignoreopt.ignore_eol',
      'cmt': _('Ignore line endings\n'
               'CR/LF line-ending differences are ignored by the native '
               'diff algorithms (Native Histogram / Native Myers).\n'
@@ -1017,7 +1016,7 @@ OPTS_META = [
      'frm': 'bool',
      'chp': 'ignoreopt',
      },
-    {'opt': 'differ.ignoreopt.ignore_numbers',
+    {'opt': 'differ2.ignoreopt.ignore_numbers',
      'cmt': _('Ignore numbers\n'
               'Digit runs are treated as equal by the native diff '
               'algorithms (Native Histogram / Native Myers) -- useful '
@@ -1039,7 +1038,7 @@ OPTS_META = [
      'chp': 'ignoreopt',
      },
     # --- chapter "advanced": behavior tweaks and debugging tools ----------
-    {'opt': 'differ.advanced.sync_scroll',
+    {'opt': 'differ2.advanced.sync_scroll',
      'cmt': _('Synchronized scrolling\n'
               'When enabled, scrolling one side of the compare view also '
               'scrolls the other side, both vertically and horizontally.\n'
@@ -1048,7 +1047,7 @@ OPTS_META = [
      'frm': 'bool',
      'chp': 'advanced',
      },
-    {'opt': 'differ.advanced.enable_sync_caret',
+    {'opt': 'differ2.advanced.enable_sync_caret',
      'cmt': _('Keep carets visible on sync\n'
               'When enabled, moving the cursor in one side also moves the '
               'cursor in the other side to the corresponding difference '
@@ -1059,7 +1058,7 @@ OPTS_META = [
      'frm': 'bool',
      'chp': 'advanced',
      },
-    {'opt': 'differ.advanced.enable_auto_refresh',
+    {'opt': 'differ2.advanced.enable_auto_refresh',
      'cmt': _('Auto-refresh after changes\n'
               'When enabled, the diff markers are automatically re-calculated '
               'after you stop editing for 1-2 seconds. When disabled, you '
@@ -1069,7 +1068,7 @@ OPTS_META = [
      'frm': 'bool',
      'chp': 'advanced',
      },
-    {'opt': 'differ.advanced.enable_keyboard_capture',
+    {'opt': 'differ2.advanced.enable_keyboard_capture',
      'cmt': _('Keyboard shortcuts in compare tabs\n'
               'When enabled, the plugin captures these keys inside compare '
               'tabs: Alt+Left/Alt+Right copy the current difference to the '
@@ -1084,7 +1083,7 @@ OPTS_META = [
      'frm': 'bool',
      'chp': 'advanced',
      },
-    {'opt': 'differ.advanced.diff_context',
+    {'opt': 'differ2.advanced.diff_context',
      'cmt': _('Context lines in unified diff\n'
               'Number of unchanged context lines shown around each change in '
               'the unified diff output (produced by the "Diff current '
@@ -1094,7 +1093,7 @@ OPTS_META = [
      'frm': 'int',
      'chp': 'advanced',
      },
-    {'opt': 'differ.advanced.enable_profiling',
+    {'opt': 'differ2.advanced.enable_profiling',
      'cmt': _('Enable profiling\n'
               'Enable profiling to trace where compare time is consumed.\n'
               'When enabled, prints a detailed timing report to the console '
@@ -1110,7 +1109,7 @@ OPTS_META = [
      'frm': 'bool',
      'chp': 'advanced',
      },
-    {'opt': 'differ.advanced.enable_cprofile',
+    {'opt': 'differ2.advanced.enable_cprofile',
      'cmt': _('Enable cProfile layer (function-level report)\n'
               'Adds the cProfile tracing profiler ON TOP of the section '
               'profiler (needs "Enable profiling" on): after each compare '
@@ -1133,22 +1132,22 @@ OPTS_META = [
      },
     # --- chapter "micromap": mini-map style helpers (overview panel and
     # built-in micromap) ----------------------------------------------------
-    {'opt': 'differ.micromap.enable_micromap',
+    {'opt': 'differ2.micromap.enable_micromap',
      'cmt': _('Enable built-in micromap\n'
               'When enabled, switches on CudaText\'s native micromap '
               '(mini-map) column in both halves of the compare split, with '
               'diff-colored line highlights.\n'
               'The micromap is fast but does NOT account for the inter-line '
-              'gaps Differ inserts for visual alignment, so it may drift '
+              'gaps Differ 2 inserts for visual alignment, so it may drift '
               'out of sync with the text when gaps are present -- for a '
               'gap-aware alternative, enable '
-              'differ.micromap.enable_overview instead (or both).\n'
+              'differ2.micromap.enable_overview instead (or both).\n'
               'Default: off.'),
      'def': False,
      'frm': 'bool',
      'chp': 'micromap',
      },
-    {'opt': 'differ.micromap.enable_overview',
+    {'opt': 'differ2.micromap.enable_overview',
      'cmt': _('Enable gap-aware overview panel\n'
               'When enabled, adds a micromap alternative docked to the right '
               'side of the compare view: a miniature of both editors '
@@ -1165,7 +1164,7 @@ OPTS_META = [
      'frm': 'bool',
      'chp': 'micromap',
      },
-    {'opt': 'differ.micromap.hide_builtin_scrollbars',
+    {'opt': 'differ2.micromap.hide_builtin_scrollbars',
      'cmt': _('Hide built-in scrollbars in compare tabs\n'
               'When enabled, and the gap-aware overview panel is on, the '
               'vertical scrollbar of both compare editors is hidden on '
@@ -1176,7 +1175,7 @@ OPTS_META = [
               'scrollbars are NEVER hidden -- without the overview (and '
               'without the built-in scrollbars) there would be no way to '
               'scroll with the mouse.\n'
-              'Only has an effect when differ.micromap.enable_overview is '
+              'Only has an effect when differ2.micromap.enable_overview is '
               'on.\n'
               'Default: on.'),
      'def': True,
@@ -1184,7 +1183,7 @@ OPTS_META = [
      'chp': 'micromap',
      },
     # --- chapter "toolbar": the compare-tab toolbar (toolbar.py) ----------
-    {'opt': 'differ.toolbar.show_toolbar',
+    {'opt': 'differ2.toolbar.show_toolbar',
      'cmt': _('Show the compare-tab toolbar\n'
               'When enabled, a toolbar is docked to the top of every '
               'compare tab: [Recompare or Cancel] | [Prev] [Next] | '
@@ -1208,7 +1207,7 @@ OPTS_META = [
      'frm': 'bool',
      'chp': 'toolbar',
      },
-    {'opt': 'differ.toolbar.show_btn_text',
+    {'opt': 'differ2.toolbar.show_btn_text',
      'cmt': _('Show button texts in the toolbar\n'
               'When enabled, the toolbar buttons show their icon plus a '
               'text caption ("\u21bb Recompare", "\u2194 Resize", "\u2191 Prev", '
@@ -1217,7 +1216,7 @@ OPTS_META = [
               'UTF-8 icons are shown (the Ignore button keeps its '
               'enabled-options counter).\n'
               'Only used when the toolbar itself is enabled '
-              '(differ.toolbar.show_toolbar).\n'
+              '(differ2.toolbar.show_toolbar).\n'
               'Default: on.'),
      'def': True,
      'frm': 'bool',
@@ -1229,12 +1228,12 @@ DIFF_TAB_COUNT = 1
 # Persistent state file: stores compare-tab state grouped by session.
 # session_key is the session file path, relative to the settings folder if
 # the session is inside it (at any depth), or the full path if outside.
-STATE_FILE = os.path.join(ct.app_path(ct.APP_DIR_SETTINGS), 'cuda_differ_state.json')
+STATE_FILE = os.path.join(ct.app_path(ct.APP_DIR_SETTINGS), 'cuda_differ2_state.json')
 # Path to plugins.ini -- used to persistently subscribe to on_start2 so the
 # plugin auto-loads on next CudaText startup when compare tabs are active.
 PLUGINS_INI = os.path.join(ct.app_path(ct.APP_DIR_SETTINGS), 'plugins.ini')
 PLUGINS_INI_SECTION = 'events'
-MODULE_NAME = __name__.split('.')[-1]  # e.g. 'cuda_differ'
+MODULE_NAME = __name__.split('.')[-1]  # e.g. 'cuda_differ2'
 
 
 _homedir = os.path.expanduser('~')
@@ -1248,16 +1247,16 @@ def collapse_filename(fn):
 
 
 def get_opt(key, def_val: tp.Any = ''):
-    """Read a 'differ.*' option from the plugin's JSON settings file."""
-    return ctx.get_opt('differ.' + key, def_val, user_json=JSONFILE)
+    """Read a 'differ2.*' option from the plugin's JSON settings file."""
+    return ctx.get_opt('differ2.' + key, def_val, user_json=JSONFILE)
 
 
 def set_opt(key, val):
-    """Write a 'differ.*' option to the plugin's JSON settings file
-    (settings/cuda_differ.json). Mirrors get_opt above; cudax_lib's
+    """Write a 'differ2.*' option to the plugin's JSON settings file
+    (settings/cuda_differ2.json). Mirrors get_opt above; cudax_lib's
     set_opt does the comment-preserving line-based update, so hand-made
     comments in the JSON survive."""
-    return ctx.set_opt('differ.' + key, val, user_json=JSONFILE)
+    return ctx.set_opt('differ2.' + key, val, user_json=JSONFILE)
 
 
 # Ignore options exposed as checkable items of the compare-tab
@@ -1281,85 +1280,12 @@ def msg(s, level=0):
         print(PLG_NAME + _(' ERROR:'), s)
 
 
-# Migration map from the old flat option names to the new categorized names.
-# Applied once at plugin import so settings saved by older plugin versions
-# survive the rename (see _migrate_old_option_names).
-_OLD_OPT_NAMES = {
-    # theme
-    'differ.changed_color': 'differ.theme.changed_color',
-    'differ.added_color': 'differ.theme.added_color',
-    'differ.deleted_color': 'differ.theme.deleted_color',
-    'differ.gap_color': 'differ.theme.gap_color',
-    # algorithm
-    'differ.diff_algorithm': 'differ.algorithm.diff_algorithm',
-    'differ.compare_with_details': 'differ.algorithm.compare_with_details',
-    'differ.beautify_alignment': 'differ.algorithm.beautify.align_by_similarity',
-    'differ.algorithm.beautify_alignment':
-        'differ.algorithm.beautify.align_by_similarity',
-    # advanced
-    'differ.sync_scroll': 'differ.advanced.sync_scroll',
-    'differ.enable_sync_caret': 'differ.advanced.enable_sync_caret',
-    'differ.enable_auto_refresh': 'differ.advanced.enable_auto_refresh',
-    'differ.diff_context': 'differ.advanced.diff_context',
-    'differ.enable_profiling': 'differ.advanced.enable_profiling',
-    # micromap
-    'differ.enable_micromap': 'differ.micromap.enable_micromap',
-    'differ.enable_overview': 'differ.micromap.enable_overview',
-}
-
-
-def _migrate_old_option_names():
-    """One-time migration of option names to the categorized scheme.
-
-    Older plugin versions stored options under flat names like
-    'differ.sync_scroll'. The current version groups options into
-    categories ('theme', 'algorithm', 'advanced', 'micromap'), so the
-    names became 'differ.<category>.<name>'. This renames the old flat
-    keys inside settings/cuda_differ.json so existing user settings
-    survive the plugin update.
-
-    The rename is line-based (same approach cudax_lib.set_opt uses for
-    simple keys), so comments and formatting in the JSON file are
-    preserved. An old key is only renamed when the new key is not
-    already present, so re-running the migration is safe (idempotent).
-    """
-    if not os.path.exists(JSONPATH):
-        return
-    try:
-        with open(JSONPATH, 'r', encoding='utf8') as f:
-            body = f.read()
-    except OSError:
-        return
-    changed = 0
-    for old, new in _OLD_OPT_NAMES.items():
-        # Match real key lines only ('^  "differ.sync_scroll":'); commented
-        # out lines (// "differ.sync_scroll": ...) do not match because of
-        # the '^\s*"' anchor.
-        cre_old = re.compile(r'(?m)^(\s*)"%s"(\s*:)' % re.escape(old))
-        cre_new = re.compile(r'(?m)^\s*"%s"\s*:' % re.escape(new))
-        if cre_old.search(body) and not cre_new.search(body):
-            body = cre_old.sub(r'\1"%s"\2' % new, body)
-            changed += 1
-    if not changed:
-        return
-    try:
-        with open(JSONPATH, 'w', encoding='utf8') as f:
-            f.write(body)
-        msg('migrated {} old option name(s) to the categorized scheme '
-            '(differ.<category>.<name>)'.format(changed))
-    except OSError as ex:
-        msg('failed to migrate old option names: {}'.format(ex), level=1)
-
-
-# NOTE: there is deliberately NO color_theme migration. The theme mode
-# ('differ.theme.color_theme') defaults to 'auto' and is only ever
+# NOTE: there is deliberately NO color_theme auto-switching. The theme
+# mode ('differ2.theme.color_theme') defaults to 'auto' and is only ever
 # changed by the user in the config dialog -- the plugin never writes
-# it, not even when custom 'differ.theme.*_color' values exist in the
-# settings (an earlier version auto-switched such configs to 'custom',
-# which changed a user-visible setting without their consent).
-
-
-_migrate_old_option_names()
+# it, not even when custom 'differ2.theme.*_color' values exist in the
+# settings (auto-switching such configs to 'custom' would change a
+# user-visible setting without their consent).
 
 
 class _CompareJob:
@@ -1513,7 +1439,8 @@ class _TabSession:
       suppress_change  remaining on_change events to swallow (the two
                        spurious events set_text_all fires when a compare
                        tab is created)
-      saved            cached 'no half dirty' flag (persisted 'saved')
+      saved            runtime 'no half dirty' flag (derived from
+                       'dirty'; drives the tab title color)
       dirty            cached set of halves with unsaved edits
       fast_temp        temporary fast mode accepted in the slow-compare
                        dialog: this tab compares with Native Myers +
@@ -1549,8 +1476,8 @@ class _TabSession:
         # algorithm / beautify options. Dies with the session (tab
         # close) -- the persisted settings are never touched.
         self.fast_temp = False
-        # Vertical scrollbar style the editors had before Differ hid it
-        # (see _apply_scrollbar_visibility): None while Differ has not
+        # Vertical scrollbar style the editors had before Differ 2 hid it
+        # (see _apply_scrollbar_visibility): None while Differ 2 has not
         # hidden any scrollbar, otherwise the captured original value
         # to restore when hiding is switched off. Gutter fold/states
         # removal and scrollbar hiding are per-tab, so this never leaks
@@ -1697,24 +1624,16 @@ class Command:
 
     def _register_compare_tab(self, session, primary_orig_id, secondary_orig_id,
                               primary_orig_name='', secondary_orig_name='',
-                              saved=True, dirty=None):
+                              dirty=()):
         """Persist a compare tab's registration under ITS OWN session key
         (session.state_key -- the CudaText session file group the tab was
         created in, not whatever session is current now), with the
         PROP_TAB_IDs and display names of its two original tabs. 'dirty'
-        tracks which halves ('a' = primary/left, 'b' = secondary/right)
-        carry unsaved edits -- on_save_pre syncs only those halves back
-        to their originals. Callers that pass only the boolean 'saved'
-        (legacy form) get the conservative mapping: unsaved -> both
-        halves dirty. Also fills the session's saved/dirty caches."""
-        if dirty is None:
-            dirty = set() if saved else {'a', 'b'}
-        else:
-            dirty = {h for h in dirty if h in ('a', 'b')}
-        # The boolean 'saved' flag (kept for compatibility with state files
-        # of older plugin versions and for the tab title color) simply
-        # means "no half is dirty".
-        saved = not dirty
+        names the halves ('a' = primary/left, 'b' = secondary/right)
+        that carry unsaved edits -- on_save_pre syncs only those halves
+        back to their originals. Also fills the session's saved/dirty
+        caches (the runtime 'saved' flag is derived: no half dirty)."""
+        dirty = {h for h in dirty if h in ('a', 'b')}
         state = self._load_state()
         if session.state_key not in state['sessions']:
             state['sessions'][session.state_key] = {}
@@ -1723,41 +1642,33 @@ class Command:
             'primary_orig_name': primary_orig_name or '',
             'secondary_orig_tab_id': secondary_orig_id,
             'secondary_orig_name': secondary_orig_name or '',
-            'saved': saved,
             'dirty': sorted(dirty),
         }
         self._save_state(state)
-        session.saved = saved
         session.dirty = set(dirty)
+        session.saved = not dirty
 
     @staticmethod
     def _entry_dirty(entry):
-        """Dirty-halves set from a persisted state entry. Entries written
-        by older plugin versions have no 'dirty' key -- derive it from the
-        legacy boolean 'saved' flag: unsaved -> both halves dirty (the old
-        save always synced both sides, so this maps the old behavior 1:1
-        onto the new selective sync)."""
+        """Dirty-halves set from a persisted state entry."""
         if not isinstance(entry, dict):
             return set()
-        raw = entry.get('dirty')
-        if raw is None:
-            return set() if entry.get('saved', True) else {'a', 'b'}
-        return {h for h in raw if h in ('a', 'b')}
+        return {h for h in entry.get('dirty', ()) if h in ('a', 'b')}
 
     def _get_dirty_halves(self, session):
         """Return the set of halves with unsaved edits for a compare
         tab's session ('a' = primary/left, 'b' = secondary/right).
         The session's cache is the live value -- it is initialized at
-        registration / on_start2 restore (from the persisted state,
-        with legacy migration via _entry_dirty) and maintained by
-        _update_dirty_state, so no disk access is needed here."""
+        registration / on_start2 restore (from the persisted state)
+        and maintained by _update_dirty_state, so no disk access is
+        needed here."""
         return set(session.dirty)
 
     def _update_dirty_state(self, session, dirty_halves):
         """Single write path for the saved/dirty state of a compare tab.
         'dirty_halves' is a subset of {'a','b'} naming the halves with
-        unsaved edits; the legacy boolean 'saved' flag is kept in sync
-        (True iff no half is dirty). Cache-guarded so on_change firing on
+        unsaved edits; the runtime 'saved' flag is derived (True iff no
+        half is dirty). Cache-guarded so on_change firing on
         every keystroke doesn't hit the disk -- only an actual state
         change (clean half gets edited / dirty half gets synced) rewrites
         the JSON."""
@@ -1765,15 +1676,13 @@ class Command:
         if session.dirty == dirty_halves:
             return
         session.dirty = set(dirty_halves)
-        saved = not dirty_halves
         state = self._load_state()
         group = state['sessions'].get(session.state_key, {})
         entry = group.get(session.tab_id_str)
         if isinstance(entry, dict):
             entry['dirty'] = sorted(dirty_halves)
-            entry['saved'] = saved
             self._save_state(state)
-        session.saved = saved
+        session.saved = not dirty_halves
 
     def _unregister_compare_tab(self, session):
         """Remove a compare tab from the persisted state (under the
@@ -1855,7 +1764,7 @@ class Command:
         'enable_keyboard_capture' setting: subscribe when enabled,
         unsubscribe when disabled. Called at plugin load (Command
         constructor) and on every config reload (config()), so both the
-        Options dialog and hand-edits to cuda_differ.json take effect
+        Options dialog and hand-edits to cuda_differ2.json take effect
         without a restart."""
         if self.cfg.get('enable_keyboard_capture', True):
             self._subscribe_on_key()
@@ -1890,14 +1799,14 @@ class Command:
     def change_config(self):
         """Open the options dialog (cuda_options_editor (Options Editor plugin)
         or cuda_prefs (Options Editor Lite builtin plugin)) for
-        the 'differ.*' settings. After the dialog closes, reload config and
+        the 'differ2.*' settings. After the dialog closes, reload config and
         re-apply sync scroll setting."""
         try:
             import cuda_options_editor as op_ed
         except ImportError:
             import cuda_prefs as op_ed
         op_ed_dlg = None
-        subset = 'differ.'  # Key to isolate settings for op_ed plugin
+        subset = 'differ2.'  # Key to isolate settings for op_ed plugin
         how = dict(hide_lex_fil=True,  # If option has not setting for lexer/cur.file
                    stor_json=JSONFILE)
         # The ignore options are hidden while a Python algorithm is
@@ -1914,7 +1823,7 @@ class Command:
             open(METAJSONFILE, 'w').write(json.dumps(opts_meta, indent=4))
             op_ed_dlg = op_ed.OptEdD(
                 path_keys_info=METAJSONFILE, subset=subset, how=how)
-        if op_ed_dlg.show(_('Differ Options')):  # Dialog caption
+        if op_ed_dlg.show(_('Differ 2 Options')):  # Dialog caption
             # Need to use updated options
             self.config()
             self.scroll.toggle(self.cfg['sync_scroll'])
@@ -1931,7 +1840,7 @@ class Command:
     # Ignore options
     # ------------------------------------------------------------------
     # The diff_proc DIFF_IGN_* ignore options live in
-    # settings/cuda_differ.json under 'differ.ignoreopt.*' (chapter
+    # settings/cuda_differ2.json under 'differ2.ignoreopt.*' (chapter
     # 'ignoreopt' in the config dialog -- see OPTS_META; built into the
     # flags bitmask by differ_native.build_ignore_flags at compare time).
     # They are ALSO exposed as checkable items in the diff-tab right-click
@@ -1939,14 +1848,14 @@ class Command:
     # tabmenu_ignore().
     #
     # The char-level tokenizer's word-break characters live in the same
-    # settings file under 'differ.algorithm.break_chars' (chapter
+    # settings file under 'differ2.algorithm.break_chars' (chapter
     # 'algorithm', flagged 'native_only' -- see OPTS_META); they are NOT
     # context-menu checkable items (a string, not toggles) and reach the
     # engine as the diff_proc(DIF_CHARS) break_chars argument, carried on
     # the Differ as diff.break_chars (see refresh_compare).
 
     def on_cli(self, fn1, fn2):
-        """Called when CudaText gets command-line param -p=cuda_differ#file1#file2.
+        """Called when CudaText gets command-line param -p=cuda_differ2#file1#file2.
         Opens both files first (so they exist as tabs), then compares them."""
         # Open both files. file_open activates the tab, so after opening fn2,
         # ct.ed points to fn2. We pass the filenames to set_files which finds
@@ -2021,7 +1930,7 @@ class Command:
     def compare_with_next_tab(self):
         """Command: compare the focused document with the NEXT tab in
         its tab group (one step to the right in the tab bar; the last
-        tab of a group has no next one). Exposed as 'Differ\\Compare
+        tab of a group has no next one). Exposed as 'Differ 2\\Compare
         current document with next tab' and in the tab context menu
         right below 'Compare with focused tab' (where it acts on the
         right-clicked tab -- the same cur-side convention every
@@ -2030,11 +1939,11 @@ class Command:
         cur = ct.ed
         next_ed = self._next_tab_editor(cur)
         if next_ed is None:
-            ct.msg_status(_('Differ: no next tab to compare with'))
+            ct.msg_status(_('Differ 2: no next tab to compare with'))
             return
         if (not self.tabmenu_editor_ok(next_ed, self.get_name(cur))
                 or self._is_compare_tab(next_ed.get_prop(ct.PROP_TAB_ID))):
-            ct.msg_status(_('Differ: the next tab cannot be compared'))
+            ct.msg_status(_('Differ 2: the next tab cannot be compared'))
             return
         self.set_files(self.get_name(cur), self.get_name(next_ed))
 
@@ -2042,7 +1951,7 @@ class Command:
         """Command: compare the clipboard text with the focused
         editor's selection -- a new compare tab ("Diff: clipboard |
         selection"), the text twin of 'Compare with...'. Exposed as
-        'Differ\\Compare clipboard to selection' and in the diff-tab
+        'Differ 2\\Compare clipboard to selection' and in the diff-tab
         context menu (right below 'Resize editors to equal width').
 
         set_files compares two OPEN tabs, so the texts travel through
@@ -2067,11 +1976,11 @@ class Command:
         except Exception:
             pass
         if not clip:
-            ct.msg_status(_('Differ: clipboard is empty'))
+            ct.msg_status(_('Differ 2: clipboard is empty'))
             return
         sel = ct.ed.get_text_sel()
         if not sel:
-            ct.msg_status(_('Differ: no selection in the focused editor'))
+            ct.msg_status(_('Differ 2: no selection in the focused editor'))
             return
         try:
             lexer = ct.ed.get_prop(ct.PROP_LEXER_FILE, '')
@@ -2099,7 +2008,7 @@ class Command:
         # Close the two scratch tabs: their content already lives in
         # the compare halves. PROP_MODIFIED is cleared first so the
         # close never shows the 'Save changes?' dialog (on_close_pre's
-        # own clearing only covers Differ compare tabs).
+        # own clearing only covers Differ 2 compare tabs).
         for e in (a_ed, b_ed):
             try:
                 e.set_prop(ct.PROP_MODIFIED, False)
@@ -2329,7 +2238,7 @@ class Command:
             session,
             orig_tab_ids[0], orig_tab_ids[1],
             orig_names[0], orig_names[1],
-            saved=True)  # initial state: content matches originals = saved
+        )  # initial state: content matches originals = no dirty halves
         # Suppress the next 2 on_change events (one per split half)
         # because set_text_all triggers on_change, which would reset
         # the green color to red. Armed BEFORE the texts are loaded
@@ -2466,7 +2375,7 @@ class Command:
                 job.error = RuntimeError('no diff result produced')
             if job.error is not None:
                 msg('unified diff failed: {}'.format(job.error), level=2)
-                ct.msg_status(_('Differ: unified diff failed'))
+                ct.msg_status(_('Differ 2: unified diff failed'))
                 return
             if job.uni_text is None:
                 # Opcode-driven path: count the difference REGIONS
@@ -2687,7 +2596,7 @@ class Command:
             # Trailing repaint 150ms after the last scroll event.
             if not session.overview_timer:
                 session.overview_timer = True
-                callback = 'module=cuda_differ;cmd=_overview_repaint_timer;info={};'.format(session.tab_id_str)
+                callback = 'module=cuda_differ2;cmd=_overview_repaint_timer;info={};'.format(session.tab_id_str)
                 ct.timer_proc(ct.TIMER_START_ONE, callback, 150)
 
     def _overview_repaint_timer(self, tag='', info=''):
@@ -2748,7 +2657,7 @@ class Command:
         '<PROP_TAB_ID>|<preset key>' (raw string, same 'cmd=' callback
         convention as toolbar_menu_ignore). Routed to the toolbar that
         built the menu item; it persists the algorithm / beautify
-        options to settings/cuda_differ.json (the config dialog's
+        options to settings/cuda_differ2.json (the config dialog's
         store) and re-compares on the 100ms timer. Unknown tab (closed
         since the menu was built) is a no-op."""
         if not info:
@@ -2764,7 +2673,7 @@ class Command:
         convention as toolbar_menu_preset). Routed to the toolbar that
         built the menu item; it toggles the app bar / gutter column /
         overview visibility (the overview toggle writes
-        differ.micromap.enable_overview and re-compares on the 100ms
+        differ2.micromap.enable_overview and re-compares on the 100ms
         timer). Unknown tab (closed since the menu was built) is a
         no-op."""
         if not info:
@@ -2984,7 +2893,7 @@ class Command:
             session.suppress_change = 0
             self._update_dirty_state(session, set())  # repair stale state
             ed_self.set_prop(ct.PROP_TAB_COLOR_FONT, 0x00A000)  # green
-            ct.msg_status(_('Differ: no unsaved changes'))
+            ct.msg_status(_('Differ 2: no unsaved changes'))
             # Block the default save (which would show a Save dialog for
             # the untitled compare tab).
             return False
@@ -3025,7 +2934,7 @@ class Command:
                 ed_self.set_prop(ct.PROP_TAB_COLOR_FONT, ct.COLOR_NONE)
             else:
                 ed_self.set_prop(ct.PROP_TAB_COLOR_FONT, 0x00A000)  # green
-            # Persist the state (legacy 'saved' flag + dirty halves) so
+            # Persist the state (per-half dirty flags) so
             # on_start2 can restore the correct color after restart.
             self._update_dirty_state(session, remaining)
             # Auto-refresh diff markers so the user sees updated
@@ -3074,9 +2983,9 @@ class Command:
                 else:
                     # Untitled tab -- mark modified, no Save dialog.
                     e.set_prop(ct.PROP_MODIFIED, True)
-                ct.msg_status(_('Differ: synced changes to original tab'))
+                ct.msg_status(_('Differ 2: synced changes to original tab'))
                 return True
-        ct.msg_status(_('Differ: original tab no longer open'))
+        ct.msg_status(_('Differ 2: original tab no longer open'))
         return False
 
     def on_start2(self, ed_self):
@@ -3138,12 +3047,8 @@ class Command:
             # diff markers are not re-painted on purpose -- see the
             # commented-out refresh above).
             tab_session = _TabSession(tab_id_int, self._current_session_key)
-            # Populate the saved/dirty caches from disk. Entries
-            # written by older plugin versions have no 'dirty' key --
-            # _entry_dirty maps the legacy 'saved' flag instead (unsaved
-            # -> both halves dirty, so the first Ctrl+S after upgrade
-            # syncs both sides, exactly like the old always-sync-both
-            # behavior).
+            # Populate the saved/dirty caches from disk (the runtime
+            # 'saved' flag is derived: no half dirty).
             tab_session.dirty = self._entry_dirty(entry)
             tab_session.saved = not tab_session.dirty
             self._sessions[tab_id_str] = tab_session
@@ -3159,7 +3064,7 @@ class Command:
         # editor parents -- so the creation runs on a one-shot 300ms
         # timer instead of here.
         if self.cfg.get('show_toolbar', True) and self._sessions:
-            callback = 'module=cuda_differ;cmd=_toolbar_restore_timer;info=_;'
+            callback = 'module=cuda_differ2;cmd=_toolbar_restore_timer;info=_;'
             ct.timer_proc(ct.TIMER_START_ONE, callback, 300)
 
         # Re-subscribe to on_scroll event if sync_scroll is enabled.
@@ -3314,7 +3219,7 @@ class Command:
         if not LOCK_EDITORS_WHILE_COMPARING:
             return
         try:
-            callback = ('module=cuda_differ;cmd=_editor_lock_timer;'
+            callback = ('module=cuda_differ2;cmd=_editor_lock_timer;'
                         'info={};').format(session.tab_id_str)
             ct.timer_proc(ct.TIMER_START_ONE, callback,
                           EDITOR_LOCK_DELAY_MS)
@@ -3475,19 +3380,19 @@ class Command:
         session = self._session_for(tab_id)
         if session is None:
             if n_uni:
-                return ct.msg_status(_('Differ: unified diff cancelled'))
-            return ct.msg_status(_('Differ: not a compare tab'))
+                return ct.msg_status(_('Differ 2: unified diff cancelled'))
+            return ct.msg_status(_('Differ 2: not a compare tab'))
         job = session.job
         session.job = None
         if job is None:
             if n_uni:
-                return ct.msg_status(_('Differ: unified diff cancelled'))
-            return ct.msg_status(_('Differ: no compare running'))
+                return ct.msg_status(_('Differ 2: unified diff cancelled'))
+            return ct.msg_status(_('Differ 2: no compare running'))
         self._cancel_job(job)
         if n_uni:
-            ct.msg_status(_('Differ: compare and unified diff cancelled'))
+            ct.msg_status(_('Differ 2: compare and unified diff cancelled'))
         else:
-            ct.msg_status(_('Differ: compare cancelled'))
+            ct.msg_status(_('Differ 2: compare cancelled'))
 
     def cancel_all_compares(self):
         """Command: cancel every in-flight background compare across all
@@ -3500,19 +3405,19 @@ class Command:
         jobs = [s.job for s in self._sessions.values() if s.job is not None]
         n_uni = self.unidiff.cancel_all()
         if not jobs and not n_uni:
-            return ct.msg_status(_('Differ: no compares running'))
+            return ct.msg_status(_('Differ 2: no compares running'))
         for job in jobs:
             job.session.job = None
             self._cancel_job(job)
         if jobs and n_uni:
-            ct.msg_status(_('Differ: cancelled {} compare(s), {} unified '
+            ct.msg_status(_('Differ 2: cancelled {} compare(s), {} unified '
                             'diff(s)').format(len(jobs), n_uni))
         elif jobs:
             ct.msg_status(
-                _('Differ: cancelled {} compare(s)').format(len(jobs)))
+                _('Differ 2: cancelled {} compare(s)').format(len(jobs)))
         else:
             ct.msg_status(
-                _('Differ: cancelled {} unified diff(s)').format(n_uni))
+                _('Differ 2: cancelled {} unified diff(s)').format(n_uni))
 
     def _arm_slow_compare_watchdog(self, session, job):
         """Arm the one-shot SLOW_COMPARE_SECONDS timer for a
@@ -3529,7 +3434,7 @@ class Command:
         if job.fast_mode or not dfn._HAS_NATIVE_DIFF:
             return
         try:
-            callback = ('module=cuda_differ;cmd=_slow_compare_timer;'
+            callback = ('module=cuda_differ2;cmd=_slow_compare_timer;'
                         'info={};').format(session.tab_id_str)
             ct.timer_proc(ct.TIMER_START_ONE, callback,
                           SLOW_COMPARE_SECONDS * 1000)
@@ -3574,7 +3479,7 @@ class Command:
         if job.fast_mode:
             return  # belt-and-braces: never armed for fast jobs
         res = ct.msg_box_ex(
-            _('Differ: slow compare'),
+            _('Differ 2: slow compare'),
             _('The compare has been running for over a minute. Keep '
               'waiting, or switch to the faster mode (Native Myers, '
               'Beautify off) for this compare?'),
@@ -3592,7 +3497,7 @@ class Command:
         self._cancel_job(job)
         session.fast_temp = True
         try:
-            ct.msg_status(_('Differ: re-comparing in the fast mode '
+            ct.msg_status(_('Differ 2: re-comparing in the fast mode '
                             '(Native Myers, Beautify off)'))
         except Exception:
             pass
@@ -3618,9 +3523,9 @@ class Command:
             ed = ct.ed
         split = ed.get_prop(ct.PROP_SPLIT)
         if not split or split[0] == '-':
-            return ct.msg_status(_('Differ: current tab has no split editors'))
+            return ct.msg_status(_('Differ 2: current tab has no split editors'))
         ed.set_prop(ct.PROP_SPLIT, (split[0], 500))
-        ct.msg_status(_('Differ: editors resized to equal widths'))
+        ct.msg_status(_('Differ 2: editors resized to equal widths'))
 
     @staticmethod
     def _editor_by_tab_id(tab_id):
@@ -3647,7 +3552,7 @@ class Command:
         """Command: swap the two compared editors of a compare tab
         (left <-> right): the text the left half shows moves to the
         right half and vice versa. Exposed as
-        'Differ\\Swap compared editors'.
+        'Differ 2\\Swap compared editors'.
 
         The swap is a VIEW operation on the existing tab, not a fresh
         compare of reversed files: each half is rewritten with the
@@ -3697,9 +3602,9 @@ class Command:
         tab_id = ed.get_prop(ct.PROP_TAB_ID)
         session = self._session_for(tab_id)
         if session is None:
-            return ct.msg_status(_('Differ: not a compare tab'))
+            return ct.msg_status(_('Differ 2: not a compare tab'))
         if session.job is not None:
-            return ct.msg_status(_('Differ: compare already running'))
+            return ct.msg_status(_('Differ 2: compare already running'))
         a_ed = ct.Editor(ed.get_prop(ct.PROP_HANDLE_PRIMARY))
         b_ed = ct.Editor(ed.get_prop(ct.PROP_HANDLE_SECONDARY))
 
@@ -3771,7 +3676,7 @@ class Command:
         # the two texts themselves did not change, so for identical
         # sides the status bar just reports the compare as before).
         self.refresh_compare(ed, show_dialog=False)
-        ct.msg_status(_('Differ: compared editors swapped'))
+        ct.msg_status(_('Differ 2: compared editors swapped'))
 
     # native_histogram / native_myers only work when cudatext.diff_proc
     # is present. On older CudaText builds the plugin falls back to the
@@ -3824,15 +3729,15 @@ class Command:
         """
         algo, use_native, fell_back = self._resolve_algorithm()
         if use_native:
-            ct.msg_status(_("Differ: Using Native Algo {}").format(algo))
+            ct.msg_status(_("Differ 2: Using Native Algo {}").format(algo))
             return dfn.Differ()
         if fell_back:
             configured = self.cfg.get('diff_algorithm', 'native_myers')
             ct.msg_status(
-                _('Differ: native API not available — falling back to Python algo {} '
+                _('Differ 2: native API not available — falling back to Python algo {} '
                   '(configured: {})').format(algo, configured))
         else:
-            ct.msg_status(_("Differ: Using Python Algo {}").format(algo))
+            ct.msg_status(_("Differ 2: Using Python Algo {}").format(algo))
         return dfp.Differ()
 
     def _ensure_correct_differ(self, session):
@@ -3980,7 +3885,7 @@ class Command:
         # -- the user can fire it any time after this one, or cancel
         # first -- picks up whatever the editors hold then.
         if session.job is not None:
-            ct.msg_status(_('Differ: compare already running'))
+            ct.msg_status(_('Differ 2: compare already running'))
             return
 
         # Load config FIRST so the profiling check below sees the current
@@ -4024,7 +3929,7 @@ class Command:
         # question the section report cannot answer. Started only when
         # the section profiler is on (the same 'enable_profiling'
         # config switch) AND the 'enable_cprofile' config option is on
-        # (differ.advanced.enable_cprofile -- settings/cuda_differ.json
+        # (differ2.advanced.enable_cprofile -- settings/cuda_differ2.json
         # or the Options dialog; editing the JSON takes effect on the
         # next compare, no restart needed. Replaces the old
         # ENABLE_CPROFILE module constant as the switch -- that constant
@@ -4226,7 +4131,7 @@ class Command:
             diff.diff_algorithm = _algo
             if _fell_back:
                 ct.msg_status(
-                    _('Differ: native API not available — falling back to Python algo {} '
+                    _('Differ 2: native API not available — falling back to Python algo {} '
                       '(configured: {})').format(
                         _algo, self.cfg.get('diff_algorithm', 'native_myers')))
             if getattr(session, 'fast_temp', False):
@@ -4248,7 +4153,7 @@ class Command:
             # strictly by design.
             diff.ignore_flags = dfn.build_ignore_flags(self.cfg)
             # Word-break chars of the native char-level tokenizer
-            # (differ.algorithm.break_chars), threaded into every
+            # (differ2.algorithm.break_chars), threaded into every
             # diff_proc(DIF_CHARS) call of this compare -- batched
             # background job, synchronous fallback and the legacy
             # single-pair path alike. DIF_TEXTS ignores it (it only
@@ -4394,7 +4299,7 @@ class Command:
                     # The timing/profiling epilogue runs in the
                     # completion callback, not in the finally below.
                     _epilogue = False
-                    ct.msg_status(_('Differ: comparing in background...'))
+                    ct.msg_status(_('Differ 2: comparing in background...'))
                     self._arm_slow_compare_watchdog(session, job)
                     return
                 # Engine refused to start the background compare: report
@@ -4451,7 +4356,7 @@ class Command:
             try:
                 _py_thread = threading.Thread(
                     target=_py_engine_worker,
-                    name='cuda_differ_pyengine',
+                    name='cuda_differ2_pyengine',
                     daemon=True)
                 _py_thread.start()
 
@@ -4484,7 +4389,7 @@ class Command:
                 # _cancel_job).
                 self._arm_editor_lock_timer(session, job)
                 _epilogue = False
-                ct.msg_status(_('Differ: comparing in background...'))
+                ct.msg_status(_('Differ 2: comparing in background...'))
                 self._arm_slow_compare_watchdog(session, job)
                 return
             except Exception:
@@ -4679,7 +4584,7 @@ class Command:
         # the toolbar's status label and the final 'compared in ...'
         # epilogue carry the rest of the feedback).
         try:
-            ct.msg_status(_('Differ: applying diff colors...'))
+            ct.msg_status(_('Differ 2: applying diff colors...'))
         except Exception:
             pass
         Profiler.start('refresh:compare_and_paint')
@@ -5975,15 +5880,15 @@ class Command:
         warning banner (profiling_report(cprofile_was_on=True))."""
         _compare_elapsed = time.perf_counter() - compare_start
         if _compare_elapsed < 1.0:
-            ct.msg_status(_('Differ: compared in {:.0f}ms').format(
+            ct.msg_status(_('Differ 2: compared in {:.0f}ms').format(
                 _compare_elapsed * 1000.0))
         elif _compare_elapsed < 60.0:
-            ct.msg_status(_('Differ: compared in {:.1f}s').format(
+            ct.msg_status(_('Differ 2: compared in {:.1f}s').format(
                 _compare_elapsed))
         else:
             _mins = int(_compare_elapsed // 60)
             _secs = _compare_elapsed - _mins * 60
-            ct.msg_status(_('Differ: compared in {}m {:.0f}s').format(
+            ct.msg_status(_('Differ 2: compared in {}m {:.0f}s').format(
                 _mins, _secs))
 
         # Print the profiling report -- even if the compare crashed with
@@ -6480,7 +6385,7 @@ class Command:
 
     def _apply_scrollbar_visibility(self, session, a_ed, b_ed, hide):
         """Hide or restore the built-in vertical scrollbars of a compare
-        tab's two editors (config 'differ.micromap.hide_builtin_scrollbars').
+        tab's two editors (config 'differ2.micromap.hide_builtin_scrollbars').
 
         Called on every compare start, with hide=True only when the
         overview panel is enabled -- the overview's own slider then
@@ -6541,7 +6446,7 @@ class Command:
 
     @staticmethod
     def get_config():
-        """Read all differ.* options from JSON + current theme, and return
+        """Read all differ2.* options from JSON + current theme, and return
         a config dict. Also registers bookmark kinds (NKIND_*) with their
         colors so CudaText can render them."""
 
@@ -6559,7 +6464,7 @@ class Command:
 
             - 'auto' -- preset of the detected theme family;
             - 'white'/'grey'/'black' -- that family's preset;
-            - 'custom' -- the six differ.theme.*_color options, each
+            - 'custom' -- the six differ2.theme.*_color options, each
               option left EMPTY filled from the auto-detected preset
               (a half-configured custom theme never falls back to
               nothing).
@@ -6707,7 +6612,7 @@ class Command:
         belongs to and where the copy commands find no hunk."""
         session = self._focused_session()
         if session is None:
-            return ct.msg_status(_('Differ: not a compare tab'))
+            return ct.msg_status(_('Differ 2: not a compare tab'))
         diff = self._session_diff(session)
         if not diff.diffmap:
             self.refresh_compare()
@@ -6829,7 +6734,7 @@ class Command:
         the one selected."""
         cur_change = self._find_hunk_at_caret(adjacent=True)
         if not cur_change:
-            return ct.msg_status(_('Differ: caret is not on a difference'))
+            return ct.msg_status(_('Differ 2: caret is not on a difference'))
         esc = self.cfg.get('enable_sync_caret', False)
         fc, eds = self.focused
         self.cfg['enable_sync_caret'] = False
@@ -6872,10 +6777,10 @@ class Command:
         the hunk (see the comment at the set_caret pair below)."""
         fc, eds = self.focused
         if self._compare_running_here(eds):
-            return ct.msg_status(_('Differ: cannot edit while compare is running'))
+            return ct.msg_status(_('Differ 2: cannot edit while compare is running'))
         current = self._find_hunk_at_caret(adjacent=True)
         if not current:
-            return ct.msg_status(_('Differ: caret is not on a difference'))
+            return ct.msg_status(_('Differ 2: caret is not on a difference'))
         else:
             a0, a1, b0, b1 = current
         # Park BOTH carets at the hunk BEFORE the delete/insert. CudaText
@@ -6934,7 +6839,7 @@ class Command:
         line-index approximation."""
         fc, eds = self.focused
         if self._compare_running_here(eds):
-            return ct.msg_status(_('Differ: cannot edit while compare is running'))
+            return ct.msg_status(_('Differ 2: cannot edit while compare is running'))
         current = self.get_current_change
 
         def get_src(ed: ct.Editor):
@@ -6953,12 +6858,12 @@ class Command:
                                 for y in range(y1, y2)]), y1
 
         if not current:
-            return ct.msg_status(_('Differ: caret is not on a changed line'))
+            return ct.msg_status(_('Differ 2: caret is not on a changed line'))
         else:
             a0, a1, b0, b1 = current
         if to_right:
             if fc == 1:
-                return ct.msg_status(_('Differ: caret must be in the left editor to copy right'))
+                return ct.msg_status(_('Differ 2: caret must be in the left editor to copy right'))
             text, y = get_src(eds[0])
             if text:
                 # Same level: the caret line is the k-th line of the source
@@ -6970,7 +6875,7 @@ class Command:
                 eds[1].insert(0, ins, text)
         else:
             if fc == 0:
-                return ct.msg_status(_('Differ: caret must be in the right editor to copy left'))
+                return ct.msg_status(_('Differ 2: caret must be in the right editor to copy left'))
             text, y = get_src(eds[1])
             if text:
                 ins = a0 + min(max(0, y - b0), a1 - a0)
@@ -7080,17 +6985,17 @@ class Command:
 
         ct.menu_proc(self.compare_menu, ct.MENU_CLEAR)
         self.menuid_withfile = ct.menu_proc(self.compare_menu, ct.MENU_ADD,
-            command='module=cuda_differ;cmd=tabmenu_chooser;',
+            command='module=cuda_differ2;cmd=tabmenu_chooser;',
             caption=_('Compare with...')
             )
         self.menuid_withfocused = ct.menu_proc(self.compare_menu, ct.MENU_ADD,
-            command='module=cuda_differ;cmd=tabmenu_files;info='+cur_fn+'::'+path_focused+';',
+            command='module=cuda_differ2;cmd=tabmenu_files;info='+cur_fn+'::'+path_focused+';',
             caption=_('Compare with focused tab')
             )
         # 'Compare with next tab', right below 'Compare with focused
         # tab': the RIGHT-CLICKED tab vs the tab one step to its right
         # in the same tab bar (no picker -- the one-click twin of the
-        # 'Differ\\Compare current document with next tab' command,
+        # 'Differ 2\\Compare current document with next tab' command,
         # which acts on the focused tab instead). The pair travels the
         # same tabmenu_files 'fn0::fn1' route as the focused-tab item,
         # so the compare starts on the same 100ms let-the-menu-close
@@ -7103,7 +7008,7 @@ class Command:
         next_ed = self._next_tab_editor(cur_ed)
         path_next = self.get_name(next_ed) if next_ed is not None else ''
         self.menuid_withnext = ct.menu_proc(self.compare_menu, ct.MENU_ADD,
-            command='module=cuda_differ;cmd=tabmenu_files;info='+cur_fn+'::'+path_next+';',
+            command='module=cuda_differ2;cmd=tabmenu_files;info='+cur_fn+'::'+path_next+';',
             caption=_('Compare with next tab')
             )
         next_ok = (next_ed is not None
@@ -7133,13 +7038,13 @@ class Command:
                 # native CudaText dialog (which has a scrollbar) -- useful
                 # when the popup menu is too long to fit on screen.
                 ct.menu_proc(self.menuid_withtab, ct.MENU_ADD,
-                    command='module=cuda_differ;cmd=tabmenu_chooser_tab;',
+                    command='module=cuda_differ2;cmd=tabmenu_chooser_tab;',
                     caption=_('More tabs...')
                     )
 
                 for path in paths:
                     ct.menu_proc(self.menuid_withtab, ct.MENU_ADD,
-                        command='module=cuda_differ;cmd=tabmenu_files;info='+cur_fn+'::'+path+';',
+                        command='module=cuda_differ2;cmd=tabmenu_files;info='+cur_fn+'::'+path+';',
                         caption=collapse_filename(path)
                         )
 
@@ -7159,13 +7064,13 @@ class Command:
         # "Compare clipboard to selection" right below 'Compare with
         # tab': a new compare tab with the clipboard text on the left
         # and the focused editor's selection on the right (the same
-        # method as the exposed 'Differ\Compare clipboard to
+        # method as the exposed 'Differ 2\Compare clipboard to
         # selection' command). Enabled only while BOTH sides exist:
         # text on the clipboard AND a selection in the focused editor
         # -- the menu is rebuilt on every right-click, so the state is
         # always fresh (an image-only clipboard disables the item).
         self.menuid_clip_sel = ct.menu_proc(self.compare_menu, ct.MENU_ADD,
-            command='module=cuda_differ;cmd=compare_clip_sel;',
+            command='module=cuda_differ2;cmd=compare_clip_sel;',
             caption=_('Compare clipboard to selection')
             )
         try:
@@ -7184,7 +7089,7 @@ class Command:
         # by Differ.
         ct.menu_proc(self.compare_menu, ct.MENU_ADD, caption='-')
         self.menuid_refresh = ct.menu_proc(self.compare_menu, ct.MENU_ADD,
-            command='module=cuda_differ;cmd=tabmenu_refresh;',
+            command='module=cuda_differ2;cmd=tabmenu_refresh;',
             caption=_('Recompare')
             )
         is_compare = self._is_compare_tab(cur_ed.get_prop(ct.PROP_TAB_ID))
@@ -7215,7 +7120,7 @@ class Command:
             ct.menu_proc(self.compare_menu, ct.MENU_ADD, caption='-')
             for key, caption in _IGNORE_OPTS:
                 item = ct.menu_proc(self.compare_menu, ct.MENU_ADD,
-                    command='module=cuda_differ;cmd=tabmenu_ignore;info='+key+';',
+                    command='module=cuda_differ2;cmd=tabmenu_ignore;info='+key+';',
                     caption=caption
                     )
                 ct.menu_proc(item, ct.MENU_SET_CHECKED,
@@ -7223,8 +7128,8 @@ class Command:
                 ct.menu_proc(item, ct.MENU_SET_ENABLED, command=is_compare)
 
         # Separator + the cancel commands at the very bottom, below
-        # everything else. Mirrors the 'Differ\Cancel compare' and
-        # 'Differ\Cancel all compares' plugin commands: they stop an
+        # everything else. Mirrors the 'Differ 2\Cancel compare' and
+        # 'Differ 2\Cancel all compares' plugin commands: they stop an
         # in-flight background compare (engine told to stop, editors
         # unlocked + made writable again). 'Cancel compare' acts on
         # THIS tab (enabled while THIS tab's session has a job in
@@ -7236,13 +7141,13 @@ class Command:
         ct.menu_proc(self.compare_menu, ct.MENU_ADD, caption='-')
         cur_session = self._session_for(cur_ed.get_prop(ct.PROP_TAB_ID))
         self.menuid_cancel = ct.menu_proc(self.compare_menu, ct.MENU_ADD,
-            command='module=cuda_differ;cmd=cancel_compare;',
+            command='module=cuda_differ2;cmd=cancel_compare;',
             caption=_('Cancel compare')
             )
         ct.menu_proc(self.menuid_cancel, ct.MENU_SET_ENABLED,
             command=cur_session is not None and cur_session.job is not None)
         self.menuid_cancel_all = ct.menu_proc(self.compare_menu, ct.MENU_ADD,
-            command='module=cuda_differ;cmd=cancel_all_compares;',
+            command='module=cuda_differ2;cmd=cancel_all_compares;',
             caption=_('Cancel all compares')
             )
         ct.menu_proc(self.menuid_cancel_all, ct.MENU_SET_ENABLED,
@@ -7250,13 +7155,13 @@ class Command:
 
         # "Resize editors to equal width" at the very end of the menu:
         # handy after dragging the editor splitter and wanting the 50/50
-        # layout back (same as the exposed 'Differ\Resize editors to
+        # layout back (same as the exposed 'Differ 2\Resize editors to
         # equal width' command). The command info carries the
         # RIGHT-CLICKED tab's id -- the right-clicked tab is not
         # necessarily the focused one (see tabmenu_equal_width).
         ct.menu_proc(self.compare_menu, ct.MENU_ADD, caption='-')
         self.menuid_equal_width = ct.menu_proc(self.compare_menu, ct.MENU_ADD,
-            command='module=cuda_differ;cmd=tabmenu_equal_width;info={};'.format(
+            command='module=cuda_differ2;cmd=tabmenu_equal_width;info={};'.format(
                 cur_ed.get_prop(ct.PROP_TAB_ID)),
             caption=_('Resize editors to equal width')
             )
@@ -7266,7 +7171,7 @@ class Command:
     def tabmenu_chooser(self):
         """Launch 'Compare with...' via a 100ms timer (needed because menu
         callbacks can't call dlg_file directly)."""
-        callback = 'module=cuda_differ;cmd=tabmenu_chooser_timer;info=_;'
+        callback = 'module=cuda_differ2;cmd=tabmenu_chooser_timer;info=_;'
         ct.timer_proc(ct.TIMER_START_ONE, callback, 100)
 
     def tabmenu_chooser_timer(self, tag='', info=''):
@@ -7276,7 +7181,7 @@ class Command:
     def tabmenu_chooser_tab(self):
         """Opens the 'Compare current document with tab...' command, which
         shows the native CudaText tab-picker dialog (with scrollbar)."""
-        callback = 'module=cuda_differ;cmd=tabmenu_chooser_tab_timer;info=_;'
+        callback = 'module=cuda_differ2;cmd=tabmenu_chooser_tab_timer;info=_;'
         ct.timer_proc(ct.TIMER_START_ONE, callback, 100)
 
     def tabmenu_chooser_tab_timer(self, tag='', info=''):
@@ -7285,7 +7190,7 @@ class Command:
 
     def tabmenu_refresh(self):
         """Recompare the compare tab -- re-applies diff markers (menu item "Recompare")."""
-        callback = 'module=cuda_differ;cmd=tabmenu_refresh_timer;info=_;'
+        callback = 'module=cuda_differ2;cmd=tabmenu_refresh_timer;info=_;'
         ct.timer_proc(ct.TIMER_START_ONE, callback, 100)
 
     def tabmenu_refresh_timer(self, tag='', info=''):
@@ -7293,9 +7198,9 @@ class Command:
         self.refresh_compare()
 
     def tabmenu_ignore(self, info):
-        """Toggle one 'differ.ignoreopt.*' option from the diff-tab context
+        """Toggle one 'differ2.ignoreopt.*' option from the diff-tab context
         menu (checkable items below 'Recompare'): persist it to
-        settings/cuda_differ.json via set_opt -- so the config dialog sees
+        settings/cuda_differ2.json via set_opt -- so the config dialog sees
         it too -- then refresh the compare on a 100ms one-shot timer (same
         convention as the other tabmenu_* callbacks, so the menu can close
         first). The context menu itself is rebuilt by tabmenu_init on every
@@ -7311,18 +7216,18 @@ class Command:
         captions = dict(_IGNORE_OPTS)
         state = _('enabled') if not old else _('disabled')
         ct.msg_status('{}: {} -- {}'.format(
-            _('Differ ignore option'), captions.get(key, key), state))
+            _('Differ 2 ignore option'), captions.get(key, key), state))
         # Re-run the compare so the change is visible immediately.
         # refresh_compare calls config() first, which detects the settings-file
         # mtime change and reloads self.cfg, so this very refresh already
         # uses the new flags.
-        callback = 'module=cuda_differ;cmd=tabmenu_refresh_timer;info=_;'
+        callback = 'module=cuda_differ2;cmd=tabmenu_refresh_timer;info=_;'
         ct.timer_proc(ct.TIMER_START_ONE, callback, 100)
 
     def tabmenu_files(self, info):
         """Launch a compare between two files specified in 'info' (format:
         'fn0::fn1') via a 100ms timer."""
-        callback = 'module=cuda_differ;cmd=tabmenu_files_timer;info='+info+';'
+        callback = 'module=cuda_differ2;cmd=tabmenu_files_timer;info='+info+';'
         ct.timer_proc(ct.TIMER_START_ONE, callback, 100)
 
     def tabmenu_files_timer(self, tag='', info=''):
@@ -7334,7 +7239,7 @@ class Command:
         """Select all diff hunks in the focused editor as multi-caret selections."""
         session = self._focused_session()
         if session is None:
-            return ct.msg_status(_('Differ: not a compare tab'))
+            return ct.msg_status(_('Differ 2: not a compare tab'))
         diff = self._session_diff(session)
         if not diff.diffmap:
             self.refresh_compare()
@@ -7475,9 +7380,9 @@ class Command:
         # During app exit, keep the state entry and autostart subscription
         # so compare tabs persist restarts and the plugin auto-loads.
         # Re-register since we already unregistered above, preserving the
-        # saved/dirty state (per-half dirty flags + legacy 'saved' flag)
-        # so on_start2 can restore the correct title color and a restart
-        # save still syncs only the halves that were dirty before exit.
+        # per-half dirty state so on_start2 can restore the correct title
+        # color and a restart save still syncs only the halves that were
+        # dirty before exit.
         #
         # NO GUI calls past this point at exit (see the docstring): the
         # entry must be re-registered and both halves put back to
@@ -7493,7 +7398,6 @@ class Command:
                     entry.get('secondary_orig_tab_id'),
                     entry.get('primary_orig_name', ''),
                     entry.get('secondary_orig_name', ''),
-                    entry.get('saved', True),
                     entry.get('dirty')
                 )
             # Put both halves back to PROP_MODIFIED=True. on_close_pre

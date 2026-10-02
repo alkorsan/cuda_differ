@@ -119,7 +119,7 @@ DIFF_IGN_BLANK_LINES = _ct.DIFF_IGN_BLANK_LINES if _HAS_NATIVE_DIFF else 16
 # default and calls SetBreakChars() with it on every compare -- so the
 # long list is what the engine effectively runs with in normal use; the
 # plugin and the CudaText diff_proc default mirror it). Exposed as the
-# plugin option 'differ.algorithm.break_chars' (config dialog,
+# plugin option 'differ2.algorithm.break_chars' (config dialog,
 # 'algorithm' chapter); the configured value is sanitized by
 # normalize_break_chars() and threaded into every diff_proc(DIF_CHARS)
 # call: every character of the string is its own token and a word
@@ -153,7 +153,7 @@ def build_ignore_flags(cfg):
 def normalize_break_chars(value):
     """Sanitize a configured break-chars value into a str.
 
-    The option lives in settings/cuda_differ.json, so a hand-edited
+    The option lives in settings/cuda_differ2.json, so a hand-edited
     file could hold a non-string (number, list, null...) -- and the
     native engine's diff_proc(DIF_CHARS) accepts a str only (any other
     type is an API error, which would fail EVERY compare). Returns the
@@ -191,8 +191,7 @@ class CudaDiffNativeMatcher:
     """
 
     # Algorithm IDs — accessed directly from cudatext (_ct) at the call
-    # sites. These class attributes are kept for API compatibility with
-    # code that references CudaDiffNativeMatcher._ALGO_MYERS etc.
+    # sites; these class attributes name the two native engine choices.
     _ALGO_MYERS = 0  # DIFF_ALGO_MYERS
     _ALGO_HISTOGRAM = 1  # DIFF_ALGO_HISTOGRAM
 
@@ -349,7 +348,7 @@ def start_async_char_diff(pairs, flags, callback, break_chars=DEFAULT_BREAK_CHAR
 
     'break_chars' is the tokenizer's word-break characters (see
     DEFAULT_BREAK_CHARS): the value of the plugin's
-    'differ.algorithm.break_chars' setting, carried on the Differ as
+    'differ2.algorithm.break_chars' setting, carried on the Differ as
     diff.break_chars. ONE value for the whole batch -- the engine
     applies the same set to every pair (exactly like 'flags').
 
@@ -408,7 +407,7 @@ def sync_char_diff(pairs, flags, break_chars=DEFAULT_BREAK_CHARS):
     only as an emergency path, never the normal flow.
 
     'break_chars' -- see start_async_char_diff (ONE value for the
-    whole batch, from the 'differ.algorithm.break_chars' setting).
+    whole batch, from the 'differ2.algorithm.break_chars' setting).
 
     Returns the per-pair opcode list (same format as
     start_async_char_diff's callback argument), or None on engine
@@ -569,7 +568,7 @@ class Differ:
         (DIF_TEXTS) and the char-level detail diff (DIF_CHARS).
 
         self.break_chars is the DIF_CHARS tokenizer's word-break
-        characters ('differ.algorithm.break_chars' config setting,
+        characters ('differ2.algorithm.break_chars' config setting,
         sanitized by normalize_break_chars). Command.refresh_compare
         sets it next to ignore_flags; it is threaded into every
         DIF_CHARS call (batched and legacy) and ignored by DIF_TEXTS.
@@ -594,7 +593,7 @@ class Differ:
         self.withdetail = True
         self.diff_algorithm = 'native_myers'
         self.align_by_similarity = False
-        # 'differ.algorithm.beautify.absorb_trivial_equal_blocks' --
+        # 'differ2.algorithm.beautify.absorb_trivial_equal_blocks' --
         # when True, the engine's finished opcodes go through
         # _absorb_trivial_equal_blocks (the module-level function at
         # the END of this file) before any phase walks them. Default
@@ -818,7 +817,7 @@ class Differ:
         # evolve independently); see the NOTE in compare_lists for why
         # the native engines need it too. Runs here, once, on the
         # engine's finished result -- and ONLY when the option
-        # 'differ.algorithm.beautify.absorb_trivial_equal_blocks' is
+        # 'differ2.algorithm.beautify.absorb_trivial_equal_blocks' is
         # on: this pass's pair walk AND the replay pass's paint walk
         # must both use the absorbed structure (the char-ops pop order
         # depends on it), and the line lists the trivial-content check
@@ -989,7 +988,7 @@ class Differ:
                 alignment invariant is unaffected.
 
         NOTE: the opcode beautify pass (absorb trivial equal blocks).
-        When 'differ.algorithm.beautify.absorb_trivial_equal_blocks' is
+        When 'differ2.algorithm.beautify.absorb_trivial_equal_blocks' is
         ON, the engine's finished opcodes go through
         _absorb_trivial_equal_blocks (the module-level function at the
         END of this file -- differ_python.py carries its own copy):
@@ -1005,7 +1004,7 @@ class Differ:
         the other file). It is a beautify OPTION, default OFF: with it
         off, the raw engine output is rendered exactly as the engine
         produced it (GNU diffutils / WinMerge faithful). The option
-        lives in the same 'differ.algorithm.beautify.*' group as
+        lives in the same 'differ2.algorithm.beautify.*' group as
         align_by_similarity, but the two are independent layers:
         align_by_similarity re-pairs lines INSIDE one replace block
         (rendering), the absorb pass changes WHICH lines belong to
@@ -1297,7 +1296,7 @@ class Differ:
 
         if _bm_start is not None:
             _bm_elapsed = time.perf_counter() - _bm_start
-            print('Differ: compare took {:.1f}ms '
+            print('Differ 2: compare took {:.1f}ms '
                   '(algo={}, a={}lines, b={}lines, opcodes={}diffs)'.format(
                       _bm_elapsed * 1000,
                       self.diff_algorithm,
@@ -1912,7 +1911,7 @@ class Differ:
 # this code -- the duplication is deliberate, so the native and Python
 # codepaths can evolve independently; see the module docstring).
 #
-# Enabled by the option 'differ.algorithm.beautify.absorb_trivial_equal_blocks'
+# Enabled by the option 'differ2.algorithm.beautify.absorb_trivial_equal_blocks'
 # (default OFF -- the engine's raw opcode stream is used as-is). Ported
 # from VS Code's heuristicSequenceOptimizations.ts
 # (removeVeryShortMatchingLinesBetweenDiffs + the adjacent-change joins
@@ -1954,7 +1953,7 @@ def _absorb_trivial_equal_blocks(a, opcodes, _book=None):
     in place, BEFORE the char-pair walk) and from compare_lists()
     (fresh-split branch: synchronous engine run / withdetail-off
     delivery) -- ONLY when the option
-    'differ.algorithm.beautify.absorb_trivial_equal_blocks' is on.
+    'differ2.algorithm.beautify.absorb_trivial_equal_blocks' is on.
 
     STEP 1 -- merge INSERT + EQUAL(trivial) + DELETE (or the mirrored
     DELETE + EQUAL(trivial) + INSERT) into one REPLACE.

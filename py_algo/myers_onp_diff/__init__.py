@@ -71,7 +71,7 @@ class MyersSequenceMatcher(difflib.SequenceMatcher):
         # detail diffing inside a 'replace' block) work without raising
         # AttributeError. The upstream MyersSequenceMatcher did not call
         # super().__init__() because Meld only ever uses it for the main
-        # line-level diff; the differ plugin also reuses it via set_seq1/
+        # line-level diff; Differ 2 also reuses it via set_seq1/
         # set_seq2 for character-level detail, so we need the difflib
         # attributes (isjunk, autojunk, fullbcount, b2j, bjunk, bpopular)
         # to be initialized. We pass autojunk=False because Myers does not
@@ -128,8 +128,8 @@ class MyersSequenceMatcher(difflib.SequenceMatcher):
             self.bindex = []
             # Reset lines_discarded so build_matching_blocks does not enter
             # the discarded-lines branch with empty aindex/bindex. Without
-            # this, reusing the matcher via set_seq1/set_seq2 (which
-            # differ._fancy_replace does for character-level detail diffing)
+            # this, reusing the matcher via set_seq1/set_seq2 for
+            # character-level detail diffing
             # would leave lines_discarded=True from a previous call while
             # aindex is now empty, causing IndexError at aindex[x].
             self.lines_discarded = False
@@ -341,8 +341,8 @@ class InlineMyersSequenceMatcher(MyersSequenceMatcher):
             self.aindex = []
             self.bindex = []
             # Reset lines_discarded -- see the base class for the rationale.
-            # Without this, reusing the matcher via set_seq1/set_seq2 (which
-            # differ._fancy_replace does) would leave lines_discarded=True
+            # Without this, reusing the matcher via set_seq1/set_seq2
+            # would leave lines_discarded=True
             # from a previous long-string call while aindex is now empty,
             # causing IndexError at aindex[x] in build_matching_blocks.
             self.lines_discarded = False

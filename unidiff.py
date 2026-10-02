@@ -22,7 +22,7 @@ sink the runner receives at construction time:
 
   * ENGINE COMPUTE -- which engine produces the opcodes (or the whole
     diff text, for the 'difflib' choice) follows the CONFIGURED
-    algorithm (differ.algorithm.diff_algorithm), resolved by
+    algorithm (differ2.algorithm.diff_algorithm), resolved by
     Command._resolve_algorithm before start():
       - 'difflib' -> stdlib difflib.unified_diff DIRECTLY, keeping its
         classic behavior (autojunk=True included);
@@ -221,7 +221,7 @@ def unified_diff_opcodes(a, b, opcodes, fromfile='', tofile='',
     backslash-newline marker either).
 
     This is what lets the "Diff current document with..." commands
-    honor differ.algorithm.diff_algorithm: all the plugin's engines
+    honor differ2.algorithm.diff_algorithm: all the plugin's engines
     agree on the opcode format, so only the RENDERING had to be
     engine-independent.
 
@@ -307,7 +307,7 @@ def _py_opcodes(algo, a, b):
 
     The unified-diff commands deliberately use the RAW algorithms:
     the beautify passes of the side-by-side view (the
-    'differ.algorithm.beautify.*' options) are NOT applied here, so
+    'differ2.algorithm.beautify.*' options) are NOT applied here, so
     what you get is the engine's own hunk structure, exactly what GNU
     diff / WinMerge would show for that algorithm. (The compare view
     can therefore paint a slightly different hunk structure than the
@@ -404,7 +404,7 @@ def report_status(elapsed, n_diffs, algo):
         d_str = _('1 difference')
     else:
         d_str = _('{} differences').format(n_diffs)
-    ct.msg_status(_('Differ: diffed in {}, {}, algo {}').format(
+    ct.msg_status(_('Differ 2: diffed in {}, {}, algo {}').format(
         t_str, d_str, algo))
 
 
@@ -541,7 +541,7 @@ class UnidiffRunner:
         job.a = split_lines_safe(job.txt0)
         job.b = split_lines_safe(job.txt1)
         JOBS.append(job)
-        ct.msg_status(_('Differ: diffing in background...'))
+        ct.msg_status(_('Differ 2: diffing in background...'))
 
     def _on_native_done(self, job, opcodes):
         """diff_proc completion callback for the unified-diff commands'
@@ -566,7 +566,7 @@ class UnidiffRunner:
         else:
             # RAW engine output: the unified-diff commands deliberately
             # do NOT run the compare view's beautify passes (the
-            # 'differ.algorithm.beautify.*' options,
+            # 'differ2.algorithm.beautify.*' options,
             # absorb_trivial_equal_blocks included) -- the unified diff
             # shows the algorithm's own hunk structure, exactly what the
             # engine produced.
@@ -631,14 +631,14 @@ class UnidiffRunner:
         try:
             thread = threading.Thread(
                 target=_worker,
-                name='cuda_differ_unidiff',
+                name='cuda_differ2_unidiff',
                 daemon=True)
             thread.start()
             ct.timer_proc(ct.TIMER_START, _poll, _POLL_MS)
             job.py_poll_cb = _poll
             job.py_engine_thread = thread
             JOBS.append(job)
-            ct.msg_status(_('Differ: diffing in background...'))
+            ct.msg_status(_('Differ 2: diffing in background...'))
         except Exception:
             # Thread / timer unavailable (exotic host, test sandbox) or a
             # raise in the kick-off tail: disarm whatever half-started

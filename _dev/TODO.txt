@@ -121,7 +121,7 @@ you have to make sure that differ2 does not interfer with the old differ, like m
 so change config files names and menus to use differ2, and read https://github.com/CudaText-addons/cuda_differ to see if there is something that may interfer with my new plugin differ2 then fix it in differ2 code
 you have to rename any mention of the plugin name to differ2, in doc, in code....etc everywhere
 
-in doc in == Authors == remove all names and keep only badr elmers, and mentions that it s a fork of https://github.com/CudaText-addons/cuda_differ of OlehL rewriten from scratch
+in doc in == Authors == remove all names and keep only badr elmers, and mention that it s a fork of https://github.com/CudaText-addons/cuda_differ of OlehL rewriten from scratch below my name and github
 
 
 ___

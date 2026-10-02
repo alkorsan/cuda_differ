@@ -1,4 +1,4 @@
-"""Lightweight hierarchical profiler for the Differ plugin.
+"""Lightweight hierarchical profiler for the Differ 2 plugin.
 
 REWRITTEN 2026-09-21. The old design instrumented every hot-loop
 iteration (one section per char-diff pair, per marker, per gap, per
@@ -346,7 +346,7 @@ class Profiler:
         items = sorted(cls._rows.items(), key=lambda kv: -kv[1].self_t)
 
         print('\n' + '=' * 114)
-        print('Differ Profiling Report  (times in ms; sorted by SELF time'
+        print('Differ 2 Profiling Report  (times in ms; sorted by SELF time'
               ' \u2192 real bottleneck at top)')
         if files:
             print('Compared files:')
@@ -360,8 +360,8 @@ class Profiler:
             print('  !! under the cProfile layer (their timing calls would be')
             print('  !! traced themselves); their time is in')
             print('  !! refresh:compare_and_paint SELF. For those rows + clean')
-            print('  !! section numbers turn OFF differ.advanced.enable_cprofile')
-            print('  !! (Options dialog / settings/cuda_differ.json) and re-run;')
+            print('  !! section numbers turn OFF differ2.advanced.enable_cprofile')
+            print('  !! (Options dialog / settings/cuda_differ2.json) and re-run;')
             print('  !! use this run for the function-level report printed')
             print('  !! after this one.')
         print('=' * 114)
@@ -676,16 +676,16 @@ def reset_profiling():
 # this layer to find the hot function, then turn it off
 # (ENABLE_CPROFILE = False) and read the section report for clean
 # phase attribution. Both layers are gated by the SAME config switch
-# (differ.advanced.enable_profiling) -- this constant only adds the
+# (differ2.advanced.enable_profiling) -- this constant only adds the
 # second layer on top.
 #
-# The names start_profiling/stop_profiling replace the legacy thin
-# aliases of Profiler.start/stop that used to live here (nothing
-# imported them -- the Profiler class is used directly for sections).
+# start_profiling / stop_profiling are the cProfile layer's entry
+# points (the Profiler class is used directly for sections; nothing
+# else needs wrapping here).
 # --------------------------------------------------------------------------
 
 # Master switch for the cProfile layer. CONFIG-DRIVEN since v7: the
-# plugin reads differ.advanced.enable_cprofile (settings/cuda_differ.json
+# plugin reads differ2.advanced.enable_cprofile (settings/cuda_differ2.json
 # or the Options dialog, chapter Advanced) at every refresh_compare and
 # starts this layer only when BOTH that option and enable_profiling are
 # on -- no source edit needed to toggle it. This constant remains only

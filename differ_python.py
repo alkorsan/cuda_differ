@@ -20,7 +20,7 @@ Alignment modes (self.align_by_similarity):
           positional top-down pairing, leftovers as plain add/delete.
           Nothing is re-paired, re-ordered or split. Default.
 
-The two beautify options (both under 'differ.algorithm.beautify.*',
+The two beautify options (both under 'differ2.algorithm.beautify.*',
 both OFF by default so the raw engine output is rendered faithfully):
   align_by_similarity (this module's self.align_by_similarity) -- a
       RENDERING choice: how lines inside one REPLACE block are paired
@@ -253,7 +253,7 @@ class Differ:
         self.withdetail = True
         self.diff_algorithm = 'hybrid'
         self.align_by_similarity = False
-        # 'differ.algorithm.beautify.absorb_trivial_equal_blocks' --
+        # 'differ2.algorithm.beautify.absorb_trivial_equal_blocks' --
         # when True, engine_opcodes() runs _absorb_trivial_equal_blocks
         # (the module-level function at the END of this file) on the
         # engine's finished opcodes. Default False: raw engine output.
@@ -343,7 +343,7 @@ class Differ:
         del diff
 
         # Opcode beautify pass -- ONLY when the option is on
-        # ('differ.algorithm.beautify.absorb_trivial_equal_blocks',
+        # ('differ2.algorithm.beautify.absorb_trivial_equal_blocks',
         # default off: raw, algo-faithful hunks). When on, it runs for
         # EVERY algorithm (measured: difflib 2x Step-1 + 22x Step-2
         # patterns on the _dev/__tests corpus, myers 1+61, hybrid 1+3,
@@ -486,7 +486,7 @@ class Differ:
                         yield from evlist
         if _bm_start is not None:
             _bm_elapsed = time.perf_counter() - _bm_start
-            print('Differ: compare took {:.1f}ms '
+            print('Differ 2: compare took {:.1f}ms '
                   '(algo={}, a={}lines, b={}lines, opcodes={}diffs)'.format(
                       _bm_elapsed * 1000,
                       self.diff_algorithm,
@@ -931,7 +931,7 @@ class Differ:
 # this code -- the duplication is deliberate, so the Python and native
 # codepaths can evolve independently; see the module docstring).
 #
-# Enabled by the option 'differ.algorithm.beautify.absorb_trivial_equal_blocks'
+# Enabled by the option 'differ2.algorithm.beautify.absorb_trivial_equal_blocks'
 # (default OFF -- the engine's raw opcode stream is used as-is). Ported
 # from VS Code's heuristicSequenceOptimizations.ts
 # (removeVeryShortMatchingLinesBetweenDiffs + the adjacent-change joins
@@ -970,7 +970,7 @@ def _absorb_trivial_equal_blocks(a, opcodes, _book=None):
     """Beautify pass for a finished opcode list -- two steps.
 
     Called from engine_opcodes() ONLY when the option
-    'differ.algorithm.beautify.absorb_trivial_equal_blocks' is on.
+    'differ2.algorithm.beautify.absorb_trivial_equal_blocks' is on.
 
     STEP 1 -- merge INSERT + EQUAL(trivial) + DELETE (or the mirrored
     DELETE + EQUAL(trivial) + INSERT) into one REPLACE.

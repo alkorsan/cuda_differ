@@ -1,4 +1,4 @@
-"""Differ compare-tab toolbar.
+"""Differ 2 compare-tab toolbar.
 
 A small toolbar docked to the TOP of every compare tab (the editor
 parent's top side), built with dlg_proc:
@@ -8,8 +8,8 @@ parent's top side), built with dlg_proc:
   ...status label
 
 Everything the toolbar does goes through the Command object of
-cuda_differ/__init__.py, which passes itself to every module-level
-entry point; this module never imports cuda_differ's __init__ (that
+cuda_differ2/__init__.py, which passes itself to every module-level
+entry point; this module never imports cuda_differ2's __init__ (that
 would be a circular import -- __init__ imports THIS module at load).
 
 Implementation notes:
@@ -86,7 +86,7 @@ Implementation notes:
 * The IGNORE dropdown is a popup menu (menu_proc MENU_CREATE) shown
   under the button via MENU_SHOW; its items are checkable and multiple
   can be checked. It is REBUILT on every compare start so it always
-  mirrors settings/cuda_differ.json (the config dialog and the tab
+  mirrors settings/cuda_differ2.json (the config dialog and the tab
   context menu write there too). While a pure-Python algorithm is the
   effective one, the items disable themselves and an explanatory
   item appears -- same guard as the tab context menu / config dialog.
@@ -100,13 +100,13 @@ Implementation notes:
   Histogram", "Algorithm 2: Native Myers"), and the two independent
   checkable toggles "Align by similarity" and "Absorb trivial equal
   blocks". It is REBUILT on every
-  open, so the checkmarks always mirror settings/cuda_differ.json,
+  open, so the checkmarks always mirror settings/cuda_differ2.json,
   and the preset checkmarks are DERIVED from it -- a preset is an
   EXACT combination of three settings: Preset 1 = native Myers +
   align off + absorb off, Preset 2 = native Histogram + align on +
   absorb off; any other combination (absorb on included) checks
   NEITHER (a custom selection is visible at a glance). Clicks persist
-  'differ.algorithm.*' (the config dialog's store) and re-compare
+  'differ2.algorithm.*' (the config dialog's store) and re-compare
   this tab on the 100ms timer, like the ignore items.
 
 * The VIEW dropdown toggles the surrounding UI from the compare tab:
@@ -117,7 +117,7 @@ Implementation notes:
   panel and tab bar (the PROC_SHOW_* app-proc pairs -- the app's own
   View-menu toggles), the gutter's numbers / bookmarks columns (an
   editor prop, set on BOTH halves of the tab) and the gap-aware
-  overview panel (the differ.micromap.enable_overview option; the
+  overview panel (the differ2.micromap.enable_overview option; the
   100ms re-compare's refresh then creates or destroys the panel).
   REBUILT on every open, so the checkmarks always mirror the live
   state -- the bars can be toggled from CudaText's own View menu too.
@@ -154,10 +154,10 @@ Implementation notes:
   popup's ROOT menu item and leaves the (main-form-owned) popup
   dangling; MENU_CLEAR empties it safely.
 
-Options (settings/cuda_differ.json, chapter 'toolbar' in the config
+Options (settings/cuda_differ2.json, chapter 'toolbar' in the config
 dialog):
-* differ.toolbar.show_toolbar (default on) -- create/hide toolbars.
-* differ.toolbar.show_btn_text (default on) -- full captions vs
+* differ2.toolbar.show_toolbar (default on) -- create/hide toolbars.
+* differ2.toolbar.show_btn_text (default on) -- full captions vs
   icon-only buttons.
 """
 
@@ -169,7 +169,7 @@ _ = get_translation(__file__)  # I18N
 
 # The plugin's settings JSON (same file __init__.JSONFILE points to;
 # kept in sync by hand -- toolbar.py must not import __init__).
-_JSON_FILE = 'cuda_differ.json'
+_JSON_FILE = 'cuda_differ2.json'
 
 # Editor text background of the active UI theme -- the toolbar's
 # background color (see _ed_text_bg). One flat color that always
@@ -224,7 +224,7 @@ def _split_color():
 
 # The five ignore options, exposed as checkable items of the toolbar's
 # Ignore dropdown, of the diff-tab context menu and of the config
-# dialog ('differ.ignoreopt.*'). Defined HERE so the toolbar and
+# dialog ('differ2.ignoreopt.*'). Defined HERE so the toolbar and
 # __init__ share one source of truth; __init__ imports it as
 # _IGNORE_OPTS. Each entry: (config key suffix, menu caption).
 IGNORE_OPTS = (
@@ -237,25 +237,25 @@ IGNORE_OPTS = (
 
 
 def _get_ignore_opt(key):
-    """Read one 'differ.ignoreopt.*' boolean from the plugin's settings
+    """Read one 'differ2.ignoreopt.*' boolean from the plugin's settings
     (mtime-cached by cudax_lib, so values changed in the config dialog
     or the tab context menu are picked up at once)."""
-    return bool(ctx.get_opt('differ.ignoreopt.' + key, False,
+    return bool(ctx.get_opt('differ2.ignoreopt.' + key, False,
                             user_json=_JSON_FILE))
 
 
 def _set_ignore_opt(key, val):
-    """Write one 'differ.ignoreopt.*' boolean to the plugin's settings
+    """Write one 'differ2.ignoreopt.*' boolean to the plugin's settings
     (same store the config dialog and the tab context menu use)."""
-    return ctx.set_opt('differ.ignoreopt.' + key, bool(val),
+    return ctx.set_opt('differ2.ignoreopt.' + key, bool(val),
                        user_json=_JSON_FILE)
 
 
 # The Presets dropdown's items: two mutually exclusive preset
 # combinations, a separator, the two native algorithms (also mutually
 # exclusive) and the two independent beautify toggles (the
-# 'differ.algorithm.beautify.align_by_similarity' /
-# 'differ.algorithm.beautify.absorb_trivial_equal_blocks' options).
+# 'differ2.algorithm.beautify.align_by_similarity' /
+# 'differ2.algorithm.beautify.absorb_trivial_equal_blocks' options).
 # Each entry: (menu key, menu caption); None = the separator.
 # Toolbar-only -- the config dialog / tab context menu keep their own
 # algorithm UIs.
@@ -288,7 +288,7 @@ _PRESET_RADIO = {
     'algo2': 2,
 }
 
-# Values written to 'differ.algorithm.diff_algorithm' by the preset /
+# Values written to 'differ2.algorithm.diff_algorithm' by the preset /
 # algorithm items (the same values the config dialog writes; on older
 # CudaText builds without diff_proc the plugin falls back to the closest
 # pure-Python algorithm).
@@ -297,57 +297,57 @@ _ALGO_HIST = 'native_histogram'
 
 
 def _get_diff_algo():
-    """The configured algorithm ('differ.algorithm.diff_algorithm'),
+    """The configured algorithm ('differ2.algorithm.diff_algorithm'),
     read live from the plugin's settings (mtime-cached by cudax_lib,
     so config-dialog / tab-menu writes are picked up at once)."""
-    return ctx.get_opt('differ.algorithm.diff_algorithm', 'native_myers',
+    return ctx.get_opt('differ2.algorithm.diff_algorithm', 'native_myers',
                        user_json=_JSON_FILE)
 
 
 def _set_diff_algo(val):
-    """Write 'differ.algorithm.diff_algorithm' to the plugin's settings
+    """Write 'differ2.algorithm.diff_algorithm' to the plugin's settings
     (same store the config dialog uses)."""
-    return ctx.set_opt('differ.algorithm.diff_algorithm', val,
+    return ctx.set_opt('differ2.algorithm.diff_algorithm', val,
                        user_json=_JSON_FILE)
 
 
 def _get_beautify():
     """The Align-by-similarity flag
-    ('differ.algorithm.beautify.align_by_similarity'), read live from
+    ('differ2.algorithm.beautify.align_by_similarity'), read live from
     the settings."""
     return bool(ctx.get_opt(
-        'differ.algorithm.beautify.align_by_similarity', False,
+        'differ2.algorithm.beautify.align_by_similarity', False,
         user_json=_JSON_FILE))
 
 
 def _set_beautify(val):
-    """Write 'differ.algorithm.beautify.align_by_similarity' to the
+    """Write 'differ2.algorithm.beautify.align_by_similarity' to the
     plugin's settings (same store the config dialog uses)."""
     return ctx.set_opt(
-        'differ.algorithm.beautify.align_by_similarity', bool(val),
+        'differ2.algorithm.beautify.align_by_similarity', bool(val),
         user_json=_JSON_FILE)
 
 
 def _get_absorb():
     """The Absorb-trivial-equal-blocks flag
-    ('differ.algorithm.beautify.absorb_trivial_equal_blocks'), read
+    ('differ2.algorithm.beautify.absorb_trivial_equal_blocks'), read
     live from the settings."""
     return bool(ctx.get_opt(
-        'differ.algorithm.beautify.absorb_trivial_equal_blocks', False,
+        'differ2.algorithm.beautify.absorb_trivial_equal_blocks', False,
         user_json=_JSON_FILE))
 
 
 def _set_absorb(val):
-    """Write 'differ.algorithm.beautify.absorb_trivial_equal_blocks'
+    """Write 'differ2.algorithm.beautify.absorb_trivial_equal_blocks'
     to the plugin's settings (same store the config dialog uses)."""
     return ctx.set_opt(
-        'differ.algorithm.beautify.absorb_trivial_equal_blocks',
+        'differ2.algorithm.beautify.absorb_trivial_equal_blocks',
         bool(val), user_json=_JSON_FILE)
 
 
 # The View dropdown's checkable items, in the user's order: CudaText's
 # six main UI bars, the gutter's two columns, then the overview panel
-# ('overview', a single key -- the differ.micromap.enable_overview
+# ('overview', a single key -- the differ2.micromap.enable_overview
 # option). Each bar entry: (menu key, caption, app-proc GET id,
 # app-proc SET id) -- the PROC_SHOW_* pairs are the app's own
 # View-menu toggles. Each gutter entry: (menu key, caption, editor
@@ -382,17 +382,17 @@ _SHOW_ALL_SKIP = frozenset(('sidepanel', 'bottompanel'))
 
 def _get_overview_opt():
     """The gap-aware overview panel option
-    ('differ.micromap.enable_overview'), read live from the plugin's
+    ('differ2.micromap.enable_overview'), read live from the plugin's
     settings (mtime-cached by cudax_lib, so config-dialog writes are
     picked up at once)."""
-    return bool(ctx.get_opt('differ.micromap.enable_overview', True,
+    return bool(ctx.get_opt('differ2.micromap.enable_overview', True,
                             user_json=_JSON_FILE))
 
 
 def _set_overview_opt(val):
-    """Write 'differ.micromap.enable_overview' to the plugin's settings
+    """Write 'differ2.micromap.enable_overview' to the plugin's settings
     (same store the config dialog uses)."""
-    return ctx.set_opt('differ.micromap.enable_overview', bool(val),
+    return ctx.set_opt('differ2.micromap.enable_overview', bool(val),
                        user_json=_JSON_FILE)
 
 
@@ -502,7 +502,7 @@ def _total_height():
 class CompareToolbar:
     """One toolbar docked to the top of ONE compare tab.
 
-    'cmd' is the Command instance of cuda_differ (all actions are its
+    'cmd' is the Command instance of cuda_differ2 (all actions are its
     methods); 'session' is the tab's _TabSession (the toolbar's
     lifetime is the session's lifetime); 'a_ed' is any editor of that
     tab (used for the parent handle and for refreshes).
@@ -583,7 +583,7 @@ class CompareToolbar:
         h = ct.dlg_proc(0, ct.DLG_CREATE)
         self.h_dlg = h
         ct.dlg_proc(h, ct.DLG_PROP_SET, prop={
-            'cap': 'Differ',
+            'cap': 'Differ 2',
             'w': 700,
             'h': self.height,
             'border': ct.DBORDER_NONE,
@@ -828,7 +828,7 @@ class CompareToolbar:
         if name == 'copy_right':
             return _('Copy current difference to the right (Alt+Right)')
         if name == 'config':
-            return _('Differ options...')
+            return _('Differ 2 options...')
         if name == 'ignore':
             return self._ignore_tooltip()
         if name == 'presets':
@@ -1022,7 +1022,7 @@ class CompareToolbar:
             pass
 
     def set_show_text(self, show_text):
-        """Apply the differ.toolbar.show_btn_text option: full captions
+        """Apply the differ2.toolbar.show_btn_text option: full captions
         or icons only."""
         show_text = bool(show_text)
         if self.show_text == show_text:
@@ -1125,7 +1125,7 @@ class CompareToolbar:
                 # would parse the info value and an unquoted value like
                 # '501|ignore_case' arrives as None -> the click did
                 # nothing in the first toolbar version.)
-                command='module=cuda_differ;cmd=toolbar_menu_ignore;'
+                command='module=cuda_differ2;cmd=toolbar_menu_ignore;'
                         'info={}|{};'.format(self.tab_id_str, key))
             try:
                 ct.menu_proc(mi, ct.MENU_SET_CHECKED,
@@ -1139,7 +1139,7 @@ class CompareToolbar:
         mi = ct.menu_proc(
             self.h_menu, ct.MENU_ADD,
             caption=_('Uncheck all options'),
-            command='module=cuda_differ;cmd=toolbar_menu_ignore;'
+            command='module=cuda_differ2;cmd=toolbar_menu_ignore;'
                     'info={}|*;'.format(self.tab_id_str))
         self.menu_items['*'] = mi
 
@@ -1181,7 +1181,7 @@ class CompareToolbar:
             self._layout_buttons()
             self._set_hint('ignore', self._ignore_tooltip())
             try:
-                ct.msg_status(_('Differ: all ignore options disabled'))
+                ct.msg_status(_('Differ 2: all ignore options disabled'))
             except Exception:
                 pass
             self._schedule_refresh()
@@ -1200,7 +1200,7 @@ class CompareToolbar:
         captions = dict(IGNORE_OPTS)
         try:
             ct.msg_status('{}: {} -- {}'.format(
-                _('Differ ignore option'), captions.get(key, key),
+                _('Differ 2 ignore option'), captions.get(key, key),
                 _('enabled') if not old else _('disabled')))
         except Exception:
             pass
@@ -1211,7 +1211,7 @@ class CompareToolbar:
         resolves the editor by tab id; the timer string command carries
         the tab id)."""
         try:
-            callback = ('module=cuda_differ;cmd=_toolbar_refresh_timer;'
+            callback = ('module=cuda_differ2;cmd=_toolbar_refresh_timer;'
                         'info={};'.format(self.tab_id_str))
             ct.timer_proc(ct.TIMER_START_ONE, callback, 100)
         except Exception:
@@ -1276,7 +1276,7 @@ class CompareToolbar:
                 # form's info to the method as the RAW string, so the
                 # '<tab id>|<preset key>' payload survives -- the same
                 # convention as the ignore items.
-                command='module=cuda_differ;cmd=toolbar_menu_preset;'
+                command='module=cuda_differ2;cmd=toolbar_menu_preset;'
                         'info={}|{};'.format(self.tab_id_str, key))
             try:
                 ct.menu_proc(mi, ct.MENU_SET_CHECKED, command=marks[key])
@@ -1316,7 +1316,7 @@ class CompareToolbar:
 
     def on_preset_action(self, action):
         """Preset-dropdown item executed: persist the combination to
-        settings/cuda_differ.json (the config dialog's store), then
+        settings/cuda_differ2.json (the config dialog's store), then
         re-compare this tab on the 100ms timer (the menu-close-first
         convention) -- refresh_compare re-reads the settings file (its
         mtime cache), so this very refresh already uses the new
@@ -1350,7 +1350,7 @@ class CompareToolbar:
             _set_absorb(absorb)
         try:
             ct.msg_status('{}: {} / {} {} / {} {}'.format(
-                _('Differ presets'), _get_diff_algo(),
+                _('Differ 2 presets'), _get_diff_algo(),
                 _('Align by similarity'),
                 _('on') if _get_beautify() else _('off'),
                 _('Absorb trivial equal blocks'),
@@ -1390,7 +1390,7 @@ class CompareToolbar:
             mi = ct.menu_proc(
                 self.h_vmenu, ct.MENU_ADD,
                 caption=caption,
-                command='module=cuda_differ;cmd=toolbar_menu_view;'
+                command='module=cuda_differ2;cmd=toolbar_menu_view;'
                         'info={}|{};'.format(self.tab_id_str, key))
             if checked is not None:
                 try:
@@ -1491,7 +1491,7 @@ class CompareToolbar:
         (_SHOW_ALL_SKIP: a bulk show must not force those docked tool
         windows open, so their items stay unchecked); any other key
         toggles ONE element. The overview writes
-        differ.micromap.enable_overview (the config dialog's store)
+        differ2.micromap.enable_overview (the config dialog's store)
         and re-compares this tab on the
         100ms timer -- the refresh creates or destroys the panel,
         exactly like the preset items; hide/show-all schedule the same
@@ -1506,7 +1506,7 @@ class CompareToolbar:
                 self._set_view_item(key, show)
             try:
                 ct.msg_status(
-                    _('Differ: all view items {}').format(
+                    _('Differ 2: all view items {}').format(
                         _('shown') if show else _('hidden')))
             except Exception:
                 pass
@@ -1521,7 +1521,7 @@ class CompareToolbar:
             self._schedule_refresh()
         try:
             ct.msg_status('{}: {} -- {}'.format(
-                _('Differ view'), self._view_caption_of(action),
+                _('Differ 2 view'), self._view_caption_of(action),
                 _('shown') if val else _('hidden')))
         except Exception:
             pass
@@ -1651,7 +1651,7 @@ class CompareToolbar:
 
 
 # ---------------------------------------------------------------------------
-# Module-level registry and entry points (used by cuda_differ/__init__).
+# Module-level registry and entry points (used by cuda_differ2/__init__).
 # ---------------------------------------------------------------------------
 
 _TOOLBARS = {}  # str(PROP_TAB_ID) -> CompareToolbar
@@ -1692,7 +1692,7 @@ def ensure_for_session(cmd, session, a_ed=None):
         if not tb.create():
             return None
     except Exception as ex:
-        print('Differ toolbar: failed to create: {}'.format(ex))
+        print('Differ 2 toolbar: failed to create: {}'.format(ex))
         return None
     _TOOLBARS[session.tab_id_str] = tb
     return tb
@@ -1776,11 +1776,11 @@ def sync_all(cmd):
 # ---------------------------------------------------------------------------
 # String-callback entry points.
 #
-# Menu items use the 'module=cuda_differ;cmd=toolbar_menu_ignore /
+# Menu items use the 'module=cuda_differ2;cmd=toolbar_menu_ignore /
 # toolbar_menu_preset / toolbar_menu_view; info=<tab id>|<action>;' form
 # (Command methods -- info arrives as the RAW string). The
 # module-level entries below are the belt-and-braces twins for any
-# 'module=cuda_differ.toolbar;
+# 'module=cuda_differ2.toolbar;
 # func=_menu_click; info="<tab id>|<action>;"' callback (info QUOTED:
 # the engine's ValueFromString turns an unquoted non-numeric value
 # into None).
@@ -1852,7 +1852,7 @@ def _menu_click(*args, **kwargs):
         import cudatext as _ct
         try:
             _ct.msg_log_console(
-                'Differ toolbar: menu callback got empty info')
+                'Differ 2 toolbar: menu callback got empty info')
         except Exception:
             pass
         return

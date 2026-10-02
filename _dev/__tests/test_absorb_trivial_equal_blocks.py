@@ -5,7 +5,7 @@ differ_python.py, one at the end of differ_native.py).
 
 Runs STANDALONE with plain python3 -- no CudaText, no plugin
 installation: cudatext / cudax_lib are stubbed, and the two differ
-modules are imported through a dummy 'cuda_differ' package (the
+modules are imported through a dummy 'cuda_differ2' package (the
 plugin's real __init__.py needs the full CudaText API and is never
 executed). Run it from anywhere:
 
@@ -39,7 +39,7 @@ touches an EQUAL block with more than 4 non-whitespace characters, so
 matched real content is never absorbed.
 
 The pass is OPT-IN: it runs only when the config option
-'differ.algorithm.beautify.absorb_trivial_equal_blocks' is ON
+'differ2.algorithm.beautify.absorb_trivial_equal_blocks' is ON
 (default OFF -- raw, algo-faithful engine output). The tests in the
 "option gating" section verify both sides of that switch, on the
 Python differ (engine_opcodes) AND the native differ
@@ -68,11 +68,11 @@ import types
 # ---------------------------------------------------------------------------
 _HERE = os.path.dirname(os.path.abspath(__file__))
 # The plugin root is normally derived from this file's location
-# (<plugin>/_dev/__tests/). The CUDA_DIFFER_TEST_ROOT environment
+# (<plugin>/_dev/__tests/). The CUDA_DIFFER2_TEST_ROOT environment
 # variable overrides it, so the suite can also be run FROM ANYWHERE
 # against any checkout (used by the packaging deploy-check).
 _PLUGIN_ROOT = os.environ.get(
-    'CUDA_DIFFER_TEST_ROOT',
+    'CUDA_DIFFER2_TEST_ROOT',
     os.path.abspath(os.path.join(_HERE, '..', '..')))
 
 # Stub the CudaText modules the differ files import (used only for the
@@ -96,20 +96,20 @@ if 'cudax_lib' not in sys.modules:
     sys.modules['cudax_lib'] = _cudax_stub
 
 # Import the differ modules WITHOUT executing the plugin's real
-# __init__.py: a dummy 'cuda_differ' package whose __path__ points at
+# __init__.py: a dummy 'cuda_differ2' package whose __path__ points at
 # the plugin directory. The relative imports inside the differ files
 # (.py_algo.*, .profiling, .utils) resolve through that path. When the
 # REAL plugin package is already imported (running inside CudaText),
 # it is used as-is instead.
-if 'cuda_differ' not in sys.modules:
-    _pkg = types.ModuleType('cuda_differ')
+if 'cuda_differ2' not in sys.modules:
+    _pkg = types.ModuleType('cuda_differ2')
     _pkg.__path__ = [_PLUGIN_ROOT]
-    _pkg.__package__ = 'cuda_differ'
-    sys.modules['cuda_differ'] = _pkg
+    _pkg.__package__ = 'cuda_differ2'
+    sys.modules['cuda_differ2'] = _pkg
 
-dfp = importlib.import_module('cuda_differ.differ_python')
-dfn = importlib.import_module('cuda_differ.differ_native')
-uni = importlib.import_module('cuda_differ.unidiff')
+dfp = importlib.import_module('cuda_differ2.differ_python')
+dfn = importlib.import_module('cuda_differ2.differ_native')
+uni = importlib.import_module('cuda_differ2.unidiff')
 
 # Keep the test output readable: silence the Differ's benchmark prints.
 dfp._BENCHMARK = False
