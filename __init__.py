@@ -2945,9 +2945,15 @@ class Command:
         dirty half failed to sync, e.g. its original tab was closed, the
         tab correctly stays red). The color is reset to COLOR_NONE (which
         CudaText re-colors red) when the user edits again -- see
-        on_change. We do NOT clear PROP_MODIFIED, because that would
-        prevent CudaText's session auto-save/restore from persisting the
-        compare tab's content across restarts."""
+        on_change. PROP_MODIFIED is deliberately left untouched here: it
+        plays no role in session persistence -- CudaText's session saver
+        ALWAYS stores the text of untitled tabs (it forces 'modified' to
+        true for them when writing the session file, for the first AND
+        the second half of a split alike; the flag only gates the text
+        of FILE tabs), and the restore path brings untitled tabs back
+        as modified anyway. The flag's real job is driving the
+        'Save changes?' dialogs, which on_close_pre already handles for
+        clean compare tabs."""
         tab_id = ed_self.get_prop(ct.PROP_TAB_ID)
         session = self._session_for(tab_id)
         if session is None:
@@ -3066,7 +3072,13 @@ class Command:
                     # Real file on disk -- save it immediately.
                     e.save()
                 else:
-                    # Untitled tab -- mark modified, no Save dialog.
+                    # Untitled original -- mark it modified so the
+                    # just-synced content is visible and not silently
+                    # lost: dot on the tab, 'Save changes?' (i.e.
+                    # Save-As) when the user later closes it. This is
+                    # NOT about the session: untitled tabs' text is
+                    # always persisted by CudaText's session saver
+                    # regardless of this flag.
                     e.set_prop(ct.PROP_MODIFIED, True)
                 ct.msg_status(_('Differ 2: synced changes to original tab'))
                 return True
@@ -7392,13 +7404,13 @@ class Command:
         'Save changes to ...?' dialog (the event can also cancel the
         close by returning False; we never do).
 
-        A diff tab is untitled and holds no real file on disk, and its
-        two halves are deliberately kept PROP_MODIFIED=True so
-        CudaText's session keeps the tab (including the SECOND half's
-        text -- the session file only persists a split tab's secondary
-        editor when its modified flag is set). The side effect: closing
-        a diff tab always asked 'Save changes?' even when nothing needs
-        syncing.
+        A diff tab is untitled and holds no real file on disk. Its
+        halves carry Modified=True merely as a side effect of being
+        filled with content (every edit sets the flag, and CudaText
+        restores untitled tabs from a session as modified too) -- not
+        for the session, which always keeps them anyway. The flag's
+        only visible effect is the 'Save changes?' prompt on close,
+        which for a CLEAN diff tab is pure noise.
 
         The plugin tracks the REAL unsaved state itself (per-half dirty
         flags -- see _get_dirty_halves). So here, when NEITHER half is
@@ -7408,19 +7420,24 @@ class Command:
         flags are left True and the dialog shows as usual -- the user
         can still choose to run the Ctrl+S sync path from it.
 
+        Clearing the flag is safe for every session concern: CudaText's
+        session saver ALWAYS stores the text of untitled tabs -- it
+        forces 'modified' to true for them when writing the session
+        file, same rule for the first and for the second half of a
+        split (the flag only gates the text of FILE tabs) -- and the
+        restore path puts the flag back to True on the next start. So
+        nothing done to PROP_MODIFIED here can drop a compare tab (or
+        either half's text) from the session.
+
         Single-tab close fires this once (for the focused half); app
         exit fires it for EVERY half of every tab, then -- if the tab
-        really closes -- on_close (also per half). on_close's exit
-        branch puts the halves back to PROP_MODIFIED=True before
-        CudaText writes the session, so restart-restore is unaffected
-        by the clearing done here.
+        really closes -- on_close (also per half).
 
         Residual edge case: if ANOTHER plugin cancels the close after
         we cleared the flags, the tab stays open with Modified=False
-        until the next edit (any edit re-sets it) or the app exit
-        (on_close restores it). No session data can be lost by that
-        alone: only a crash before any of those would save the session
-        without the second half's text.
+        until the next edit (any edit re-sets it). No session data can
+        be lost by that: untitled halves are always persisted by the
+        session saver, whatever the flag says.
         """
         tab_id = ed_self.get_prop(ct.PROP_TAB_ID)
         session = self._session_for(tab_id)
@@ -7546,11 +7563,15 @@ class Command:
         # dirty before exit.
         #
         # NO GUI calls past this point at exit (see the docstring): the
-        # entry must be re-registered and both halves put back to
-        # PROP_MODIFIED=True before this handler returns -- CudaText
-        # writes its session file right after the whole exit loop, and
-        # it only persists a split tab's SECOND half text when that half
-        # is modified.
+        # entry must be re-registered before this handler returns --
+        # CudaText writes its session file right after the whole exit
+        # loop. Nothing else is needed for the halves' text: the session
+        # saver ALWAYS stores untitled tabs (both halves of a split,
+        # whatever their modified flags -- the exit 'Save tabs?' dialog
+        # has already run before on_close anyway), so the PROP_MODIFIED
+        # clearing on_close_pre did for clean tabs drops no content from
+        # the session, and the restore path brings the tabs back with
+        # Modified=True on the next start regardless.
         if getattr(self, '_app_exiting', False):
             if entry is not None:
                 self._register_compare_tab(
@@ -7561,22 +7582,6 @@ class Command:
                     entry.get('secondary_orig_name', ''),
                     entry.get('dirty')
                 )
-            # Put both halves back to PROP_MODIFIED=True. on_close_pre
-            # (which fires for every half before the exit dialogs) may
-            # have cleared the flags on a CLEAN tab to skip the save
-            # dialog -- but the session is written AFTER on_close, and
-            # it only persists a split tab's SECOND half text when that
-            # half is modified. Without this restore, a clean diff tab
-            # would come back after restart with an empty right side.
-            # The tab is closing anyway, so Modified=True here has no
-            # other visible effect.
-            try:
-                for h in (ed_self.get_prop(ct.PROP_HANDLE_PRIMARY),
-                          ed_self.get_prop(ct.PROP_HANDLE_SECONDARY)):
-                    if h:
-                        ct.Editor(h).set_prop(ct.PROP_MODIFIED, True)
-            except Exception:
-                pass
             return
 
         # REAL tab close (not app exit): the state entry is meant to be
