@@ -623,17 +623,16 @@ Switching CudaText sessions (the Sessions menu, app_proc(PROC_LOAD_SESSION),
 session-manager plugins) keeps the tracking alive too: a session switch
 closes the old session's tabs to replace them, and those closes are NOT
 user closes -- the plugin recognizes them through CudaText's
-APPSTATE_SESSION_LOAD_BEGIN_PRE event (which fires before the switch's first
-tab close; APPSTATE_SESSION_LOAD_BEGIN arrives only after the closes, too
-late to be usable) and keeps every closed compare tab's persisted
-registration, because the tab still exists in the session file being left.
-When you switch back, the restored compare tabs are re-attached exactly
-like after a restart (per-tab session, toolbar, title color, dirty/saved
-state; run Recompare to start the compare), and closing them afterwards
-cleans up as usual. This needs a CudaText build with the
-APPSTATE_SESSION_LOAD_BEGIN_PRE event; on older builds a session switch degrades
-to the old behavior (the tracking entry is deleted, so the restored tab is
-not re-attached and stays a plain split tab).
+APPSTATE_SESSION_LOAD_BEGIN_PRE event (which fires before the switch's
+first tab close; APPSTATE_SESSION_LOAD_BEGIN arrives only after the
+closes, too late to be usable) and keeps every closed compare tab's
+persisted registration, because the tab still exists in the session file
+being left. When you switch back, the restored compare tabs are
+re-attached exactly like after a restart (per-tab session, toolbar,
+title color, dirty/saved state; run Recompare to start the compare), and
+closing them afterwards cleans up as usual. This needs a CudaText build
+with the APPSTATE_SESSION_LOAD_BEGIN_PRE event (a fresh build with the
+author's merged patch).
 
 When you close a compare tab manually (not via app exit):
 - While a comparison is running, the tab is busy and cannot be closed

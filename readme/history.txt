@@ -7,11 +7,11 @@
   persisted registrations of tabs that were not really closed -- they
   still exist in the session file being left and come back when the user
   returns to it. The plugin now brackets the load with CudaText's new
-  APPSTATE_SESSION_LOAD_BEGIN_PRE event (the only one that fires BEFORE the
-  load's first on_close_pre / on_close -- APPSTATE_SESSION_LOAD_BEGIN
+  APPSTATE_SESSION_LOAD_BEGIN_PRE event (the only one that fires BEFORE
+  the load's first on_close_pre / on_close -- APPSTATE_SESSION_LOAD_BEGIN
   arrives only after the closes, too late; the SESSION_SAVE_BEFORE and
   SESSION_SAVE_AFTER events cannot tell a switch from the ~40s auto-save):
-  _session_loading is raised on LOAD_PRE, and every on_close inside the
+  _session_loading is raised on BEGIN_PRE, and every on_close inside the
   window keeps the tab's persisted entry (the runtime teardown still
   runs -- the editor object is genuinely destroyed; the app-exit flag
   outranks the session-loading flag). On APPSTATE_SESSION_LOAD the
@@ -20,24 +20,8 @@
   compare tabs (per-tab sessions, toolbars, title colors, scroll set,
   dead-record cleanup) exactly like a restart; on APPSTATE_SESSION_LOAD_FAIL
   only the flag is cleared (the pass's dead-record cleanup must not run
-  against an uncertain session state). Builds without the event keep the
-  old behavior (numeric fallback 36 keeps the plugin importable). readme
-  documents the behavior in the "Compare tabs, restarts and session
-  switches" chapter.
-* change: install.inf homepage is now github.com/badrelmers/cuda_differ2;
-  the readme Authors section reads: Badr Elmers,
-  github.com/badrelmers -- forked from Differ by OlehL
-  (github.com/CudaText-addons/cuda_differ) and rewritten from scratch.
-* change: readme adds the support policy for the diff algorithms: only
-  the two native algorithms are supported and maintained and receive
-  improvements over time; the five pure-Python algorithms are
-  unsupported except bug fixes -- no speed or readability enhancements,
-  kept just as experimental references to track the native algorithms'
-  divergence over time, and issues asking to speed them up or improve
-  their output readability will not be accepted.
-* change: changelog cleanup -- the "Differ 2" rename is now applied only
-  to entries dated after 2026.07.08; older entries keep the plugin's
-  original name (they describe the pre-fork plugin's changes).
+  against an uncertain session state). readme documents the behavior in
+  the "Compare tabs, restarts and session switches" chapter.
 
 2026.10.02 (by @badrelmers)
 * change: the plugin is renamed Differ 2 and fully de-conflicted from

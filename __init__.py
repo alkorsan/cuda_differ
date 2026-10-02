@@ -1234,19 +1234,15 @@ STATE_FILE = os.path.join(ct.app_path(ct.APP_DIR_SETTINGS), 'cuda_differ2_state.
 PLUGINS_INI = os.path.join(ct.app_path(ct.APP_DIR_SETTINGS), 'plugins.ini')
 PLUGINS_INI_SECTION = 'events'
 MODULE_NAME = __name__.split('.')[-1]  # e.g. 'cuda_differ2'
-# CudaText's APPSTATE_SESSION_LOAD_BEGIN_PRE (value 36): fired before EVERYTHING
-# a session load does -- in particular before the load closes the old
-# session's tabs (on_close_pre / on_close), which is exactly what
+# CudaText's APPSTATE_SESSION_LOAD_BEGIN_PRE (value 36): fired before
+# EVERYTHING a session load does -- in particular before the load closes
+# the old session's tabs (on_close_pre / on_close), which is exactly what
 # APPSTATE_SESSION_LOAD_BEGIN cannot do (it only arrives AFTER the closes,
 # too late to tell a session-manager close from a user close). The plugin
-# brackets the load with it: from LOAD_PRE until APPSTATE_SESSION_LOAD /
+# brackets the load with it: from BEGIN_PRE until APPSTATE_SESSION_LOAD /
 # _FAIL, on_close keeps the closing compare tabs' persisted registrations
 # (the tabs still exist in the session file being left and come back when
-# the user returns to that session). Builds without the constant never
-# fire value 36, so the numeric fallback keeps the plugin importable
-# there -- the session-switch protection then silently degrades to the
-# old behavior.
-SESSION_LOAD_PRE_STATE = getattr(ct, 'APPSTATE_SESSION_LOAD_BEGIN_PRE', 36)
+# the user returns to that session).
 
 
 _homedir = os.path.expanduser('~')
@@ -1525,15 +1521,15 @@ class Command:
         # temp-file deletion and let compare tabs persist across restarts.
         self._app_exiting = False
         # True while CudaText is loading a session: raised on
-        # APPSTATE_SESSION_LOAD_BEGIN_PRE (which fires BEFORE the load's first
-        # on_close_pre / on_close), cleared on APPSTATE_SESSION_LOAD /
-        # APPSTATE_SESSION_LOAD_FAIL. Inside that window every tab close
-        # is the session manager replacing the tab set, not the user
-        # closing a tab -- on_close then keeps the tab's persisted
-        # registration (the tab still exists in the session file being
-        # left) and only tears down the runtime session; on
-        # APPSTATE_SESSION_LOAD, _restore_session_tabs re-attaches the
-        # tabs the loaded session restored.
+        # APPSTATE_SESSION_LOAD_BEGIN_PRE (which fires BEFORE the load's
+        # first on_close_pre / on_close), cleared on
+        # APPSTATE_SESSION_LOAD / APPSTATE_SESSION_LOAD_FAIL. Inside that
+        # window every tab close is the session manager replacing the
+        # tab set, not the user closing a tab -- on_close then keeps the
+        # tab's persisted registration (the tab still exists in the
+        # session file being left) and only tears down the runtime
+        # session; on APPSTATE_SESSION_LOAD, _restore_session_tabs
+        # re-attaches the tabs the loaded session restored.
         self._session_loading = False
         # The unified-diff commands' background runner (see unidiff.py):
         # all their engine / rendering / cancellation machinery lives in
@@ -2498,7 +2494,7 @@ class Command:
             difftb.update_theme_all()
         elif state == ct.APPSTATE_THEME_SYNTAX:
             self.config()
-        elif state == SESSION_LOAD_PRE_STATE:
+        elif state == ct.APPSTATE_SESSION_LOAD_BEGIN_PRE:
             # Session load starting: fires BEFORE the load closes the old
             # session's tabs (on_close_pre / on_close) -- unlike
             # APPSTATE_SESSION_LOAD_BEGIN, which only arrives after the
@@ -2513,17 +2509,16 @@ class Command:
             self._session_loading = True
         elif state == ct.APPSTATE_SESSION_LOAD:
             # Session load completed. Only react when the load was seen
-            # starting (LOAD_PRE above): on builds without that event
-            # nothing was protected, so there is nothing to re-attach
-            # either. The pass is the very one on_start2 runs at startup
-            # -- rebuilt per-tab sessions, toolbars, title colors, scroll
-            # set -- just triggered by a mid-run session switch instead
-            # of program start.
+            # starting (BEGIN_PRE above): a stray LOAD with no load in
+            # flight has nothing to re-attach. The pass is the very one
+            # on_start2 runs at startup -- rebuilt per-tab sessions,
+            # toolbars, title colors, scroll set -- just triggered by a
+            # mid-run session switch instead of program start.
             if self._session_loading:
                 self._session_loading = False
                 self._restore_session_tabs()
         elif state == ct.APPSTATE_SESSION_LOAD_FAIL:
-            # Session load failed after LOAD_PRE had already fired: clear
+            # Session load failed after BEGIN_PRE had already fired: clear
             # the flag (the load is over either way) but do NOT run the
             # re-attach pass -- with the load failed, which tabs survived
             # and what the current session now is are uncertain, and the
@@ -7409,16 +7404,15 @@ class Command:
         the Sessions menu, session-manager plugins) the state entry is
         preserved too: the load CLOSES the old session's tabs to replace
         them, which fires this handler for tabs the user did not close.
-        The load announces itself with APPSTATE_SESSION_LOAD_BEGIN_PRE -- the
-        only event that fires BEFORE the closes -- so _session_loading is
-        already up when they arrive, and here the persisted registration
-        is kept: the tab still exists in the session file being left and
-        comes back (re-attached by _restore_session_tabs, the same pass
-        on_start2 runs) when the user returns to that session. The
-        runtime teardown is NOT skipped -- the editor object is genuinely
-        being destroyed; only the disk record survives. On builds without
-        APPSTATE_SESSION_LOAD_BEGIN_PRE the flag never rises and these closes
-        degrade to the old behavior (entry deleted).
+        The load announces itself with APPSTATE_SESSION_LOAD_BEGIN_PRE --
+        the only event that fires BEFORE the closes -- so
+        _session_loading is already up when they arrive, and here the
+        persisted registration is kept: the tab still exists in the
+        session file being left and comes back (re-attached by
+        _restore_session_tabs, the same pass on_start2 runs) when the
+        user returns to that session. The runtime teardown is NOT
+        skipped -- the editor object is genuinely being destroyed; only
+        the disk record survives.
 
         IMPORTANT: the toolbar is destroyed ONLY on a REAL tab close
         (the non-exit branch at the bottom). During app exit CudaText
@@ -7441,12 +7435,12 @@ class Command:
         if session is None:
             return  # not a compare tab
 
-        # Session switch in progress (APPSTATE_SESSION_LOAD_BEGIN_PRE seen,
-        # APPSTATE_SESSION_LOAD / _FAIL not yet -- see on_state): this is
-        # the session manager replacing the tab set, not the user closing
-        # the tab. Keep the persisted registration -- the tab still exists
-        # in the session file being left and is re-attached when that
-        # session comes back (_restore_session_tabs on
+        # Session switch in progress (APPSTATE_SESSION_LOAD_BEGIN_PRE
+        # seen, APPSTATE_SESSION_LOAD / _FAIL not yet -- see on_state):
+        # this is the session manager replacing the tab set, not the user
+        # closing the tab. Keep the persisted registration -- the tab
+        # still exists in the session file being left and is re-attached
+        # when that session comes back (_restore_session_tabs on
         # APPSTATE_SESSION_LOAD, on_start2 on the next restart). The
         # _app_exiting case below outranks this one: an exit during a load
         # must keep the exit semantics. Everything after this point still
