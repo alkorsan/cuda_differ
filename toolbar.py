@@ -92,16 +92,19 @@ Implementation notes:
   item appears -- same guard as the tab context menu / config dialog.
 
 * The PRESETS dropdown is the quick way to set the algorithm +
-  align-by-similarity combination: two mutually exclusive presets
+  the two beautify flags: two mutually exclusive RADIO presets
   ("Preset 1: Fastest comparison - Myers, Align Off", "Preset 2:
   Better readability (slower) - Histogram, Align On"), a separator,
-  the two native algorithms (also mutually exclusive) and the
-  independent "Align by similarity" toggle. It is REBUILT on every
+  two mutually exclusive RADIO algorithms ("Algorithm 1: Native
+  Histogram", "Algorithm 2: Native Myers"), and the two independent
+  checkable toggles "Align by similarity" and "Absorb trivial equal
+  blocks". It is REBUILT on every
   open, so the checkmarks always mirror settings/cuda_differ.json,
-  and the preset checkmarks are DERIVED from it: native Myers +
-  align off checks Preset 1, native Histogram + align
-  on checks Preset 2, any other combination checks NEITHER (a custom
-  selection is visible at a glance). Clicks persist
+  and the preset checkmarks are DERIVED from it -- a preset is an
+  EXACT combination of three settings: Preset 1 = native Myers +
+  align off + absorb off, Preset 2 = native Histogram + align on +
+  absorb off; any other combination (absorb on included) checks
+  NEITHER (a custom selection is visible at a glance). Clicks persist
   'differ.algorithm.*' (the config dialog's store) and re-compare
   this tab on the 100ms timer, like the ignore items.
 
@@ -249,10 +252,12 @@ def _set_ignore_opt(key, val):
 
 # The Presets dropdown's items: two mutually exclusive preset
 # combinations, a separator, the two native algorithms (also mutually
-# exclusive) and the independent "Align by similarity" toggle (the
-# 'differ.algorithm.beautify.align_by_similarity' option). Each entry:
-# (menu key, menu caption); None = the separator. Toolbar-only -- the
-# config dialog / tab context menu keep their own algorithm UIs.
+# exclusive) and the two independent beautify toggles (the
+# 'differ.algorithm.beautify.align_by_similarity' /
+# 'differ.algorithm.beautify.absorb_trivial_equal_blocks' options).
+# Each entry: (menu key, menu caption); None = the separator.
+# Toolbar-only -- the config dialog / tab context menu keep their own
+# algorithm UIs.
 _PRESET_ITEMS = (
     ('preset1',  _('Preset 1: Fastest comparison - Myers, Align Off')),
     ('preset2',  _('Preset 2: Better readability (slower) - Histogram, '
@@ -261,7 +266,25 @@ _PRESET_ITEMS = (
     ('algo1',    _('Algorithm 1: Native Histogram')),
     ('algo2',    _('Algorithm 2: Native Myers')),
     ('beautify', _('Align by similarity')),
+    ('absorb',   _('Absorb trivial equal blocks')),
 )
+
+# Radio-item grouping of the mutually exclusive items (menu_proc
+# MENU_SET_RADIOITEM + MENU_SET_GROUPINDEX -- the Lazarus radio
+# mechanism: items marked RadioItem that share a GroupIndex form one
+# group; clicking one checks it and auto-unchecks the others, and the
+# mark renders as a radio dot instead of a checkmark). The two
+# presets form one group, the two algorithms another; the two
+# beautify toggles stay plain checkable items (they are independent).
+# Purely visual polish -- the checkmarks are still re-derived from
+# the settings on every menu open, and the click handlers write the
+# same exclusive values, so behavior is unchanged without it.
+_PRESET_RADIO = {
+    'preset1': 1,
+    'preset2': 1,
+    'algo1': 2,
+    'algo2': 2,
+}
 
 # Values written to 'differ.algorithm.diff_algorithm' by the preset /
 # algorithm items (the same values the config dialog writes; on older
@@ -301,6 +324,23 @@ def _set_beautify(val):
     return ctx.set_opt(
         'differ.algorithm.beautify.align_by_similarity', bool(val),
         user_json=_JSON_FILE)
+
+
+def _get_absorb():
+    """The Absorb-trivial-equal-blocks flag
+    ('differ.algorithm.beautify.absorb_trivial_equal_blocks'), read
+    live from the settings."""
+    return bool(ctx.get_opt(
+        'differ.algorithm.beautify.absorb_trivial_equal_blocks', False,
+        user_json=_JSON_FILE))
+
+
+def _set_absorb(val):
+    """Write 'differ.algorithm.beautify.absorb_trivial_equal_blocks'
+    to the plugin's settings (same store the config dialog uses)."""
+    return ctx.set_opt(
+        'differ.algorithm.beautify.absorb_trivial_equal_blocks',
+        bool(val), user_json=_JSON_FILE)
 
 
 # The View dropdown's checkable items, in the user's order: CudaText's
@@ -810,12 +850,14 @@ class CompareToolbar:
         (read from the settings file, so it is always current -- the
         same 'know the current state without opening it' feedback the
         Ignore tooltip's enabled-list gives)."""
-        beautify = _get_beautify()
         return '\r'.join((
-            _('Comparison presets: algorithm and Align by similarity'),
-            '{}: {} / {} {}'.format(_('Current'), _get_diff_algo(),
-                                    _('Align by similarity'),
-                                    _('on') if beautify else _('off')),
+            _('Comparison presets: algorithm and beautify options'),
+            '{}: {} / {} {} / {} {}'.format(
+                _('Current'), _get_diff_algo(),
+                _('Align by similarity'),
+                _('on') if _get_beautify() else _('off'),
+                _('Absorb trivial equal blocks'),
+                _('on') if _get_absorb() else _('off')),
         ))
 
     def _view_tooltip(self):
@@ -1178,14 +1220,21 @@ class CompareToolbar:
     def rebuild_preset_menu(self):
         """(Re)build the Presets dropdown: the two mutually exclusive
         presets, a separator, the two native algorithms (also mutually
-        exclusive) and the independent "Align by similarity" toggle.
+        exclusive) and the two independent beautify toggles ("Align by
+        similarity", "Absorb trivial equal blocks").
 
-        The checkmarks are DERIVED from the settings file: native
-        Myers + align off -> Preset 1 checked; native Histogram +
-        align on -> Preset 2 checked; any other combination ->
-        NEITHER preset checked, so a custom selection is visible at a
-        glance. Called on every open (popup_preset_menu); the whole
-        body is guarded like the ignore twin's."""
+        The presets and the algorithms are RADIO items (a dot, not a
+        checkmark -- see _PRESET_RADIO); the toggles are plain
+        checkable items.
+
+        The checkmarks are DERIVED from the settings file -- a preset
+        is an EXACT combination of three settings: native
+        Myers + align off + absorb off -> Preset 1 checked; native
+        Histogram + align on + absorb off -> Preset 2 checked; any
+        other combination -> NEITHER preset checked, so a custom
+        selection is visible at a glance. Called on every open
+        (popup_preset_menu); the whole body is guarded like the
+        ignore twin's."""
         if self.h_dlg is None:
             return
         try:
@@ -1200,12 +1249,19 @@ class CompareToolbar:
 
         algo = _get_diff_algo()
         beautify = _get_beautify()
+        absorb = _get_absorb()
         marks = {
-            'preset1': algo == _ALGO_MYERS and not beautify,
-            'preset2': algo == _ALGO_HIST and beautify,
+            # a preset is an EXACT combination of three settings --
+            # absorb on unchecks BOTH (it is not part of either
+            # preset's combination)
+            'preset1': algo == _ALGO_MYERS and not beautify
+                       and not absorb,
+            'preset2': algo == _ALGO_HIST and beautify
+                       and not absorb,
             'algo1': algo == _ALGO_HIST,
             'algo2': algo == _ALGO_MYERS,
             'beautify': beautify,
+            'absorb': absorb,
         }
         for key, caption in _PRESET_ITEMS:
             if key is None:
@@ -1222,6 +1278,12 @@ class CompareToolbar:
                         'info={}|{};'.format(self.tab_id_str, key))
             try:
                 ct.menu_proc(mi, ct.MENU_SET_CHECKED, command=marks[key])
+                group = _PRESET_RADIO.get(key)
+                if group is not None:
+                    # mutually exclusive pair -> radio item (dot mark,
+                    # click auto-unchecks the group's other item)
+                    ct.menu_proc(mi, ct.MENU_SET_RADIOITEM, command=True)
+                    ct.menu_proc(mi, ct.MENU_SET_GROUPINDEX, index=group)
             except Exception:
                 pass
 
@@ -1256,31 +1318,41 @@ class CompareToolbar:
         re-compare this tab on the 100ms timer (the menu-close-first
         convention) -- refresh_compare re-reads the settings file (its
         mtime cache), so this very refresh already uses the new
-        algorithm / beautify flags. The menu is rebuilt on every open,
-        so the new checkmarks show up the next time it pops."""
+        algorithm / beautify flags. A preset click writes ALL THREE
+        settings of its exact combination (the algorithm, Align by
+        similarity, Absorb trivial equal blocks -- both presets have
+        absorb off). The menu is rebuilt on every open, so the new
+        checkmarks show up the next time it pops."""
         algo = None          # None = leave the option unchanged
         beautify = None
+        absorb = None
         if action == 'preset1':
-            algo, beautify = _ALGO_MYERS, False
+            algo, beautify, absorb = _ALGO_MYERS, False, False
         elif action == 'preset2':
-            algo, beautify = _ALGO_HIST, True
+            algo, beautify, absorb = _ALGO_HIST, True, False
         elif action == 'algo1':
             algo = _ALGO_HIST
         elif action == 'algo2':
             algo = _ALGO_MYERS
         elif action == 'beautify':
             beautify = not _get_beautify()
+        elif action == 'absorb':
+            absorb = not _get_absorb()
         else:
             return
         if algo is not None:
             _set_diff_algo(algo)
         if beautify is not None:
             _set_beautify(beautify)
+        if absorb is not None:
+            _set_absorb(absorb)
         try:
-            ct.msg_status('{}: {} / {} {}'.format(
+            ct.msg_status('{}: {} / {} {} / {} {}'.format(
                 _('Differ presets'), _get_diff_algo(),
                 _('Align by similarity'),
-                _('on') if _get_beautify() else _('off')))
+                _('on') if _get_beautify() else _('off'),
+                _('Absorb trivial equal blocks'),
+                _('on') if _get_absorb() else _('off')))
         except Exception:
             pass
         self._schedule_refresh()

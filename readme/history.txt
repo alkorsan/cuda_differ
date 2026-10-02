@@ -68,6 +68,40 @@
   under both option states), a unidiff-must-be-raw check, and the
   test_2 corpus smoke test. Replaces the former
   test_realign_opcodes.py.
+* change: the toolbar's two presets are now EXACT combinations of
+  THREE settings -- Preset 1 = Native Myers + Align by similarity off
+  + Absorb trivial equal blocks off, Preset 2 = Native Histogram +
+  Align on + Absorb off -- and the marks are derived from all three on
+  every menu open, so Absorb on unchecks BOTH presets (any deviation
+  checks neither, making a custom selection visible at a glance).
+  Clicking a preset now writes all three settings (both presets write
+  Absorb off). New independent checkable item "Absorb trivial equal
+  blocks" in the Presets dropdown, below "Align by similarity" --
+  writes differ.algorithm.beautify.absorb_trivial_equal_blocks and
+  re-compares the tab, exactly like the align toggle above it. The
+  dropdown's tooltip and the post-click status message now report the
+  live algorithm + both beautify flags.
+* change: the Preset 1 / Preset 2 pair and the Algorithm 1 /
+  Algorithm 2 pair in the toolbar's Presets dropdown are now RADIO
+  menu items (menu_proc MENU_SET_RADIOITEM + MENU_SET_GROUPINDEX --
+  the Lazarus radio mechanism: same GroupIndex = one group, a dot
+  mark instead of a checkmark, clicking one auto-unchecks the other).
+  The two beautify toggles stay plain checkable items (independent).
+  The radio look is polish only -- the marks are still re-derived
+  from the settings on every open and the click handlers write the
+  same exclusive values, so the behavior is identical without it.
+* change: the slow-compare dialog's temporary fast mode ("Switch to
+  faster compare") now forces the absorb pass off for that tab too
+  (like Align-by-similarity already was), and _is_fast_mode requires
+  the exact Preset 1 combination -- Native Myers with BOTH beautify
+  options off -- before a job may skip the slow-compare watchdog.
+* change: unidiff._py_opcodes no longer force-assigns
+  absorb_trivial_equal_blocks=False on its fresh Differ -- redundant
+  (a fresh Differ defaults it to off and the path reads no config).
+  The docstring now also explains why align_by_similarity is not set
+  there: engine_opcodes never consults it (a paint-walk flag for the
+  side-by-side REPLACE rendering, which the unified-diff path never
+  runs), so neither flag needs forcing for the output to be raw.
 2026.10.01 (by @badrelmers)
 * change: toolbar copy buttons reordered -- "→ Copy" (copy current
   difference to the right) now comes first, "← Copy" (copy to the

@@ -307,19 +307,23 @@ def _py_opcodes(algo, a, b):
 
     The unified-diff commands deliberately use the RAW algorithms:
     the beautify passes of the side-by-side view (the
-    'differ.algorithm.beautify.*' options, absorb_trivial_equal_blocks
-    included) are NOT applied here, so what you get is the engine's
-    own hunk structure, exactly what GNU diff / WinMerge would show
-    for that algorithm. (The compare view can therefore paint a
-    slightly different hunk structure than the unified diff when a
-    beautify option is on -- by design.)
+    'differ.algorithm.beautify.*' options) are NOT applied here, so
+    what you get is the engine's own hunk structure, exactly what GNU
+    diff / WinMerge would show for that algorithm. (The compare view
+    can therefore paint a slightly different hunk structure than the
+    unified diff when a beautify option is on -- by design.)
+
+    Why no flags are set on the fresh Differ:
+      * absorb_trivial_equal_blocks -- a fresh Differ already defaults
+        it to False and this path reads no config, so engine_opcodes
+        returns the raw engine opcodes by construction;
+      * align_by_similarity -- engine_opcodes never consults it. It
+        is a paint-walk flag (how lines inside one REPLACE block are
+        paired when the side-by-side view renders it), and this path
+        never runs the paint walk.
     """
     diff = dfp.Differ()
     diff.diff_algorithm = algo
-    # Hard guarantee of 'raw': a fresh Differ defaults to no absorb
-    # pass, and the flag is forced off explicitly so a future config
-    # read here can never silently change the unified-diff output.
-    diff.absorb_trivial_equal_blocks = False
     return diff.engine_opcodes(a, b)
 
 

@@ -1422,7 +1422,7 @@ class _CompareJob:
         'editor_lock',      # whole-compare lock/RO state (see class docstring)
         'stale',            # job dropped (tab closed / app exiting)
         'in_flight',        # background engine call was started
-        'fast_mode',        # started as the fast mode (Native Myers, Beautify off): the slow-compare dialog never asks
+        'fast_mode',        # started as the fast mode (Native Myers, both beautify off): the slow-compare dialog never asks
         'py_poll_cb',       # Python-engine completion poll timer callback (to TIMER_STOP on cancel), None when off
         'py_engine_thread', # daemon thread running the Python engine (diagnostic ref), None when off
     )
@@ -1468,12 +1468,14 @@ class _CompareJob:
 
 def _is_fast_mode(diff):
     """True when the Differ is configured exactly as the slow-compare
-    dialog's 'faster mode': the NATIVE engine running Native Myers with
-    Align-by-similarity off (the toolbar preset 1 combination). A job
-    started this way never arms the slow-compare watchdog."""
+    dialog's 'faster mode' -- the toolbar's Preset 1 combination: the
+    NATIVE engine running Native Myers with BOTH beautify options
+    off (Align-by-similarity and the absorb pass). A job started
+    this way never arms the slow-compare watchdog."""
     return (isinstance(diff, dfn.Differ)
             and getattr(diff, 'diff_algorithm', '') == 'native_myers'
-            and not getattr(diff, 'align_by_similarity', False))
+            and not getattr(diff, 'align_by_similarity', False)
+            and not getattr(diff, 'absorb_trivial_equal_blocks', False))
 
 
 class _TabSession:
@@ -3516,7 +3518,8 @@ class Command:
         """Arm the one-shot SLOW_COMPARE_SECONDS timer for a
         just-started BACKGROUND compare (both background forms: the
         native engine job and the Python engine thread). Skipped when
-        the compare already runs the fast mode (Native Myers + Beautify
+        the compare already runs the fast mode (Native Myers + both
+        beautify
         off -- the mode the dialog would switch to; asking would be
         pointless) or when the native engine is unavailable (the
         switch would be impossible). The timer callback
@@ -3537,8 +3540,8 @@ class Command:
         """One-shot SLOW_COMPARE_SECONDS timer callback: a background
         compare has been running for over a minute and was NOT started
         in the fast mode -- ask the user whether to keep waiting or to
-        re-run this compare in the fast mode (Native Myers, Beautify
-        off).
+        re-run this compare in the fast mode (Native Myers, both
+        beautify options off).
 
         Guards (each resolves to a silent no-op): the tab closed with
         the timer in flight, the compare finished or was cancelled,
@@ -3551,7 +3554,8 @@ class Command:
         'Switch to faster compare' cancels the running job exactly
         like the Cancel command, sets the session's temporary
         fast-mode flag (every later compare of this tab runs Native
-        Myers + Beautify off until the tab closes; the persisted
+        Myers + both beautify options off until the tab closes; the
+        persisted
         settings are NOT touched) and re-runs the compare with the
         same 'show identical' dialog policy the original compare had.
         'Continue compare' (and Esc / closing the dialog) leaves the
@@ -4226,16 +4230,17 @@ class Command:
                       '(configured: {})').format(
                         _algo, self.cfg.get('diff_algorithm', 'native_myers')))
             if getattr(session, 'fast_temp', False):
-                # Temporary fast mode: Align-by-similarity off for this
-                # compare tab, regardless of the configured option.
+                # Temporary fast mode (the slow-compare dialog's
+                # 'faster mode' -- the exact Preset 1 combination):
+                # BOTH beautify options off for this compare tab,
+                # regardless of the configured options.
                 diff.align_by_similarity = False
+                diff.absorb_trivial_equal_blocks = False
             else:
                 diff.align_by_similarity = self.cfg.get(
                     'align_by_similarity')
-            # Opcode beautify pass option -- follows the config in fast
-            # mode too (the pass is O(n), not a slow-compare risk).
-            diff.absorb_trivial_equal_blocks = self.cfg.get(
-                'absorb_trivial_equal_blocks')
+                diff.absorb_trivial_equal_blocks = self.cfg.get(
+                    'absorb_trivial_equal_blocks')
             # Ignore options -> diff_proc DIFF_IGN_* bitmask for the
             # native algorithms (applies to BOTH the line-level diff and
             # the char-level details). The pure-Python Differ simply

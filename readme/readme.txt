@@ -374,21 +374,27 @@ into the compare view):
   guard as the tab context menu).
 - ★ Preset ▾ -- dropdown with quick "preset" combinations: "Preset 1:
   Fastest comparison - Myers, Align Off" and "Preset 2: Better
-  readability (slower) - Histogram, Align On"; only one of the two
-  presets can be checked at a time. After a separator, "Algorithm 1:
-  Native Histogram" and "Algorithm 2: Native Myers" (also mutually
-  exclusive) and the independent "Align by similarity" toggle (works
-  with either algorithm). The preset checkmarks are DERIVED from the
-  current settings on every menu open: Native Myers + Align off
-  checks Preset 1, Native Histogram + Align on checks Preset 2, any
-  other combination checks NEITHER -- so a custom selection is
-  visible at a glance. Picking an item writes
-  differ.algorithm.diff_algorithm /
-  differ.algorithm.beautify.align_by_similarity
-  (the same settings the config dialog edits) and re-runs this tab's
+  readability (slower) - Histogram, Align On"; the two presets are
+  RADIO items (a dot mark instead of a checkmark; clicking one
+  unchecks the other), so at most one is ever marked. After a
+  separator, "Algorithm 1: Native Histogram" and "Algorithm 2:
+  Native Myers" (also radio items, also mutually exclusive) and the
+  two independent checkable toggles "Align by similarity" and
+  "Absorb trivial equal blocks" (each works with either algorithm).
+  The preset marks are DERIVED from the current settings on every
+  menu open -- a preset is an EXACT combination of three settings:
+  Native Myers + Align off + Absorb off checks Preset 1, Native
+  Histogram + Align on + Absorb off checks Preset 2, any other
+  combination (Absorb on included) checks NEITHER -- so a custom
+  selection is visible at a glance. Picking a preset writes ALL
+  THREE settings (differ.algorithm.diff_algorithm /
+  differ.algorithm.beautify.align_by_similarity /
+  differ.algorithm.beautify.absorb_trivial_equal_blocks -- the same
+  settings the config dialog edits; both presets write Absorb off)
+  and re-runs this tab's
   compare immediately. The button is disabled while a compare runs
   (like the Ignore dropdown); its tooltip shows the current
-  algorithm / align combination.
+  algorithm + both beautify flags.
 - ⇋ Swap -- swap the two sides of this compare tab (same as the
   "Swap compared editors" command): the texts trade places together
   with their syntax highlighting and per-side settings, and the
@@ -555,12 +561,13 @@ files are.
   the native engine's background form for the native algorithms.)
 - Slow-compare offer: when a background compare has been running for
   over a minute and is not already using the fastest combination
-  (Native Myers with Beautify alignment off), the plugin asks once:
+  (Native Myers with both beautify options off -- the Preset 1
+  combination), the plugin asks once:
   keep waiting, or switch to that faster combination for this compare?
   "Switch" cancels the running compare and re-runs it in the fast mode;
   it is temporary -- it applies to that compare tab until the tab is
   closed (every later re-compare of the tab stays fast) and the
-  configured algorithm / Beautify options in the settings are never
+  configured algorithm / beautify options in the settings are never
   touched. "Continue" (or closing the dialog) just keeps waiting.
   Compares already running the fast combination never ask.
 
