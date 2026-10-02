@@ -1234,6 +1234,19 @@ STATE_FILE = os.path.join(ct.app_path(ct.APP_DIR_SETTINGS), 'cuda_differ2_state.
 PLUGINS_INI = os.path.join(ct.app_path(ct.APP_DIR_SETTINGS), 'plugins.ini')
 PLUGINS_INI_SECTION = 'events'
 MODULE_NAME = __name__.split('.')[-1]  # e.g. 'cuda_differ2'
+# CudaText's APPSTATE_SESSION_LOAD_BEGIN_PRE (value 36): fired before EVERYTHING
+# a session load does -- in particular before the load closes the old
+# session's tabs (on_close_pre / on_close), which is exactly what
+# APPSTATE_SESSION_LOAD_BEGIN cannot do (it only arrives AFTER the closes,
+# too late to tell a session-manager close from a user close). The plugin
+# brackets the load with it: from LOAD_PRE until APPSTATE_SESSION_LOAD /
+# _FAIL, on_close keeps the closing compare tabs' persisted registrations
+# (the tabs still exist in the session file being left and come back when
+# the user returns to that session). Builds without the constant never
+# fire value 36, so the numeric fallback keeps the plugin importable
+# there -- the session-switch protection then silently degrades to the
+# old behavior.
+SESSION_LOAD_PRE_STATE = getattr(ct, 'APPSTATE_SESSION_LOAD_BEGIN_PRE', 36)
 
 
 _homedir = os.path.expanduser('~')
@@ -1511,6 +1524,17 @@ class Command:
         # on_close (which fires next, once per closing tab) can skip
         # temp-file deletion and let compare tabs persist across restarts.
         self._app_exiting = False
+        # True while CudaText is loading a session: raised on
+        # APPSTATE_SESSION_LOAD_BEGIN_PRE (which fires BEFORE the load's first
+        # on_close_pre / on_close), cleared on APPSTATE_SESSION_LOAD /
+        # APPSTATE_SESSION_LOAD_FAIL. Inside that window every tab close
+        # is the session manager replacing the tab set, not the user
+        # closing a tab -- on_close then keeps the tab's persisted
+        # registration (the tab still exists in the session file being
+        # left) and only tears down the runtime session; on
+        # APPSTATE_SESSION_LOAD, _restore_session_tabs re-attaches the
+        # tabs the loaded session restored.
+        self._session_loading = False
         # The unified-diff commands' background runner (see unidiff.py):
         # all their engine / rendering / cancellation machinery lives in
         # that module; the Command only supplies the completion callback
@@ -2451,7 +2475,9 @@ class Command:
 
     def on_state(self, ed_self, state):
         """App-level state changes: reload the config when a UI or syntax
-        theme switch may have moved the compare colors.
+        theme switch may have moved the compare colors; bracket CudaText
+        session loads so session-switch tab closes keep their persisted
+        registrations.
 
         Note: EDSTATE_* values (word-wrap, read-only, zoom...) never
         arrive here. Since CudaText 1.94.0 (api 1.0.320) on_state only
@@ -2472,6 +2498,39 @@ class Command:
             difftb.update_theme_all()
         elif state == ct.APPSTATE_THEME_SYNTAX:
             self.config()
+        elif state == SESSION_LOAD_PRE_STATE:
+            # Session load starting: fires BEFORE the load closes the old
+            # session's tabs (on_close_pre / on_close) -- unlike
+            # APPSTATE_SESSION_LOAD_BEGIN, which only arrives after the
+            # closes, too late to tell them apart from user closes. Raise
+            # the flag every on_close in the window consults: the closing
+            # compare tabs are being replaced by the session manager, not
+            # closed by the user, so their persisted registrations must
+            # survive for the re-attach pass below. (APPSTATE_SESSION_
+            # SAVE_BEFORE/AFTER are of no use here: the built-in session
+            # saver also fires them every ~40s, so they cannot tell a
+            # save from a switch.)
+            self._session_loading = True
+        elif state == ct.APPSTATE_SESSION_LOAD:
+            # Session load completed. Only react when the load was seen
+            # starting (LOAD_PRE above): on builds without that event
+            # nothing was protected, so there is nothing to re-attach
+            # either. The pass is the very one on_start2 runs at startup
+            # -- rebuilt per-tab sessions, toolbars, title colors, scroll
+            # set -- just triggered by a mid-run session switch instead
+            # of program start.
+            if self._session_loading:
+                self._session_loading = False
+                self._restore_session_tabs()
+        elif state == ct.APPSTATE_SESSION_LOAD_FAIL:
+            # Session load failed after LOAD_PRE had already fired: clear
+            # the flag (the load is over either way) but do NOT run the
+            # re-attach pass -- with the load failed, which tabs survived
+            # and what the current session now is are uncertain, and the
+            # pass's dead-record cleanup could then erase the very entries
+            # the flag just spent the load protecting. The kept entries
+            # are re-validated by the next successful load or startup.
+            self._session_loading = False
 
     def on_state_ed(self, ed_self, state):
         """Editor-level state changes (EDSTATE_* constants -- this event,
@@ -2992,15 +3051,38 @@ class Command:
         """Called once on program start, after configs are applied and just
         before the main form shows.
 
-        Performs startup cleanup: removes dead records (compare tabs that
-        were not restored by CudaText -- e.g. empty untitled tabs are
-        discarded by CudaText on restart). Then rebuilds in-memory caches,
-        re-subscribes to on_scroll, re-applies title colors, and re-applies
-        diff markers for each surviving compare tab.
+        Startup restore of the plugin's compare-tab world: delegates to
+        _restore_session_tabs -- the pass shared with mid-run session
+        switches (on_state / APPSTATE_SESSION_LOAD), which re-attaches
+        the compare tabs CudaText restored from the session file.
 
         We use on_start2 (not on_start) because on_start fires too early --
         before session restore completes. By on_start2, all editors exist
         and CudaText has finished restoring the modified flag/tab colors."""
+        self._restore_session_tabs()
+
+    def _restore_session_tabs(self):
+        """Re-attach the plugin's runtime world to the compare tabs of the
+        CURRENT CudaText session -- the shared body of on_start2 (startup
+        restore) and on_state(APPSTATE_SESSION_LOAD) (a mid-run session
+        switch just finished loading).
+
+        The pass, in order: cache the current session's state-file key;
+        drop the current session's dead records (entries whose tab ids are
+        not open -- e.g. CudaText discards empty untitled tabs on
+        restore); rebuild the in-memory scroll set and the per-tab
+        sessions (a restored tab gets a full standalone session with its
+        dirty/saved caches repopulated from disk); re-apply the green
+        title color of clean compare tabs; re-create the compare toolbars
+        (on a one-shot 300ms timer -- docking needs the fully-laid-out
+        editor parents); re-subscribe to on_scroll when sync-scroll is on.
+
+        Groups of OTHER sessions in the state file are deliberately left
+        alone: their entries describe tabs that live in those session
+        files (kept safe through session switches by _session_loading --
+        see on_close) and are validated only when their session is loaded
+        again. A restored tab's diff markers are NOT re-painted on purpose
+        (no compare runs here): run Recompare to start the compare."""
         # Get the current session and cache its key.
         try:
             session_path = ct.app_path(ct.APP_FILE_SESSION) or ''
@@ -3043,9 +3125,9 @@ class Command:
             self.scroll.tab_id.add(tab_id_int)
             # A restored tab gets a full standalone session, but its
             # Differ stays None until the first compare needs it (no
-            # 'Using ... Algo' status spam at startup; a restored tab's
-            # diff markers are not re-painted on purpose -- see the
-            # commented-out refresh above).
+            # 'Using ... Algo' status spam at restore time; a restored
+            # tab's diff markers are not re-painted on purpose -- see the
+            # method docstring).
             tab_session = _TabSession(tab_id_int, self._current_session_key)
             # Populate the saved/dirty caches from disk (the runtime
             # 'saved' flag is derived: no half dirty).
@@ -3059,10 +3141,11 @@ class Command:
 
         # Restore the compare TOOLBARS of the session-restored compare
         # tabs (the toolbar is docked into the editor parent, which is
-        # destroyed with the tab on exit). on_start2 fires just before
-        # the main form shows, and docking needs the fully-laid-out
-        # editor parents -- so the creation runs on a one-shot 300ms
-        # timer instead of here.
+        # destroyed with the tab on exit). At startup this pass runs just
+        # before the main form shows; after a mid-run session switch the
+        # parents are laid out already -- but in both cases the one-shot
+        # 300ms timer is used anyway, so the editor parents are fully
+        # laid out when the docking happens.
         if self.cfg.get('show_toolbar', True) and self._sessions:
             callback = 'module=cuda_differ2;cmd=_toolbar_restore_timer;info=_;'
             ct.timer_proc(ct.TIMER_START_ONE, callback, 300)
@@ -3073,7 +3156,8 @@ class Command:
 
     def _apply_color_to_tab(self, tab_id_str, color):
         """Apply a title font color to a compare tab by its PROP_TAB_ID.
-        Used by on_start2 to restore the green/default color after restart."""
+        Used by _restore_session_tabs (startup restore and mid-run
+        session switches) to re-apply the green/default color."""
         target = str(tab_id_str)
         for h in ct.ed_handles():
             e = ct.Editor(h)
@@ -7312,14 +7396,29 @@ class Command:
 
     def on_close(self, ed_self: ct.Editor):
         """Fires after the close is confirmed. For a compare tab: destroy
-        its ENTIRE standalone session (persisted registration, overview
-        panel, in-flight job, all per-tab caches) so the tab's world is
-        fully gone and can never leak into another tab. If this was the
-        last compare tab, disable autostart. No temp files to delete
-        (split-tab approach).
+        its ENTIRE standalone session (overview panel, in-flight job, all
+        per-tab caches, and -- on a REAL close -- the persisted
+        registration) so the tab's world is fully gone and can never leak
+        into another tab. If this was the last compare tab, disable
+        autostart. No temp files to delete (split-tab approach).
 
         During app exit, the state entry and autostart are preserved so
         the compare tab can be restored after restart.
+
+        During a CudaText session switch (app_proc(PROC_LOAD_SESSION),
+        the Sessions menu, session-manager plugins) the state entry is
+        preserved too: the load CLOSES the old session's tabs to replace
+        them, which fires this handler for tabs the user did not close.
+        The load announces itself with APPSTATE_SESSION_LOAD_BEGIN_PRE -- the
+        only event that fires BEFORE the closes -- so _session_loading is
+        already up when they arrive, and here the persisted registration
+        is kept: the tab still exists in the session file being left and
+        comes back (re-attached by _restore_session_tabs, the same pass
+        on_start2 runs) when the user returns to that session. The
+        runtime teardown is NOT skipped -- the editor object is genuinely
+        being destroyed; only the disk record survives. On builds without
+        APPSTATE_SESSION_LOAD_BEGIN_PRE the flag never rises and these closes
+        degrade to the old behavior (entry deleted).
 
         IMPORTANT: the toolbar is destroyed ONLY on a REAL tab close
         (the non-exit branch at the bottom). During app exit CudaText
@@ -7342,9 +7441,23 @@ class Command:
         if session is None:
             return  # not a compare tab
 
-        # Remove the persisted registration (under the tab's OWN
-        # state_key).
-        entry = self._unregister_compare_tab(session)
+        # Session switch in progress (APPSTATE_SESSION_LOAD_BEGIN_PRE seen,
+        # APPSTATE_SESSION_LOAD / _FAIL not yet -- see on_state): this is
+        # the session manager replacing the tab set, not the user closing
+        # the tab. Keep the persisted registration -- the tab still exists
+        # in the session file being left and is re-attached when that
+        # session comes back (_restore_session_tabs on
+        # APPSTATE_SESSION_LOAD, on_start2 on the next restart). The
+        # _app_exiting case below outranks this one: an exit during a load
+        # must keep the exit semantics. Everything after this point still
+        # runs -- the runtime teardown is correct because the editor
+        # object really is being destroyed; only the disk record survives.
+        if self._session_loading and not self._app_exiting:
+            entry = None
+        else:
+            # Remove the persisted registration (under the tab's OWN
+            # state_key).
+            entry = self._unregister_compare_tab(session)
 
         # Remove from in-memory scroll set.
         try:

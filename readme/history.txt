@@ -1,3 +1,44 @@
+2026.10.03 (by @badrelmers)
+- fix: switching CudaText sessions (the Sessions menu,
+  app_proc(PROC_LOAD_SESSION), session-manager plugins) no longer deletes
+  the compare tabs' tracking info from settings/cuda_differ2_state.json.
+  The session manager closes the old session's tabs to replace them, and
+  those closes used to hit on_close's unregister path, killing the
+  persisted registrations of tabs that were not really closed -- they
+  still exist in the session file being left and come back when the user
+  returns to it. The plugin now brackets the load with CudaText's new
+  APPSTATE_SESSION_LOAD_BEGIN_PRE event (the only one that fires BEFORE the
+  load's first on_close_pre / on_close -- APPSTATE_SESSION_LOAD_BEGIN
+  arrives only after the closes, too late; the SESSION_SAVE_BEFORE and
+  SESSION_SAVE_AFTER events cannot tell a switch from the ~40s auto-save):
+  _session_loading is raised on LOAD_PRE, and every on_close inside the
+  window keeps the tab's persisted entry (the runtime teardown still
+  runs -- the editor object is genuinely destroyed; the app-exit flag
+  outranks the session-loading flag). On APPSTATE_SESSION_LOAD the
+  re-attach pass _restore_session_tabs -- the body of on_start2, now
+  shared by both call sites -- re-attaches the loaded session's restored
+  compare tabs (per-tab sessions, toolbars, title colors, scroll set,
+  dead-record cleanup) exactly like a restart; on APPSTATE_SESSION_LOAD_FAIL
+  only the flag is cleared (the pass's dead-record cleanup must not run
+  against an uncertain session state). Builds without the event keep the
+  old behavior (numeric fallback 36 keeps the plugin importable). readme
+  documents the behavior in the "Compare tabs, restarts and session
+  switches" chapter.
+* change: install.inf homepage is now github.com/badrelmers/cuda_differ2;
+  the readme Authors section reads: Badr Elmers,
+  github.com/badrelmers -- forked from Differ by OlehL
+  (github.com/CudaText-addons/cuda_differ) and rewritten from scratch.
+* change: readme adds the support policy for the diff algorithms: only
+  the two native algorithms are supported and maintained and receive
+  improvements over time; the five pure-Python algorithms are
+  unsupported except bug fixes -- no speed or readability enhancements,
+  kept just as experimental references to track the native algorithms'
+  divergence over time, and issues asking to speed them up or improve
+  their output readability will not be accepted.
+* change: changelog cleanup -- the "Differ 2" rename is now applied only
+  to entries dated after 2026.07.08; older entries keep the plugin's
+  original name (they describe the pre-fork plugin's changes).
+
 2026.10.02 (by @badrelmers)
 * change: the plugin is renamed Differ 2 and fully de-conflicted from
   the upstream published Differ plugin
@@ -1035,13 +1076,13 @@
 
 2023.03.26
 * change: reverted last change (ie don't show messagebox on closing pair-tab)
-* change: when comparing untitled tab, make its copy in the Differ 2-tab
+* change: when comparing untitled tab, make its copy in the Differ-tab
 
 2023.03.20
-+ add: on closing pair-tab controlled by Differ 2, ask user to 'return back to 2 separate tabs'
++ add: on closing pair-tab controlled by Differ, ask user to 'return back to 2 separate tabs'
 
 2023.03.16
-+ add: context menu item "Differ 2 > Compare with tab > (Focused tab)"
++ add: context menu item "Differ > Compare with tab > (Focused tab)"
 
 2023.03.11
 * change: for untitled compared buffers, use folder settings/differ_backup instead of OS TEMP
@@ -1052,7 +1093,7 @@
 - fix: reverted "clean temp-dir on exiting", we may have untitled tabs saved there
 
 2023.02.24
-- fix: allow sync'ed scrolling _only_ for Differ 2-controlled file-pair
+- fix: allow sync'ed scrolling _only_ for Differ-controlled file-pair
 
 2023.01.18
 + add: commands to produce a diff file (or patch)
@@ -1136,7 +1177,7 @@
 + add: UI: if 2 files opened in group-1, Choose File dialog suggests these 2 files
 + add: UI: if 2 files opened in group-1 and group-1, Choose File dialog suggests them
 + add: UI: if plugin opens file from group-2 and now group-2 is empty, plugin sets "one group" mode
-+ add: command "Options / Settings-plugins / Differ 2 / Clear recents history"
++ add: command "Options / Settings-plugins / Differ / Clear recents history"
 
 2019.04.17
 * require CudaText 1.78.7

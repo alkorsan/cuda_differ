@@ -592,7 +592,7 @@ When you edit files inside the compare view and press Ctrl+S:
   the synced changes with Ctrl+Z after switching to the original tab.
 
 
-== Compare tabs and restarts ==
+== Compare tabs, restarts and session switches ==
 
 Compare tabs survive CudaText restarts:
 
@@ -618,6 +618,22 @@ Compare tabs survive CudaText restarts:
   global diagnostic -- if you enable profiling and compare two tabs
   concurrently, the printed timings interleave (profiling is off by
   default).
+
+Switching CudaText sessions (the Sessions menu, app_proc(PROC_LOAD_SESSION),
+session-manager plugins) keeps the tracking alive too: a session switch
+closes the old session's tabs to replace them, and those closes are NOT
+user closes -- the plugin recognizes them through CudaText's
+APPSTATE_SESSION_LOAD_BEGIN_PRE event (which fires before the switch's first
+tab close; APPSTATE_SESSION_LOAD_BEGIN arrives only after the closes, too
+late to be usable) and keeps every closed compare tab's persisted
+registration, because the tab still exists in the session file being left.
+When you switch back, the restored compare tabs are re-attached exactly
+like after a restart (per-tab session, toolbar, title color, dirty/saved
+state; run Recompare to start the compare), and closing them afterwards
+cleans up as usual. This needs a CudaText build with the
+APPSTATE_SESSION_LOAD_BEGIN_PRE event; on older builds a session switch degrades
+to the old behavior (the tracking entry is deleted, so the restored tab is
+not re-attached and stays a plain split tab).
 
 When you close a compare tab manually (not via app exit):
 - While a comparison is running, the tab is busy and cannot be closed
@@ -1173,6 +1189,15 @@ five pure-Python ones (Hybrid, Myers, VS Code, Patience, difflib). The
 complete description of every algorithm is in the
 differ2.algorithm.diff_algorithm option.
 
+Support policy: only the two NATIVE algorithms are supported and
+maintained -- only they will receive improvements over time, if God
+wills. The five pure-Python algorithms are NOT supported and NOT
+maintained, except for bug fixes: they will not receive speed or
+readability enhancements. They are kept just as EXPERIMENTAL reference
+implementations, to track the divergence of the native algorithms over
+time. Any issue opened to speed them up or to improve their output
+readability will not be accepted -- only bug reports are welcome.
+
 Two option combinations cover the two extreme needs:
 
 Fastest compare (very big files, minimum CPU and memory) -- this is
@@ -1424,6 +1449,7 @@ Reporting a performance problem:
 == Authors ==
 
   Badr Elmers, https://github.com/badrelmers
-  Forked from Differ by OlehL (https://github.com/CudaText-addons/cuda_differ) and rewritten from scratch.
-  
+  Forked from Differ by OlehL (https://github.com/CudaText-addons/cuda_differ)
+  and rewritten from scratch.
+
 License: MIT
