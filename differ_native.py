@@ -832,7 +832,16 @@ class Differ:
         if self.absorb_trivial_equal_blocks:
             if not isinstance(opcodes, list):
                 opcodes = list(opcodes)
-            absorbed = _absorb_trivial_equal_blocks(self._lines_a, opcodes)
+            # Umbrella section over the whole pass + nested per-step
+            # marks (the report's 'Beautify passes' block): collect
+            # runs on the main thread, so regular sections/marks nest
+            # fine -- the umbrella's SELF is the pass minus its steps
+            # (list copy, guards, fixpoint bookkeeping).
+            Profiler.start('absorb_trivial_equal_blocks')
+            absorbed = _absorb_trivial_equal_blocks(
+                self._lines_a, opcodes,
+                Profiler.mark if Profiler.enabled else None)
+            Profiler.stop('absorb_trivial_equal_blocks')
             if absorbed is not opcodes:
                 opcodes[:] = absorbed
 
@@ -1029,7 +1038,7 @@ class Differ:
         # old report show replace_block:positional_pair as a fake ~20s
         # bottleneck. Only sections that close before a yield remain
         # (compare:algorithm, per-chunk compare:positional_pairs /
-        # compare:find_best_pairs).
+        # compare:align_by_similarity).
 
         # REPLAY-mode setup: the batched char results the engine
         # delivered. Assignment (not an if-guard) so a compare() call
@@ -1162,10 +1171,17 @@ class Differ:
             # on a 1M-line compare the pass costs ~0.5s -- two cheap
             # tuple sweeps, no engine call.
             if self.absorb_trivial_equal_blocks:
-                opcodes = _absorb_trivial_equal_blocks(a_lines, opcodes)
+                # Umbrella section + nested per-step marks, same as the
+                # collect pass (see collect_char_pairs): this branch
+                # runs on the main thread too.
+                Profiler.start('absorb_trivial_equal_blocks')
+                opcodes = _absorb_trivial_equal_blocks(
+                    a_lines, opcodes,
+                    Profiler.mark if Profiler.enabled else None)
+                Profiler.stop('absorb_trivial_equal_blocks')
 
         # Event production for REPLACE blocks is instrumented per chunk
-        # ('compare:positional_pairs' / 'compare:find_best_pairs' open
+        # ('compare:positional_pairs' / 'compare:align_by_similarity' open
         # AFTER the chunk list is built and close BEFORE it is yielded —
         # one row per producer, so the report shows WHICH of the two
         # pairing modes a block used); equal/delete/insert/ignore
@@ -1490,7 +1506,7 @@ class Differ:
         b[blo:bhi]. GENERATOR OF EVENT LISTS: yields the block's paint
         events as one or more lists, in exactly the order the old
         generator-based version yielded them. The producing section
-        ('compare:find_best_pairs' for the beautify path,
+        ('compare:align_by_similarity' for the beautify path,
         'compare:positional_pairs' for the positional path — one row per
         producer so the report shows which mode a block used) opens
         after a list starts and closes before the list is yielded —
@@ -1556,11 +1572,11 @@ class Differ:
             # these rows keep reporting ONLY the paint-pass walk.
             _collecting = self._char_pairs_pending is not None
             if not _collecting:
-                Profiler.start('compare:find_best_pairs')
+                Profiler.start('compare:align_by_similarity')
             evs = []
             self._find_best_pairs_events(evs, a, alo, ahi, b, blo, bhi)
             if not _collecting:
-                Profiler.stop('compare:find_best_pairs')
+                Profiler.stop('compare:align_by_similarity')
             yield evs
             return
 
@@ -1636,7 +1652,11 @@ class Differ:
         Profiling: both searches and the char diffs are perf_counter-
         timed and booked as batched marks (calls = 1 per invocation) —
         no sections, so recursion depth adds zero instrumentation cost.
-        The SEARCH marks run in every mode (the search itself runs in
+        The two searches are the pass's STEPS and book their own rows
+        ('align_by_similarity:step1_exact_match_search' /
+        'align_by_similarity:step2_prefix_suffix_search' — the report's
+        'Beautify passes' block prints them under the pass). The
+        SEARCH marks run in every mode (the search itself runs in
         every pass); the CHAR-DIFF timing runs only in the legacy
         synchronous mode (in the two-phase flow the engine time is
         booked by the async pair around the batched DIF_CHARS job).
@@ -1688,7 +1708,7 @@ class Differ:
                     best_exact_i = sub_a_unique[line]
                     best_exact_j = j
         if prof_on:
-            Profiler.mark('find_best_pairs:exact_match_search',
+            Profiler.mark('align_by_similarity:step1_exact_match_search',
                           time.perf_counter() - _t0)
 
         best_score = -1
@@ -1738,7 +1758,7 @@ class Differ:
                         best_score, best_i, best_j = score, i, j
                         best_prefix = prefix
             if prof_on:
-                Profiler.mark('find_best_pairs:prefix_suffix_search',
+                Profiler.mark('align_by_similarity:step2_prefix_suffix_search',
                               time.perf_counter() - _t0)
 
         # Minimum similarity threshold: only pair lines if the BEST pair
@@ -1927,7 +1947,7 @@ def _non_ws_len(a, i1, i2):
     return len(text)
 
 
-def _absorb_trivial_equal_blocks(a, opcodes):
+def _absorb_trivial_equal_blocks(a, opcodes, _book=None):
     """Beautify pass for a finished opcode list -- two steps.
 
     Called from collect_char_pairs() (the two-phase background flow,
@@ -2039,6 +2059,20 @@ def _absorb_trivial_equal_blocks(a, opcodes):
         opcodes: difflib-style (tag, i1, i2, j1, j2) tuples from any
             engine. Tags: 'equal' / 'delete' / 'insert' / 'replace' /
             'ignore' (the native engine's suppressed all-blank hunks).
+        _book: optional profiler booking callable (row_name, dt) ->
+            None, used only by the plugin's compare paths when
+            profiling is on: this module's collect_char_pairs /
+            compare_lists pass Profiler.mark under their
+            'absorb_trivial_equal_blocks' umbrella section (both run
+            on the main thread, so the step marks nest and the
+            umbrella's SELF is the pass minus its steps);
+            differ_python.engine_opcodes passes the thread-safe
+            Profiler.mark_standalone instead (it runs on the
+            background Python-engine thread). Each step books its
+            OWN row ('absorb_trivial_equal_blocks:step1_merge_ins_eq_del'
+            / ':step2_absorb_short_equal' -- the report's 'Beautify
+            passes' block). None (default) = run untimed -- the
+            standalone tests and any pure-algorithm caller.
 
     Returns:
         A NEW list with the merges applied (the input list is never
@@ -2066,6 +2100,7 @@ def _absorb_trivial_equal_blocks(a, opcodes):
     # ends at the newly created REPLACE, so cascades of adjacent
     # patterns collapse left-to-right to a fixpoint in one sweep.
     # ------------------------------------------------------------------
+    _t0 = time.perf_counter() if _book else 0.0
     i = 1
     while i < len(result) - 1:
         prev = result[i - 1]
@@ -2084,6 +2119,9 @@ def _absorb_trivial_equal_blocks(a, opcodes):
                     i -= 1
                 continue
         i += 1
+    if _book:
+        _book('absorb_trivial_equal_blocks:step1_merge_ins_eq_del',
+              time.perf_counter() - _t0)
 
     # ------------------------------------------------------------------
     # STEP 2: absorb a short trivial EQUAL block between two changed
@@ -2101,6 +2139,7 @@ def _absorb_trivial_equal_blocks(a, opcodes):
     # a merge can bring two previously separated changed blocks next to
     # a new short EQUAL, which must be absorbed in a following sweep.
     # ------------------------------------------------------------------
+    _t0 = time.perf_counter() if _book else 0.0
     changed = True
     iterations = 0
     while changed and iterations < 10:
@@ -2128,5 +2167,8 @@ def _absorb_trivial_equal_blocks(a, opcodes):
                             i -= 1
                         continue
             i += 1
+    if _book:
+        _book('absorb_trivial_equal_blocks:step2_absorb_short_equal',
+              time.perf_counter() - _t0)
 
     return result

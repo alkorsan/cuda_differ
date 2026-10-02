@@ -93,8 +93,9 @@ Implementation notes:
 
 * The PRESETS dropdown is the quick way to set the algorithm +
   the two beautify flags: two mutually exclusive RADIO presets
-  ("Preset 1: Fastest comparison - Myers, Align Off", "Preset 2:
-  Better readability (slower) - Histogram, Align On"), a separator,
+  ("Preset 1: Fastest comparison - Myers, Align Off, Absorb Off",
+  "Preset 2: Better readability (slower) - Histogram, Align On,
+  Absorb Off"), a separator,
   two mutually exclusive RADIO algorithms ("Algorithm 1: Native
   Histogram", "Algorithm 2: Native Myers"), and the two independent
   checkable toggles "Align by similarity" and "Absorb trivial equal
@@ -259,9 +260,10 @@ def _set_ignore_opt(key, val):
 # Toolbar-only -- the config dialog / tab context menu keep their own
 # algorithm UIs.
 _PRESET_ITEMS = (
-    ('preset1',  _('Preset 1: Fastest comparison - Myers, Align Off')),
+    ('preset1',  _('Preset 1: Fastest comparison - Myers, Align Off, '
+                   'Absorb Off')),
     ('preset2',  _('Preset 2: Better readability (slower) - Histogram, '
-                   'Align On')),
+                   'Align On, Absorb Off')),
     (None, None),
     ('algo1',    _('Algorithm 1: Native Histogram')),
     ('algo2',    _('Algorithm 2: Native Myers')),

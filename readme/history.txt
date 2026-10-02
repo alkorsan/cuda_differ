@@ -33,7 +33,8 @@
   _OLD_OPT_NAMES). Behavior unchanged: similarity-anchored re-pairing
   of lines inside unequal-count REPLACE blocks, off by default. The
   toolbar's toggle is re-captioned "Align by similarity" and the
-  preset captions read "Myers, Align Off" / "Histogram, Align On".
+  preset captions read "Myers, Align Off, Absorb Off" /
+  "Histogram, Align On, Absorb Off".
 * change: the shared module py_algo/realign.py is DISSOLVED. Each
   differ now carries its own private copy of
   _absorb_trivial_equal_blocks at the END of its file
@@ -102,6 +103,39 @@
   there: engine_opcodes never consults it (a paint-walk flag for the
   side-by-side REPLACE rendering, which the unified-diff path never
   runs), so neither flag needs forcing for the output to be raw.
+* change: the toolbar preset captions now name the third setting of
+  each exact combination too: "Preset 1: Fastest comparison - Myers,
+  Align Off, Absorb Off" and "Preset 2: Better readability (slower)
+  - Histogram, Align On, Absorb Off" (both presets write Absorb
+  off, and the captions now say so -- the same "show what the click
+  will configure" the Align part always gave).
+* add: per-step profiling for BOTH beautify passes -- the profiling
+  report now shows each pass broken into its steps instead of hiding
+  them inside other rows. align_by_similarity's two searches book
+  their own rows (align_by_similarity:step1_exact_match_search /
+  :step2_prefix_suffix_search -- renamed from the old
+  find_best_pairs:* names that did not say which pass they belonged
+  to), under the renamed compare:align_by_similarity umbrella
+  section (was compare:find_best_pairs).
+  _absorb_trivial_equal_blocks -- which had NO profiling rows at
+  all -- now books per-step rows via a new optional _book parameter
+  (absorb_trivial_equal_blocks:step1_merge_ins_eq_del /
+  :step2_absorb_short_equal), plus an absorb_trivial_equal_blocks
+  umbrella section on the native paths (collect_char_pairs and
+  compare_lists's fresh-split branch, whose SELF is then the pass
+  minus its steps); the Python engine books its steps from the
+  background thread with the thread-safe mark_standalone (no
+  umbrella row there -- the steps' sum IS the pass total, and the
+  time also stays inside the engine-wait row). The report gains a
+  'Beautify passes' block that prints each pass with its steps IN
+  RUN ORDER (the flat table's self-time sort scatters them), with
+  an explicit "(no rows: the option is off, or nothing matched)"
+  note so a pass that did not run is never mistaken for a
+  profiling gap; the row-families legend documents the new names.
+  The _book callable keeps the pass itself pure-Python-testable
+  (None = untimed -- the standalone tests' default), and the two
+  differ copies of the function stay code-identical modulo
+  docstrings (scripts/check_copies_ast.py).
 2026.10.01 (by @badrelmers)
 * change: toolbar copy buttons reordered -- "→ Copy" (copy current
   difference to the right) now comes first, "← Copy" (copy to the

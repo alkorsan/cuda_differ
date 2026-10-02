@@ -176,12 +176,12 @@ def _timed_produce(list_iter):
     generator is suspended at 'yield evs' with NO section open, so the
     dispatch time cannot be booked into 'compare:produce'. The walk's
     own per-chunk sections (compare:positional_pairs /
-    compare:find_best_pairs) open during the fetch and therefore nest
+    compare:align_by_similarity) open during the fetch and therefore nest
     UNDER produce: the tree reads
 
         refresh:compare_and_paint
             compare:produce            (per event-list fetch)
-                compare:positional_pairs / find_best_pairs (walk chunks)
+                compare:positional_pairs / align_by_similarity (walk chunks)
             paint:attr / paint:gap / paint:micromap / wrap_calc (marks)
             <SELF = pure dispatch: branch ladder + collection>
 
@@ -4638,7 +4638,7 @@ class Command:
         # loop: its SELF time is the honest per-event dispatch+collection
         # cost (the generator's production time is booked separately by
         # the differ's per-chunk 'compare:positional_pairs' /
-        # 'compare:find_best_pairs' sections and batched 'char_diff:*'
+        # 'compare:align_by_similarity' sections and batched 'char_diff:*'
         # marks — no per-event sections anywhere, see profiling.py's
         # docstring).
         #
@@ -4786,7 +4786,7 @@ class Command:
         # generator's section). All dispatch+collection time lands
         # honestly in this section's self time; the generator's own
         # production time is visible in the per-chunk
-        # 'compare:positional_pairs' / 'compare:find_best_pairs' rows +
+        # 'compare:positional_pairs' / 'compare:align_by_similarity' rows +
         # the batched 'char_diff:*' marks (see differ_native /
         # differ_python).
         #

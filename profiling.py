@@ -19,6 +19,13 @@ the profiler itself. The rewrite:
                             stretch of hot code with time.perf_counter()
                             (a ~60ns read; safe per pair) and books it
                             WITHOUT pushing a frame. ~0.3 us per mark.
+     mark_standalone(name, dt, calls, dt_max) -- the THREAD-SAFE mark
+                            variant for NON-MAIN threads (the Python
+                            engine's background thread books its absorb
+                            pass here): books the row without nesting
+                            into any open section, so a booking from
+                            another thread can never corrupt the main
+                            thread's self times.
    Per-pair/per-event sections no longer exist anywhere.
 
 2. stop() books to the frame that was actually popped. The name
@@ -192,6 +199,43 @@ class Profiler:
         cls._timed_ops += calls
 
     # ------------------------------------------------------------------
+    # Thread-safe marks (non-main threads)
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def mark_standalone(cls, name, dt, calls=1, dt_max=None):
+        """Book 'dt' seconds into row 'name' WITHOUT touching the
+        section stack -- the thread-safe variant of mark().
+
+        For callers that run on a NON-MAIN thread: the Python engine's
+        background thread books its _absorb_trivial_equal_blocks steps
+        here. A regular mark() from another thread would add its dt to
+        the innermost section open on the MAIN thread at that moment
+        (the shared _stack), driving that section's self time toward
+        negative values; a start()/stop() pair would interleave frames
+        with the main thread's own pushes. Standalone rows are simply
+        not nested: no section's self excludes them, and the report's
+        'Beautify passes' block presents them next to their step rows.
+
+        Row booking itself (dict get/set + float adds on distinct
+        rows) is GIL-atomic; the only shared counters (_mark_ops /
+        _timed_ops) could lose one increment in a rare interleave --
+        harmless for the overhead ESTIMATE line."""
+        if not cls.enabled:
+            return
+        row = cls._rows.get(name)
+        if row is None:
+            row = cls._rows[name] = _Row()
+        row.total += dt
+        row.self_t += dt
+        row.calls += calls
+        m = dt if dt_max is None else dt_max
+        if m > row.max_dt:
+            row.max_dt = m
+        cls._mark_ops += 1
+        cls._timed_ops += calls
+
+    # ------------------------------------------------------------------
     # Context-manager form (rare, non-hot sections only)
     # ------------------------------------------------------------------
 
@@ -301,7 +345,7 @@ class Profiler:
         sum_self = sum(r.self_t for r in cls._rows.values())
         items = sorted(cls._rows.items(), key=lambda kv: -kv[1].self_t)
 
-        print('\n' + '=' * 100)
+        print('\n' + '=' * 114)
         print('Differ Profiling Report  (times in ms; sorted by SELF time'
               ' \u2192 real bottleneck at top)')
         if files:
@@ -320,16 +364,16 @@ class Profiler:
             print('  !! (Options dialog / settings/cuda_differ.json) and re-run;')
             print('  !! use this run for the function-level report printed')
             print('  !! after this one.')
-        print('=' * 100)
-        print('  {:<40s} {:>10s} {:>10s} {:>9s} {:>10s} {:>6s}'.format(
+        print('=' * 114)
+        print('  {:<54s} {:>10s} {:>10s} {:>9s} {:>10s} {:>6s}'.format(
             'section', 'self', 'total', 'calls', 'max', '%'))
-        print('  ' + '-' * 98)
+        print('  ' + '-' * 112)
         for name, row in items:
             pct = (row.self_t / grand_total * 100.0) if grand_total > 0 else 0.0
-            print('  {:<40s} {:>8.1f}ms {:>8.1f}ms {:>9d} {:>8.1f}ms {:>5.1f}%'.format(
+            print('  {:<54s} {:>8.1f}ms {:>8.1f}ms {:>9d} {:>8.1f}ms {:>5.1f}%'.format(
                 name, row.self_t * 1000.0, row.total * 1000.0, row.calls,
                 row.max_dt * 1000.0, pct))
-        print('  ' + '-' * 98)
+        print('  ' + '-' * 112)
         print('  Outermost (100% baseline): {} = {:.1f}ms'.format(
             outermost_name if outermost_name else '(none)',
             grand_total * 1000.0))
@@ -357,7 +401,55 @@ class Profiler:
             if cprofile_was_on:
                 print('      (clean per-op costs; the cProfile tracing that')
                 print('       inflated the rows above is NOT included)')
-        print('=' * 100)
+
+        # -- Beautify passes: grouped step breakdown ------------------
+        # The two option-gated post-processing layers, each printed
+        # with its steps in RUN order. The flat table above sorts by
+        # SELF time, which scatters the steps of one pass all over
+        # the report; this block keeps every pass's rows together so
+        # the step costs read as the sequence they run in. A pass
+        # whose rows are all absent did not run (its option is off,
+        # or nothing matched its patterns) -- said explicitly, so a
+        # missing pass is never mistaken for a profiling gap.
+        print('=' * 114)
+        print('Beautify passes (option-gated; steps in run order):')
+        for _title, _desc, _rows in (
+                ('align_by_similarity',
+                 're-pairs lines inside unequal REPLACE blocks',
+                 (('total (blocks walked)', 'compare:align_by_similarity'),
+                  ('step1 exact_match_search',
+                   'align_by_similarity:step1_exact_match_search'),
+                  ('step2 prefix_suffix_search',
+                   'align_by_similarity:step2_prefix_suffix_search'))),
+                ('absorb_trivial_equal_blocks',
+                 'merges trivial EQUAL blocks into REPLACEs',
+                 (('total (whole pass)', 'absorb_trivial_equal_blocks'),
+                  ('step1 merge_ins_eq_del',
+                   'absorb_trivial_equal_blocks:step1_merge_ins_eq_del'),
+                  ('step2 absorb_short_equal',
+                   'absorb_trivial_equal_blocks:step2_absorb_short_equal')))):
+            print('  {} -- {}:'.format(_title, _desc))
+            _any = False
+            for _label, _name in _rows:
+                _r = cls._rows.get(_name)
+                if _r is None:
+                    continue
+                _any = True
+                print('    {:<26s} {:>8.1f}ms {:>8.1f}ms {:>7d} {:>8.1f}ms'.format(
+                    _label, _r.self_t * 1000.0, _r.total * 1000.0,
+                    _r.calls, _r.max_dt * 1000.0))
+            if not _any:
+                print('    (no rows: the option is off, or nothing matched)')
+        print('  Notes: an umbrella SELF = the pass minus its steps (list')
+        print('  copy, guards, fixpoint bookkeeping); the align searches')
+        print('  also run in the COLLECT pass, so step calls can exceed')
+        print('  the umbrella block count; the python engine books its')
+        print('  absorb steps from the background thread WITHOUT an')
+        print('  umbrella row (thread-safe standalone marks -- see')
+        print('  differ_python.engine_opcodes), so there the steps sum')
+        print('  IS the pass total (and stays part of the engine-wait')
+        print('  row too).')
+        print('=' * 114)
         print('Note: self  = time here EXCLUDING nested children/marks'
               ' (the real cost).')
         print('      total = time INCLUDING children.')
@@ -373,12 +465,24 @@ class Profiler:
         print('              final EDACTION_UNLOCK repaint) + the')
         print('              whole-tree root')
         print('  compare:*   event GENERATION: line split, per-block pairing')
-        print('              (positional_pairs / find_best_pairs), engine walk,')
-        print('              PRODUCE (per event-list fetch -- the walk runs')
+        print('              (positional_pairs / align_by_similarity), engine')
+        print('              walk, PRODUCE (per event-list fetch -- the walk runs')
         print('              during the fetch; compare_and_paint SELF is then')
         print('              pure DISPATCH); compare:algorithm wraps')
         print('              line_diff:native_engine (wall time incl. the')
         print('              background wait)')
+        print('  align_by_similarity:*')
+        print('              steps of the Align-by-similarity beautify:')
+        print('              step1 exact-match anchor search, step2 prefix/')
+        print('              suffix similarity scoring; compare:align_by_')
+        print('              similarity is the umbrella section per unequal')
+        print('              block (see the Beautify passes block above)')
+        print('  absorb_trivial_equal_blocks*')
+        print('              steps of the Absorb pass: step1 merges INSERT +')
+        print('              EQUAL(trivial) + DELETE into one REPLACE, step2')
+        print('              absorbs a short trivial EQUAL between large')
+        print('              changed blocks; the umbrella row is a section on')
+        print('              the native paths (see the Beautify passes block)')
         print('  char_diff:* char-level engine calls, booked per chunk')
         print('  paint:*     CONSUMER work: per-operation categories')
         print('              (attr/micromap/gap/wrap_calc) + flushes')
@@ -402,7 +506,7 @@ class Profiler:
         print('  - the epilogue (report printing) is intentionally outside')
         print('    all sections: the overhead micro-benchmark clears the')
         print('    section stack.')
-        print('=' * 100 + '\n')
+        print('=' * 114 + '\n')
 
     @classmethod
     def _estimated_overhead_ms(cls):

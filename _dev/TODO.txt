@@ -115,46 +115,16 @@ split beautifier to blocks/modules
 
 _________________
  
+
+rename the plugin to Differ 2, and remove backward-compatibility like move old config migration ...etc, this plugin now have nothing to do with the old published plugin https://github.com/CudaText-addons/cuda_differ so we can simplify code by removing any backward compatibility, search all code and remove any backward compatibility code, this plugin was never published
+you have to make sure that differ2 does not interfer with the old differ, like menus and config files...etc
+so change config files names and menus to use differ2, and read https://github.com/CudaText-addons/cuda_differ to see if there is something that may interfer with my new plugin differ2 then fix it in differ2 code
+you have to rename any mention of the plugin name to differ2, in doc, in code....etc everywhere
+
+in doc in == Authors == remove all names and keep only badr elmers, and mentions that it s a fork of https://github.com/CudaText-addons/cuda_differ of OlehL rewriten from scratch
+
+
 ___
-the profiling does not show profiling of align_by_similarity and absorb_trivial_equal_blocks, i want to see both of them separated by steps, so align_by_similarity must show step1 and step2 separated , and also absorb_trivial_equal_blocks , organise it in steps and profile each one in steps, currently i see only this profiling
-
-Differ Profiling Report  (times in ms; sorted by SELF time → real bottleneck at top)
-Compared files:
-  Left : F:\_bin\_src\cudatext\cuda_differ\___diff_proc\pascal\_alkarsana\org\cuda_differ\differ_python.py
-  Right: F:\_bin\_src\cudatext\cuda_differ\___diff_proc\pascal\_alkarsana\org\cuda_differ\__realign.py
-====================================================================================================
-  section                                        self      total     calls        max      %
-  --------------------------------------------------------------------------------------------------
-  refresh                                      27.3ms     79.0ms         1     79.0ms  34.5%
-  refresh:wrapinfo_update                      19.7ms     19.7ms         2     10.5ms  24.9%
-  find_best_pairs:prefix_suffix_search         12.5ms     12.5ms        50      2.5ms  15.9%
-  line_diff:native_engine                       3.9ms      3.9ms         1      3.9ms   4.9%
-  char_diff:native_engine                       2.5ms      2.5ms         1      2.5ms   3.2%
-  refresh:wrapinfo_api                          2.4ms      2.4ms         2      2.3ms   3.1%
-  refresh:compare_and_paint                     1.9ms     10.4ms         1     10.4ms   2.4%
-  find_best_pairs:exact_match_search            1.3ms      1.3ms        50      0.1ms   1.7%
-  refresh:clear                                 1.2ms      1.2ms         1      1.2ms   1.5%
-  refresh:wrapinfo_count                        0.9ms      0.9ms         2      0.8ms   1.2%
-  compare:collect_pairs                         0.7ms      8.0ms         1      8.0ms   0.9%
-  paint:marks:apply                             0.7ms      0.7ms         1      0.7ms   0.8%
-  refresh:wrap_counts                           0.5ms     23.6ms         1     23.6ms   0.7%
-  compare:find_best_pairs                       0.5ms      7.4ms         7      5.8ms   0.6%
-  paint:bookmark                                0.5ms      0.5ms         1      0.5ms   0.6%
-  compare:produce                               0.4ms      7.8ms        19      5.8ms   0.6%
-  paint:overview                                0.4ms      0.4ms         1      0.4ms   0.5%
-  refresh:get_text                              0.4ms      0.4ms         1      0.4ms   0.5%
-  compare:split_lines                           0.4ms      0.4ms         1      0.4ms   0.5%
-  paint:gap                                     0.3ms      0.3ms        58      0.0ms   0.4%
-  paint:wrap_calc                               0.3ms      0.3ms       118      0.1ms   0.3%
-  paint:attr                                    0.2ms      0.2ms       269      0.0ms   0.2%
-  paint:marks:build                             0.2ms      0.2ms         1      0.2ms   0.2%
-  paint:marker_window                           0.0ms      0.8ms         1      0.8ms   0.0%
-  compare:algorithm                             0.0ms      3.9ms         1      3.9ms   0.0%
-  compare:char_phase                            0.0ms      2.5ms         1      2.5ms   0.0%
-_________________________
-
-rename  plugin to Differ 2, and remove backward-compatible to move old config
-
 
 add compare folder
 

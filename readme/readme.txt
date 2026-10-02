@@ -373,8 +373,9 @@ into the compare view):
   disable themselves and an explanatory item heads the menu (same
   guard as the tab context menu).
 - ★ Preset ▾ -- dropdown with quick "preset" combinations: "Preset 1:
-  Fastest comparison - Myers, Align Off" and "Preset 2: Better
-  readability (slower) - Histogram, Align On"; the two presets are
+  Fastest comparison - Myers, Align Off, Absorb Off" and "Preset 2:
+  Better readability (slower) - Histogram, Align On, Absorb Off"; the
+  two presets are
   RADIO items (a dot mark instead of a checkmark; clicking one
   unchecks the other), so at most one is ever marked. After a
   separator, "Algorithm 1: Native Histogram" and "Algorithm 2:
@@ -977,11 +978,32 @@ Advanced section:
     REPLACE-block chunks in the positional pairing mode (the
     algo-faithful default and the beautify fast path):
     'calls' is the number of produced chunks.
-  - compare:find_best_pairs -- the same event production in the
+  - compare:align_by_similarity -- the same event production in the
     beautify mode's anchor / prefix-suffix pairing (present only
     when align_by_similarity produced unequal-count blocks):
     'calls' is the number of such blocks. One row per producer, so
     the report always shows WHICH pairing mode the time went to.
+  - align_by_similarity:step1_exact_match_search /
+    align_by_similarity:step2_prefix_suffix_search -- the two STEPS
+    of the Align-by-similarity beautify, timed per invocation with
+    perf_counter and booked as batched marks: step1 builds the
+    unique-line index and scans for the longest unique exact match
+    (the anchor), step2 (only when no anchor was found) does the
+    O(N*M) prefix/suffix similarity scoring. The searches also run
+    in the native collect pass, so 'calls' can exceed the
+    compare:align_by_similarity block count.
+  - absorb_trivial_equal_blocks -- the WHOLE Absorb pass as one
+    section on the native paths (the collect pass and the
+    fresh-split compare branch); its SELF is the pass minus the
+    steps below (list copy, guards, fixpoint bookkeeping).
+  - absorb_trivial_equal_blocks:step1_merge_ins_eq_del /
+    absorb_trivial_equal_blocks:step2_absorb_short_equal -- the two
+    STEPS of the Absorb pass, booked per invocation: step1 merges
+    INSERT + EQUAL(trivial) + DELETE (or the mirror) into one
+    REPLACE, step2 absorbs a short trivial EQUAL between large
+    changed blocks. The Python engine books them from its
+    background thread via thread-safe standalone marks (no umbrella
+    row there -- the steps' sum IS the pass total).
   - refresh:wrapinfo_api -- the ed.get_wrapinfo() calls (one per
     editor, wrap on): the single most expensive editor API of a
     wrapped big-file refresh (~4.9s on 1M lines). Nests under
@@ -1010,8 +1032,15 @@ Advanced section:
     (with the paint:overview:build / paint:overview:draw split) --
     the other refresh phases and their sub-rows.
   The report header names what was compared (per side: the original
-  file's path, or the tab title for untitled tabs), and a final
-  block ESTIMATES the profiler's own overhead with ALL THREE cost
+  file's path, or the tab title for untitled tabs). After the main
+  table a 'Beautify passes' block prints each option-gated pass with
+  its steps IN RUN ORDER (align_by_similarity: the
+  compare:align_by_similarity umbrella + step1 + step2;
+  absorb_trivial_equal_blocks: the umbrella + step1 + step2), so the
+  step costs read as the sequence they run in instead of being
+  scattered by the self-time sort; a pass whose rows are all absent
+  did not run (its option is off, or nothing matched its patterns).
+  A final block ESTIMATES the profiler's own overhead with ALL THREE cost
   components (start/stop sections + mark() bookings + the call-site
   perf_counter pairs, each with its micro-benchmarked per-op cost),
   so the observer effect is visible instead of hiding inside the
