@@ -99,6 +99,23 @@ function-level report (the section report still attributes the
 parallel run via thread-safe standalone marks) -- a profiled scan
 is therefore somewhat slower than a normal one, on purpose.
 
+The scan's threading SHAPE is switchable (option differ2.dirs.scan_
+threading) -- the control the update-8 finding asked for: a tax
+that appears only inside the real scan, on the scan's threads,
+while the same folder lists in ~0 ms from the main thread, cannot
+be diagnosed further without moving the work. Three shapes:
+'pool' (the default engine above), 'serial' (the scanner thread
+alone, no pool -- separates "the pool's concurrent bursts" from
+"any worker thread pays"), and 'main' (the whole scan
+SYNCHRONOUSLY on the UI thread: run() called inline, no worker
+thread, no timer ticks, no repaint, no cancel; rows appear at the
+end and the window freezes for the scan's duration). A fast 'main'
+run on folders that crawl in the threaded modes proves the disk
+and the filter stack innocent: the tax follows the threading, and
+the report's per-listing tid column shows exactly which thread
+paid which directory. 'main' is a diagnostic, not a fix: a huge
+tree would freeze the window for its whole walk.
+
 The "same folders, 30 s today / 1 s tomorrow" effect is the file
 system, not growing code: each metadata call costs microseconds
 warm and can cost 100-200 ms cold (antivirus scanning the file, a
@@ -351,6 +368,22 @@ HEAD_TAIL_CHUNK = 64 * 1024   # quick_only sampling: head+tail window size
 # work, so the count does not scale with CPUs; 1 = serial mode
 # (also forced while the cProfile layer traces the scan).
 SCAN_POOL_THREADS = 8
+
+# Threading SHAPES of the folder scan (option differ2.dirs.scan_
+# threading; see the module docstring's "The scan engine"):
+#   pool    the scanner thread + the scan pool (the default engine)
+#   serial  the scanner thread ALONE: the walk runs directory by
+#           directory on it, no pool (the cProfile layer's shape)
+#   main    EVERYTHING synchronously on the MAIN thread: no scanner
+#           thread, no pool, no timer, no repaint, no cancel -- a
+#           diagnostic mode (and the answer to boxes where worker
+#           threads are billed: run() is called INLINE, so the
+#           whole scan -- self-test, deep probe, walks, rows -- runs
+#           on the thread that owns the UI)
+SCAN_MODE_POOL = 'pool'
+SCAN_MODE_SERIAL = 'serial'
+SCAN_MODE_MAIN = 'main'
+_SCAN_MODES = (SCAN_MODE_POOL, SCAN_MODE_SERIAL, SCAN_MODE_MAIN)
 
 HISTORY_MAX = 12               # remembered folder paths per side
 POLL_MS = 200                  # worker -> UI poll period while scanning
@@ -1672,7 +1705,8 @@ class _Scanner(threading.Thread):
     """
 
     def __init__(self, dir_l, dir_r, recursive, mask, quick_only,
-                 method=METHOD_CONTENTS, cprofile_on=False):
+                 method=METHOD_CONTENTS, cprofile_on=False,
+                 scan_mode=SCAN_MODE_POOL):
         super().__init__(daemon=True, name='Differ2DirCompare')
         self.dir_l = dir_l
         self.dir_r = dir_r
@@ -1680,6 +1714,13 @@ class _Scanner(threading.Thread):
         self.mask = mask
         self.quick_only = quick_only
         self.method = method
+        # Threading shape of this scan (differ2.dirs.scan_threading;
+        # see the module docstring). 'main' never .start()s the
+        # thread: the FORM calls run() inline so the whole scan runs
+        # on the main thread -- the attribute stays on the worker so
+        # the facts block can name the thread that paid each number.
+        self.scan_mode = scan_mode if scan_mode in _SCAN_MODES \
+            else SCAN_MODE_POOL
         # Scanner-thread cProfile layer (the 2nd profiler mode):
         # enabled by the FORM when the config double-gate is on. The
         # Profile object is created and enabled HERE, on the thread it
@@ -1826,9 +1867,10 @@ class _Scanner(threading.Thread):
         them -- the win on sources where every metadata call is
         expensive (network share, cloud placeholders, antivirus).
         Without a pool (the cProfile layer is on: it traces only THIS
-        thread, so the scan runs serially on purpose, or
-        SCAN_POOL_THREADS is 1) the same _scan_dir runs inline, the
-        left tree first, then the right.
+        thread, so the scan runs serially on purpose, SCAN_POOL_THREADS
+        is 1, or the scan shape is serial/main -- differ2.dirs.scan_
+        threading) the same _scan_dir runs inline, the left tree first,
+        then the right.
 
         Per-side totals are booked as dirs:walk_left / dirs:walk_right
         (thread-safe standalone marks, WITH their time spans: the
@@ -1929,11 +1971,13 @@ class _Scanner(threading.Thread):
         runs on the worker thread -- see the note in _quick_contents_equal
         about why not sections). The walk and the equal-size content
         tests run on the scan pool (see the module docstring's "The
-        scan engine"); with the cProfile layer active the pool is
-        skipped, so the profile sees every call on THIS thread."""
+        scan engine"); the pool is skipped while the cProfile layer
+        traces this thread or the scan shape is serial/main
+        (differ2.dirs.scan_threading), so every call runs HERE."""
         prof = Profiler.is_enabled()
         pool = None
-        if self.cprofile is None and SCAN_POOL_THREADS > 1:
+        if (self.cprofile is None and SCAN_POOL_THREADS > 1
+                and self.scan_mode == SCAN_MODE_POOL):
             try:
                 pool = ThreadPoolExecutor(
                     max_workers=SCAN_POOL_THREADS,
@@ -2403,6 +2447,33 @@ def _prof_facts_block(worker):
     except Exception:
         pass
 
+    # update 9: the scan's threading SHAPE (differ2.dirs.scan_
+    # threading) -- which engine produced every number below; the
+    # per-listing tid column then shows which thread paid which
+    # directory. First thing after the host line so every pasted
+    # report names its own shape.
+    mode = getattr(worker, 'scan_mode', SCAN_MODE_POOL) \
+        if worker is not None else SCAN_MODE_POOL
+    thr_nm = 'MAIN' if mode == SCAN_MODE_MAIN else 'SCANNER'
+    if worker is not None and getattr(worker, 'cprofile_on', False):
+        mode_txt = 'SERIAL on the {} thread (differ2.advanced.' \
+                   'enable_cprofile is on: the pool is skipped so ' \
+                   'cProfile sees every call) -- set it off and ' \
+                   'rescan to measure real speed'.format(thr_nm)
+    elif mode == SCAN_MODE_MAIN:
+        mode_txt = ('MAIN thread, synchronous (differ2.dirs.scan_'
+                    'threading=main): no worker thread, no pool, no '
+                    'UI ticks while scanning -- the window was frozen '
+                    'for the whole scan, rows appeared at the end')
+    elif mode == SCAN_MODE_SERIAL:
+        mode_txt = ('SERIAL on the SCANNER thread (differ2.dirs.scan_'
+                    'threading=serial): no pool, walk directory by '
+                    'directory, UI ticks + row streaming as usual')
+    else:
+        mode_txt = 'PARALLEL (scanner thread + scan pool of {}) -- ' \
+                   'the default engine'.format(SCAN_POOL_THREADS)
+    lines.append('scan mode: ' + mode_txt)
+
     def _probe_verdict(root_ms, ctrl_ms):
         """The probe's interpretation line (None = nothing to say)."""
         if not root_ms:
@@ -2478,8 +2549,9 @@ def _prof_facts_block(worker):
     fi = facts.get('selftest_find_ms')
     if fi is not None or sd is not None:
         lines.append(
-            'worker self-test (SCANNER thread, before the walk, same '
+            'worker self-test ({} thread, before the walk, same '
             'folder): os.scandir {}; engine {}'.format(
+                thr_nm,
                 'n/a' if sd is None else '{:.1f} ms'.format(sd),
                 'n/a' if fi is None else '{:.1f} ms'.format(fi)))
     root_l = facts.get('root_ms_l')
@@ -2502,7 +2574,9 @@ def _prof_facts_block(worker):
     dp = facts.get('deep_probe')
     if dp:
         lines.append('')
-        lines.append('deep probe (update 8, scanner thread, pre-walk):')
+        lines.append('deep probe (update 8, {} thread, pre-walk):'
+                     .format('main' if mode == SCAN_MODE_MAIN
+                             else 'scanner'))
 
         def _btxt(tag, b):
             if not b:
@@ -2519,14 +2593,16 @@ def _prof_facts_block(worker):
                         _f(b.get('kern_ms')), _f(b.get('user_ms')),
                         _f(b.get('wall_ms'))))
 
-        lines.append(_btxt('this (scanner) thread', dp.get('mine')))
+        lines.append(_btxt('this (main) thread' if mode == SCAN_MODE_MAIN
+                           else 'this (scanner) thread', dp.get('mine')))
         lines.append(_btxt('fresh thread, same moment', dp.get('sib')))
         lines.append(_btxt('fresh thread, right after', dp.get('sib2')))
         extra = []
         if dp.get('nthreads'):
             extra.append('{} threads alive'.format(dp['nthreads']))
         if dp.get('prio') is not None:
-            extra.append('scanner priority {} (0 = normal)'.format(
+            extra.append('{} priority {} (0 = normal)'.format(
+                'main' if mode == SCAN_MODE_MAIN else 'scanner',
                 dp['prio']))
         if dp.get('token'):
             extra.append('thread token: {}'.format(dp['token']))
@@ -2584,11 +2660,6 @@ def _prof_facts_block(worker):
     else:
         lines.append('content tests: 0 (every pair was decided by '
                      'size alone / one-sided)')
-    if worker is not None and getattr(worker, 'cprofile_on', False):
-        lines.append(
-            'scan mode: SERIAL (differ2.advanced.enable_cprofile is on) '
-            '-- set it off and rescan to run the parallel engine and '
-            'measure real speed')
     return '\n'.join(lines)
 
 
@@ -3518,6 +3589,16 @@ class DirCompareForm:
         self._dir_r = os.path.normpath(pr)
         self._quick_only = bool(_get_opt('dirs.quick_only', False))
         self._method = _get_method()
+        # Threading shape of THIS scan (differ2.dirs.scan_threading;
+        # see the module docstring's "The scan engine"): 'pool' is the
+        # default engine, 'serial' walks on the scanner thread alone,
+        # 'main' runs the whole scan synchronously HERE. Reloaded per
+        # scan, so the three shapes can be A/B-ed from the same
+        # window (set the option, press Refresh).
+        mode = _get_opt('dirs.scan_threading', SCAN_MODE_POOL)
+        if mode not in _SCAN_MODES:
+            mode = SCAN_MODE_POOL
+        self._scan_mode = mode
 
         if self._worker is not None:
             self._worker.cancel()
@@ -3563,7 +3644,7 @@ class DirCompareForm:
 
         self._worker = _Scanner(self._dir_l, self._dir_r, recursive,
                                 mask, self._quick_only, self._method,
-                                cprof_scan)
+                                cprof_scan, scan_mode=mode)
         self._rows = []
         self._view = []
         self._lb_n = 0
@@ -3583,6 +3664,21 @@ class DirCompareForm:
         self._sb_text(1, _('Comparing...'))
         self._sb_text(2, '')
         self._fill_list()          # empty the list right away
+        if mode == SCAN_MODE_MAIN:
+            # Synchronous main-thread scan: run() called INLINE
+            # (never .start()) executes the whole scan body -- spawn
+            # lag, self-test, deep probe, walks, rows -- on THIS
+            # thread: the same code, the same section bookings, the
+            # same per-listing probes, one thread only. The window
+            # is intentionally NOT pumped meanwhile: no timer, no
+            # repaint, no streaming (rows appear at the end), no
+            # cancel -- the purest measurement of what a single
+            # thread pays for these folders on this box. The finish
+            # path is the timer's own (_scan_done), shared here.
+            self._worker.run()
+            _rows, _total, _fin = self._worker.snapshot()
+            self._scan_done(self._worker, _rows, _total)
+            return
         self._worker.start()
         ct.timer_proc(ct.TIMER_START, self._on_timer, POLL_MS)
 
@@ -3631,13 +3727,27 @@ class DirCompareForm:
                 Profiler.mark('dirs:ui_timer_tick', dt, t0=t0)
             return
         # Finished (normally or cancelled): last full update.
+        self._scan_done(w, rows, total)
+        if Profiler.is_enabled():
+            dt = time.perf_counter() - t0
+            Profiler.mark('dirs:ui_timer_tick', dt, t0=t0)
+
+    def _scan_done(self, w, rows, total):
+        """Shared finish path: the timer's last tick AND the
+        synchronous main-thread scan (dirs.scan_threading=main, which
+        calls this straight after run()). Stop the timer, book the
+        finish lag, final fill, counts, status line, profiling
+        epilogue."""
         self._stop_timer()
         if Profiler.is_enabled() and getattr(w, 'run_end', None):
-            # Wall time from the worker's real end to THIS tick: the
-            # timer quantum + whatever kept the main thread busy --
-            # with dirs:spawn_lag this closes the loop on where every
-            # millisecond of dirs:scan_wall went. Booked with its span
-            # so the report nests it under dirs:worker.
+            # Wall time from the worker's real end to THIS moment:
+            # the timer quantum + whatever kept the main thread busy
+            # -- with dirs:spawn_lag this closes the loop on where
+            # every millisecond of dirs:scan_wall went. Booked with
+            # its span so the report nests it under dirs:worker.
+            # (In the synchronous main mode this is ~0 by
+            # construction: the same thread continues straight from
+            # run()'s finally into this call.)
             try:
                 lag = time.perf_counter() - w.run_end
                 Profiler.mark('dirs:finish_lag', lag, 1, lag,
@@ -3665,9 +3775,6 @@ class DirCompareForm:
                               self._dir_l, self._dir_r)
         self._prof_token = None
         self._sb_text(1, msg)
-        if Profiler.is_enabled():
-            dt = time.perf_counter() - t0
-            Profiler.mark('dirs:ui_timer_tick', dt, t0=t0)
 
     def _stop_timer(self):
         # NOTE: the interval argument is REQUIRED by timer_proc's

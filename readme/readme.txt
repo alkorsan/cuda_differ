@@ -1510,6 +1510,19 @@ Folders section (see the "Compare folders" chapter above for details):
   for slow file sources (network shares, cloud-sync placeholders,
   antivirus-hooked opens).
   See the "Compare folders" chapter for the full trade-offs.
+- differ2.dirs.scan_threading: Folder scan threading (default:
+  parallel)
+  "parallel" is the engine as it always was: a scanner thread plus
+  a small pool walking both trees concurrently, rows streaming in
+  while it scans. "serial" walks on the scanner thread alone (no
+  pool). "main" runs the whole scan synchronously on the UI thread
+  -- a diagnostic mode: the window freezes for the scan's duration
+  (no repaint, no cancel, rows appear at the end), but if folders
+  that crawl in the threaded modes are instant in "main", the disk
+  and the filter stack are innocent and the tax follows the
+  threading; the profiling report's per-listing table then shows
+  which thread paid which directory. Do not leave "main" on for
+  everyday use.
 
 
 == Diff algorithms and best practices ==

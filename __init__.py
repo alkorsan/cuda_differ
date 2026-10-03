@@ -1321,6 +1321,36 @@ OPTS_META = [
                                   'Quick, no file reads)'))],
      'chp': 'dirs',
      },
+    {'opt': 'differ2.dirs.scan_threading',
+     'cmt': _('Folder scan threading (diagnostic)\n'
+              'Which threads run the folder scan. "Parallel" (the '
+              'default) is the fast engine: a scanner thread plus a '
+              'small pool walking both trees concurrently, rows '
+              'streaming into the window while it scans. "Serial" '
+              'runs the same walk on the scanner thread alone, one '
+              'directory at a time -- useful to separate "any worker '
+              'thread pays a tax" from "the pool\'s concurrent '
+              'bursts trigger something". "Main thread" runs the '
+              'WHOLE scan synchronously on the UI thread: no worker '
+              'thread, no pool, no cancel, and the window stays '
+              'frozen (no repaint, rows appear at the end) for the '
+              'scan\'s duration. That last mode is a diagnostic: '
+              'when a scan is mysteriously slow, a fast main-thread '
+              'run on the same folders proves the folders, the disk '
+              'and the filter stack innocent -- the tax then follows '
+              'the threading, and the profiling report (Plugins > '
+              'Differ 2 > enable_profiling) shows exactly which '
+              'thread paid which directory listing. Do not leave it '
+              'on for everyday use: a big tree freezes the window '
+              'for its whole walk.\n'
+              'Default: parallel.'),
+     'def': 'pool',
+     'frm': 'str2s',
+     'dct': [('pool', _('Parallel (scanner thread + pool, the default)')),
+             ('serial', _('Serial (scanner thread, no pool)')),
+             ('main', _('Main thread (synchronous, diagnostic)'))],
+     'chp': 'dirs',
+     },
 ]
 
 DIFF_TAB_COUNT = 1

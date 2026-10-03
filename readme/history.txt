@@ -1,3 +1,33 @@
+2026.10.05 (9th release, by @alkorsan)
++ feature: option differ2.dirs.scan_threading -- the folder scan's
+  threading SHAPE is switchable per scan, the missing control for
+  the update-8 finding (the listing tax lives only in the REAL
+  scan: ~0.2 ms from the main thread and from fresh threads, but
+  200-2000 ms per listing on every scan thread while rows stream):
+  * 'pool' (default): the engine as it was -- scanner thread + the
+    scan pool, both trees walked concurrently;
+  * 'serial': the scanner thread ALONE, directory by directory (no
+    pool, UI ticks + streaming as usual) -- separates "any worker
+    thread pays" from "the pool's concurrent bursts trigger it";
+  * 'main': the whole scan runs SYNCHRONOUSLY on the UI thread:
+    _Scanner.run() called INLINE (never .start()), so self-test,
+    deep probe, both walks and the row building all run on the
+    main thread -- no worker thread, no pool, no timer, no
+    repaint, no cancel; the window freezes for the scan's duration
+    and the rows appear at the end. If the same folders that crawl
+    in the threaded modes are instant in 'main', the disk, the
+    folders and the filter stack are all innocent: the tax follows
+    the threading (the report's per-listing tid column then shows
+    exactly which thread paid which directory).
+  The option is reloaded on every start_scan, so the three shapes
+  can be A/B-ed live from the same window (set it, press Refresh).
+  The timer's finish path and the synchronous scan's finish path
+  are now one method (_scan_done; dirs:finish_lag is ~0 in 'main'
+  by construction), and the facts block prints a 'scan mode:' line
+  as its first content line naming the shape, labels the self-test
+  and deep-probe headers with the ACTUAL thread (MAIN vs SCANNER),
+  and replaces the old cProfile 'scan mode: SERIAL' tail line.
+
 2026.10.04 (8th release, by @alkorsan)
 + feature: the deep probe -- update 7 named the tax ('follows the
   THREAD'), and the round-5 standalone probe (run from both a plain
