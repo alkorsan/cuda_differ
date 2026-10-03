@@ -343,6 +343,20 @@ is slow" (exclude the volume), "this process pays the antivirus tax"
 (add CudaText and its Python to the AV exclusions; WinMerge never
 paid it), or "warm right now" (reproduce cold to see the cost).
 
+And when the probe says the drive is FAST (scandir ~0 ms on the
+compared root, no antivirus in sight) but listings inside the scan
+still cost hundreds of milliseconds each, the folders are innocent:
+the tax is either the listing CALL's parameters or the THREAD the
+call runs on. The report measures the SAME folder from three
+corners, seconds apart, and prints a verdict that names the tax:
+"the listing CALL" (the default FindFirstFileExW parameters are the
+problem -- the engine probe already switched this session to the
+fastest correct variant), "the THREAD" (fast from the main thread,
+slow from the scanner thread), or "only the busy phase" (fast in
+isolation, slow while rows stream). The engine probe runs once per
+session on the first compare, on the main thread, and re-tunes the
+engine in place; on a healthy box it is sub-millisecond noise.
+
 The window's controls:
 
 - The two path edits are editable: type two paths and press Refresh
@@ -449,12 +463,27 @@ are warm right now") and dirs:cprofile_import (the one-time cost of
 loading the cProfile stdlib, pre-warmed on the main thread so it
 cannot hide inside the scanner thread; seconds when CudaText's
 Python lives on a slow, filtered drive).
+Two more rows close the "engine experiment": dirs:engine_pick
+(once per session, main thread, BEFORE the scan -- every listing
+variant of the bulk finder timed on the left root; the fastest
+CORRECT one, entry names verified against os.scandir, becomes this
+session's engine) and dirs:selftest (scanner thread, booked by the
+worker right before the walk: the same root scandir'd and listed
+while the main thread is still quiet). Together with the first
+in-scan listing of each compared root ("root listings: left ... /
+right ..." in the facts block) they separate "the listing CALL is
+the tax" (a fast variant exists -- already switched to) from "the
+THREAD is" (fast on the main thread, slow from the scanner) from
+"only the busy phase is" (fast in isolation, slow while rows
+stream).
 After the section report a compact "folder scan facts" block prints
 the same story in a few lines: the environment probe with its
-verdict, listings count with total/slowest/average latency, tree
-sizes (file and folder rows per side), how many content pairs
-stopped at the first difference vs were read to the end, and whether
-the run was serial because the cProfile layer was on.
+verdict, the engine line with the picked variant and its matrix,
+the worker self-test, the root listings, listings count with
+total/slowest/average latency, tree sizes (file and folder rows per
+side), how many content pairs stopped at the first difference vs
+were read to the end, and whether the run was serial because the
+cProfile layer was on.
 The cProfile layer runs on the scanner thread (the walk/compare work)
 and prints its function report sorted by INTERNAL time
 (sort_key='time'), so the real bottleneck function sits at the top.

@@ -1,3 +1,41 @@
+2026.10.03 (7th release, by @alkorsan)
++ feature: the engine experiment -- the report now names WHICH side
+  of a listing is slow: the call, the thread, or the busy phase.
+  The user's v6 reports (cProfile off + on) showed the strongest
+  signal so far: os.scandir on the compared root pays 0 ms on the
+  MAIN thread (the env probe, twice) and System32 scandirs in 0 ms,
+  while the SAME folder costs 740-1200 ms per listing inside the
+  scan through the ctypes call -- 99.8% of the scan wall, with no
+  antivirus in sight. The folders, the drive and the filter stack
+  are exonerated: what remains is either the FindFirstFileExW
+  parameters or the thread the call runs on. Update 7 measures the
+  same folder from three corners, seconds apart, and the facts
+  block prints a verdict that names the tax:
+  * dirs:engine_pick (once per session, MAIN thread, before the
+    scan): every listing variant of the bulk finder -- Basic+
+    LARGE_FETCH (WinMerge's call, the default), Basic, Standard+
+    LARGE_FETCH, Standard (== plain FindFirstFileW) -- timed on the
+    left root; the fastest CORRECT one (entry names verified
+    against os.scandir on the same folder in the same second)
+    becomes this session's engine, re-tuned in place (find() reads
+    the flags at call time). A fast variant that drops entries is
+    recorded as 'WRONG ENTRIES' and never picked. On a healthy box
+    the probe is sub-millisecond noise; profiling runs measure all
+    four variants, normal runs stop at the first fast correct one.
+  * dirs:selftest (SCANNER thread, booked by the worker before the
+    walk, main thread still quiet): the same root scandir'd and
+    listed by the engine on the worker thread.
+  * root_ms_l/r (facts): the first in-scan listing of each compared
+    root itself -- the busy-phase corner, taken while rows stream
+    and the pool runs.
+  The verdicts: "the listing CALL is the tax" (default slow,
+  another variant fast -- the engine has already switched to it),
+  "the THREAD" (fast on the main thread, slow from the scanner),
+  "only the busy phase" (fast in isolation, slow while rows
+  stream), "everything fast end to end". Plus the "EVERY variant
+  slow on the main thread while scandir is fast" case (the ctypes
+  ExW call itself), each with the numbers that produced it.
+
 2026.10.03 (6th release, by @alkorsan)
 + feature: the profiling report's SELF column now ADDS UP. The user's
   report showed worker 8.3 s + listing 5.1 s + walk_left 4.3 s for an

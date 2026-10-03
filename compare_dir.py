@@ -132,6 +132,27 @@ _prof_facts_block). For folders compared often, excluding them
 (and CudaText's Python) from real-time antivirus scanning removes
 that cost entirely.
 
+The engine experiment: when the probe says the drive is FAST
+(scandir ~0 ms on the compared root) and listings inside the scan
+still cost hundreds of milliseconds each, the folders are innocent
+-- the tax is either the listing CALL's parameters or the THREAD it
+runs on. The report measures all three corners on the SAME folder,
+seconds apart: the ENGINE PROBE (dirs:engine_pick, MAIN thread,
+before the scan) times every FindFirstFileExW variant (Basic+
+LARGE_FETCH / Basic / Standard+LARGE_FETCH / Standard == plain
+FindFirstFileW) and switches this session's engine to the fastest
+CORRECT one -- 'correct' = the entry names match os.scandir on the
+same folder in the same second; the WORKER SELF-TEST (dirs:selftest,
+SCANNER thread, before the walk, main thread still quiet) lists the
+same root again; and the first in-scan listing of each compared root
+itself (root_ms_l/r in the facts block) is the busy-phase corner,
+taken while rows stream and the pool runs. The facts block prints
+all three plus a verdict that names the tax: 'the listing CALL' (a
+fast variant exists -- the engine has already switched to it), 'the
+THREAD' (fast from the main thread, slow from the scanner), or 'only
+the busy phase' (fast in isolation, slow while the UI streams). Once
+per session, first compare; sub-millisecond cost on a healthy box.
+
 == Threading model ==================================================
 
 The scan runs on a daemon thread that touches ONLY the file system
@@ -573,6 +594,19 @@ def _facts_reset():
         'probe_root_ms': [],    # scandir round trips on the left root
         'probe_ctrl_ms': None,  # same on the control dir (C:\Windows),
                                 # None = control dir not available
+        # The engine experiment (see _probe_engine / _worker_selftest /
+        # _book_listing): the main-thread variant matrix, the
+        # scanner-thread self-test and the first in-scan listing of
+        # each compared root -- the three corners that separate 'the
+        # listing call is the tax' (call parameters) from 'the thread
+        # is' (host scheduling) from 'only the busy streaming phase
+        # is' (UI contention) in the facts block.
+        'engine_matrix': None,        # {variant: ms | 'error: ...' |
+                                     #  '... ms, WRONG ENTRIES ...'}
+        'selftest_scandir_ms': None,  # worker thread, before the walk
+        'selftest_find_ms': None,
+        'root_ms_l': None,            # first in-scan listing of the
+        'root_ms_r': None,            # compared roots themselves
     }
 
 
@@ -591,7 +625,7 @@ def _facts_add(**kw):
 _facts_reset()
 
 
-def _book_listing(dt, n_entries, side, t0=None):
+def _book_listing(dt, n_entries, side, t0=None, is_root=False):
     """One directory listing finished: profiler row + facts counters.
     t0 (the listing's start) is passed through as the row's SPAN, with
     the owning walk as its parent hint: the report nests this row
@@ -599,7 +633,15 @@ def _book_listing(dt, n_entries, side, t0=None):
     counting it against the walk AND the worker wall. The hint matters
     in a parallel scan, where both walks start at the same instant
     and time containment alone could pin a listing to the wrong
-    tree's walk."""
+    tree's walk.
+
+    is_root (base == '': the compared folder itself) additionally
+    stores the FIRST root listing per side as root_ms_l/r: the roots
+    are the exact directories the engine probe (main thread) and the
+    worker self-test (scanner thread) list moments earlier -- their
+    three-way comparison in the facts block separates 'the call is
+    the tax' / 'the thread is the tax' / 'only the busy phase is
+    the tax' (see _probe_engine)."""
     if Profiler.is_enabled():
         parent = 'dirs:walk_' + side if side in ('left', 'right') \
             else None
@@ -609,6 +651,10 @@ def _book_listing(dt, n_entries, side, t0=None):
         facts = _SCAN_FACTS
         if dt * 1000.0 > facts.get('listing_ms_max', 0.0):
             facts['listing_ms_max'] = dt * 1000.0
+        if is_root and side in ('left', 'right'):
+            key = 'root_ms_' + {'left': 'l', 'right': 'r'}[side]
+            if facts.get(key) is None:
+                facts[key] = dt * 1000.0
         if side == 'left':
             _facts_add(entries_l=n_entries)
         elif side == 'right':
@@ -857,6 +903,27 @@ def _mask_ok(name, mask):
 
 _WIN_FIND = None   # pattern -> (entries, error); set by _init_win_find
 
+# The engine's call parameters, read by find() at CALL time so a probe
+# can re-tune the engine for this session without re-binding anything
+# (see _probe_engine): (FINDEX_INFO_LEVELS, FIND_FIRST_EX_FLAGS).
+# The default is WinMerge's call: FindExInfoBasic + LARGE_FETCH. The
+# other three combinations of interest are probed once per session on
+# the first compare and the fastest correct one wins:
+#   Basic+LARGE_FETCH (1, 2) -- today's engine, WinMerge's call
+#   Basic             (1, 0) -- no bulk 64 KB fetch
+#   Standard+LARGE(0, 2)     -- 8.3 short names included again
+#   Standard          (0, 0) -- == plain FindFirstFileW (what os.scandir
+#                               makes, in ctypes form)
+_WIN_FLAGS = (1, 2)
+_WIN_FIND_VARIANTS = (
+    ('Basic+LARGE_FETCH', 1, 2),
+    ('Basic', 1, 0),
+    ('Standard+LARGE_FETCH', 0, 2),
+    ('Standard', 0, 0),
+)
+_ENGINE_PICKED = None   # the once-per-session probe result (see
+                        # _probe_engine); None until picked
+
 
 def _init_win_find():
     """Bind the WinMerge-style bulk FindFirstFileEx enumerator (Windows
@@ -900,9 +967,9 @@ def _init_win_find():
         k32.FindClose.argtypes = [ctypes.c_void_p]
 
         invalid = ctypes.c_void_p(-1).value
-        find_ex_info_basic = 1     # FINDEX_INFO_LEVELS
-        find_ex_search_name_match = 0  # FINDEX_SEARCH_OPS
-        find_first_ex_large_fetch = 2  # FIND_FIRST_EX_FLAGS
+        find_ex_search_name_match = 0  # FINDEX_SEARCH_OPS (the only
+                                        # value FindFirstFileEx accepts
+                                        # with a wildcard pattern)
         file_attr_dir = 0x10
         file_attr_device = 0x4
         file_attr_reparse = 0x400
@@ -911,9 +978,12 @@ def _init_win_find():
 
         def find(pattern):
             fd = _WFD()
+            info, fl = _WIN_FLAGS   # module state, read per call (see
+                                    # _probe_engine): lets a session
+                                    # pick re-tune the engine in place
             h = k32.FindFirstFileExW(
-                pattern, find_ex_info_basic, ctypes.byref(fd),
-                find_ex_search_name_match, None, find_first_ex_large_fetch)
+                pattern, info, ctypes.byref(fd),
+                find_ex_search_name_match, None, fl)
             if not h or h == invalid:
                 err = ctypes.get_last_error()
                 if err == err_file_not_found:
@@ -958,6 +1028,151 @@ def _init_win_find():
 
 
 _init_win_find()
+
+
+def _engine_pick_reset():
+    """Restore the engine to its factory state (default flags, no pick).
+    Only meaningful for the tests, which must re-run the once-per-
+    session probe with different fake finders."""
+    global _WIN_FLAGS, _ENGINE_PICKED
+    _WIN_FLAGS = _WIN_FIND_VARIANTS[0][1], _WIN_FIND_VARIANTS[0][2]
+    _ENGINE_PICKED = None
+
+
+def _probe_engine(root):
+    """(Once per session, on the MAIN thread, from start_scan -- before
+    the scanner thread exists.) Time every _WIN_FIND call variant on a
+    directory that is about to be scanned anyway (the left root) and
+    switch the engine to the fastest CORRECT one -- 'correct' = it
+    returns the same entry names as os.scandir on the same folder in
+    the same second; a fast variant that drops entries would corrupt
+    compares, so it is recorded and skipped, never picked.
+
+    Why this exists: the v6 profiling reports showed a machine where
+    os.scandir on the compared root pays ~0 ms on the MAIN thread (the
+    env probe) while the SAME folder costs ~740 ms per listing inside
+    the scan, on the scanner thread, through the ctypes call -- with
+    no antivirus in sight. That leaves exactly two suspects: the
+    FindFirstFileExW parameters (LARGE_FETCH / info level), or the
+    thread the call runs on. This probe is the discriminating
+    experiment:
+
+      * probe slow for the default variant but fast for another ->
+        the call parameters were the tax; the engine now uses the
+        fast variant for the whole session (the fix ships itself);
+      * every variant fast on the MAIN thread (all ~0 ms) ->
+        the call is fine from the main thread; whatever the scan
+        pays is thread- or phase-dependent -- the worker self-test
+        (dirs:selftest, booked by the scanner at run() start) and
+        the root-listing facts (root_ms_l/r, booked by _book_listing
+        for base == '') carry the other two corners of the triangle
+        in the same report.
+
+    On a healthy box every variant costs a fraction of a millisecond
+    and the probe itself is one scandir + up to four listings of one
+    directory: sub-millisecond noise, once per session. When profiling
+    is on, ALL variants are measured (the full matrix goes into the
+    facts block); when it is off, the probe stops at the first fast
+    correct variant. The whole thing is booked as dirs:engine_pick,
+    OUTSIDE dirs:scan_wall, like dirs:env_probe -- it is a diagnostic
+    of the machine, not a phase of any scan. No-ops when the bulk
+    finder is unavailable (non-Windows, failed binding)."""
+    global _WIN_FLAGS, _ENGINE_PICKED
+    if _ENGINE_PICKED is not None or _WIN_FIND is None:
+        return
+    if not root or not os.path.isdir(root):
+        return
+    # The correctness baseline: the same directory, os.scandir, on
+    # this thread, right now. (scandir may or may not yield '.'/'..'
+    # depending on platform -- filter both sides the same way.)
+    try:
+        with os.scandir(root) as it:
+            base_names = frozenset(
+                e.name for e in it if e.name not in ('.', '..'))
+    except OSError:
+        return
+    full = Profiler.is_enabled()
+    t0 = time.perf_counter()
+    old = _WIN_FLAGS
+    matrix = {}
+    winner = None   # (name, ms, (info, flags))
+    try:
+        for name, info, fl in _WIN_FIND_VARIANTS:
+            _WIN_FLAGS = (info, fl)
+            tp = time.perf_counter()
+            try:
+                entries, err = _WIN_FIND(os.path.join(root, '*'))
+            except Exception as ex:
+                err = ex
+            ms = (time.perf_counter() - tp) * 1000.0
+            if err is not None:
+                matrix[name] = 'error: {}'.format(err)
+                continue
+            got = frozenset(e['name'] for e in entries
+                            if e['name'] not in ('.', '..'))
+            if got != base_names:
+                matrix[name] = ('{:.1f} ms, WRONG ENTRIES ({} vs {})'
+                                .format(ms, len(got), len(base_names)))
+                continue
+            matrix[name] = ms
+            if winner is None or ms < winner[1]:
+                winner = (name, ms, (info, fl))
+            if not full and ms < 5.0:
+                break   # fast + correct is good enough outside reports
+    finally:
+        _WIN_FLAGS = winner[2] if winner is not None else old
+    dt = time.perf_counter() - t0
+    _ENGINE_PICKED = {
+        'root': root,
+        'matrix': dict(matrix),
+        'winner': winner[0] if winner is not None else None,
+        'winner_ms': winner[1] if winner is not None else None,
+    }
+    if Profiler.is_enabled():
+        try:
+            Profiler.mark_standalone('dirs:engine_pick', dt, 1, dt,
+                                     t0=t0)
+        except Exception:
+            pass
+        facts = _SCAN_FACTS
+        if facts:
+            facts['engine_matrix'] = dict(matrix)
+
+
+def _worker_selftest(root):
+    """The scanner-thread corner of the engine experiment (see
+    _probe_engine): one os.scandir consume-all and one engine listing
+    of the left root, timed ON THE WORKER THREAD before the walk
+    starts -- the main thread is quiet at that moment, no rows are
+    streaming yet. Booked by the scanner's run() as dirs:selftest;
+    the numbers land in the facts block next to the main-thread
+    matrix, and the two together separate 'the call is the tax' from
+    'the thread is the tax' from 'only the busy phase is the tax'.
+    Returns (scandir_ms, find_ms, n_entries); (None, None, 0) when
+    the root cannot be tested."""
+    sd_ms = None
+    fi_ms = None
+    n = 0
+    if not root or not os.path.isdir(root):
+        return sd_ms, fi_ms, n
+    try:
+        t0 = time.perf_counter()
+        with os.scandir(root) as it:
+            for e in it:
+                if e.name not in ('.', '..'):
+                    n += 1
+        sd_ms = (time.perf_counter() - t0) * 1000.0
+    except OSError:
+        return None, None, 0
+    if _WIN_FIND is not None:
+        try:
+            t0 = time.perf_counter()
+            entries, err = _WIN_FIND(os.path.join(root, '*'))
+            if err is None:
+                fi_ms = (time.perf_counter() - t0) * 1000.0
+        except Exception:
+            fi_ms = None
+    return sd_ms, fi_ms, n
 
 
 # ----------------------------------------------------------------------
@@ -1016,7 +1231,7 @@ def _scan_dir(root, base, mask, cancel_evt, on_err, side=''):
             t0 = time.perf_counter()
             entries, err = _WIN_FIND(os.path.join(full, '*'))
             _book_listing(time.perf_counter() - t0, len(entries),
-                          side, t0)
+                          side, t0, is_root=(base == ''))
         except Exception:
             entries = None               # unexpected: scandir fallback
         else:
@@ -1063,7 +1278,8 @@ def _scan_dir(root, base, mask, cancel_evt, on_err, side=''):
                     break
     except OSError as e:
         on_err(e, full)   # keep entries listed before the failure
-    _book_listing(time.perf_counter() - t0, len(entries), side, t0)
+    _book_listing(time.perf_counter() - t0, len(entries), side, t0,
+                  is_root=(base == ''))
     for entry in entries:
         if cancel_evt is not None and cancel_evt.is_set():
             break
@@ -1220,6 +1436,25 @@ class _Scanner(threading.Thread):
                                          dt, 1, dt, t0=t0)
             except Exception:
                 pr = s = None
+        if Profiler.is_enabled():
+            # The scanner-thread corner of the engine experiment (see
+            # _probe_engine): the left root -- the same folder the
+            # main thread's probes just listed -- scandir'd and listed
+            # by the engine ON THIS THREAD, while the main thread is
+            # still quiet (no rows stream yet). Booked with its span,
+            # nested under dirs:worker.
+            try:
+                t0 = time.perf_counter()
+                sd_ms, fi_ms, n = _worker_selftest(self.dir_l)
+                dt = time.perf_counter() - t0
+                facts = _SCAN_FACTS
+                if facts and n:
+                    facts['selftest_scandir_ms'] = sd_ms
+                    facts['selftest_find_ms'] = fi_ms
+                Profiler.mark_standalone('dirs:selftest', dt, 1, dt,
+                                         t0=t0, parent='dirs:worker')
+            except Exception:
+                pass
         try:
             self._scan()
         except Exception as ex:  # never let the thread die silently
@@ -1625,6 +1860,93 @@ def _prof_begin_scan(cmd, root_probe=None):
     return token, cprof_scan
 
 
+def _engine_verdict(mx):
+    """One line about the main-thread variant matrix (None = nothing
+    discriminating to say). 'mx' maps variant name -> ms (float) or an
+    'error / WRONG ENTRIES' string (see _probe_engine)."""
+    if not mx:
+        return None
+
+    def _ms(name):
+        v = mx.get(name)
+        return v if isinstance(v, (int, float)) else None
+
+    default = _ms('Basic+LARGE_FETCH')
+    best = None
+    best_nm = None
+    for nm, _i, _f in _WIN_FIND_VARIANTS:
+        v = _ms(nm)
+        if v is not None and (best is None or v < best):
+            best, best_nm = v, nm
+    if best is None:
+        return None
+    if default is not None and default < 5.0:
+        return None   # the default call is already fast from the main
+                        # thread: the call is not this box's problem --
+                        # the answer, if any, is in the self-test line
+    # here: the default variant is slow, unusable (an error string /
+    # WRONG ENTRIES), or simply was not measured -- and some other
+    # variant is fast and correct.
+    if best < 5.0:
+        return ('the listing CALL is the tax on this box: the default '
+                'FindFirstFileExW parameters (Basic+LARGE_FETCH) {} '
+                'while {} costs {:.1f} ms on the same folder, same '
+                'thread, same second -- the engine has switched to {} '
+                'for this session'.format(
+                    'cost {:.0f} ms'.format(default)
+                    if default is not None else 'are unusable here',
+                    best_nm, best, best_nm))
+    return ('EVERY FindFirstFileExW variant pays {:.0f}+ ms on the MAIN '
+            'thread while os.scandir pays ~0 ms there (see the probe '
+            'line above): the ctypes ExW call itself is the tax on this '
+            'box -- the engine should fall back to scandir (report this '
+            'matrix)'.format(default if default is not None else best))
+
+
+def _phase_verdict(mx, sd_ms, fi_ms, root_l, root_r, facts):
+    """One line tying the engine experiment's corners together (None
+    = nothing discriminating). The corners: 'mx' = the same folder
+    listed on the MAIN thread through every call variant; sd/fi = the
+    scandir and engine listings of it on the SCANNER thread before
+    the walk (main thread quiet); root_l/r = its first listing INSIDE
+    the scan (UI streaming, pool busy); facts = the whole-run
+    counters (walk average over all listings)."""
+    listings = facts.get('listings', 0)
+    avg = (facts.get('listing_ms', 0.0) / listings) if listings else 0.0
+    probe = facts.get('probe_root_ms') or []
+    probe_avg = (sum(probe) / len(probe)) if probe else None
+    iso = fi_ms if fi_ms is not None else sd_ms
+    # 1) fast on the main thread, slow from the scanner thread, with
+    #    the main thread quiet: the tax follows the THREAD.
+    if fi_ms is not None and fi_ms > 50.0 \
+            and (probe_avg is None or probe_avg < 10.0):
+        return ('the engine pays {:.0f} ms on the SCANNER thread but '
+                '~{:.0f} ms on the MAIN thread (same folder, seconds '
+                'apart): the tax follows the THREAD, not the call and '
+                'not the drive -- host scheduling / per-thread context, '
+                'not the folders'.format(fi_ms, probe_avg or 0))
+    # 2) fast in the quiet self-test, slow in the real walk: the tax
+    #    appears only while rows stream.
+    if avg > 50.0 and iso is not None and iso < 10.0:
+        return ('listings are FAST in isolation ({:.1f} ms on the '
+                'scanner thread) but the walk pays {:.0f} ms per '
+                'directory: the tax appears only in the busy phase, '
+                'while the UI streams rows -- contention, not the '
+                'drive'.format(iso, avg))
+    # 3) the root itself, seconds after the probes listed it in ~0.
+    if root_l is not None and root_l > 50.0 \
+            and (probe_avg is None or probe_avg < 10.0):
+        return ('the left root cost {:.0f} ms inside the scan, seconds '
+                'after the probes listed it in ~{:.0f} ms: the tax is '
+                'context-dependent, not the folder'.format(
+                    root_l, probe_avg or 0))
+    # 4) everything quiet end to end.
+    if avg and avg < 10.0:
+        return ('listings are fast end to end (walk avg {:.1f} ms)'.
+                format(avg))
+    return None
+
+
 def _prof_facts_block(worker):
     """The 'folder scan facts' epilogue lines: what the scan-facts
     counters say about THIS run (see _SCAN_FACTS). Printed right after
@@ -1692,6 +2014,55 @@ def _prof_facts_block(worker):
         verdict = _probe_verdict(root_ms, ctrl_ms)
         if verdict:
             lines.append('  -> ' + verdict)
+
+    # The engine experiment (see _probe_engine): which FindFirstFileExW
+    # parameters this session runs with, the same folder's numbers from
+    # all three corners (main thread / scanner thread quiet / scanner
+    # thread mid-walk), and the verdict that names the tax.
+    ep = _ENGINE_PICKED
+    if ep is not None and ep.get('winner'):
+        wms = ep.get('winner_ms')
+        lines.append(
+            'engine (listing call): {} -- picked once per session on '
+            'the first compare ({})'.format(
+                ep['winner'],
+                'n/a' if wms is None else '{:.1f} ms'.format(wms)))
+    mx = facts.get('engine_matrix')
+    if mx:
+        parts = []
+        for nm, _i, _f in _WIN_FIND_VARIANTS:
+            v = mx.get(nm)
+            if v is None:
+                continue
+            if isinstance(v, (int, float)):
+                parts.append('{}: {:.1f} ms'.format(nm, v))
+            else:
+                parts.append('{}: {}'.format(nm, v))
+        lines.append(
+            'engine probe (MAIN thread, left root, before the scan): '
+            + '; '.join(parts))
+        verdict = _engine_verdict(mx)
+        if verdict:
+            lines.append('  -> ' + verdict)
+    sd = facts.get('selftest_scandir_ms')
+    fi = facts.get('selftest_find_ms')
+    if fi is not None or sd is not None:
+        lines.append(
+            'worker self-test (SCANNER thread, before the walk, same '
+            'folder): os.scandir {}; engine {}'.format(
+                'n/a' if sd is None else '{:.1f} ms'.format(sd),
+                'n/a' if fi is None else '{:.1f} ms'.format(fi)))
+    root_l = facts.get('root_ms_l')
+    root_r = facts.get('root_ms_r')
+    if root_l is not None or root_r is not None:
+        lines.append(
+            'root listings (the compared folders themselves, inside '
+            'the scan): left {}; right {}'.format(
+                'n/a' if root_l is None else '{:.0f} ms'.format(root_l),
+                'n/a' if root_r is None else '{:.0f} ms'.format(root_r)))
+    verdict = _phase_verdict(mx, sd, fi, root_l, root_r, facts)
+    if verdict:
+        lines.append('  -> ' + verdict)
 
     n = facts.get('listings', 0)
     ms = facts.get('listing_ms', 0.0)
@@ -2673,6 +3044,14 @@ class DirCompareForm:
         token, cprof_scan = _prof_begin_scan(self._cmd, pl)
         self._prof_token = token
         self._prof_cprof_scan = cprof_scan
+        # The engine probe (see _probe_engine): once per session, on
+        # the MAIN thread, before the scanner exists -- time the bulk
+        # finder's call variants on the left root and keep the fastest
+        # correct one for the whole session. Runs AFTER the env probe
+        # (so that probe's scandir numbers stay as cold as the machine
+        # allows) and BEFORE the worker self-test books the same
+        # folder from the scanner thread.
+        _probe_engine(pl)
         # Colors for the drawn rows: the diff-tab hunk colors (the
         # painter looks them up by the cfg-key names ST_COLOR_KEY
         # maps statuses to) + the themed list/selection colors. A
