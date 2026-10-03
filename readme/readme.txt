@@ -357,6 +357,28 @@ isolation, slow while rows stream). The engine probe runs once per
 session on the first compare, on the main thread, and re-tunes the
 engine in place; on a healthy box it is sub-millisecond noise.
 
+When the verdict is "the THREAD", the deep probe takes over
+(update 8): the round-5 standalone probe proved everything is FAST
+outside the scan -- the call, the drive, cold dirs, fresh threads
+-- so the tax needs the real scan context, and the deep probe
+measures inside it. Right after the self-test (same spot, scanner
+thread, main thread still quiet) it runs a battery of scandir +
+engine listing + fresh stats + a GIL re-acquire chain wrapped in
+the thread's kernel/user CPU delta, on the scanner thread AND on a
+fresh sibling thread SIMULTANEOUSLY, and once more right after.
+That splits the remaining question in one shot: the scanner thread
+paying while the simultaneous sibling does not means the tax is
+specific to that thread (per-thread context: token / priority /
+host scheduling); the sibling paying too means a process-wide
+moment. The mechanism gets its own line: a slow GIL hand-back is a
+GIL convoy; KERNEL CPU burned ~ the wall is a filter working on
+this thread's IRPs; a big wall with ~0 CPU and a fast hand-back is
+a call parked in the kernel. Every real walk listing also carries
+its own copy of those numbers into the facts block's per-listing
+table (ms / KERNEL / USER / GIL / tid per directory), and the
+block prints the host (Windows build + service pack, python, cpus)
+plus the scanner thread's priority and token state.
+
 The window's controls:
 
 - The two path edits are editable: type two paths and press Refresh
@@ -476,6 +498,11 @@ the tax" (a fast variant exists -- already switched to) from "the
 THREAD is" (fast on the main thread, slow from the scanner) from
 "only the busy phase is" (fast in isolation, slow while rows
 stream).
+One more row closes it (update 8): dirs:deep_probe -- the same
+battery as the self-test, plus a simultaneous fresh-thread sibling
+and a second one right after, plus the per-listing rows (kernel /
+user / GIL-handback / tid per directory) during the walk. See the
+engine chapter above for how to read it.
 After the section report a compact "folder scan facts" block prints
 the same story in a few lines: the environment probe with its
 verdict, the engine line with the picked variant and its matrix,

@@ -153,6 +153,27 @@ THREAD' (fast from the main thread, slow from the scanner), or 'only
 the busy phase' (fast in isolation, slow while the UI streams). Once
 per session, first compare; sub-millisecond cost on a healthy box.
 
+The deep probe (update 8): the engine experiment named the tax
+('follows the THREAD'), and the round-5 standalone probe then proved
+the drive, the filters at rest, cold directories, fresh threads and
+the call itself are all FAST in this process -- the tax needs the
+REAL scan context to appear. Update 8 measures inside it, at the one
+spot where the tax reliably reproduces (the self-test moment, scanner
+thread, main thread quiet): a battery of scandir + engine listing +
+fresh stats + a GIL re-acquire chain, wrapped in the thread's
+kernel/user CPU delta (dirs:deep_probe); a FRESH sibling thread runs
+the same battery SIMULTANEOUSLY (slow here / fast sibling = the tax
+is that thread's; slow sibling too = a process-wide moment), and a
+second fresh sibling runs it right after. GIL wait is user-mode
+deschedule time: it grows the wall while leaving both CPU counters
+untouched and shows up in the Sleep(0) chain; a filter actively
+working burns KERNEL CPU; a call parked in the kernel leaves all
+three alone with a fast handback. Three signatures, one battery --
+and every real walk listing carries its own copy of those numbers
+into the facts block's per-listing table (kernel/user/GIL/tid per
+directory). Everything degrades to a no-op off Windows / without
+ctypes / with profiling off.
+
 == Threading model ==================================================
 
 The scan runs on a daemon thread that touches ONLY the file system
@@ -607,6 +628,12 @@ def _facts_reset():
         'selftest_find_ms': None,
         'root_ms_l': None,            # first in-scan listing of the
         'root_ms_r': None,            # compared roots themselves
+        'deep_probe': None,          # update 8: the scanner-thread
+                                     # battery + simultaneous fresh
+                                     # siblings (see _worker_deepprobe)
+        'listing_rows': [],          # update 8: per-listing probe rows
+                                     # (kernel/user/GIL/tid), printed
+                                     # as the per-listing table
     }
 
 
@@ -625,7 +652,8 @@ def _facts_add(**kw):
 _facts_reset()
 
 
-def _book_listing(dt, n_entries, side, t0=None, is_root=False):
+def _book_listing(dt, n_entries, side, t0=None, is_root=False,
+                  probe=None, rel=''):
     """One directory listing finished: profiler row + facts counters.
     t0 (the listing's start) is passed through as the row's SPAN, with
     the owning walk as its parent hint: the report nests this row
@@ -641,7 +669,16 @@ def _book_listing(dt, n_entries, side, t0=None, is_root=False):
     worker self-test (scanner thread) list moments earlier -- their
     three-way comparison in the facts block separates 'the call is
     the tax' / 'the thread is the tax' / 'only the busy phase is
-    the tax' (see _probe_engine)."""
+    the tax' (see _probe_engine).
+
+    probe (update 8, from _listed_with_probe) additionally appends
+    one row to facts['listing_rows'] -- THIS listing's kernel/user
+    CPU delta and GIL-handback maximum, with the thread id -- printed
+    as the per-listing table in the facts block. rel is the
+    directory's path relative to its root ('' = a compared root
+    itself); the table shows it so a slow row can be tied to its
+    directory and its thread.
+    """
     if Profiler.is_enabled():
         parent = 'dirs:walk_' + side if side in ('left', 'right') \
             else None
@@ -661,6 +698,18 @@ def _book_listing(dt, n_entries, side, t0=None, is_root=False):
             _facts_add(entries_r=n_entries)
         else:
             _facts_add(entries_x=n_entries)
+        if probe is not None and facts is not None:
+            rows = facts.get('listing_rows')
+            if rows is None:
+                rows = facts['listing_rows'] = []
+            if len(rows) < 24:
+                rows.append({
+                    'side': side or 'x', 'rel': rel, 'ms': dt * 1000.0,
+                    'kern': (probe or {}).get('kern_ms'),
+                    'user': (probe or {}).get('user_ms'),
+                    'gil': (probe or {}).get('gil_max_ms'),
+                    'tid': threading.get_ident(),
+                })
 
 
 def _quick_contents_equal(pl, pr, size, quick_only, cancel_evt=None):
@@ -1176,6 +1225,274 @@ def _worker_selftest(root):
 
 
 # ----------------------------------------------------------------------
+# The deep probe (update 8): WHY one listing pays hundreds of ms on
+# the scanner thread while the same folder, same process, same second
+# is ~0.1 ms from the main thread and from console-spawned threads.
+# The round-5 standalone probe proved the call, the drive, the
+# filters at rest, cold dirs and fresh threads are all FAST outside
+# the scan -- the tax needs the real scan context. This block runs
+# INSIDE it, at the one spot where the tax reliably reproduces (the
+# worker self-test moment, main thread quiet), and splits the
+# remaining hypothesis space in one shot. Everything here degrades
+# to no-ops off-Windows / without ctypes / with profiling off, and
+# nothing touches the scan result.
+# ----------------------------------------------------------------------
+
+_TT = None    # thread-tools state: None until the first call, then a
+              # dict {'ok': bool, 'k32': ..., 'FT': ..., 'cur_thread': ...}
+
+
+def _tt_init():
+    """One-time setup of the GetThreadTimes / Sleep(0) tools. Returns
+    True when they are usable (Windows + ctypes); every other helper
+    in this block returns its 'unavailable' answer otherwise, so the
+    whole probe degrades silently on other platforms."""
+    global _TT
+    if _TT is not None:
+        return _TT.get('ok', False)
+    ok = False
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class _FT(ctypes.Structure):
+            _fields_ = [('lo', wintypes.DWORD), ('hi', wintypes.DWORD)]
+
+        k32 = ctypes.windll.kernel32
+        k32.GetThreadTimes.argtypes = [wintypes.HANDLE] + \
+            [ctypes.POINTER(_FT)] * 4
+        k32.GetThreadTimes.restype = wintypes.BOOL
+        k32.GetThreadPriority.argtypes = [wintypes.HANDLE]
+        k32.GetThreadPriority.restype = ctypes.c_int
+        _TT = {'ok': True, 'k32': k32, 'FT': _FT,
+               'cur_thread': wintypes.HANDLE(-2)}   # pseudo-handle
+        ok = True
+    except Exception:
+        _TT = {'ok': False}
+    return ok
+
+
+def _tt_sample():
+    """(kernel_ms, user_ms) of THIS thread so far, or (None, None):
+    sample twice around a call and the delta is the CPU the call
+    burned on this thread. Blocked time (GIL wait, an IRP parked in
+    the filter stack) accrues to NEITHER counter -- that is exactly
+    what separates 'working' from 'waiting'."""
+    if not _tt_init():
+        return (None, None)
+    try:
+        import ctypes
+        FT = _TT['FT']
+        c, e, k, u = FT(), FT(), FT(), FT()
+        if not _TT['k32'].GetThreadTimes(_TT['cur_thread'],
+                                         ctypes.byref(c), ctypes.byref(e),
+                                         ctypes.byref(k), ctypes.byref(u)):
+            return (None, None)
+
+        def _ms(ft):
+            return ((ft.hi << 32) | ft.lo) / 10000.0
+        return (_ms(k), _ms(u))
+    except Exception:
+        return (None, None)
+
+
+def _gil_probe(n=12):
+    """Max/avg ms for THIS thread to hand the GIL out and get it back:
+    n calls to kernel32.Sleep(0), a foreign call ctypes releases the
+    GIL around, doing no work. On an uncontended interpreter this is
+    ~0.01 ms; a large max means some other thread holds the GIL in
+    long slices RIGHT NOW -- any listing latency seen on top of a
+    fast handback is therefore NOT the GIL: it is inside the syscall.
+    Returns (max_ms, avg_ms) or (None, None)."""
+    if not _tt_init():
+        return (None, None)
+    try:
+        ts = []
+        for _i in range(n):
+            t0 = time.perf_counter()
+            _TT['k32'].Sleep(0)
+            ts.append((time.perf_counter() - t0) * 1000.0)
+        return (max(ts), sum(ts) / len(ts))
+    except Exception:
+        return (None, None)
+
+
+def _thread_prio():
+    """GetThreadPriority of THIS thread (0 = normal), or None."""
+    if not _tt_init():
+        return None
+    try:
+        return _TT['k32'].GetThreadPriority(_TT['cur_thread'])
+    except Exception:
+        return None
+
+
+def _thread_token_note():
+    """Is THIS thread running under an impersonation token? A normal
+    thread has none (its kernel calls run under the process token);
+    a thread WITH one runs them under a different security context --
+    the one per-thread difference Windows actually has, and a prime
+    suspect for 'the tax follows the thread'. Short string for the
+    facts block, or None when the check cannot run."""
+    if not _tt_init():
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+        adv = _TT.get('advapi')
+        if adv is None:
+            adv = ctypes.WinDLL('advapi32', use_last_error=True)
+            adv.OpenThreadToken.argtypes = [
+                wintypes.HANDLE, wintypes.DWORD, wintypes.BOOL,
+                ctypes.POINTER(wintypes.HANDLE)]
+            _TT['advapi'] = adv
+        h = wintypes.HANDLE()
+        if adv.OpenThreadToken(_TT['cur_thread'], 0x0008, False,  # QUERY
+                                ctypes.byref(h)):
+            try:
+                _TT['k32'].CloseHandle(h)
+            except Exception:
+                pass
+            return ('impersonating (thread token PRESENT) -- kernel '
+                    'ops run under another security context on this '
+                    'thread')
+        return 'none (normal)'
+    except Exception:
+        return None
+
+
+def _listing_battery(root):
+    """One round, on the CALLING thread: os.scandir consume-all (entry
+    names collected for the stat leg -- no extra listing call), one
+    engine listing, 3 fresh os.stat calls, and a GIL re-acquire chain,
+    wrapped in this thread's kernel/user CPU delta. Returns a dict
+    (always the same keys; None = leg unavailable)."""
+    out = {'scandir_ms': None, 'find_ms': None, 'stat_ms': None,
+           'gil_max_ms': None, 'gil_avg_ms': None,
+           'kern_ms': None, 'user_ms': None, 'wall_ms': None}
+    names = []
+    k0, u0 = _tt_sample()
+    t0 = time.perf_counter()
+    try:
+        ts = time.perf_counter()
+        with os.scandir(root) as it:
+            for e in it:
+                if e.name not in ('.', '..') and len(names) < 3:
+                    names.append(e.name)
+        out['scandir_ms'] = (time.perf_counter() - ts) * 1000.0
+    except OSError:
+        pass
+    if _WIN_FIND is not None:
+        try:
+            ts = time.perf_counter()
+            entries, err = _WIN_FIND(os.path.join(root, '*'))
+            if err is None:
+                out['find_ms'] = (time.perf_counter() - ts) * 1000.0
+        except Exception:
+            pass
+    try:
+        ts = time.perf_counter()
+        for nm in (names or [root]):
+            os.stat(nm is root and root or os.path.join(root, nm))
+        out['stat_ms'] = (time.perf_counter() - ts) * 1000.0
+    except OSError:
+        pass
+    g, ga = _gil_probe()
+    out['gil_max_ms'] = g
+    out['gil_avg_ms'] = ga
+    k1, u1 = _tt_sample()
+    out['wall_ms'] = (time.perf_counter() - t0) * 1000.0
+    if k0 is not None and k1 is not None:
+        out['kern_ms'] = k1 - k0
+        out['user_ms'] = u1 - u0
+    return out
+
+
+def _worker_deepprobe(root):
+    """The update-8 discriminator, booked by run() right after the
+    worker self-test (same spot -- the one place the tax reliably
+    reproduces): the battery ON THE SCANNER THREAD, a FRESH sibling
+    thread running the same battery SIMULTANEOUSLY, and a second
+    fresh sibling right after. Reading it:
+
+      scanner slow, sibling #1 fast  -> the tax is THIS thread's
+                                        (per-thread context: token,
+                                        priority, host scheduling)
+      scanner slow, sibling #1 slow,
+      sibling #2 fast               -> a short process-wide MOMENT
+                                        at scan start, not a thread
+      all three slow                -> process-wide during the scan
+      everything fast               -> the tax moved; read the
+                                        per-listing rows instead
+
+    Returns {} when it cannot run; the facts block prints it under
+    'deep probe' with a verdict line per case (see _deep_verdict)."""
+    deep = {}
+    if not root or not os.path.isdir(root):
+        return deep
+    _tt_init()
+    deep['prio'] = _thread_prio()
+    deep['nthreads'] = len(threading.enumerate())
+    deep['token'] = _thread_token_note()
+    res = {}
+
+    def _sib_run():
+        go.wait()
+        res['sib'] = _listing_battery(root)
+
+    def _sib2_run():
+        res['sib2'] = _listing_battery(root)
+
+    go = threading.Event()
+    sib = threading.Thread(target=_sib_run)
+    sib.daemon = True
+    sib.start()
+    go.set()                      # release the sibling, then run the
+    res['mine'] = _listing_battery(root)   # same battery here at the
+    sib.join(60.0)                          # same moment
+    sib2 = threading.Thread(target=_sib2_run)
+    sib2.daemon = True
+    sib2.start()
+    sib2.join(60.0)
+    deep.update(res)
+    return deep
+
+
+def _listed_with_probe(pattern):
+    """One _WIN_FIND listing call for _scan_dir's bulk branch, plus
+    the per-listing probe numbers around it: the call, then a GIL
+    re-acquire chain and a kernel/user CPU delta sample (see the
+    deep-probe block comment). Returns (entries, err, probe); probe
+    is {} whenever profiling is off or the tools are unavailable --
+    zero overhead in normal use, and the caller then books a plain
+    listing row."""
+    if _WIN_FIND is None:
+        return None, None, {}
+    if not Profiler.is_enabled():
+        try:
+            return _WIN_FIND(pattern) + ({},)
+        except Exception as ex:
+            return None, ex, {}
+    k0, u0 = _tt_sample()
+    try:
+        ts = time.perf_counter()
+        try:
+            entries, err = _WIN_FIND(pattern)
+        except Exception as ex:
+            entries, err = None, ex
+        wall = (time.perf_counter() - ts) * 1000.0
+        g, _ga = _gil_probe(6)
+    except Exception:
+        return None, None, {}
+    k1, u1 = _tt_sample()
+    p = {'wall_ms': wall, 'gil_max_ms': g}
+    if k0 is not None and k1 is not None:
+        p['kern_ms'] = k1 - k0
+        p['user_ms'] = u1 - u0
+    return entries, err, p
+
+
+# ----------------------------------------------------------------------
 # One-directory scan (the unit of work, serial or pool)
 # ----------------------------------------------------------------------
 
@@ -1226,12 +1543,17 @@ def _scan_dir(root, base, mask, cancel_evt, on_err, side=''):
     if _WIN_FIND is not None and len(full) < 240:
         # WinMerge-style bulk listing (see _init_win_find's comment);
         # paths that would need the \\?\ long-path prefix stay on the
-        # scandir path (which handles them itself).
+        # scandir path (which handles them itself). The listing goes
+        # through _listed_with_probe: with profiling ON it carries the
+        # per-listing probe (kernel/user/GIL/tid -> the facts block's
+        # per-listing table); OFF it is the plain call, no overhead.
         try:
             t0 = time.perf_counter()
-            entries, err = _WIN_FIND(os.path.join(full, '*'))
+            entries, err, lprobe = _listed_with_probe(
+                os.path.join(full, '*'))
             _book_listing(time.perf_counter() - t0, len(entries),
-                          side, t0, is_root=(base == ''))
+                          side, t0, is_root=(base == ''),
+                          probe=lprobe, rel=base)
         except Exception:
             entries = None               # unexpected: scandir fallback
         else:
@@ -1279,7 +1601,7 @@ def _scan_dir(root, base, mask, cancel_evt, on_err, side=''):
     except OSError as e:
         on_err(e, full)   # keep entries listed before the failure
     _book_listing(time.perf_counter() - t0, len(entries), side, t0,
-                  is_root=(base == ''))
+                  is_root=(base == ''), rel=base)
     for entry in entries:
         if cancel_evt is not None and cancel_evt.is_set():
             break
@@ -1453,6 +1775,24 @@ class _Scanner(threading.Thread):
                     facts['selftest_find_ms'] = fi_ms
                 Profiler.mark_standalone('dirs:selftest', dt, 1, dt,
                                          t0=t0, parent='dirs:worker')
+            except Exception:
+                pass
+            # update 8: the deep probe right after the self-test, same
+            # spot, same thread, main thread still quiet -- the battery
+            # plus simultaneous fresh siblings that split thread vs
+            # moment vs mechanism (see the deep-probe block comment).
+            # Booked like the selftest; the numbers land in the facts
+            # block under a 'deep probe' heading with its own verdict.
+            try:
+                t0 = time.perf_counter()
+                deep = _worker_deepprobe(self.dir_l)
+                dt = time.perf_counter() - t0
+                if deep:
+                    facts = _SCAN_FACTS
+                    if facts:
+                        facts['deep_probe'] = deep
+                    Profiler.mark_standalone('dirs:deep_probe', dt, 1, dt,
+                                             t0=t0, parent='dirs:worker')
             except Exception:
                 pass
         try:
@@ -1947,6 +2287,85 @@ def _phase_verdict(mx, sd_ms, fi_ms, root_l, root_r, facts):
     return None
 
 
+def _deep_verdict(dp, facts):
+    """The update-8 verdict lines for the deep probe (a LIST of 0-2
+    strings; the facts block prints each under '-> '). First the WHO:
+
+    1. the scanner thread's battery paid the tax while a fresh
+       sibling running the SAME battery at the SAME moment did not:
+       the tax is specific to that thread -- per-thread context
+       (impersonation token / priority / host scheduling), never the
+       folders; the token+priority lines in the block say which.
+    2. the sibling paid too, but sibling #2 (right after) did not: a
+       short process-wide MOMENT around scan start, not a thread.
+    3. all three paid: process-wide for as long as the scan runs.
+    Then the HOW (whenever the scanner battery was taxed):
+
+    - GIL hand-back slow           -> the listings waited for the
+                                      interpreter lock: a GIL convoy;
+    - KERNEL CPU ~ the wall        -> the filter stack was actively
+                                      working on this thread's IRPs;
+    - wall big, both CPU counters
+      ~0 and a fast hand-back     -> the call was parked in the
+                                      kernel (filter / disk) while
+                                      the thread idled.
+    And the fallback: batteries all fast but the real walk listings
+    paid -> the tax lives only in the busy phase; the per-listing
+    table carries it."""
+    out = []
+    mine = dp.get('mine') or {}
+    sib = dp.get('sib') or {}
+    sib2 = dp.get('sib2') or {}
+
+    def _taxed(b):
+        v = b.get('find_ms')
+        if v is None:
+            v = b.get('scandir_ms')
+        return v is not None and v > 50.0
+
+    listings = facts.get('listings', 0)
+    walk_avg = (facts.get('listing_ms', 0.0) / listings) if listings else 0.0
+    gil = mine.get('gil_max_ms')
+    kern = mine.get('kern_ms')
+    wall = mine.get('wall_ms')
+    if _taxed(mine) and not _taxed(sib):
+        out.append('the SCANNER thread paid the tax while a fresh thread '
+                   'running the same battery at the same moment did not: '
+                   'the tax is specific to that thread -- per-thread '
+                   'context (token / priority / host scheduling), never '
+                   'the folders')
+    elif _taxed(mine) and _taxed(sib) and not _taxed(sib2):
+        out.append('the fresh sibling paid it too at that moment, but not '
+                   'right after: a short process-wide MOMENT around scan '
+                   'start, not a thread')
+    elif _taxed(mine) and _taxed(sib):
+        out.append('every thread paid it, before AND after: process-wide '
+                   'for as long as the scan runs')
+    if _taxed(mine):
+        if gil is not None and gil > 20.0:
+            out.append('mechanism: GIL hand-back took {:.1f} ms -- the '
+                       'listings waited for the interpreter lock, not '
+                       'the disk: a GIL convoy'.format(gil))
+        elif kern is not None and kern > 5.0 and wall is not None \
+                and kern > wall * 0.5:
+            out.append('mechanism: KERNEL CPU {:.0f} of {:.0f} ms wall -- '
+                       'the filter stack was actively working on this '
+                       'thread\'s IRPs (see fltmc filters)'.format(
+                           kern, wall))
+        elif wall is not None and wall > 50.0 and gil is not None \
+                and gil < 5.0 and (kern is None or kern < 5.0):
+            out.append('mechanism: {:.0f} ms wall with ~0 kernel/user CPU '
+                       'and a fast GIL hand-back: the call was parked in '
+                       'the kernel (filter / disk) while the thread '
+                       'idled'.format(wall))
+    if not out and walk_avg > 50.0 and mine and not _taxed(mine):
+        out.append('the deep probe was FAST but the walk paid {:.0f} ms '
+                   'per listing: the tax lives only in the busy phase -- '
+                   'the per-listing table below carries it'.format(
+                       walk_avg))
+    return out
+
+
 def _prof_facts_block(worker):
     """The 'folder scan facts' epilogue lines: what the scan-facts
     counters say about THIS run (see _SCAN_FACTS). Printed right after
@@ -1972,6 +2391,17 @@ def _prof_facts_block(worker):
     if not facts:
         return ''
     lines = ['--- Differ 2 folder scan facts ---']
+
+    # update 8: the host line (the box the numbers below were taken
+    # on; skipped off-Windows where sys.getwindowsversion is absent)
+    try:
+        wv = sys.getwindowsversion()
+        lines.append('host: Windows {}.{} build {} ({}) / python {} /'
+                     ' {} cpus'.format(
+                         wv[0], wv[1], wv[2], wv.service_pack,
+                         sys.version.split()[0], os.cpu_count()))
+    except Exception:
+        pass
 
     def _probe_verdict(root_ms, ctrl_ms):
         """The probe's interpretation line (None = nothing to say)."""
@@ -2063,6 +2493,68 @@ def _prof_facts_block(worker):
     verdict = _phase_verdict(mx, sd, fi, root_l, root_r, facts)
     if verdict:
         lines.append('  -> ' + verdict)
+
+    # update 8: the deep probe -- the battery on the scanner thread at
+    # the self-test moment, simultaneous fresh siblings, and the
+    # mechanism split. Then the per-listing table: every real walk
+    # listing with its own wall/kernel/user/GIL-handback numbers and
+    # the thread id that paid them.
+    dp = facts.get('deep_probe')
+    if dp:
+        lines.append('')
+        lines.append('deep probe (update 8, scanner thread, pre-walk):')
+
+        def _btxt(tag, b):
+            if not b:
+                return '  {:<26}: n/a'.format(tag)
+
+            def _f(v, prec='.1f'):
+                return ('n/a' if v is None
+                        else ('{:' + prec + '} ms').format(v))
+            return ('  {:<26}: scandir {:>10}; engine {:>10}; stat {:>10}; '
+                    'GIL handback max {:>10}; KERNEL {:>10} / USER {:>10} '
+                    '(wall {})'.format(
+                        tag, _f(b.get('scandir_ms')), _f(b.get('find_ms')),
+                        _f(b.get('stat_ms')), _f(b.get('gil_max_ms'), '.2f'),
+                        _f(b.get('kern_ms')), _f(b.get('user_ms')),
+                        _f(b.get('wall_ms'))))
+
+        lines.append(_btxt('this (scanner) thread', dp.get('mine')))
+        lines.append(_btxt('fresh thread, same moment', dp.get('sib')))
+        lines.append(_btxt('fresh thread, right after', dp.get('sib2')))
+        extra = []
+        if dp.get('nthreads'):
+            extra.append('{} threads alive'.format(dp['nthreads']))
+        if dp.get('prio') is not None:
+            extra.append('scanner priority {} (0 = normal)'.format(
+                dp['prio']))
+        if dp.get('token'):
+            extra.append('thread token: {}'.format(dp['token']))
+        if extra:
+            lines.append('  ' + '; '.join(extra))
+        for v in _deep_verdict(dp, facts):
+            lines.append('  -> ' + v)
+
+    rows = facts.get('listing_rows') or []
+    if rows:
+        lines.append('')
+        lines.append('per-listing (ms | KERNEL ms | USER ms | GIL handback'
+                     ' max ms | tid):')
+
+        def _c(v, prec='.1f'):
+            return ('-' if v is None
+                    else ('{:' + prec + '}').format(v))
+        for r in rows[:12]:
+            lines.append('  {} {:<32} {:>7} | {:>6} | {:>6} | {:>7} |'
+                         ' {:d}'.format(
+                             (r.get('side') or 'x')[:1].upper(),
+                             (r.get('rel') or '(root)')[:32],
+                             _c(r.get('ms')), _c(r.get('kern')),
+                             _c(r.get('user')), _c(r.get('gil'), '.2f'),
+                             r.get('tid') or 0))
+        if len(rows) > 12:
+            lines.append('  ... {} more (cap 24; see facts['
+                         'listing_rows])'.format(len(rows) - 12))
 
     n = facts.get('listings', 0)
     ms = facts.get('listing_ms', 0.0)

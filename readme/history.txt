@@ -1,3 +1,49 @@
+2026.10.04 (8th release, by @alkorsan)
++ feature: the deep probe -- update 7 named the tax ('follows the
+  THREAD'), and the round-5 standalone probe (run from both a plain
+  python.exe and CudaText's own console) then proved the call, the
+  drive, the filters at rest, cold directories, fresh threads and
+  both drives are all FAST outside the scan: every listing op
+  0.0-0.3 ms on 8 batteries (main, plain workers, worker + 200 ms
+  GIL ticker, main under churn, worker #2, cold dirs on F: and on
+  the TEMP drive), KERNEL = 0 on every thread, healthy Sleep(50)
+  hand-backs, no antivirus (the user's box: Windows 7, 4 cpus,
+  luafv + SbieDrv + FileInfo in the filter stack). The tax needs
+  the REAL scan context to appear -- so update 8 measures inside
+  it, at the one spot where it reliably reproduces (the self-test
+  moment, scanner thread, main thread quiet):
+  * dirs:deep_probe (SCANNER thread, right after dirs:selftest):
+    a battery of os.scandir consume-all + one engine listing + 3
+    fresh stats + a GIL re-acquire chain, wrapped in the thread's
+    kernel/user CPU delta (GetThreadTimes). A FRESH sibling thread
+    runs the same battery SIMULTANEOUSLY, and a second fresh
+    sibling right after: slow-here/fast-sibling = the tax is THIS
+    thread's; slow sibling too but fast sibling #2 = a short
+    process-wide moment at scan start; all three slow = the whole
+    process pays for as long as the scan runs.
+  * the mechanism split, printed as a second verdict line whenever
+    the battery was taxed: GIL wait grows the wall while leaving
+    both CPU counters untouched and shows in the Sleep(0) chain
+    (a GIL convoy); a filter actively working burns KERNEL CPU;
+    a call parked in the kernel (filter / disk) leaves wall big
+    with ~0 kernel, ~0 user and a fast hand-back.
+  * per-listing rows (facts['listing_rows'], the facts block's
+    'per-listing' table): every real walk listing through the bulk
+    branch now carries its own wall / KERNEL / USER / GIL-handback
+    numbers plus the thread id -- which thread paid which
+    directory, per row, cap 24.
+  * the facts block also prints a host line now (Windows build +
+    service pack, python, cpus) and the scanner thread's priority
+    and impersonation-token state (the one per-thread difference
+    Windows actually has; OpenThreadToken says 'none (normal)'
+    for a plain thread).
+  All of it degrades to no-ops off-Windows / without ctypes / with
+  profiling off; the scan result is untouched. Tests:
+  scripts/test_deep_probe.py (41 checks: degradation, battery,
+  siblings, cap 24, passthrough, block rendering, all 6 verdict
+  renderings), test_scanner 9d (real profiled run: deep facts,
+  per-listing rows == listings, dirs:deep_probe row, verdict
+  fixtures), test_gui (deep-probe row + facts lines).
 2026.10.03 (7th release, by @alkorsan)
 + feature: the engine experiment -- the report now names WHICH side
   of a listing is slow: the call, the thread, or the busy phase.
