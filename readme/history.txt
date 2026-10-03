@@ -1,3 +1,44 @@
+2026.10.03 (3rd release, by @alkorsan)
++ fix: folder compare could take 20-30 s on the very same folders
+  that later compared in 1 s. Profiling on the user's machine showed
+  the scan was pure metadata-syscall latency (each stat/scandir/
+  entry-read costing 100-200 ms cold: antivirus on-access pass, disk
+  seeks, network round trips -- the code's own logic ran ~1 ms). The
+  walk was rewritten around that:
+  * flat scandir per directory instead of os.walk + os.stat per file:
+    on Windows a DirEntry carries size and mtime from the listing
+    itself, so a whole tree now walks with ZERO per-file stat() and
+    zero lstat() calls (the old walk spent one extra syscall per file
+    + one per folder row). Folder rows take their mtime from the
+    parent listing; _stat_side survives only in the main thread's
+    single-row refresh after a copy/delete.
+  * the directory listings of both trees run CONCURRENTLY on a small
+    thread pool (SCAN_POOL_THREADS = 8), breadth-first waves: the
+    wall time on a slow source approaches the slowest single
+    directory instead of the sum of all directories. The equal-size
+    content tests ride the same pool afterwards.
+  * the remaining 30 s-vs-1 s variance is the OS file cache (cold
+    first-ever compare vs warm later ones) -- documented in the
+    readme together with the "Size and timestamp" escape hatch.
++ change: the folder-compare cProfile report now prints sorted by
+  INTERNAL time (stop_profiling sort_key='time', max_lines=100), so
+  the real bottleneck function (e.g. nt.stat / scandir built-ins)
+  sits at the top of the table.
++ change: while the cProfile layer is on, a folder scan runs in
+  serial single-thread mode on purpose -- cProfile traces only the
+  thread that started it, so the pool threads would be invisible in
+  the function-level report (the section report still attributes the
+  parallel run via thread-safe standalone marks). With the layer off
+  (the default), the scan is fully parallel.
++ fix (docs/code): the profiling comments claimed "Python 3.12+
+  allows only one active profiling tool per process" as the reason
+  for the scanner-thread profile placement -- true for 3.12+ (the
+  scanner claims the slot, quiet fallback), but on Python 3.8-3.11
+  profiles are PER-THREAD and simply coexist. The whole feature is
+  verified Python 3.8-compatible (vermin minimum 3.6; no 3.9+ syntax
+  or stdlib): the plugin requires 3.8, and the pool shutdown avoids
+  the 3.9-only cancel_futures parameter.
+
 2026.10.03 (2nd release, by @alkorsan)
 + feature: full-line row colors in the folder-compare list. The list
   is now an owner-drawn listbox (listbox_ex + LISTBOX_SET_DRAWN) --

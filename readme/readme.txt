@@ -272,8 +272,8 @@ runs. How a same-named pair is decided is chosen by the option
   always proven byte for byte by default.
 - "Size and timestamp" (WinMerge's Quick method): equal size AND
   equal mtime -> Identical, anything else -> Different. NO file is
-  ever opened -- the whole verdict comes from the directory walk.
-  Use this when file reads are expensive: files on a slow network
+  ever opened -- the whole verdict comes from the directory listing
+  itself. Use this when file reads are expensive: files on a slow network
   share, cloud-sync placeholders (OneDrive etc. -- opening one can
   trigger a download), an antivirus hooking every open. The scan is
   then pure directory listing, whatever the tree size. Trade-offs:
@@ -295,6 +295,22 @@ progress line); a second scan can be started at any time, it simply
 cancels the first. Any number of compare windows can be open at the
 same time -- compare two folders, then compare two other folders, and
 use both windows at once; closing one never touches the others.
+
+How the walk reads the disk (why the same folders can take 30 s once
+and 1 s the next time): every directory is listed once with scandir,
+and on Windows the listing itself already carries each entry's size
+and mtime -- the tree walks with ZERO extra per-file stat calls. The
+directory listings of both trees (and the content tests for equal-size
+pairs) run CONCURRENTLY on a small thread pool, so on a slow source
+(network share, cloud placeholder filter, antivirus scanning every
+metadata call) the wall time approaches the slowest single directory
+instead of the sum of all of them. The remaining variance is the file
+system's own cache: a first-ever compare of a tree pays the cold
+cost of every metadata call (antivirus pass, disk seeks, SMB round
+trips -- each can cost 100-200 ms), every later compare of the same
+tree finds it all cached by the OS and finishes near-instantly. When
+even that is too slow, the "Size and timestamp" method above removes
+the file reads too.
 
 The window's controls:
 
@@ -381,9 +397,15 @@ antivirus -- switch the compare method to "Size and timestamp");
 dirs:walk_left/right show the directory-listing time; dirs:ui_* show
 the CudaText API time on the main thread; dirs:worker /
 dirs:scan_wall bracket the scanner thread and the whole operation.
-The cProfile layer runs on the scanner thread (the walk/hash work);
-a scan cancelled by a rescan or a closing window prints nothing,
-like the tab compare's cancel path.
+The cProfile layer runs on the scanner thread (the walk/hash work)
+and prints its function report sorted by INTERNAL time
+(sort_key='time'), so the real bottleneck function sits at the top.
+While that layer is on, the scan runs in serial single-thread mode on
+purpose: cProfile traces only the thread that started it, so the pool
+threads would be invisible in the function report (the section report
+still attributes the parallel run) -- a profiled compare is therefore
+somewhat slower than a normal one. A scan cancelled by a rescan or a
+closing window prints nothing, like the tab compare's cancel path.
 
 
 == Keyboard shortcuts ==

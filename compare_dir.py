@@ -39,11 +39,12 @@ cheapest test that decides the question is applied, in this order
 
 "size_timestamp" (WinMerge's Quick method): equal size AND equal
 modification time -> Identical, different size or time -> Different.
-NO file is ever opened -- the verdict comes from the directory walk's
-stat() data alone. This is the method to use when content reads are
-expensive (files on a slow network share, cloud-sync placeholders that
-could trigger downloads, aggressive antivirus hooks on every open):
-the whole scan is then pure directory listing, whatever the tree size.
+NO file is ever opened -- the verdict comes from the size/mtime data
+the directory listing itself carries. This is the method to use when
+content reads are expensive (files on a slow network share, cloud-sync
+placeholders that could trigger downloads, aggressive antivirus hooks
+on every open): the whole scan is then pure directory listing,
+whatever the tree size.
 The trade-off is documented: a file rewritten while preserving its
 size and mtime can be missed, and a merely touched file (same size,
 newer mtime) is flagged Different without reading it -- double-click
@@ -55,6 +56,40 @@ a collision would need two files engineered to collide, and even then
 the worst case is a wrong "Identical" badge that the double-click diff
 corrects.
 
+== The scan engine (what a slow compare is made of) ================
+
+The walk is one flat os.scandir per directory (_scan_dir), NOT
+os.walk + a stat() per file: a scandir DirEntry carries the entry's
+size and mtime from the directory listing itself, so on Windows a
+full tree walk needs ZERO per-file stat() calls and no lstat() at
+all (os.walk + os.stat doubles the metadata syscalls -- on a source
+where every call costs 100-200 ms that is the whole scan). Folder
+rows take their mtime from the parent listing the same way;
+_stat_side survives only in the main thread's single-row refresh
+after a copy/delete action.
+
+The directory scans run CONCURRENTLY on a small thread pool
+(SCAN_POOL_THREADS): the two roots, then every subfolder found, are
+enumerated in parallel waves, and the equal-size content tests ride
+the same pool afterwards. On a fast local disk this changes little;
+on a source with high per-call latency (network share, cloud
+placeholder filter, antivirus on-access hooks) the wall time
+approaches the slowest single directory instead of the sum of all
+directories plus all file opens. While the cProfile layer is on, the
+scan deliberately falls back to the serial one-thread mode:
+cProfile only traces the thread that started it, so pool threads
+would be invisible in the function-level report (the section
+report still attributes the parallel run via thread-safe standalone
+marks).
+
+The "same folders, 30 s today / 1 s tomorrow" effect is the file
+system, not growing code: each metadata call costs microseconds
+warm and can cost 100-200 ms cold (antivirus scanning the file, a
+spinning disk seeking, an SMB round trip). The engine halves the
+number of metadata calls and hides the rest behind concurrency, but
+the first-ever compare of a tree can still be slower than every
+later one -- the OS then has the metadata cached.
+
 == Threading model ==================================================
 
 The scan runs on a daemon thread that touches ONLY the file system
@@ -64,7 +99,8 @@ worker's results under its lock and updates the list view on the main
 thread, so huge trees stream into the window while it stays fully
 responsive; closing the window or starting a rescan simply sets a
 cancel flag the worker checks between every file. Several compare
-windows can run scans at once -- each owns one worker and one timer.
+windows can run scans at once -- each owns one worker, one timer and
+its own scan pool (the worker thread itself only coordinates).
 
 == Profiling ========================================================
 
@@ -92,12 +128,17 @@ like a tab compare does:
     compare that can actually be slow (the main thread's UI phases
     are already phase-measured by the section rows dirs:ui_*, and
     the main thread is what the tab compare's own cProfile layer
-    covers). Python 3.12+ allows only one active profiling tool per
-    PROCESS, so main+scanner profiles cannot coexist there anyway;
-    the scanner claims the slot, and if something else already
-    holds it (e.g. a simultaneously profiled tab compare), the
-    layer quietly stays off for this scan. Printed after the
-    section report at the scan's natural end.
+    covers). While this layer is on the scan runs in its SERIAL
+    one-thread mode, so the profile sees every walk/hash call. On
+    Python up to 3.11 profiles are per-thread and the scanner's
+    layer would coexist with a simultaneously profiled tab compare
+    anyway; Python 3.12+ allows one active profiling tool per
+    PROCESS -- there the scanner claims the slot, and if something
+    else already holds it, start_profiling() fails quietly, the
+    layer stays off for this scan and the scan stays parallel.
+    Printed after the section report at the scan's natural end,
+    sorted by internal time (sort_key='time'), max_lines=100: the
+    real bottleneck function sits at the top of the table.
 
 This is the tool to answer "why is my compare slow": the tier rows
 show the content-read time per method step, the walk rows the
@@ -160,6 +201,7 @@ import subprocess
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, wait
 
 import cudatext as ct
 import cudax_lib as ctx
@@ -181,6 +223,12 @@ MODULE_JSON = 'cuda_differ2.json'
 # Compare-speed constants (see the module docstring's "Speed model"):
 SMALL_FILE_FULL = 256 * 1024   # up to this size: one full-content MD5
 HEAD_TAIL_CHUNK = 64 * 1024    # bigger: MD5 of head + tail chunks first
+
+# Concurrent directory scans / content tests inside one folder
+# compare (see the module docstring's "The scan engine"). Pure I/O
+# work, so the count does not scale with CPUs; 1 = serial mode
+# (also forced while the cProfile layer traces the scan).
+SCAN_POOL_THREADS = 8
 
 HISTORY_MAX = 12               # remembered folder paths per side
 POLL_MS = 200                  # worker -> UI poll period while scanning
@@ -496,7 +544,9 @@ def _contents_equal(pl, pr, size, quick_only):
 # built by exactly the same logic as a scanned row.
 
 def _stat_side(path):
-    """(size, mtime) of 'path', None when it is missing/unreadable."""
+    """(size, mtime) of 'path', None when it is missing/unreadable.
+    Main-thread single-row refresh only (_refresh_row): the scanner
+    itself never stats -- its rows carry the listing's own data."""
     try:
         st = os.stat(path)
         return (st.st_size, st.st_mtime)
@@ -504,10 +554,14 @@ def _stat_side(path):
         return None
 
 
-def _file_row(dir_l, dir_r, rel, sl, sr, quick_only, method):
-    """Row for the file 'rel' given per-side (size, mtime) or None.
-    'method' selects the compare method (METHOD_*; see the module
-    docstring's "Speed model") -- the size test runs first in both."""
+def _file_row_base(dir_l, dir_r, rel, sl, sr, method):
+    """Stats-only half of _file_row: builds the row and applies every
+    verdict the size/mtime data already decides (one-sided presence,
+    size mismatch, two empties, unreadable files, the whole timestamp
+    method). Returns (row, content): content is None when the verdict
+    is final, otherwise (path_l, path_r, size) -- the content test
+    still owed, which the caller runs inline (serial mode, single-row
+    refresh) or submits to the scan pool."""
     name = os.path.basename(rel)
     row = {
         'rel': rel,
@@ -524,28 +578,28 @@ def _file_row(dir_l, dir_r, rel, sl, sr, quick_only, method):
         row['size_r'], row['mtime_r'] = sr
 
     if sl is None and sr is None:
-        return row  # vanished from both sides mid-scan; caller drops it
+        return row, None  # vanished both sides mid-scan; caller drops
     if sl is None:
         row['status'] = ST_RONLY
-        return row
+        return row, None
     if sr is None:
         row['status'] = ST_LONLY
-        return row
+        return row, None
     if sl[0] < 0 or sr[0] < 0:
-        row['status'] = ST_ERR  # stat() failed at walk time
-        return row
+        row['status'] = ST_ERR  # stat failed at scan time
+        return row, None
     if sl[0] != sr[0]:
         row['status'] = ST_DIFF  # different sizes cannot be equal content
-        return row
+        return row, None
     if sl[0] == 0:
         row['status'] = ST_SAME  # two empty files
-        return row
+        return row, None
 
     if method == METHOD_SIZE_TIME:
         # WinMerge's Quick method: equal size + equal mtime ->
         # Identical; anything else -> Different. No file is opened --
-        # the whole verdict comes from the walk's stat data, which is
-        # what makes this method immune to slow opens (network,
+        # the whole verdict comes from the listing's own data, which
+        # is what makes this method immune to slow opens (network,
         # cloud placeholders, antivirus). The trade-off is documented
         # in the option's comment; the double-click diff is the
         # honest check.
@@ -555,11 +609,24 @@ def _file_row(dir_l, dir_r, rel, sl, sr, quick_only, method):
             Profiler.mark_standalone('dirs:tier_timestamp',
                                      time.perf_counter() - t0)
         row['status'] = ST_SAME if same else ST_DIFF
-        return row
+        return row, None
 
-    same = _contents_equal(os.path.join(dir_l, rel),
-                           os.path.join(dir_r, rel),
-                           sl[0], quick_only)
+    return row, (os.path.join(dir_l, rel),
+                 os.path.join(dir_r, rel),
+                 sl[0])
+
+
+def _file_row(dir_l, dir_r, rel, sl, sr, quick_only, method):
+    """Row for the file 'rel' given per-side (size, mtime) or None.
+    The serial one-row path: _refresh_row calls this from the main
+    thread after a copy/delete; the scanner's fast path calls
+    _file_row_base and runs the owed content tests on its pool.
+    'method' selects the compare method (METHOD_*; see the module
+    docstring's "Speed model") -- the size test runs first in both."""
+    row, content = _file_row_base(dir_l, dir_r, rel, sl, sr, method)
+    if content is None:
+        return row
+    same = _contents_equal(content[0], content[1], content[2], quick_only)
     if same is None:
         row['status'] = ST_ERR
     else:
@@ -607,6 +674,85 @@ def _mask_ok(name, mask):
 
 
 # ----------------------------------------------------------------------
+# One-directory scan (the unit of work, serial or pool)
+# ----------------------------------------------------------------------
+
+def _scan_dir(root, base, mask, cancel_evt, on_err):
+    """Scan ONE directory of a compared tree. Returns (files, dirs,
+    subdirs):
+
+      files    normcase(rel) -> (rel, size, mtime); (-1, -1) when the
+               entry's stat data cannot be had (an unreadable file:
+               _file_row_base turns that into a Cannot-read row)
+      dirs     normcase(rel) -> (rel, mtime or None)
+      subdirs  rel paths of real subfolders to scan next -- symlinked
+               folders get a row in 'dirs' but never appear here
+               (os.walk's followlinks=False semantics: no cycles)
+
+    'base' is this directory's path RELATIVE to 'root' ('' = the root
+    itself) -- the walk always knows where it is, no relpath() calls.
+    Size and mtime come from the scandir DirEntry: on Windows they
+    are part of the directory listing itself, so a whole tree walks
+    with ZERO per-file stat() calls and zero lstat() calls -- on a
+    source where every metadata syscall costs 100-200 ms (cold
+    antivirus pass, network share, cloud placeholder filter) that
+    alone halves the syscall count of the old os.walk + os.stat walk.
+
+    Built as a pool job: a pure function of its arguments plus an
+    error callback, cancellation checked at entry / between entries,
+    and every OSError confined -- one unreadable entry or a listing
+    that fails mid-way never aborts the directory, let alone the scan
+    (whatever the iterator yielded before the error is kept)."""
+    files = {}
+    dirs = {}
+    subdirs = []
+    full = root if not base else os.path.join(root, base)
+    if cancel_evt is not None and cancel_evt.is_set():
+        return files, dirs, subdirs
+    entries = []
+    try:
+        with os.scandir(full) as it:
+            for entry in it:
+                entries.append(entry)
+                if cancel_evt is not None and cancel_evt.is_set():
+                    break
+    except OSError as e:
+        on_err(e, full)   # keep entries listed before the failure
+    for entry in entries:
+        if cancel_evt is not None and cancel_evt.is_set():
+            break
+        try:
+            if entry.is_dir(follow_symlinks=False):
+                rel = os.path.join(base, entry.name)
+                try:
+                    mtime = entry.stat(follow_symlinks=False).st_mtime
+                except OSError:
+                    mtime = None
+                dirs[os.path.normcase(rel)] = (rel, mtime)
+                if not entry.is_symlink():
+                    subdirs.append(rel)
+                continue
+            try:
+                ok = entry.is_file()       # through symlinks, like the
+            except OSError:                # old stat-through walk
+                ok = entry.is_symlink()    # broken link: unreadable row
+            if not ok:
+                continue                   # sockets, fifos, devices...
+            if not _mask_ok(entry.name, mask):
+                continue
+            rel = os.path.join(base, entry.name)
+            try:
+                st = entry.stat()          # free on Windows (listing
+                info = (rel, st.st_size, st.st_mtime)  # data), one
+            except OSError:                # stat on other systems
+                info = (rel, -1, -1)
+            files[os.path.normcase(rel)] = info
+        except OSError as e:
+            on_err(e, entry.path)
+    return files, dirs, subdirs
+
+
+# ----------------------------------------------------------------------
 # Scanner (the background worker)
 # ----------------------------------------------------------------------
 
@@ -625,10 +771,15 @@ class _Scanner(threading.Thread):
     every directory and every file, so a scan of a huge tree stops
     within one file's read of clicking Close.
 
-    os.walk is used with its default followlinks=False, so symlinked
-    directories never create cycles; symlinked FILES are stat()ed
-    through (their target's size/content is compared -- the useful
-    semantic for "did anything change here").
+    The walk is one _scan_dir per directory (flat scandir; entries
+    carry size/mtime on Windows, so no per-file stat() at all).
+    Symlinked directories get a row but are never descended (os.walk's
+    followlinks=False semantics -- no cycles); symlinked FILES are
+    statted through (their target's size/content is compared -- the
+    useful semantic for "did anything change here"). Directories and
+    equal-size content tests run on the scan pool; with the cProfile
+    layer on, everything runs serially on this thread so the profile
+    sees it (see the module docstring's "The scan engine").
 
     Walk errors (unreadable folders, permission problems) are collected
     (bounded, first 50) into walk_errors instead of aborting the scan:
@@ -650,10 +801,11 @@ class _Scanner(threading.Thread):
         # Profile object is created and enabled HERE, on the thread it
         # must trace -- cProfile only traces the thread that called
         # enable(); the main thread's UI work is covered by the form's
-        # own Profile. The pair is stopped+printed by the form at the
-        # scan's natural end (never from this thread: printing is a
-        # main-thread concern), and cancelled without printing on
-        # every abandonment path.
+        # own Profile. While this is active, _scan runs in SERIAL mode
+        # (no pool) so the profile sees every walk/hash call. The pair
+        # is stopped+printed by the form at the scan's natural end
+        # (never from this thread: printing is a main-thread concern),
+        # and cancelled without printing on every abandonment path.
         self.cprofile_on = cprofile_on
         self.cprofile = None      # (pr, stream) once run() started it
         self.cancel_evt = threading.Event()
@@ -697,141 +849,206 @@ class _Scanner(threading.Thread):
             with self.lock:
                 self.finished = True
 
-    def _walk_err(self, e):
+    def _walk_err(self, e, path):
         if len(self.walk_errors) < 50:
             try:
-                self.walk_errors.append((e.filename or '?', str(e)))
+                self.walk_errors.append((path or '?', str(e)))
             except Exception:
                 pass
 
-    def _walk(self, root):
-        """Return (files, dirs): normcase(relpath) -> relpath for dirs,
-        normcase(relpath) -> (relpath, size, mtime) for files. Files not
-        passing the mask are skipped entirely (WinMerge behavior:
-        a mask hides files, it does not mark them). A file whose stat()
-        fails gets (-1, -1) so _file_row can flag it unreadable."""
+    def _walks(self, pool):
+        """Walk BOTH trees; returns (files_l, dirs_l, files_r, dirs_r).
+
+        With a pool: breadth-first WAVES of concurrent directory scans
+        -- wave 1 scans the two roots, wave 2 every subfolder wave 1
+        found, and so on (a wave's jobs all run at once; the next wave
+        is submitted when the whole wave finished). The wall time
+        therefore approaches the slowest directory per depth level
+        instead of the sum over all directories -- the win on sources
+        where every metadata call is expensive (network share, cloud
+        placeholders, antivirus). Without a pool (the cProfile layer
+        is on: it traces only THIS thread, so the scan runs serially
+        on purpose, or SCAN_POOL_THREADS is 1) the same _scan_dir
+        runs inline, the left tree first, then the right.
+
+        Per-side totals are booked as dirs:walk_left / dirs:walk_right
+        (thread-safe standalone marks; in the parallel mode the two
+        rows overlap in wall time -- both are honest).
+        """
+        prof = Profiler.is_enabled()
+        roots = (('left', self.dir_l), ('right', self.dir_r))
         files = {}
         dirs = {}
-        if self.recursive:
-            for dirpath, dirnames, filenames in os.walk(
-                    root, onerror=self._walk_err):
-                if self.cancelled():
-                    return files, dirs
-                base = os.path.relpath(dirpath, root)
-                if base == '.':
-                    base = ''
-                for d in dirnames:
-                    rel = d if not base else os.path.join(base, d)
-                    dirs[os.path.normcase(rel)] = rel
-                for fn in filenames:
-                    if not _mask_ok(fn, self.mask):
-                        continue
-                    rel = fn if not base else os.path.join(base, fn)
-                    try:
-                        st = os.stat(os.path.join(dirpath, fn))
-                        info = (rel, st.st_size, st.st_mtime)
-                    except OSError:
-                        info = (rel, -1, -1)
-                    files[os.path.normcase(rel)] = info
-        else:
-            try:
-                it = os.scandir(root)
-            except OSError as e:
-                self._walk_err(e)
-                return files, dirs
-            with it:
-                for entry in it:
-                    if self.cancelled():
-                        return files, dirs
-                    try:
-                        if entry.is_dir(follow_symlinks=False):
-                            dirs[os.path.normcase(entry.name)] = entry.name
-                            continue
-                        if not entry.is_file():
-                            continue  # sockets, fifos, devices...
-                        if not _mask_ok(entry.name, self.mask):
-                            continue
-                        st = entry.stat()  # through symlinks: compare
-                        info = (entry.name, st.st_size, st.st_mtime)  # targets
-                    except OSError as e:
-                        self._walk_err(e)
-                        continue
-                    files[os.path.normcase(entry.name)] = info
-        return files, dirs
+        for side, root in roots:
+            files[side] = {}
+            dirs[side] = {}
+
+        if pool is None:
+            for side, root in roots:
+                t0 = time.perf_counter()
+                stack = ['']
+                i = 0
+                while i < len(stack) and not self.cancelled():
+                    base = stack[i]
+                    i += 1
+                    f, d, subs = _scan_dir(root, base, self.mask,
+                                           self.cancel_evt, self._walk_err)
+                    files[side].update(f)
+                    dirs[side].update(d)
+                    if self.recursive:
+                        stack.extend(subs)
+                if prof:
+                    Profiler.mark_standalone('dirs:walk_' + side,
+                                             time.perf_counter() - t0)
+            return files['left'], dirs['left'], files['right'], dirs['right']
+
+        t0s = {}
+        booked = set()
+        for side, _root in roots:
+            t0s[side] = time.perf_counter()
+        wave = [(side, '') for side, _root in roots]
+        while wave and not self.cancelled():
+            futs = {}
+            for side, base in wave:
+                root = self.dir_l if side == 'left' else self.dir_r
+                fut = pool.submit(_scan_dir, root, base, self.mask,
+                                  self.cancel_evt, self._walk_err)
+                futs[fut] = side
+            wait(list(futs))               # the whole wave (ALL_COMPLETED)
+            nxt = []
+            for fut, side in futs.items():
+                try:
+                    f, d, subs = fut.result()
+                except Exception:
+                    continue   # _scan_dir books its own errors; paranoia
+                files[side].update(f)
+                dirs[side].update(d)
+                if self.recursive and not self.cancelled():
+                    nxt.extend((side, s) for s in subs)
+            wave = nxt
+            for side, _root in roots:
+                if side not in booked and not any(w[0] == side
+                                                  for w in wave):
+                    booked.add(side)
+                    if prof:
+                        Profiler.mark_standalone(
+                            'dirs:walk_' + side,
+                            time.perf_counter() - t0s[side])
+        return files['left'], dirs['left'], files['right'], dirs['right']
 
     def _scan(self):
         """Walk both trees, then build the rows. Every step is booked
         to the profiler as thread-safe standalone marks (this method
         runs on the worker thread -- see the note in _contents_equal
-        about why not sections)."""
+        about why not sections). The walk and the equal-size content
+        tests run on the scan pool (see the module docstring's "The
+        scan engine"); with the cProfile layer active the pool is
+        skipped, so the profile sees every call on THIS thread."""
         prof = Profiler.is_enabled()
-
-        t0 = time.perf_counter()
-        files_l, dirs_l = self._walk(self.dir_l)
-        if prof:
-            Profiler.mark_standalone('dirs:walk_left',
-                                     time.perf_counter() - t0)
-        t0 = time.perf_counter()
-        files_r, dirs_r = self._walk(self.dir_r)
-        if prof:
-            Profiler.mark_standalone('dirs:walk_right',
-                                     time.perf_counter() - t0)
-        if self.cancelled():
-            return
-
-        t0 = time.perf_counter()
-        dir_keys = sorted(set(dirs_l) | set(dirs_r))
-        file_keys = sorted(set(files_l) | set(files_r))
-        if prof:
-            Profiler.mark_standalone('dirs:pair_keys',
-                                     time.perf_counter() - t0,
-                                     2)  # two merges+sorts per call
-        with self.lock:
-            self.total = len(dir_keys) + len(file_keys)
-
-        # Folder rows first (they are also the skeleton of the partial
-        # view while the file rows stream in behind them).
-        t0 = time.perf_counter()
-        for k in dir_keys:
+        pool = None
+        if self.cprofile is None and SCAN_POOL_THREADS > 1:
+            try:
+                pool = ThreadPoolExecutor(
+                    max_workers=SCAN_POOL_THREADS,
+                    thread_name_prefix='Differ2DirScan')
+            except Exception:
+                pool = None
+        try:
+            files_l, dirs_l, files_r, dirs_r = self._walks(pool)
             if self.cancelled():
                 return
-            rl = dirs_l.get(k)
-            rr = dirs_r.get(k)
-            rel = rl if rl is not None else rr
-            ml = _stat_side(os.path.join(self.dir_l, rel))[1] \
-                if rl is not None else None
-            mr = _stat_side(os.path.join(self.dir_r, rel))[1] \
-                if rr is not None else None
-            with self.lock:
-                self.rows.append(_dir_row(rel, ml, mr,
-                                          rl is not None, rr is not None))
-        if prof:
-            Profiler.mark_standalone('dirs:dir_rows',
-                                     time.perf_counter() - t0,
-                                     len(dir_keys))
 
-        t0 = time.perf_counter()
-        n_files = 0
-        for k in file_keys:
-            if self.cancelled():
-                return
-            fl = files_l.get(k)
-            fr = files_r.get(k)
-            sl = (fl[1], fl[2]) if fl is not None else None
-            sr = (fr[1], fr[2]) if fr is not None else None
-            rel = (fl or fr)[0]
-            row = _file_row(self.dir_l, self.dir_r, rel, sl, sr,
-                            self.quick_only, self.method)
-            n_files += 1
+            t0 = time.perf_counter()
+            dir_keys = sorted(set(dirs_l) | set(dirs_r))
+            file_keys = sorted(set(files_l) | set(files_r))
+            if prof:
+                Profiler.mark_standalone('dirs:pair_keys',
+                                         time.perf_counter() - t0,
+                                         2)  # two merges+sorts per call
             with self.lock:
-                self.rows.append(row)
-        if prof:
-            # NOTE: this stretch INCLUDES the content-test time (the
-            # dirs:tier_* rows are booked inside); the row-building
-            # self time is the difference. Booked with the file count
-            # so the per-file average is readable in the report.
-            Profiler.mark_standalone('dirs:file_rows',
-                                     time.perf_counter() - t0, n_files)
+                self.total = len(dir_keys) + len(file_keys)
+
+            # Folder rows first (they are also the skeleton of the
+            # partial view while the file rows stream in behind them).
+            # The walk already collected every folder's mtime with its
+            # listing -- zero stat() calls in this whole loop.
+            t0 = time.perf_counter()
+            for k in dir_keys:
+                if self.cancelled():
+                    return
+                rl = dirs_l.get(k)
+                rr = dirs_r.get(k)
+                if rl is not None:
+                    rel, ml = rl
+                else:
+                    rel, ml = rr[0], None
+                mr = rr[1] if rr is not None else None
+                with self.lock:
+                    self.rows.append(_dir_row(rel, ml, mr,
+                                              rl is not None, rr is not None))
+            if prof:
+                Profiler.mark_standalone('dirs:dir_rows',
+                                         time.perf_counter() - t0,
+                                         len(dir_keys))
+
+            # File rows. Pass 1 applies every verdict the stats decide
+            # and submits the owed content tests (equal-size pairs) to
+            # the pool; pass 2 takes their results in sorted order, so
+            # rows still stream into the list one by one, in order,
+            # while the remaining tests keep running in parallel.
+            t0 = time.perf_counter()
+            n_files = 0
+            decided = []          # (key, row, content) in file_keys order
+            pending = {}          # key -> Future of the content test
+            for k in file_keys:
+                if self.cancelled():
+                    return
+                fl = files_l.get(k)
+                fr = files_r.get(k)
+                sl = (fl[1], fl[2]) if fl is not None else None
+                sr = (fr[1], fr[2]) if fr is not None else None
+                rel = (fl or fr)[0]
+                row, content = _file_row_base(self.dir_l, self.dir_r,
+                                              rel, sl, sr, self.method)
+                if content is not None and pool is not None:
+                    pending[k] = pool.submit(_contents_equal,
+                                             content[0], content[1],
+                                             content[2], self.quick_only)
+                decided.append((k, row, content))
+                n_files += 1
+            for k, row, content in decided:
+                if self.cancelled():
+                    return
+                if content is not None:
+                    if k in pending:
+                        try:
+                            same = pending[k].result()
+                        except Exception:
+                            same = None
+                    else:
+                        # serial mode (cProfile on / pool off)
+                        same = _contents_equal(content[0], content[1],
+                                               content[2], self.quick_only)
+                    row['status'] = (ST_ERR if same is None
+                                     else (ST_SAME if same else ST_DIFF))
+                with self.lock:
+                    self.rows.append(row)
+            if prof:
+                # NOTE: this stretch INCLUDES the content-test time (the
+                # dirs:tier_* rows are booked inside _contents_equal, on
+                # the pool threads -- thread-safe standalone marks);
+                # the row-building self time is the difference. Booked
+                # with the file count so the per-file average is
+                # readable in the report.
+                Profiler.mark_standalone('dirs:file_rows',
+                                         time.perf_counter() - t0, n_files)
+        finally:
+            if pool is not None:
+                # Python 3.8-compatible shutdown (no cancel_futures=
+                # parameter there): queued jobs no-op instantly -- the
+                # first thing _scan_dir checks is the cancel event --
+                # so wait=True returns promptly even after a cancel.
+                pool.shutdown(wait=True)
 
 
 # ----------------------------------------------------------------------
@@ -866,12 +1083,15 @@ def _prof_begin_scan(cmd):
     the scanner thread should start the cProfile layer.
 
     The cProfile layer belongs to the SCANNER thread (see the comment
-    block above): Python 3.12+ permits one active profiling tool per
-    process, so a main-thread profile would silently block the
-    scanner's -- and the scanner is where a folder compare can be
-    slow. The scanner claims the slot; if another profiling tool
-    already holds it, its start_profiling() fails quietly and the
-    scan runs with the section profiler only."""
+    block above) -- that is where a folder compare can be slow, and
+    cProfile only traces the thread that called enable(). Python up
+    to 3.11: profiles are per-thread, so it would coexist with a
+    simultaneously profiled tab compare anyway. Python 3.12+: one
+    active profiling tool per PROCESS -- the scanner claims the slot;
+    if another tool already holds it, start_profiling() fails quietly
+    and the scan runs with the section profiler only (and stays
+    parallel). While the layer IS on, the scan runs serially so the
+    profile sees every walk/hash call."""
     global _prof_users, _prof_enabled_here
     # Load the config FIRST so the gate sees the current option value
     # (same order as refresh_compare -- without this, the first scan
@@ -927,7 +1147,7 @@ def _prof_finish_scan(cmd, token, worker, dir_l, dir_r):
     if cprof_scan:
         try:
             stop_profiling(cprof_scan[0], cprof_scan[1],
-                           max_lines=25,
+                           sort_key='time', max_lines=100,
                            title='Differ 2 folder compare: scanner thread'
                                  ' (cProfile)')
         except Exception:
