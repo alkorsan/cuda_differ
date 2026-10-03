@@ -1,3 +1,61 @@
+2026.10.03 (6th release, by @alkorsan)
++ feature: the profiling report's SELF column now ADDS UP. The user's
+  report showed worker 8.3 s + listing 5.1 s + walk_left 4.3 s for an
+  8 s scan (sum 221.9%): the dirs:* rows were standalone marks that
+  did not nest, so the same milliseconds appeared in up to three
+  rows. Bookings now carry their start times as SPANS (profiling.py,
+  _Row.spans) and the report rebuilds the nesting a shared section
+  stack cannot give cross-thread work: listings nest under the walk
+  that listed them (a parent hint pins each listing to its own tree
+  even when the two walks start at the same instant), the walks, row
+  phases, content tests, UI rows and lags nest under dirs:worker,
+  and worker's SELF becomes just the glue left over -- a serial scan
+  now sums to ~100% of the outermost row, like the tab compare's
+  stack families always did. Rows whose spans overlapped a sibling
+  are tagged "(parallel)" (the two walks of a parallel scan): their
+  totals are per-thread walls, and the report prints the parallel
+  overlap under the sum line -- counting it once, the SELF column
+  totals ~100% in EVERY scan mode. The report's baseline is now the
+  widest span, not the largest summed total (nine parallel listings
+  can sum above the scan wall; their widest single span cannot).
++ feature: environment probe -- the report now NAMES the culprit when
+  listings are slow. Two scandir round trips on the compared folder
+  vs one on the system disk (SystemRoot\System32), booked as
+  dirs:env_probe BEFORE the scan starts, in THIS python.exe. The
+  facts block prints the numbers and the verdict: "that volume is
+  slow" (probe slow, system disk fast -- a filter driver bills the
+  volume), "every file operation in this process pays ~X ms" (both
+  slow -- real-time antivirus scrutinizes the unsigned interpreter;
+  a signed tool like WinMerge doesn't pay that tax; add CudaText +
+  its Python and the compared folders to the AV exclusions), or
+  "fast right now" (warm caches; reproduce cold). This answers the
+  "WinMerge is instant on the same folders" observation with
+  measurements instead of theory: the plugin already makes WinMerge's
+  exact listing call; when it costs 300-800 ms here and ~0 there,
+  the difference is the process, not the algorithm.
++ fix: the ~3.2 s gap between dirs:worker's wall and the profiled
+  window in the cProfile run is found and moved out of the scan:
+  start_profiling() imports cProfile/profile/pstats LAZILY, and with
+  CudaText on the slow drive those module loads ran inside the
+  scanner thread BEFORE pr.enable() -- invisible to cProfile itself,
+  booked nowhere, and paid on every first profiled scan of a
+  session. The imports are now pre-warmed by _prof_begin_scan on the
+  MAIN thread before the scan starts (booked as dirs:cprofile_import,
+  outside the scan wall), and the scanner thread's own remaining
+  setup is booked as dirs:cprofile_setup (~0 once pre-warmed).
++ fix: the facts block said "file rows: 0 left / 0 right; folder
+  rows: 0 / 0" about scans that had built every row: the walk booked
+  files_left/dirs_left (side names) while the block printed
+  files_l/dirs_l (single letters) -- invisible keys. Both branches
+  (serial + parallel) now book the printed keys, and the block also
+  states the entries/files/folders per side explicitly.
++ change: the cProfile-inflated rows are no longer the only story the
+  report tells about a serial run: with spans, the same report shows
+  the true chain scan_wall > worker > walk > listing with honest
+  self times at every level, and the "Sum of self times" line is
+  computed from them (the old line summed the double counts).
+
+
 2026.10.03 (5th release, by @alkorsan)
 + feature: WinMerge's "quick contents" compare engine. The user's new
   profiling (8 s first compare, 2 s later ones) showed the listings

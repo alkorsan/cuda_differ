@@ -328,6 +328,21 @@ even the cold runs are too slow, exclude the compared folders (or
 the editor's Python) from real-time antivirus scanning, or switch
 the compare method to "Size and timestamp" below.
 
+"But WinMerge is instant on the same folders": when every single
+listing costs 300-800 ms and another tool on the same folders is
+instant, the difference is usually the PROCESS, not the algorithm --
+the plugin already makes WinMerge's exact listing call. A real-time
+antivirus can bill every file operation of an unsigned python.exe
+while a signed, well-known executable passes its filter untouched:
+same calls, different process, a 100x different bill (the effect
+also hits loading the cProfile stdlib from such a drive -- seconds).
+The profiled scan measures this directly: the "metadata probe" in
+the facts block times round trips on the compared folder vs the
+system disk, in this process, and prints the verdict -- "that volume
+is slow" (exclude the volume), "this process pays the antivirus tax"
+(add CudaText and its Python to the AV exclusions; WinMerge never
+paid it), or "warm right now" (reproduce cold to see the cost).
+
 The window's controls:
 
 - The two path edits are editable: type two paths and press Refresh
@@ -406,7 +421,8 @@ Profiling a folder compare: the whole pipeline is instrumented with
 the plugin's own profiler (see the "Profiling" section of this readme
 for the general story). Turn on differ2.advanced.enable_profiling (and
 additionally differ2.advanced.enable_cprofile for the function-level
-layer), run a compare, and read the report in the console: the
+layer), run a compare, and read the report in the console. The rows
+NEST by time containment (see below), so the SELF column adds up:
 dirs:listing rows show the directory-listing time (calls = listings,
 max = the single slowest listing -- pure metadata round-trip latency:
 disk, antivirus, network; huge values mean the SOURCE is slow, and
@@ -414,15 +430,31 @@ any other tool pays the same on a cold tree); dirs:quick_content
 rows show the content-read time (huge values mean the file SOURCE is
 slow: network share, cloud placeholders downloading, antivirus --
 switch the compare method to "Size and timestamp");
-dirs:walk_left/right summarize each tree's walk; dirs:spawn_lag and
-dirs:finish_lag measure the kick-off and tick-adoption overheads, so
-walks + content + lags + ui rows add up to the dirs:scan_wall total;
-dirs:ui_* show the CudaText API time on the main thread.
+dirs:walk_left/right summarize each tree's walk (listings subtract
+from them); dirs:worker is the scan wall MINUS everything inside it
+(just the glue); dirs:spawn_lag and dirs:finish_lag measure the
+kick-off and tick-adoption overheads; dirs:ui_* show the CudaText
+API time on the main thread. Rows printed with a "(parallel)" tag
+ran at the same time as a sibling row (the two walks in a parallel
+scan): their totals are per-thread walls, and the report prints the
+parallel overlap right under the sum line -- counting the overlap
+once, the SELF column totals ~100% of the outermost row in every
+scan mode; a serial scan simply sums to ~100%.
+Two diagnostic rows sit OUTSIDE the scan wall, booked before the
+scan starts: dirs:env_probe (two metadata round trips on the left
+folder vs one on the system disk -- the numbers that tell "that
+volume is slow" from "every file operation in this python.exe pays
+an antivirus tax while WinMerge's signed exe doesn't" from "caches
+are warm right now") and dirs:cprofile_import (the one-time cost of
+loading the cProfile stdlib, pre-warmed on the main thread so it
+cannot hide inside the scanner thread; seconds when CudaText's
+Python lives on a slow, filtered drive).
 After the section report a compact "folder scan facts" block prints
-the same story in five lines: listings count with total/slowest/
-average latency, tree sizes, how many content pairs stopped at the
-first difference vs were read to the end, and whether the run was
-serial because the cProfile layer was on.
+the same story in a few lines: the environment probe with its
+verdict, listings count with total/slowest/average latency, tree
+sizes (file and folder rows per side), how many content pairs
+stopped at the first difference vs were read to the end, and whether
+the run was serial because the cProfile layer was on.
 The cProfile layer runs on the scanner thread (the walk/compare work)
 and prints its function report sorted by INTERNAL time
 (sort_key='time'), so the real bottleneck function sits at the top.

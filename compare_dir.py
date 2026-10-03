@@ -110,9 +110,27 @@ second, identical one, because the background scan finished by
 then). The engine minimizes the number of metadata round trips and
 hides the rest behind concurrency, but the first-ever compare of
 freshly copied folders can still be slower than every later one.
-For folders you compare often, excluding them (or the editor's
-Python) from real-time antivirus scanning removes that cost
-entirely.
+
+When EVERY listing costs hundreds of milliseconds and WinMerge on
+the same folders is instant, the cause is usually not the folder at
+all: a real-time antivirus can bill every file operation of THIS
+python.exe (an unsigned interpreter) while a signed, well-known
+executable like WinMerge.exe passes its filter untouched -- same
+calls, different process, 100x different bill. The profiled scan
+now measures exactly that, twice over: the ENVIRONMENT PROBE (two
+scandir round trips on the compared root vs one on the system disk,
+booked as dirs:env_probe BEFORE the scan, before the pair even
+starts) discriminates "that volume is slow" (probe slow, system
+disk fast) from "this process pays an antivirus tax on everything"
+(both slow) from "warm caches right now" (both fast); and the
+cProfile layer's stdlib import cost -- seconds, when CudaText's
+Python lives on such a drive -- is pre-warmed on the MAIN thread
+(dirs:cprofile_import, outside the scan wall) instead of hiding as
+an unexplained gap inside the scanner thread. The facts block
+prints the probe numbers and the matching advice (see
+_prof_facts_block). For folders compared often, excluding them
+(and CudaText's Python) from real-time antivirus scanning removes
+that cost entirely.
 
 == Threading model ==================================================
 
@@ -148,12 +166,30 @@ like a tab compare does:
     main-thread UI work (dirs:ui_*, dirs:picker, dirs:form_build,
     dirs:open_compare_pair) as sections/marks. The report prints at
     the scan's natural end, followed by the "folder scan facts"
-    block (see _prof_facts_block): listings count + their total/
+    block (see _prof_facts_block): the environment probe (see the
+    scan-engine chapter above), listings count + their total/
     slowest/average latency, tree sizes, how much content the
     compare read, and whether the run was serial because the
     cProfile layer was on. A cancelled scan (rescan, window closed)
     cancels its pending pieces and prints nothing, like the tab
     compare's cancel path.
+
+    NESTED ACCOUNTING (this is what makes the report's numbers
+    add up): the dirs:* bookings carry their start times as SPANS
+    (profiling.py, _Row.spans), and the report rebuilds the nesting
+    a shared section stack cannot give cross-thread work: listings
+    nest under the walk that listed them (a parent hint pins each
+    to its own tree even when the two walks overlap), the walks,
+    row phases, content tests, UI rows and lags nest under
+    dirs:worker, and worker's SELF becomes just the glue left
+    over. Rows whose spans overlapped a sibling carry the
+    "(parallel)" tag: their totals are per-thread walls, and the
+    report prints the parallel overlap under the table -- counting
+    it once, the SELF column totals ~100% of the outermost row in
+    every scan mode (a serial scan simply sums to ~100%). The
+    report's baseline is likewise the widest SPAN, not the largest
+    summed total (nine parallel listings can sum above the scan
+    wall; their widest single span cannot).
   * the cProfile layer, additionally gated by
     differ2.advanced.enable_cprofile (same double gate as the tab
     compare): ONE profile, started INSIDE the scanner thread -- it
@@ -161,17 +197,25 @@ like a tab compare does:
     compare that can actually be slow (the main thread's UI phases
     are already phase-measured by the section rows dirs:ui_*, and
     the main thread is what the tab compare's own cProfile layer
-    covers). While this layer is on the scan runs in its SERIAL
-    one-thread mode, so the profile sees every walk/hash call. On
-    Python up to 3.11 profiles are per-thread and the scanner's
-    layer would coexist with a simultaneously profiled tab compare
-    anyway; Python 3.12+ allows one active profiling tool per
-    PROCESS -- there the scanner claims the slot, and if something
-    else already holds it, start_profiling() fails quietly, the
-    layer stays off for this scan and the scan stays parallel.
-    Printed after the section report at the scan's natural end,
-    sorted by internal time (sort_key='time'), max_lines=100: the
-    real bottleneck function sits at the top of the table.
+    covers). Its stdlib (cProfile/profile/pstats) is pre-warmed by
+    _prof_begin_scan on the MAIN thread, BEFORE the scan starts
+    (booked as dirs:cprofile_import -- a per-SESSION cost; without
+    the pre-warm those imports ran inside the scanner thread, and
+    on a drive where every file open costs ~300-800 ms they hid
+    there as a seconds-wide gap between dirs:worker's wall and the
+    profiled window); the scanner thread's own setup is booked as
+    dirs:cprofile_setup and is ~0 once pre-warmed. While this
+    layer is on the scan runs in its SERIAL one-thread mode, so
+    the profile sees every walk/hash call. On Python up to 3.11
+    profiles are per-thread and the scanner's layer would coexist
+    with a simultaneously profiled tab compare anyway; Python 3.12+
+    allows one active profiling tool per PROCESS -- there the
+    scanner claims the slot, and if something else already holds
+    it, start_profiling() fails quietly, the layer stays off for
+    this scan and the scan stays parallel. Printed after the
+    section report at the scan's natural end, sorted by internal
+    time (sort_key='time'), max_lines=100: the real bottleneck
+    function sits at the top of the table.
 
 This is the tool to answer "why is my compare slow": the listing
 rows show the directory-listing latency (metadata round trips),
@@ -520,6 +564,15 @@ def _facts_reset():
         'pairs_early': 0,       # stopped at the first differing chunk
         'pairs_full': 0,        # read to the end (identical, or sampled)
         'pair_bytes': 0,        # bytes read by content tests
+        # environment probe (booked in _prof_begin_scan, BEFORE the
+        # scan): per-round-trip scandir times on the compared root vs
+        # a control directory -- the numbers that separate "the drive
+        # / these folders are slow" from "every file operation in
+        # THIS python.exe is slow" (real-time antivirus billing the
+        # process; WinMerge's signed exe doesn't pay that).
+        'probe_root_ms': [],    # scandir round trips on the left root
+        'probe_ctrl_ms': None,  # same on the control dir (C:\Windows),
+                                # None = control dir not available
     }
 
 
@@ -538,10 +591,20 @@ def _facts_add(**kw):
 _facts_reset()
 
 
-def _book_listing(dt, n_entries, side):
-    """One directory listing finished: profiler row + facts counters."""
+def _book_listing(dt, n_entries, side, t0=None):
+    """One directory listing finished: profiler row + facts counters.
+    t0 (the listing's start) is passed through as the row's SPAN, with
+    the owning walk as its parent hint: the report nests this row
+    under that walk (see profiling.py, _Row.spans) instead of double-
+    counting it against the walk AND the worker wall. The hint matters
+    in a parallel scan, where both walks start at the same instant
+    and time containment alone could pin a listing to the wrong
+    tree's walk."""
     if Profiler.is_enabled():
-        Profiler.mark_standalone('dirs:listing', dt, 1, dt)
+        parent = 'dirs:walk_' + side if side in ('left', 'right') \
+            else None
+        Profiler.mark_standalone('dirs:listing', dt, 1, dt, t0=t0,
+                                 parent=parent)
         _facts_add(listings=1, listing_ms=dt * 1000.0)
         facts = _SCAN_FACTS
         if dt * 1000.0 > facts.get('listing_ms_max', 0.0):
@@ -614,7 +677,8 @@ def _quick_contents_equal(pl, pr, size, quick_only, cancel_evt=None):
     finally:
         if Profiler.is_enabled():
             dt = time.perf_counter() - t0
-            Profiler.mark_standalone('dirs:quick_content', dt, 1, dt)
+            Profiler.mark_standalone('dirs:quick_content', dt, 1, dt,
+                                     t0=t0)
             kw = {'pairs': 1, 'pair_bytes': n_bytes}
             kw['pairs_early' if early else 'pairs_full'] = 1
             _facts_add(**kw)
@@ -951,7 +1015,8 @@ def _scan_dir(root, base, mask, cancel_evt, on_err, side=''):
         try:
             t0 = time.perf_counter()
             entries, err = _WIN_FIND(os.path.join(full, '*'))
-            _book_listing(time.perf_counter() - t0, len(entries), side)
+            _book_listing(time.perf_counter() - t0, len(entries),
+                          side, t0)
         except Exception:
             entries = None               # unexpected: scandir fallback
         else:
@@ -998,7 +1063,7 @@ def _scan_dir(root, base, mask, cancel_evt, on_err, side=''):
                     break
     except OSError as e:
         on_err(e, full)   # keep entries listed before the failure
-    _book_listing(time.perf_counter() - t0, len(entries), side)
+    _book_listing(time.perf_counter() - t0, len(entries), side, t0)
     for entry in entries:
         if cancel_evt is not None and cancel_evt.is_set():
             break
@@ -1129,17 +1194,30 @@ class _Scanner(threading.Thread):
             # this thread actually runs: scheduling + the main thread's
             # remaining kick-off work. On a healthy setup this is ~0;
             # a large value means the scan started late, not that it ran
-            # slow -- the row keeps that question answerable.
+            # slow -- the row keeps that question answerable. Booked
+            # with its span: the report nests it under dirs:worker.
             lag = time.perf_counter() - self._t_spawn
             try:
-                Profiler.mark_standalone('dirs:spawn_lag', lag, 1, lag)
+                Profiler.mark_standalone('dirs:spawn_lag', lag, 1, lag,
+                                         t0=self._t_spawn)
             except Exception:
                 pass
         pr = s = None
         if self.cprofile_on and Profiler.is_enabled():
+            # The cProfile layer's SETUP is timed and booked: the
+            # imports inside start_profiling (cProfile + profile on
+            # first use; pstats is pre-warmed by _prof_begin_scan on
+            # the main thread) can cost SECONDS when CudaText and its
+            # Python live on a slow / heavily-filtered drive -- a
+            # per-SESSION cost that used to hide inside dirs:worker's
+            # wall with no row of its own.
             try:
+                t0 = time.perf_counter()
                 pr, s = start_profiling()
                 self.cprofile = (pr, s)
+                dt = time.perf_counter() - t0
+                Profiler.mark_standalone('dirs:cprofile_setup',
+                                         dt, 1, dt, t0=t0)
             except Exception:
                 pr = s = None
         try:
@@ -1178,11 +1256,22 @@ class _Scanner(threading.Thread):
         left tree first, then the right.
 
         Per-side totals are booked as dirs:walk_left / dirs:walk_right
-        (thread-safe standalone marks) when a side fully drains -- its
-        last outstanding job completed and discovered nothing new.
+        (thread-safe standalone marks, WITH their time spans: the
+        report nests the listings that ran inside each walk under it,
+        and nests the walks under dirs:worker -- so the family's SELF
+        times sum to ~100% of the scan wall instead of counting the
+        same milliseconds two or three times) when a side fully drains
+        -- its last outstanding job completed and discovered nothing
+        new.
         """
         prof = Profiler.is_enabled()
         sides = ('left', 'right')
+        # facts-counter key suffix per side ('files_l' / 'files_r' ...
+        # -- the keys _prof_facts_block prints; booking 'files_' +
+        # side used to create files_left/files_right, which nothing
+        # ever printed: the report said "file rows: 0" about a scan
+        # that had built every row)
+        fkey = {'left': 'l', 'right': 'r'}
         roots = {'left': self.dir_l, 'right': self.dir_r}
         files = {s: {} for s in sides}
         dirs = {s: {} for s in sides}
@@ -1202,13 +1291,16 @@ class _Scanner(threading.Thread):
                     dirs[side].update(d)
                     self.scanned_dirs += 1
                     if Profiler.is_enabled():
-                        _facts_add(**{'files_' + side: len(f),
-                                      'dirs_' + side: len(d)})
+                        _facts_add(**{'files_' + fkey[side]: len(f),
+                                      'dirs_' + fkey[side]: len(d)})
                     if self.recursive:
                         stack.extend(subs)
                 if prof:
-                    Profiler.mark_standalone('dirs:walk_' + side,
-                                             time.perf_counter() - t0)
+                    Profiler.mark_standalone(
+                        'dirs:walk_' + side,
+                        time.perf_counter() - t0, 1,
+                        time.perf_counter() - t0, t0=t0,
+                        parent='dirs:worker')
             return files['left'], dirs['left'], files['right'], dirs['right']
 
         t0s = {s: time.perf_counter() for s in sides}
@@ -1237,8 +1329,8 @@ class _Scanner(threading.Thread):
                 dirs[side].update(d)
                 self.scanned_dirs += 1
                 if Profiler.is_enabled():
-                    _facts_add(**{'files_' + side: len(f),
-                                  'dirs_' + side: len(d)})
+                    _facts_add(**{'files_' + fkey[side]: len(f),
+                                  'dirs_' + fkey[side]: len(d)})
                 if self.recursive and not self.cancelled():
                     for rel in subs:
                         submit(side, rel)
@@ -1251,7 +1343,9 @@ class _Scanner(threading.Thread):
                         if prof:
                             Profiler.mark_standalone(
                                 'dirs:walk_' + side,
-                                time.perf_counter() - t0s[side])
+                                time.perf_counter() - t0s[side], 1,
+                                time.perf_counter() - t0s[side],
+                                t0=t0s[side], parent='dirs:worker')
         return files['left'], dirs['left'], files['right'], dirs['right']
 
     def _scan(self):
@@ -1280,9 +1374,9 @@ class _Scanner(threading.Thread):
             dir_keys = sorted(set(dirs_l) | set(dirs_r))
             file_keys = sorted(set(files_l) | set(files_r))
             if prof:
-                Profiler.mark_standalone('dirs:pair_keys',
-                                         time.perf_counter() - t0,
-                                         2)  # two merges+sorts per call
+                dt = time.perf_counter() - t0
+                Profiler.mark_standalone('dirs:pair_keys', dt, 2, dt,
+                                         t0=t0)  # two merges+sorts per call
             with self.lock:
                 self.total = len(dir_keys) + len(file_keys)
 
@@ -1305,9 +1399,12 @@ class _Scanner(threading.Thread):
                     self.rows.append(_dir_row(rel, ml, mr,
                                               rl is not None, rr is not None))
             if prof:
-                Profiler.mark_standalone('dirs:dir_rows',
-                                         time.perf_counter() - t0,
-                                         len(dir_keys))
+                dt = time.perf_counter() - t0
+                # Booked with its span: the report nests it under
+                # dirs:worker (and nests the content tests that ran
+                # inside this stretch under IT).
+                Profiler.mark_standalone('dirs:dir_rows', dt,
+                                         len(dir_keys), dt, t0=t0)
 
             # File rows. Pass 1 applies every verdict the stats decide
             # and submits the owed content tests (equal-size pairs) to
@@ -1357,11 +1454,13 @@ class _Scanner(threading.Thread):
                 # NOTE: this stretch INCLUDES the content-test time (the
                 # dirs:quick_content rows are booked inside
                 # _quick_contents_equal, on the pool threads -- thread-
-                # safe standalone marks); the row-building self time is
-                # the difference. Booked with the file count so the
-                # per-file average is readable in the report.
-                Profiler.mark_standalone('dirs:file_rows',
-                                         time.perf_counter() - t0, n_files)
+                # safe standalone marks WITH spans, so the report
+                # subtracts them from THIS row); the row-building self
+                # time is the difference. Booked with the file count so
+                # the per-file average is readable in the report.
+                dt = time.perf_counter() - t0
+                Profiler.mark_standalone('dirs:file_rows', dt, n_files,
+                                         dt, t0=t0)
         finally:
             if pool is not None:
                 # Python 3.8-compatible shutdown (no cancel_futures=
@@ -1397,10 +1496,43 @@ _prof_users = 0            # profiled scans currently running
 _prof_enabled_here = False # WE flipped Profiler.enabled for this batch
 
 
-def _prof_begin_scan(cmd):
+def _prof_probe_one(path):
+    """One metadata round trip: open a directory listing, pull ONE
+    entry, close. The cheapest file operation any tool performs --
+    its wall time is the per-operation tax THIS python.exe pays on
+    'path'. Returns seconds, or None when the path cannot be probed."""
+    try:
+        t0 = time.perf_counter()
+        with os.scandir(path) as it:
+            next(it, None)
+        return time.perf_counter() - t0
+    except OSError:
+        return None
+
+
+def _prof_begin_scan(cmd, root_probe=None):
     """Called by DirCompareForm.start_scan. Returns (token, cprof_scan_on):
     token for stop_async_pair (None when profiling is off), and whether
     the scanner thread should start the cProfile layer.
+
+    'root_probe' (the LEFT compared folder) is probed -- two metadata
+    round trips -- when profiling is on, together with one round trip
+    on a CONTROL directory on the system disk (SystemRoot\\System32).
+    The numbers land in the facts block and discriminate the three
+    slow-scan causes no code change can fix:
+
+      probe slow, control fast  -> the compared folders' VOLUME is
+                                   billed by a filter driver (AV,
+                                   cloud sync) -- exclude that volume;
+      probe slow, control slow  -> every file operation in THIS
+                                   python.exe is billed (real-time
+                                   antivirus scrutinizes an unsigned
+                                   interpreter; WinMerge's signed exe
+                                   doesn't pay that) -- exclude
+                                   CudaText + its python;
+      probe fast               -> warm caches right now; the slow
+                                   first scan needs a cold start to
+                                   reproduce.
 
     The cProfile layer belongs to the SCANNER thread (see the comment
     block above) -- that is where a folder compare can be slow, and
@@ -1441,6 +1573,53 @@ def _prof_begin_scan(cmd):
                 cprof_scan = bool(cmd.cfg.get('enable_cprofile', False))
             except Exception:
                 cprof_scan = False
+            # cProfile stdlib PRE-WARM, on the MAIN thread, BEFORE the
+            # scan starts: start_profiling() lazily imports cProfile +
+            # profile, stop_profiling() imports pstats. When CudaText
+            # and its Python live on a slow or heavily-filtered drive,
+            # those imports cost SECONDS -- and they used to happen
+            # inside the scanner thread, hiding as an unexplained gap
+            # between dirs:worker's wall and the profiled window (the
+            # imports run before pr.enable(), so cProfile itself never
+            # saw them). Imported here, the cost becomes a named,
+            # per-SESSION row outside dirs:scan_wall, and the scan
+            # itself starts clean.
+            if cprof_scan:
+                try:
+                    import importlib
+                    t0 = time.perf_counter()
+                    importlib.import_module('cProfile')  # pre-warm
+                    importlib.import_module('pstats')    # pre-warm
+                    dt = time.perf_counter() - t0
+                    Profiler.mark('dirs:cprofile_import', dt, 1, dt,
+                                  t0=t0)
+                except Exception:
+                    pass
+            # The environment probe (see the docstring). Booked as one
+            # row OUTSIDE dirs:scan_wall -- it is a diagnostic of the
+            # machine, not a phase of the scan.
+            if root_probe and os.path.isdir(root_probe):
+                try:
+                    t0 = time.perf_counter()
+                    a = _prof_probe_one(root_probe)
+                    b = _prof_probe_one(root_probe)
+                    ctrl = os.environ.get('SystemRoot', '') or ''
+                    if ctrl:
+                        ctrl = os.path.join(ctrl, 'System32')
+                    c = _prof_probe_one(ctrl) \
+                        if ctrl and os.path.isdir(ctrl) else None
+                    dt = time.perf_counter() - t0
+                    facts = _SCAN_FACTS
+                    for v in (a, b):
+                        if v is not None:
+                            facts['probe_root_ms'].append(v * 1000.0)
+                    if c is not None:
+                        facts['probe_ctrl_ms'] = c * 1000.0
+                    mx = max([v for v in (a, b, c) if v is not None]
+                             or [dt])
+                    Profiler.mark('dirs:env_probe', dt, 3, mx, t0=t0)
+                except Exception:
+                    pass
         _prof_users += 1
         token = Profiler.start_async_pair('dirs:scan_wall', 'dirs:worker')
     return token, cprof_scan
@@ -1449,23 +1628,71 @@ def _prof_begin_scan(cmd):
 def _prof_facts_block(worker):
     """The 'folder scan facts' epilogue lines: what the scan-facts
     counters say about THIS run (see _SCAN_FACTS). Printed right after
-    the section report -- deliberately compact, four statements that
-    answer the four questions every slow-compare report raises:
+    the section report -- deliberately compact, five statements that
+    answer the five questions every slow-compare report raises:
 
-      1. how many directory listings ran, and how much of the wall
+      1. is the ENVIRONMENT slow (the metadata probe: compared root
+         vs the system disk, in THIS python.exe -- the numbers that
+         separate "the drive / these folders are slow" from "every
+         file operation in this process pays an antivirus tax" from
+         "everything is warm right now");
+      2. how many directory listings ran, and how much of the wall
          time was pure listing latency (metadata round trips -- the
-         disk/antivirus/network, not plugin code: the same number any
-         other tool, WinMerge included, pays on a cold tree);
-      2. how big the trees were (entries / file rows / folder rows);
-      3. how much file CONTENT the compare had to read (pairs stopped
+         same number any other tool, WinMerge included, pays on a
+         cold tree);
+      3. how big the trees were (entries / file rows / folder rows);
+      4. how much file CONTENT the compare had to read (pairs stopped
          at the first differing chunk vs read to the end);
-      4. whether the scan ran serially because the cProfile layer was
+      5. whether the scan ran serially because the cProfile layer was
          on (the function-report mode -- slower on purpose; turn it
          off to measure speed)."""
     facts = _SCAN_FACTS
     if not facts:
         return ''
     lines = ['--- Differ 2 folder scan facts ---']
+
+    def _probe_verdict(root_ms, ctrl_ms):
+        """The probe's interpretation line (None = nothing to say)."""
+        if not root_ms:
+            return None
+        avg = sum(root_ms) / len(root_ms)
+        if avg < 50.0:
+            return ('metadata round trips are FAST right now ({:.0f} ms '
+                    'avg) -- caches are warm; reproduce the slow first '
+                    'scan right after a reboot / on a cold app'.format(
+                        avg))
+        if ctrl_ms is None:
+            return ('every metadata round trip on the compared folders '
+                    'pays ~{:.0f} ms; no control directory was available '
+                    'to tell drive from process'.format(avg))
+        if ctrl_ms < avg / 5.0:
+            return ('the compared folders pay ~{:.0f} ms per round trip '
+                    'while the system disk pays {:.0f} ms: a filter '
+                    '(antivirus / cloud sync) bills THAT volume -- '
+                    'exclude it from real-time scanning and re-scan'.format(
+                        avg, ctrl_ms))
+        return ('EVERY round trip in THIS python.exe pays ~{:.0f} ms '
+                '(the system disk too: {:.0f} ms): real-time antivirus '
+                'bills this process -- a signed tool like WinMerge does '
+                'not pay that tax. Add CudaText (with its python) and '
+                'the compared folders to the antivirus exclusions and '
+                're-scan: listings should drop to a few ms'.format(
+                    avg, ctrl_ms))
+
+    root_ms = facts.get('probe_root_ms') or []
+    ctrl_ms = facts.get('probe_ctrl_ms')
+    if root_ms or ctrl_ms is not None:
+        txt_root = ', '.join('{:.0f} ms'.format(x) for x in root_ms) \
+            if root_ms else '(failed)'
+        txt_ctrl = '{:.0f} ms'.format(ctrl_ms) \
+            if ctrl_ms is not None else 'n/a'
+        lines.append(
+            'metadata probe (before the scan, this python.exe): left '
+            'root: {} / system disk: {}'.format(txt_root, txt_ctrl))
+        verdict = _probe_verdict(root_ms, ctrl_ms)
+        if verdict:
+            lines.append('  -> ' + verdict)
+
     n = facts.get('listings', 0)
     ms = facts.get('listing_ms', 0.0)
     mx = facts.get('listing_ms_max', 0.0)
@@ -2246,9 +2473,10 @@ class DirCompareForm:
             pass
         self._view = view
         if Profiler.is_enabled():
-            Profiler.mark('dirs:ui_fill_list', time.perf_counter() - t0,
+            dt = time.perf_counter() - t0
+            Profiler.mark('dirs:ui_fill_list', dt,
                           len(view) - len(old_view) if incremental
-                          else len(view))
+                          else len(view), t0=t0)
 
     @staticmethod
     def _item_caption(r):
@@ -2362,7 +2590,8 @@ class DirCompareForm:
                 continue
 
         if Profiler.is_enabled():
-            Profiler.mark('dirs:ui_draw_item', time.perf_counter() - t0)
+            dt = time.perf_counter() - t0
+            Profiler.mark('dirs:ui_draw_item', dt, t0=t0)
 
     def _update_counts(self):
         rows = self._rows
@@ -2438,8 +2667,10 @@ class DirCompareForm:
         # config FIRST (the same order as refresh_compare), so both the
         # enable_profiling/enable_cprofile gates and the hunk colors
         # below see the CURRENT options -- also on the very first scan
-        # after changing them.
-        token, cprof_scan = _prof_begin_scan(self._cmd)
+        # after changing them. 'pl' is passed as the probe root: with
+        # profiling on, the environment probe runs BEFORE the scan
+        # (see _prof_begin_scan).
+        token, cprof_scan = _prof_begin_scan(self._cmd, pl)
         self._prof_token = token
         self._prof_cprof_scan = cprof_scan
         # Colors for the drawn rows: the diff-tab hunk colors (the
@@ -2525,8 +2756,8 @@ class DirCompareForm:
                 self._last_fill = len(rows)
                 self._fill_list(rows)
             if Profiler.is_enabled():
-                Profiler.mark('dirs:ui_timer_tick',
-                              time.perf_counter() - t0)
+                dt = time.perf_counter() - t0
+                Profiler.mark('dirs:ui_timer_tick', dt, t0=t0)
             return
         # Finished (normally or cancelled): last full update.
         self._stop_timer()
@@ -2534,10 +2765,12 @@ class DirCompareForm:
             # Wall time from the worker's real end to THIS tick: the
             # timer quantum + whatever kept the main thread busy --
             # with dirs:spawn_lag this closes the loop on where every
-            # millisecond of dirs:scan_wall went.
+            # millisecond of dirs:scan_wall went. Booked with its span
+            # so the report nests it under dirs:worker.
             try:
                 lag = time.perf_counter() - w.run_end
-                Profiler.mark('dirs:finish_lag', lag, 1, lag)
+                Profiler.mark('dirs:finish_lag', lag, 1, lag,
+                              t0=w.run_end)
             except Exception:
                 pass
         self._rows = rows
@@ -2562,7 +2795,8 @@ class DirCompareForm:
         self._prof_token = None
         self._sb_text(1, msg)
         if Profiler.is_enabled():
-            Profiler.mark('dirs:ui_timer_tick', time.perf_counter() - t0)
+            dt = time.perf_counter() - t0
+            Profiler.mark('dirs:ui_timer_tick', dt, t0=t0)
 
     def _stop_timer(self):
         # NOTE: the interval argument is REQUIRED by timer_proc's
