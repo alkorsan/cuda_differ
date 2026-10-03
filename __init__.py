@@ -47,16 +47,43 @@ _ = get_translation(__file__)  # I18N
 # Command._create_differ below.
 df = dfn
 
-DIFF_TAG = 148
+# --- Cross-plugin namespace isolation (vs the original cuda_differ) --
+# This plugin runs side by side with the original cuda_differ in the
+# same CudaText, and CudaText has TWO pieces of state a plugin cannot
+# privately own:
+#
+# 1) BOOKMARK KIND COLORS. AppBookmarkSetup[1..63] is ONE app-global
+#    array: bookmark(BOOKMARK_SETUP, nkind, ncolor) overwrites the
+#    color of that kind for the WHOLE app, and ATSynEdit resolves the
+#    background color of every line carrying a bookmark2 through it
+#    (EditorOnCalcBookmarkColor -> AppBookmarkSetup[kind].Color).
+#    The original cuda_differ registers kinds 24/25/26 with ITS theme
+#    colors on every compare it runs. Sharing those kind numbers made
+#    the two plugins fight over the same global slots: a fork compare
+#    run after an original compare painted the ORIGINAL's colors,
+#    because the fork's config cache (file mtime / theme names) had no
+#    reason to re-run its own BOOKMARK_SETUP calls. Kinds are clamped
+#    by CudaText to 1..63; we take the top of the range, far from the
+#    small numbers plugins usually pick. The colors are additionally
+#    re-applied before every compare (Command.config ->
+#    _register_bookmark_kinds), so even a future kind collision with
+#    yet another plugin is self-healing on the next compare.
+NKIND_DELETED = 61
+NKIND_ADDED = 62
+NKIND_CHANGED = 63
+# 2) EDITOR TAGS (attr markers / gaps / decor / bookmark2 'tag').
+#    Tags live per editor, but both differs can paint the same editor
+#    (e.g. comparing a tab the original plugin compared earlier): with
+#    one shared tag value each plugin's clear-by-tag wiped the other's
+#    marks. Tags are plain ints -- a high, distinctive pair the
+#    original's 148/149 can never collide with.
+DIFF_TAG = 4082
 # Gap tag for ignored-difference gaps (DIFF_IGN_BLANK_LINES suppressed
 # hunks). Separate from DIFF_TAG so the compensating gaps WinMerge-style
 # "ignored differences" insert are identifiable (and deletable) on
 # their own — they are also painted with the ignored color instead of
 # the regular gap color.
-IGN_GAP_TAG = 149
-NKIND_DELETED = 24
-NKIND_ADDED = 25
-NKIND_CHANGED = 26
+IGN_GAP_TAG = 4083
 GAP_WIDTH = 5000
 DEFAULT_SYNC_SCROLL = '1'
 U_PREFIX = 'untitled:'
@@ -1261,6 +1288,35 @@ OPTS_META = [
      'frm': 'bool',
      'chp': 'dirs',
      },
+    {'opt': 'differ2.dirs.compare_method',
+     'cmt': _('Folder compare method\n'
+              'How the folder-compare window decides that two '
+              'same-named files are identical. "Contents" reads the '
+              'files (tiered: size check, then full hash for small '
+              'files, then head+tail sampling for big ones) -- an '
+              '"Identical" verdict is always proven by content, but '
+              'every file pair on both sides is opened and read.\n'
+              '"Size and timestamp" (WinMerge\'s Quick method) never '
+              'opens a single file: equal size AND equal modification '
+              'time means Identical, anything else means Different. '
+              'Use it when file reads are expensive -- files on a '
+              'slow network share, cloud-sync placeholders that '
+              'could trigger downloads, an antivirus hooking every '
+              'open: the scan is then pure directory listing. The '
+              'documented trade-off: a file rewritten with its size '
+              'and mtime preserved can be missed, and a merely '
+              'touched file (same size, newer time) is flagged '
+              'Different without reading -- double-clicking always '
+              'opens the real compare, which never lies.\n'
+              'Default: Contents.'),
+     'def': 'contents',
+     'frm': 'str2s',
+     'dct': [('contents', _('Contents (tiered hashing, proven '
+                            'identical)')),
+             ('size_timestamp', _('Size and timestamp (WinMerge '
+                                  'Quick, no file reads)'))],
+     'chp': 'dirs',
+     },
 ]
 
 DIFF_TAB_COUNT = 1
@@ -1552,6 +1608,10 @@ class Command:
     def __init__(self):
         self.scroll = ScrollSplittedTab(__name__)
         self.cfg = self.get_config()
+        # Register our (namespaced) bookmark kinds with the loaded
+        # colors; config() re-applies them before every compare -- see
+        # the constants block above for why this is never cached.
+        self._register_bookmark_kinds()
         # Subscribe to the on_key event when keyboard capture is enabled
         # (runtime subscription -- install.inf no longer lists on_key).
         self._sync_on_key_subscription()
@@ -3003,9 +3063,15 @@ class Command:
         dirty half failed to sync, e.g. its original tab was closed, the
         tab correctly stays red). The color is reset to COLOR_NONE (which
         CudaText re-colors red) when the user edits again -- see
-        on_change. We do NOT clear PROP_MODIFIED, because that would
-        prevent CudaText's session auto-save/restore from persisting the
-        compare tab's content across restarts."""
+        on_change. PROP_MODIFIED is deliberately left untouched here: it
+        plays no role in session persistence -- CudaText's session saver
+        ALWAYS stores the text of untitled tabs (it forces 'modified' to
+        true for them when writing the session file, for the first AND
+        the second half of a split alike; the flag only gates the text
+        of FILE tabs), and the restore path brings untitled tabs back
+        as modified anyway. The flag's real job is driving the
+        'Save changes?' dialogs, which on_close_pre already handles for
+        clean compare tabs."""
         tab_id = ed_self.get_prop(ct.PROP_TAB_ID)
         session = self._session_for(tab_id)
         if session is None:
@@ -3124,7 +3190,13 @@ class Command:
                     # Real file on disk -- save it immediately.
                     e.save()
                 else:
-                    # Untitled tab -- mark modified, no Save dialog.
+                    # Untitled original -- mark it modified so the
+                    # just-synced content is visible and not silently
+                    # lost: dot on the tab, 'Save changes?' (i.e.
+                    # Save-As) when the user later closes it. This is
+                    # NOT about the session: untitled tabs' text is
+                    # always persisted by CudaText's session saver
+                    # regardless of this flag.
                     e.set_prop(ct.PROP_MODIFIED, True)
                 ct.msg_status(_('Differ 2: synced changes to original tab'))
                 return True
@@ -6539,22 +6611,53 @@ class Command:
 
     def config(self):
         """Reload config from disk if the JSON file or a theme has changed.
-        Caches the result in self.cfg to avoid repeated disk reads."""
+        Caches the result in self.cfg to avoid repeated disk reads.
+
+        ALWAYS re-registers the bookmark kinds afterwards (three cheap
+        BOOKMARK_SETUP calls): AppBookmarkSetup[] is app-global shared
+        state, and the cache key (file mtime / theme names) cannot see
+        foreign plugins rewriting our kind slots between two of our
+        compares. Skipping the re-registration on a cache hit was the
+        bug that made a fork compare run after an original compare
+        paint the original's colors."""
         opt_time = os.path.getmtime(JSONPATH) if os.path.exists(JSONPATH) else 0
         theme_name = ct.app_proc(ct.PROC_THEME_SYNTAX_GET, '')
         ui_theme_name = _ui_theme_name()
-        if self.cfg.get('opt_time') == opt_time and \
-           self.cfg.get('theme_name') == theme_name and \
-           self.cfg.get('ui_theme_name') == ui_theme_name:
-            return
-        self.cfg = self.get_config()
-        # Keep the runtime on_key subscription in step with the (possibly
-        # changed) enable_keyboard_capture setting -- takes effect at
-        # once, without a restart.
-        self._sync_on_key_subscription()
-        # (No menu re-sync needed anymore: the diff-tab context menu is
-        # rebuilt from the settings file by tabmenu_init on every
-        # right-click, so it always mirrors the current values.)
+        if self.cfg.get('opt_time') != opt_time or \
+           self.cfg.get('theme_name') != theme_name or \
+           self.cfg.get('ui_theme_name') != ui_theme_name:
+            self.cfg = self.get_config()
+            # Keep the runtime on_key subscription in step with the
+            # (possibly changed) enable_keyboard_capture setting --
+            # takes effect at once, without a restart.
+            self._sync_on_key_subscription()
+            # (No menu re-sync needed anymore: the diff-tab context menu
+            # is rebuilt from the settings file by tabmenu_init on every
+            # right-click, so it always mirrors the current values.)
+        # AppBookmarkSetup[kind] may have been overwritten by another
+        # plugin since our last call -- unconditionally re-apply OUR
+        # colors so the kinds always match self.cfg.
+        self._register_bookmark_kinds()
+
+    def _register_bookmark_kinds(self):
+        """(Re)register the plugin's bookmark kinds with self.cfg's colors.
+
+        bookmark(BOOKMARK_SETUP) writes the app-global
+        AppBookmarkSetup[kind] slots, and CudaText resolves the
+        background color of every bookmarked line through those slots:
+        they must match OUR config before any compare paints. Cheap
+        (three API calls) and idempotent; called from __init__ and
+        every config() (compares, refreshes, options dialog, theme
+        switches, tab menu)."""
+        for kind, color in (
+                (NKIND_DELETED, self.cfg.get('color_deleted')),
+                (NKIND_ADDED, self.cfg.get('color_added')),
+                (NKIND_CHANGED, self.cfg.get('color_changed')),
+                ):
+            ct.ed.bookmark(ct.BOOKMARK_SETUP, 0,
+                           nkind=kind,
+                           ncolor=color,
+                           text='')
 
     def _apply_scrollbar_visibility(self, session, a_ed, b_ed, hide):
         """Hide or restore the built-in vertical scrollbars of a compare
@@ -6620,15 +6723,11 @@ class Command:
     @staticmethod
     def get_config():
         """Read all differ2.* options from JSON + current theme, and return
-        a config dict. Also registers bookmark kinds (NKIND_*) with their
-        colors so CudaText can render them."""
-
-        def new_nkind(val, color):
-            ct.ed.bookmark(ct.BOOKMARK_SETUP, 0,
-                           nkind=val,
-                           ncolor=color,
-                           text=''
-                           )
+        a config dict. (Bookmark kinds are NOT registered here -- that
+        moved to Command._register_bookmark_kinds, which runs on every
+        config() call, not only on config cache misses: the kinds live
+        in the app-global AppBookmarkSetup[] that foreign plugins can
+        rewrite at any time.)"""
 
         def get_theme():
             """Resolve the six compare colors from the 'color_theme'
@@ -6752,10 +6851,6 @@ class Command:
             'show_btn_text':
                 get_opt('toolbar.show_btn_text', True),
         }
-
-        new_nkind(NKIND_DELETED, config.get('color_deleted'))
-        new_nkind(NKIND_ADDED, config.get('color_added'))
-        new_nkind(NKIND_CHANGED, config.get('color_changed'))
 
         return config
 
@@ -7432,13 +7527,13 @@ class Command:
         'Save changes to ...?' dialog (the event can also cancel the
         close by returning False; we never do).
 
-        A diff tab is untitled and holds no real file on disk, and its
-        two halves are deliberately kept PROP_MODIFIED=True so
-        CudaText's session keeps the tab (including the SECOND half's
-        text -- the session file only persists a split tab's secondary
-        editor when its modified flag is set). The side effect: closing
-        a diff tab always asked 'Save changes?' even when nothing needs
-        syncing.
+        A diff tab is untitled and holds no real file on disk. Its
+        halves carry Modified=True merely as a side effect of being
+        filled with content (every edit sets the flag, and CudaText
+        restores untitled tabs from a session as modified too) -- not
+        for the session, which always keeps them anyway. The flag's
+        only visible effect is the 'Save changes?' prompt on close,
+        which for a CLEAN diff tab is pure noise.
 
         The plugin tracks the REAL unsaved state itself (per-half dirty
         flags -- see _get_dirty_halves). So here, when NEITHER half is
@@ -7448,19 +7543,24 @@ class Command:
         flags are left True and the dialog shows as usual -- the user
         can still choose to run the Ctrl+S sync path from it.
 
+        Clearing the flag is safe for every session concern: CudaText's
+        session saver ALWAYS stores the text of untitled tabs -- it
+        forces 'modified' to true for them when writing the session
+        file, same rule for the first and for the second half of a
+        split (the flag only gates the text of FILE tabs) -- and the
+        restore path puts the flag back to True on the next start. So
+        nothing done to PROP_MODIFIED here can drop a compare tab (or
+        either half's text) from the session.
+
         Single-tab close fires this once (for the focused half); app
         exit fires it for EVERY half of every tab, then -- if the tab
-        really closes -- on_close (also per half). on_close's exit
-        branch puts the halves back to PROP_MODIFIED=True before
-        CudaText writes the session, so restart-restore is unaffected
-        by the clearing done here.
+        really closes -- on_close (also per half).
 
         Residual edge case: if ANOTHER plugin cancels the close after
         we cleared the flags, the tab stays open with Modified=False
-        until the next edit (any edit re-sets it) or the app exit
-        (on_close restores it). No session data can be lost by that
-        alone: only a crash before any of those would save the session
-        without the second half's text.
+        until the next edit (any edit re-sets it). No session data can
+        be lost by that: untitled halves are always persisted by the
+        session saver, whatever the flag says.
         """
         tab_id = ed_self.get_prop(ct.PROP_TAB_ID)
         session = self._session_for(tab_id)
@@ -7586,11 +7686,15 @@ class Command:
         # dirty before exit.
         #
         # NO GUI calls past this point at exit (see the docstring): the
-        # entry must be re-registered and both halves put back to
-        # PROP_MODIFIED=True before this handler returns -- CudaText
-        # writes its session file right after the whole exit loop, and
-        # it only persists a split tab's SECOND half text when that half
-        # is modified.
+        # entry must be re-registered before this handler returns --
+        # CudaText writes its session file right after the whole exit
+        # loop. Nothing else is needed for the halves' text: the session
+        # saver ALWAYS stores untitled tabs (both halves of a split,
+        # whatever their modified flags -- the exit 'Save tabs?' dialog
+        # has already run before on_close anyway), so the PROP_MODIFIED
+        # clearing on_close_pre did for clean tabs drops no content from
+        # the session, and the restore path brings the tabs back with
+        # Modified=True on the next start regardless.
         if getattr(self, '_app_exiting', False):
             if entry is not None:
                 self._register_compare_tab(
@@ -7601,22 +7705,6 @@ class Command:
                     entry.get('secondary_orig_name', ''),
                     entry.get('dirty')
                 )
-            # Put both halves back to PROP_MODIFIED=True. on_close_pre
-            # (which fires for every half before the exit dialogs) may
-            # have cleared the flags on a CLEAN tab to skip the save
-            # dialog -- but the session is written AFTER on_close, and
-            # it only persists a split tab's SECOND half text when that
-            # half is modified. Without this restore, a clean diff tab
-            # would come back after restart with an empty right side.
-            # The tab is closing anyway, so Modified=True here has no
-            # other visible effect.
-            try:
-                for h in (ed_self.get_prop(ct.PROP_HANDLE_PRIMARY),
-                          ed_self.get_prop(ct.PROP_HANDLE_SECONDARY)):
-                    if h:
-                        ct.Editor(h).set_prop(ct.PROP_MODIFIED, True)
-            except Exception:
-                pass
             return
 
         # REAL tab close (not app exit): the state entry is meant to be

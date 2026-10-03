@@ -258,20 +258,36 @@ per-side sizes and timestamps and a status column:
 
 The FIRST pass is deliberately cheap so even huge trees fill the list
 fast: nothing is ever loaded into an editor and no diff algorithm
-runs. For each file present on both sides the cheapest deciding test
-is applied, in order: different sizes -> Different (no read at all);
-both empty -> Identical (no read); small files (<=256 KB) -> one full
-MD5 per side (a single sequential read); bigger files -> an MD5 of
-each side's head and tail 64 KB chunks first (a head or tail change is
-caught after reading at most 128 KB per side). Only when those samples
-match is the full content of both files hashed, so an "Identical"
-verdict is always proven byte for byte by default. Timestamps are
-never trusted -- a copied file with a fresh mtime compares as
-identical, as it should. (The "Fast (sampling) compare" option
-differ2.dirs.quick_only skips the final full read -- the fastest mode
-for giant trees, at the documented cost that a change confined to the
-middle of a big file can be missed in the LIST; the double-click
-compare never misses anything.)
+runs. How a same-named pair is decided is chosen by the option
+"differ2.dirs.compare_method":
+
+- "Contents" (default): for each file present on both sides the
+  cheapest deciding test is applied, in order: different sizes ->
+  Different (no read at all); both empty -> Identical (no read);
+  small files (<=256 KB) -> one full MD5 per side (a single
+  sequential read); bigger files -> an MD5 of each side's head and
+  tail 64 KB chunks first (a head or tail change is caught after
+  reading at most 128 KB per side). Only when those samples match is
+  the full content of both files hashed, so an "Identical" verdict is
+  always proven byte for byte by default.
+- "Size and timestamp" (WinMerge's Quick method): equal size AND
+  equal mtime -> Identical, anything else -> Different. NO file is
+  ever opened -- the whole verdict comes from the directory walk.
+  Use this when file reads are expensive: files on a slow network
+  share, cloud-sync placeholders (OneDrive etc. -- opening one can
+  trigger a download), an antivirus hooking every open. The scan is
+  then pure directory listing, whatever the tree size. Trade-offs:
+  a file rewritten with size and mtime preserved can be missed, and
+  a merely touched file (same size, newer time) is flagged Different
+  without being read; the double-click compare never lies.
+
+Timestamps are never trusted in the "Contents" method -- a copied
+file with a fresh mtime compares as identical, as it should. (The
+"Fast (sampling) compare" option differ2.dirs.quick_only skips the
+final full read -- the fastest mode for giant trees, at the
+documented cost that a change confined to the middle of a big file
+can be missed in the LIST; the double-click compare never misses
+anything.)
 
 The scan runs on a background thread (the window stays responsive and
 rows stream in while it works -- watch the "Comparing... X / Y"
@@ -298,12 +314,28 @@ The window's controls:
   listed at all. It applies on Apply (or Enter when the list has
   focus).
 - Click a column header to sort by that column (Name, Folder, Status,
-  left/right size or date); click again to reverse. Your manual column
-  width drags survive every list refresh.
+  left/right size or date); click again to reverse. Column widths are
+  fixed (Name stretches with the window) so the header always aligns
+  with the drawn rows.
 - The status bar shows the scan progress / result line on the left
   and the counts (Different / Only left / Only right / Identical) on
   the right.
 - The window remembers its size and position across sessions.
+
+Row colors (the whole line, WinMerge/Beyond-Compare style): every row
+is painted with the SAME colors the diff tabs use for their hunks, so
+what you see in the list is exactly what the double-clicked compare
+will paint:
+
+  Different      the changed-lines color (color_changed)
+  Only left      the deleted-lines color (color_deleted)
+  Only right     the added-lines color (color_added)
+  Identical /    no fill (the theme's list background) -- that is
+  Folder         what makes the colored rows pop
+
+The selected row shows the theme's list-selection colors instead
+(selection wins, like in an editor). The colors follow the
+"Color theme" option like everywhere else in the plugin.
 
 Working with rows:
 
@@ -337,6 +369,21 @@ content; the filename mask is case-insensitive on Windows and
 case-sensitive on Linux/macOS, matching each file system's own
 behavior; unreadable folders are skipped and counted in the summary
 line instead of aborting the scan.
+
+Profiling a folder compare: the whole pipeline is instrumented with
+the plugin's own profiler (see the "Profiling" section of this readme
+for the general story). Turn on differ2.advanced.enable_profiling (and
+additionally differ2.advanced.enable_cprofile for the function-level
+layer), run a compare, and read the report in the console: the
+dirs:tier_* rows show the content-read time (huge values mean the
+file SOURCE is slow: network share, cloud placeholders downloading,
+antivirus -- switch the compare method to "Size and timestamp");
+dirs:walk_left/right show the directory-listing time; dirs:ui_* show
+the CudaText API time on the main thread; dirs:worker /
+dirs:scan_wall bracket the scanner thread and the whole operation.
+The cProfile layer runs on the scanner thread (the walk/hash work);
+a scan cancelled by a rescan or a closing window prints nothing,
+like the tab compare's cancel path.
 
 
 == Keyboard shortcuts ==
@@ -1314,6 +1361,13 @@ Folders section (see the "Compare folders" chapter above for details):
   window (default: on)
   Ask before the folder window's context menu overwrites or deletes
   anything (Copy to left/right, Delete from left/right).
+- differ2.dirs.compare_method: Folder compare method (default:
+  Contents)
+  "Contents" hashes file contents (tiered, proven identical);
+  "Size and timestamp" (WinMerge's Quick method) decides by size+mtime
+  alone and never opens a file -- the method for slow file sources
+  (network shares, cloud-sync placeholders, antivirus-hooked opens).
+  See the "Compare folders" chapter for the full trade-offs.
 
 
 == Diff algorithms and best practices ==

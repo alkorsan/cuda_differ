@@ -16,8 +16,11 @@ receives the Command object via every module-level entry point.
 The first pass is deliberately CHEAP -- a fast "are they different?"
 overview, with the heavy line/char-level diff algorithms reserved for
 the double-click. The scanner never loads a file into an editor and
-never runs a diff algorithm; for every file present on both sides it
-applies the cheapest test that decides the question, in this order
+never runs a diff algorithm. Two compare methods are available
+(option differ2.dirs.compare_method):
+
+"contents" (default): for every file present on both sides the
+cheapest test that decides the question is applied, in this order
 (WinMerge-like "quick compare", but cheaper):
 
   1. sizes differ            -> Different   (no read at all)
@@ -34,10 +37,23 @@ applies the cheapest test that decides the question, in this order
      both sides so an Identical verdict is always content-proven
      (default).
 
-Files that exist on one side only need no content test at all. MD5 is
-used for speed (this is change detection, not security); a collision
-would need two files engineered to collide, and even then the worst
-case is a wrong "Identical" badge that the double-click diff corrects.
+"size_timestamp" (WinMerge's Quick method): equal size AND equal
+modification time -> Identical, different size or time -> Different.
+NO file is ever opened -- the verdict comes from the directory walk's
+stat() data alone. This is the method to use when content reads are
+expensive (files on a slow network share, cloud-sync placeholders that
+could trigger downloads, aggressive antivirus hooks on every open):
+the whole scan is then pure directory listing, whatever the tree size.
+The trade-off is documented: a file rewritten while preserving its
+size and mtime can be missed, and a merely touched file (same size,
+newer mtime) is flagged Different without reading it -- double-click
+still opens the real compare, which never lies.
+
+Files that exist on one side only need no content test at all in either
+method. MD5 is used for speed (this is change detection, not security);
+a collision would need two files engineered to collide, and even then
+the worst case is a wrong "Identical" badge that the double-click diff
+corrects.
 
 == Threading model ==================================================
 
@@ -49,6 +65,68 @@ thread, so huge trees stream into the window while it stays fully
 responsive; closing the window or starting a rescan simply sets a
 cancel flag the worker checks between every file. Several compare
 windows can run scans at once -- each owns one worker and one timer.
+
+== Profiling ========================================================
+
+The whole folder-compare pipeline is instrumented with the plugin's
+own profiler (profiling.py), gated by the same config switch as the
+tab compare: differ2.advanced.enable_profiling (Options dialog /
+settings/cuda_differ2.json; picked up at every scan start, no restart
+needed). When it is on, a scan books BOTH profiler layers, exactly
+like a tab compare does:
+
+  * the section Profiler: 'dirs:scan_wall'/'dirs:worker' (an async
+    pair -- wall time from the scan kick-off to the finished list),
+    the scanner thread's steps as thread-safe standalone marks
+    (dirs:walk_left/right, dirs:pair_keys, dirs:dir_rows,
+    dirs:file_rows) and per-tier content-test rows (dirs:tier_*),
+    main-thread UI work (dirs:ui_*, dirs:picker, dirs:form_build,
+    dirs:open_compare_pair) as sections/marks. The report prints at
+    the scan's natural end; a cancelled scan (rescan, window closed)
+    cancels its pending pieces and prints nothing, like the tab
+    compare's cancel path.
+  * the cProfile layer, additionally gated by
+    differ2.advanced.enable_cprofile (same double gate as the tab
+    compare): ONE profile, started INSIDE the scanner thread -- it
+    traces the actual walk/hash work, i.e. the part of a folder
+    compare that can actually be slow (the main thread's UI phases
+    are already phase-measured by the section rows dirs:ui_*, and
+    the main thread is what the tab compare's own cProfile layer
+    covers). Python 3.12+ allows only one active profiling tool per
+    PROCESS, so main+scanner profiles cannot coexist there anyway;
+    the scanner claims the slot, and if something else already
+    holds it (e.g. a simultaneously profiled tab compare), the
+    layer quietly stays off for this scan. Printed after the
+    section report at the scan's natural end.
+
+This is the tool to answer "why is my compare slow": the tier rows
+show the content-read time per method step, the walk rows the
+directory-listing time, the ui rows the CudaText API time, and the
+untracked gap between 'dirs:scan_wall' and 'dirs:worker' the timer
+quantum + thread scheduling.
+
+== Row coloring =====================================================
+
+The results list is an owner-drawn listbox (listbox_ex +
+LISTBOX_SET_DRAWN): every row is painted by the plugin, so the whole
+line carries a status background color. The colors are the SAME
+config colors the diff tabs use for their hunks (Command.cfg / the
+theme presets):
+
+  Different             -> color_changed  (the changed-hunks color)
+  Only left (+folders)  -> color_deleted  (the deleted-hunks color)
+  Only right (+folders) -> color_added    (the added-hunks color)
+  Identical / Folder    -> no fill (the theme list background)
+
+So a file painted yellow in the folder list is painted yellow line
+by line when double-clicked into a compare tab; a red "only left"
+file opens with red (deleted) gaps on the left side, a green "only
+right" file with green (added) gaps on the right. The selected row is
+painted with the theme's ListSelBg/ListSelFont and overrides the
+status color. The plain listview control was abandoned on purpose:
+the dialog API's listview has no per-row colors at all --
+owner-drawing was the only way to give the folder list
+WinMerge/Beyond-Compare-style row colors.
 
 == Windows / instances =============================================
 
@@ -87,6 +165,13 @@ import cudatext as ct
 import cudax_lib as ctx
 from cudax_lib import get_translation
 
+# The plugin's profiler -- same import surface __init__.py uses; like
+# every sibling module, this file never imports the package __init__
+# (circular import), but profiling.py is a leaf module, safe to take.
+from .profiling import (Profiler, enable_profiling, profiling_report,
+                        reset_profiling, start_profiling, stop_profiling,
+                        cancel_profiling)
+
 _ = get_translation(__file__)  # I18N
 
 # The plugin's user settings file (settings/<name>.json), the same file
@@ -99,8 +184,21 @@ HEAD_TAIL_CHUNK = 64 * 1024    # bigger: MD5 of head + tail chunks first
 
 HISTORY_MAX = 12               # remembered folder paths per side
 POLL_MS = 200                  # worker -> UI poll period while scanning
-PARTIAL_FILL_STEP = 400        # new rows between two progressive refills
+PARTIAL_FILL_STEP = 50         # new rows between two progressive refills
 ICON_CACHE_VER = '1'           # bump to force-renew the icon cache dir
+
+# Owner-drawn list metrics (the results list is a listbox_ex in
+# LISTBOX_SET_DRAWN mode -- see the module docstring "Row coloring"):
+# one row's height, and the icon gutter before the first column.
+LIST_ITEM_H = 26
+ICON_GUTTER = 22
+
+# Column separator for the listbox items/header. A control character
+# is used (not '|'): item captions are built from real file names,
+# and '|' legally occurs in file names on Linux -- an invisible
+# separator the file system cannot produce keeps the header columns
+# and the fallback (non-drawn) rendering aligned.
+COL_SEP = chr(31)              # ASCII unit separator
 
 # Row statuses. Files: ST_SAME / ST_DIFF / ST_LONLY / ST_RONLY / ST_ERR.
 # Folders: ST_DIR (on both sides) / ST_DIR_LONLY / ST_DIR_RONLY.
@@ -138,6 +236,23 @@ STATUS_SEVERITY = {
     ST_DIR:       7,
 }
 
+# Row statuses painted with a full-line background color in the
+# owner-drawn list, mapped to the Command.cfg key that holds the
+# color (the SAME keys the diff tabs use for their hunk lines --
+# see the module docstring "Row coloring"). Statuses absent from
+# this mapping keep the plain list background.
+ST_COLOR_KEY = {
+    ST_DIFF:      'color_changed',
+    ST_LONLY:     'color_deleted',
+    ST_DIR_LONLY: 'color_deleted',
+    ST_RONLY:     'color_added',
+    ST_DIR_RONLY: 'color_added',
+}
+
+# Compare methods (differ2.dirs.compare_method).
+METHOD_CONTENTS = 'contents'
+METHOD_SIZE_TIME = 'size_timestamp'
+
 # Columns of the compare list: (caption, alignment 'L'/'R', width).
 # The two sides' size/date columns mirror WinMerge's "Left/Right
 # size/date" layout; the Folder column keeps the Name column clean
@@ -163,6 +278,15 @@ def _get_opt(key, def_val):
     same convention as __init__.py's get_opt -- the full option name
     matches the OPTS_META entries ("differ2.dirs.quick_only")."""
     return ctx.get_opt('differ2.' + key, def_val, user_json=MODULE_JSON)
+
+
+def _get_method():
+    """Sanitized differ2.dirs.compare_method value ('contents' or
+    'size_timestamp'); anything hand-edited and unknown falls back to
+    the safe default (a broken value must not break the scan)."""
+    m = _get_opt('dirs.compare_method', METHOD_CONTENTS)
+    return m if m in (METHOD_CONTENTS, METHOD_SIZE_TIME) \
+        else METHOD_CONTENTS
 
 
 def _set_opt(key, val):
@@ -315,15 +439,38 @@ def _contents_equal(pl, pr, size, quick_only):
     """Content test for two same-sized files (the caller already knows
     the sizes match and are > 0). Applies the tiered strategy from the
     module docstring; returns True/False, or None when a side cannot be
-    read (the caller turns that into ST_ERR)."""
+    read (the caller turns that into ST_ERR).
+
+    Every tier is booked to the profiler as a thread-safe standalone
+    row (dirs:tier_*) -- deliberately NOT a section: this runs on the
+    scanner thread, where pushing frames onto the shared section stack
+    would interleave with the main thread's sections (see
+    profiling.py's mark_standalone). The timed stretch includes the
+    open+read of BOTH sides, which is what a slow file source (network
+    share, cloud placeholder, antivirus hook) shows up as."""
     try:
         if size <= SMALL_FILE_FULL:
-            return _md5_file(pl) == _md5_file(pr)
-        if _quick_hash(pl, size) != _quick_hash(pr, size):
+            t0 = time.perf_counter()
+            eq = _md5_file(pl) == _md5_file(pr)
+            if Profiler.is_enabled():
+                Profiler.mark_standalone('dirs:tier_md5_small',
+                                         time.perf_counter() - t0)
+            return eq
+        t0 = time.perf_counter()
+        qeq = _quick_hash(pl, size) == _quick_hash(pr, size)
+        if Profiler.is_enabled():
+            Profiler.mark_standalone('dirs:tier_quick_hash',
+                                     time.perf_counter() - t0)
+        if not qeq:
             return False
         if quick_only:
             return True
-        return _md5_file(pl) == _md5_file(pr)
+        t0 = time.perf_counter()
+        eq = _md5_file(pl) == _md5_file(pr)
+        if Profiler.is_enabled():
+            Profiler.mark_standalone('dirs:tier_md5_full',
+                                     time.perf_counter() - t0)
+        return eq
     except OSError:
         return None
 
@@ -357,8 +504,10 @@ def _stat_side(path):
         return None
 
 
-def _file_row(dir_l, dir_r, rel, sl, sr, quick_only):
-    """Row for the file 'rel' given per-side (size, mtime) or None."""
+def _file_row(dir_l, dir_r, rel, sl, sr, quick_only, method):
+    """Row for the file 'rel' given per-side (size, mtime) or None.
+    'method' selects the compare method (METHOD_*; see the module
+    docstring's "Speed model") -- the size test runs first in both."""
     name = os.path.basename(rel)
     row = {
         'rel': rel,
@@ -390,6 +539,22 @@ def _file_row(dir_l, dir_r, rel, sl, sr, quick_only):
         return row
     if sl[0] == 0:
         row['status'] = ST_SAME  # two empty files
+        return row
+
+    if method == METHOD_SIZE_TIME:
+        # WinMerge's Quick method: equal size + equal mtime ->
+        # Identical; anything else -> Different. No file is opened --
+        # the whole verdict comes from the walk's stat data, which is
+        # what makes this method immune to slow opens (network,
+        # cloud placeholders, antivirus). The trade-off is documented
+        # in the option's comment; the double-click diff is the
+        # honest check.
+        t0 = time.perf_counter()
+        same = (sl[1] == sr[1])
+        if Profiler.is_enabled():
+            Profiler.mark_standalone('dirs:tier_timestamp',
+                                     time.perf_counter() - t0)
+        row['status'] = ST_SAME if same else ST_DIFF
         return row
 
     same = _contents_equal(os.path.join(dir_l, rel),
@@ -471,13 +636,26 @@ class _Scanner(threading.Thread):
     reports how many folders were skipped.
     """
 
-    def __init__(self, dir_l, dir_r, recursive, mask, quick_only):
+    def __init__(self, dir_l, dir_r, recursive, mask, quick_only,
+                 method=METHOD_CONTENTS, cprofile_on=False):
         super().__init__(daemon=True, name='Differ2DirCompare')
         self.dir_l = dir_l
         self.dir_r = dir_r
         self.recursive = recursive
         self.mask = mask
         self.quick_only = quick_only
+        self.method = method
+        # Scanner-thread cProfile layer (the 2nd profiler mode):
+        # enabled by the FORM when the config double-gate is on. The
+        # Profile object is created and enabled HERE, on the thread it
+        # must trace -- cProfile only traces the thread that called
+        # enable(); the main thread's UI work is covered by the form's
+        # own Profile. The pair is stopped+printed by the form at the
+        # scan's natural end (never from this thread: printing is a
+        # main-thread concern), and cancelled without printing on
+        # every abandonment path.
+        self.cprofile_on = cprofile_on
+        self.cprofile = None      # (pr, stream) once run() started it
         self.cancel_evt = threading.Event()
         self.lock = threading.Lock()
         self.rows = []          # completed rows, in relpath order
@@ -502,11 +680,20 @@ class _Scanner(threading.Thread):
     # -- the work ------------------------------------------------------
 
     def run(self):
+        pr = s = None
+        if self.cprofile_on and Profiler.is_enabled():
+            try:
+                pr, s = start_profiling()
+                self.cprofile = (pr, s)
+            except Exception:
+                pr = s = None
         try:
             self._scan()
         except Exception as ex:  # never let the thread die silently
             self.fatal = '{}: {}'.format(type(ex).__name__, ex)
         finally:
+            if pr is not None:
+                cancel_profiling(pr)  # just disable; the form prints it
             with self.lock:
                 self.finished = True
 
@@ -573,18 +760,38 @@ class _Scanner(threading.Thread):
         return files, dirs
 
     def _scan(self):
+        """Walk both trees, then build the rows. Every step is booked
+        to the profiler as thread-safe standalone marks (this method
+        runs on the worker thread -- see the note in _contents_equal
+        about why not sections)."""
+        prof = Profiler.is_enabled()
+
+        t0 = time.perf_counter()
         files_l, dirs_l = self._walk(self.dir_l)
+        if prof:
+            Profiler.mark_standalone('dirs:walk_left',
+                                     time.perf_counter() - t0)
+        t0 = time.perf_counter()
         files_r, dirs_r = self._walk(self.dir_r)
+        if prof:
+            Profiler.mark_standalone('dirs:walk_right',
+                                     time.perf_counter() - t0)
         if self.cancelled():
             return
 
+        t0 = time.perf_counter()
         dir_keys = sorted(set(dirs_l) | set(dirs_r))
         file_keys = sorted(set(files_l) | set(files_r))
+        if prof:
+            Profiler.mark_standalone('dirs:pair_keys',
+                                     time.perf_counter() - t0,
+                                     2)  # two merges+sorts per call
         with self.lock:
             self.total = len(dir_keys) + len(file_keys)
 
         # Folder rows first (they are also the skeleton of the partial
         # view while the file rows stream in behind them).
+        t0 = time.perf_counter()
         for k in dir_keys:
             if self.cancelled():
                 return
@@ -598,7 +805,13 @@ class _Scanner(threading.Thread):
             with self.lock:
                 self.rows.append(_dir_row(rel, ml, mr,
                                           rl is not None, rr is not None))
+        if prof:
+            Profiler.mark_standalone('dirs:dir_rows',
+                                     time.perf_counter() - t0,
+                                     len(dir_keys))
 
+        t0 = time.perf_counter()
+        n_files = 0
         for k in file_keys:
             if self.cancelled():
                 return
@@ -608,9 +821,141 @@ class _Scanner(threading.Thread):
             sr = (fr[1], fr[2]) if fr is not None else None
             rel = (fl or fr)[0]
             row = _file_row(self.dir_l, self.dir_r, rel, sl, sr,
-                            self.quick_only)
+                            self.quick_only, self.method)
+            n_files += 1
             with self.lock:
                 self.rows.append(row)
+        if prof:
+            # NOTE: this stretch INCLUDES the content-test time (the
+            # dirs:tier_* rows are booked inside); the row-building
+            # self time is the difference. Booked with the file count
+            # so the per-file average is readable in the report.
+            Profiler.mark_standalone('dirs:file_rows',
+                                     time.perf_counter() - t0, n_files)
+
+
+# ----------------------------------------------------------------------
+# Profiling lifecycle (module level: several compare windows can scan
+# at once, and the enable/disable must be owned by exactly one of them)
+# ----------------------------------------------------------------------
+#
+# The pattern mirrors Command.refresh_compare: config() first (so a
+# just-toggled option takes effect on the next scan, no restart), then
+# enable_profiling()/reset_profiling() when the config says so, the
+# async pair 'dirs:scan_wall'/'dirs:worker' for the whole operation's
+# wall time, the cProfile layer under the double gate
+# (enable_profiling AND enable_cprofile) started inside the SCANNER
+# thread, and the epilogue at the scan's natural end: section report
+# first, then the cProfile report, then disable -- but only if THIS
+# form was the one that enabled it. A cancelled run (rescan, window
+# closed, app exit) cancels its pending pieces without printing, like
+# the tab compare's cancel paths.
+#
+# The user counter handles overlapping scans: the first profiled scan
+# of a batch owns the enable/reset/report, later ones only add their
+# marks (their rows merge into the same report -- a documented
+# diagnostic-tool limitation; one compare at a time is the norm).
+
+_prof_users = 0            # profiled scans currently running
+_prof_enabled_here = False # WE flipped Profiler.enabled for this batch
+
+
+def _prof_begin_scan(cmd):
+    """Called by DirCompareForm.start_scan. Returns (token, cprof_scan_on):
+    token for stop_async_pair (None when profiling is off), and whether
+    the scanner thread should start the cProfile layer.
+
+    The cProfile layer belongs to the SCANNER thread (see the comment
+    block above): Python 3.12+ permits one active profiling tool per
+    process, so a main-thread profile would silently block the
+    scanner's -- and the scanner is where a folder compare can be
+    slow. The scanner claims the slot; if another profiling tool
+    already holds it, its start_profiling() fails quietly and the
+    scan runs with the section profiler only."""
+    global _prof_users, _prof_enabled_here
+    # Load the config FIRST so the gate sees the current option value
+    # (same order as refresh_compare -- without this, the first scan
+    # after enabling profiling in Options would run unprofiled).
+    try:
+        cmd.config()
+    except Exception:
+        pass
+    was_on = Profiler.is_enabled()
+    enabled_here = False
+    if not was_on:
+        try:
+            do_profile = bool(cmd.cfg.get('enable_profiling', False))
+        except Exception:
+            do_profile = False
+        if do_profile:
+            enable_profiling(True)
+            enabled_here = True
+    token = None
+    cprof_scan = False
+    if Profiler.is_enabled():
+        if _prof_users == 0:
+            reset_profiling()
+            _prof_enabled_here = enabled_here
+            try:
+                cprof_scan = bool(cmd.cfg.get('enable_cprofile', False))
+            except Exception:
+                cprof_scan = False
+        _prof_users += 1
+        token = Profiler.start_async_pair('dirs:scan_wall', 'dirs:worker')
+    return token, cprof_scan
+
+
+def _prof_finish_scan(cmd, token, worker, dir_l, dir_r):
+    """Natural end of a scan: stop the pair, and when this was the
+    last profiled scan, print the reports and give the profiler back
+    (only if we took it)."""
+    global _prof_users, _prof_enabled_here
+    if token is not None:
+        Profiler.stop_async_pair(token)
+    cprof_scan = getattr(worker, 'cprofile', None) if worker else None
+    if _prof_users > 0:
+        _prof_users -= 1
+    if _prof_users > 0:
+        return  # another scan still owns the batch
+    if Profiler.is_enabled():
+        try:
+            profiling_report(
+                files=[('Left', dir_l), ('Right', dir_r)],
+                cprofile_was_on=bool(cprof_scan))
+        except Exception:
+            pass
+    if cprof_scan:
+        try:
+            stop_profiling(cprof_scan[0], cprof_scan[1],
+                           max_lines=25,
+                           title='Differ 2 folder compare: scanner thread'
+                                 ' (cProfile)')
+        except Exception:
+            pass
+    if _prof_enabled_here:
+        enable_profiling(False)
+        _prof_enabled_here = False
+
+
+def _prof_abandon_scan(cmd, token, worker):
+    """Cancelled run (rescan replaced it, window closed, app exit):
+    stop the pair, cancel the scanner's cProfile WITHOUT printing,
+    release the user slot; the last one out disables the profiler if
+    we took it."""
+    global _prof_users, _prof_enabled_here
+    if token is not None:
+        Profiler.stop_async_pair(token)
+    cprof_scan = getattr(worker, 'cprofile', None) if worker else None
+    if cprof_scan:
+        cancel_profiling(cprof_scan)
+        worker.cprofile = None
+    if _prof_users > 0:
+        _prof_users -= 1
+    if _prof_users > 0:
+        return
+    if _prof_enabled_here:
+        enable_profiling(False)
+        _prof_enabled_here = False
 
 
 # ----------------------------------------------------------------------
@@ -813,12 +1158,24 @@ class DirCompareForm:
                         [x]Subfolders  Mask:[ edit ][ Apply ]
       +--------------------------------------------------------------+
       | Name | Folder | Status | Left size | Left date | R.size | R.date |
-      | (listview, stretches with the form)                          |
+      | (owner-drawn listbox_ex, stretches with the form; every row  |
+      |  is painted here with its status color -- see below)         |
       +--------------------------------------------------------------+
       [ status line / progress                    ][ counts          ]
 
     The path edits are editable on purpose: type two paths and press
     Refresh (or Enter) to compare them without reopening any dialog.
+
+    The results list is an owner-drawn listbox_ex (LISTBOX_SET_DRAWN):
+    the control never paints items itself, it calls on_draw_item for
+    every visible row and the form paints background + icon + all
+    cells -- which is what makes the full-line status colors possible
+    (the dialog API's listview has no per-row colors at all). The
+    colors are the diff-tab hunk colors (color_changed / color_deleted
+    / color_added of Command.cfg), so a row's color matches exactly
+    what its double-clicked compare tab paints. The built-in column
+    header is driven with the same pixel widths the painter uses, so
+    header clicks (sorting) align with the drawn cells.
     """
 
     DEF_W = 940
@@ -839,7 +1196,10 @@ class DirCompareForm:
     PATH_W = 330
     BRW_W = 82
 
-    # Row C (filters).
+    # Row C (filters). NOTE 'act': True is required on every check
+    # control (set in _build): without it CudaText does not fire
+    # on_change when the user (un)checks the box -- the API doc:
+    # "act: active state... control's value change fires events".
     FILTER_CHECKS = (
         ('chk_diff', _('Different'), True),
         ('chk_lonly', _('Only left'), True),
@@ -860,16 +1220,29 @@ class DirCompareForm:
         self._sort_col = 1              # default: Folder, ascending
         self._sort_desc = False
         self._quick_only = bool(_get_opt('dirs.quick_only', False))
+        self._method = _get_method()
         self._show = {                  # status filter checkboxes
             ST_DIFF: True, ST_LONLY: True, ST_RONLY: True, ST_SAME: True,
         }
+        # Profiling state of the CURRENT scan (all None/False when the
+        # config gate is off): the async-pair token + whether the
+        # scanner thread started its own cProfile layer.
+        self._prof_token = None
+        self._prof_cprof_scan = False
+        # Diff-tab hunk colors for the drawn rows (refreshed at every
+        # start_scan from Command.cfg, which is reloaded there first).
+        self._colors = {}
         # Dialog plumbing
         self.h = 0
         self.h_sb = 0
+        self.h_list = 0                # listbox_ex handle (LISTBOX_*)
         self.h_imglist = 0
         self.ctl = {}                   # name -> control index
         self.ctl_rev = {}               # control index -> name
         self._icon_idx = {}             # icon name -> imagelist index
+        self._lb_n = 0                  # items currently in the listbox
+        self._lb_key = None             # (sort_col, desc, filter tuple)
+                                            # the listbox was filled for
         # Teardown flags (each stage runs at most once)
         self._torn = False              # worker cancelled, timer stopped
         self._freed = False             # DLG_FREE scheduled/done
@@ -976,6 +1349,7 @@ class DirCompareForm:
                 'h': 20, 'autosize': True, 'w': 100,
                 'a_t': ('ed_left', ']'), 'sp_t': 10,
                 'font_color': tcol,
+                'act': True,  # fire on_change on every (un)check
                 'on_change': self._on_check,
             }
             if prev is None:
@@ -990,6 +1364,7 @@ class DirCompareForm:
             'a_l': ('chk_same', ']'), 'sp_l': 24,
             'a_t': ('ed_left', ']'), 'sp_t': 10,
             'font_color': tcol,
+            'act': True,      # without it the toggle would do nothing
             'on_change': self._on_check,
         })
         self._add('label', 'lab_mask', {
@@ -1038,18 +1413,23 @@ class DirCompareForm:
         except Exception:
             pass
 
-        # -- The list ----------------------------------------------------
+        # -- The list (owner-drawn listbox_ex) ---------------------------
+        # NOT a listview: the dialog API's listview has no per-row
+        # colors, and full-line status colors are the point (see the
+        # class docstring). listbox_ex + LISTBOX_SET_DRAWN hands the
+        # painting to on_draw_item; the column header (sorting) comes
+        # from LISTBOX_SET_HEADER over LISTBOX_SET_COLUMNS widths --
+        # the same pixel widths _col_layout derives the cell offsets
+        # from, so header and cells stay aligned.
         p = {
             'a_l': ('', '['), 'sp_l': 10,
             'a_r': ('', ']'), 'sp_r': 10,
             'a_t': ('ed_left', ']'), 'sp_t': 40,
             'a_b': ('sbar', '['), 'sp_b': 4,
-            'columns': '\t'.join(
-                '\r'.join((cap, str(w), '', '', align))
-                for cap, align, w in _LIST_COLUMNS),
             'on_click_dbl': self._on_list_dbl,
             'on_click_header': self._on_header,
             'on_menu': self._on_list_menu,
+            'on_draw_item': self._on_draw_item,
         }
         li_bg = _theme_color('ListBg', ed_bg)
         li_fg = _theme_color('ListFont', ed_fg)
@@ -1057,7 +1437,27 @@ class DirCompareForm:
             p['color'] = li_bg
         if li_fg is not None:
             p['font_color'] = li_fg
-        self._add('listview', 'list', p)
+        self._add('listbox_ex', 'list', p)
+        self.h_list = ct.dlg_proc(h, ct.DLG_CTL_HANDLE, name='list')
+        try:
+            ct.listbox_proc(self.h_list, ct.LISTBOX_SET_ITEM_H,
+                            index=LIST_ITEM_H)
+            ct.listbox_proc(self.h_list, ct.LISTBOX_SET_COLUMN_SEP,
+                            text=COL_SEP)
+            ct.listbox_proc(self.h_list, ct.LISTBOX_SET_COLUMNS,
+                            text=self._col_spec())
+            ct.listbox_proc(self.h_list, ct.LISTBOX_SET_HEADER,
+                            text=self._header_text())
+            # Owner-drawn ON after the header/columns exist: from here
+            # the control paints nothing itself -- every visible row
+            # arrives in _on_draw_item (the header keeps its built-in
+            # themed painting; it is not affected by the drawn flag).
+            ct.listbox_proc(self.h_list, ct.LISTBOX_SET_DRAWN, index=1)
+        except Exception:
+            # Pre-listbox_proc CudaText builds: the list degrades to a
+            # plain (undrawn, single-column) listbox -- ugly but the
+            # window still compares, filters and sorts.
+            pass
 
         # Per-window imagelist (owned by the form -> freed with it).
         try:
@@ -1068,8 +1468,6 @@ class DirCompareForm:
                 idx = ct.imagelist_proc(self.h_imglist, ct.IMAGELIST_ADD,
                                         value=paths[name])
                 self._icon_idx[name] = idx if idx is not None else -1
-            ct.dlg_proc(h, ct.DLG_CTL_PROP_SET, name='list',
-                        prop={'imagelist_small': self.h_imglist})
         except Exception:
             pass  # icons are decoration; the Status column carries the info
 
@@ -1103,38 +1501,53 @@ class DirCompareForm:
         ct.dlg_proc(self.h, ct.DLG_SHOW_NONMODAL)
 
     # ------------------------------------------------------------------
-    # List view filling / sorting / formatting
+    # List filling / drawing / sorting
     # ------------------------------------------------------------------
 
-    def _header_str(self):
-        """The 'items' header line: 'Title=W' entries ('\r'-joined),
-        widths/alignments taken from the LIVE columns so the user's
-        manual column drags survive refills; the sort column's caption
-        carries the direction marker."""
-        cols = []
-        try:
-            s = ct.dlg_proc(self.h, ct.DLG_CTL_PROP_GET,
-                            name='list').get('columns', '')
-            for c in s.split('\t'):
-                parts = c.split('\r')
-                cols.append(parts + [''] * (5 - len(parts)))
-        except Exception:
-            cols = []
-        if len(cols) != len(_LIST_COLUMNS):
-            cols = [[cap, str(w), '', '', align]
-                    for cap, align, w in _LIST_COLUMNS]
+    def _header_text(self):
+        """The listbox header line: column captions joined by COL_SEP,
+        the sort column's caption carrying the direction marker (the
+        header is rebuilt via LISTBOX_SET_HEADER whenever the sort
+        changes -- see _apply_header)."""
         out = []
-        for i, c in enumerate(cols):
-            cap = c[0]
-            for mark in _SORT_MARK.values():
-                if cap.endswith(mark):
-                    cap = cap[:-len(mark)]
+        for i, (cap, _align, _w) in enumerate(_LIST_COLUMNS):
             if i == self._sort_col:
                 cap += _SORT_MARK[self._sort_desc]
-            width = c[1] if c[1] else '100'
-            align = c[4] if c[4] in ('L', 'R', 'C') else 'L'
-            out.append(cap + '=' + align + width)
-        return '\r'.join(out)
+            out.append(cap)
+        return COL_SEP.join(out)
+
+    def _apply_header(self):
+        """Push the (possibly re-marked) header captions to the list."""
+        if self._torn or not self.h_list:
+            return
+        try:
+            ct.listbox_proc(self.h_list, ct.LISTBOX_SET_HEADER,
+                            text=self._header_text())
+        except Exception:
+            pass
+
+    @staticmethod
+    def _col_spec():
+        """Column widths for LISTBOX_SET_COLUMNS, in _LIST_COLUMNS
+        order: 0 (= auto-stretch) for Name, the fixed pixel width for
+        every other column. The header splits its captions over these
+        same widths; _col_layout derives the drawn cells' offsets from
+        the same table -- one source of truth for all three."""
+        return [0] + [w for _cap, _align, w in _LIST_COLUMNS[1:]]
+
+    def _col_layout(self, width):
+        """Drawn-cell layout for a row 'width' pixels wide: a list of
+        (x, w, align) per column, mirroring LISTBOX_SET_COLUMNS'
+        semantics (fixed widths taken from the right edge of the given
+        width; Name gets the remainder)."""
+        fixed = [w for _cap, _align, w in _LIST_COLUMNS[1:]]
+        name_w = max(60, width - sum(fixed) - 4)
+        out = [(0, name_w, 'L')]
+        x = name_w + 2
+        for (_cap, align, w) in _LIST_COLUMNS[1:]:
+            out.append((x, w - 6, align))
+            x += w
+        return out
 
     def _sort_key(self, r):
         c = self._sort_col
@@ -1179,30 +1592,174 @@ class DirCompareForm:
         return self._show[ST_SAME]  # ST_SAME and plain ST_DIR rows
 
     def _fill_list(self, rows=None):
-        """Filter+sort 'rows' (default: the finished self._rows) into the
-        list view, preserving the live column widths (see _header_str)."""
-        if self._torn or not self.h:
+        """Filter+sort 'rows' (default: the finished self._rows) into
+        the owner-drawn list. The listbox only holds one caption string
+        per row (the joined cells -- what a non-drawn fallback would
+        show); the painted content comes from self._view, so keeping
+        the two in sync is this method's whole job. Refills are
+        INCREMENTAL while a scan streams rows in (same sort+filter ->
+        the new view extends the old one -> only the delta is appended,
+        one LISTBOX_ADD per new row); a sort or filter change rebuilds
+        the list from scratch and restores the selection."""
+        if self._torn or not self.h_list:
             return
         if rows is None:
             rows = self._rows
+        t0 = time.perf_counter()
         view = [r for r in rows if self._filter_ok(r)]
         view.sort(key=self._sort_key)
         if self._sort_desc:
             view.reverse()
-        self._view = view
-        data = [self._header_str()]
-        icons = []
-        for r in view:
-            data.append('\r'.join(self._row_cells(r)))
-            icons.append(str(self._icon_idx.get(_ICON_OF.get(r['status']),
-                                                -1)))
+
+        key = (self._sort_col, self._sort_desc,
+               tuple(sorted(self._show.items())))
+        old_view = self._view
+        keep_sel = self._sel_index()
+
+        incremental = (
+            key == self._lb_key and
+            len(view) >= len(old_view) and
+            all(view[i] is old_view[i] for i in range(len(old_view)))
+        )
         try:
-            ct.dlg_proc(self.h, ct.DLG_CTL_PROP_SET, name='list', prop={
-                'items': '\t'.join(data),
-                'imageindexes': '\t'.join(icons),
-            })
+            if incremental:
+                for r in view[self._lb_n:]:
+                    ct.listbox_proc(self.h_list, ct.LISTBOX_ADD,
+                                    index=-1, text=self._item_caption(r))
+                self._lb_n = len(view)
+                # Selection: an unchanged prefix keeps the selection
+                # valid -- nothing to restore while streaming.
+            else:
+                ct.listbox_proc(self.h_list, ct.LISTBOX_DELETE_ALL)
+                for r in view:
+                    ct.listbox_proc(self.h_list, ct.LISTBOX_ADD,
+                                    index=-1, text=self._item_caption(r))
+                self._lb_n = len(view)
+                self._lb_key = key
+                if 0 <= keep_sel < self._lb_n:
+                    ct.listbox_proc(self.h_list, ct.LISTBOX_SET_SEL,
+                                    index=keep_sel)
         except Exception:
             pass
+        self._view = view
+        if Profiler.is_enabled():
+            Profiler.mark('dirs:ui_fill_list', time.perf_counter() - t0,
+                          len(view) - len(old_view) if incremental
+                          else len(view))
+
+    @staticmethod
+    def _item_caption(r):
+        """The listbox item string of a row: cells joined by COL_SEP.
+        The drawn list never shows it (the painter draws the cells one
+        by one); it exists for the non-drawn fallback and for
+        copy/paste friendliness of the raw control content."""
+        return COL_SEP.join(DirCompareForm._row_cells(r))
+
+    # ------------------------------------------------------------------
+    # Row painting (owner-drawn listbox_ex)
+    # ------------------------------------------------------------------
+
+    def _on_draw_item(self, id_dlg, id_ctl, data='', info=''):
+        """LISTBOX_SET_DRAWN painter: draws one row -- background
+        (status color: the SAME colors the diff tabs paint their hunks
+        with), status icon, and the seven cells at _col_layout offsets.
+
+        Runs inside the control's paint cycle: only canvas_proc /
+        imagelist_proc calls here (paint-only, no re-entrant repaints),
+        and it must stay fast (every repaint of every visible row goes
+        through here -- ~15 API calls per row).
+        """
+        try:
+            index = int(data.get('index', -1))
+            rect = data.get('rect')
+            canvas = data.get('canvas')
+            if canvas is None or rect is None:
+                return
+            if not (0 <= index < len(self._view)):
+                return
+            row = self._view[index]
+        except Exception:
+            return
+        x0, y0, x1, y1 = rect
+        w, h = x1 - x0, y1 - y0
+        if w <= 0 or h <= 0:
+            return
+
+        st = row['status']
+        t0 = time.perf_counter() if Profiler.is_enabled() else 0.0
+
+        # -- background: selected > status color > plain list bg ------
+        try:
+            sel = ct.listbox_proc(self.h_list, ct.LISTBOX_GET_SEL)
+        except Exception:
+            sel = -1
+        col = self._colors
+        if index == sel:
+            bg = col.get('sel_bg')
+            fg = col.get('sel_font')
+        else:
+            bg = col.get(ST_COLOR_KEY.get(st, ''), )
+            fg = col.get('font')
+        if bg is None:
+            bg = col.get('bg', 0xF0F0F0)
+        if fg is None:
+            fg = 0x000000
+
+        try:
+            ct.canvas_proc(canvas, ct.CANVAS_SET_BRUSH, color=bg,
+                           style=ct.BRUSH_SOLID)
+            ct.canvas_proc(canvas, ct.CANVAS_RECT_FILL,
+                           x=x0, y=y0, x2=x1, y2=y1)
+        except Exception:
+            return
+
+        # -- status icon in the gutter before the Name column ---------
+        icon = _ICON_OF.get(st)
+        if icon is not None:
+            idx = self._icon_idx.get(icon, -1)
+            if idx is not None and idx >= 0 and self.h_imglist:
+                try:
+                    ct.imagelist_proc(
+                        self.h_imglist, ct.IMAGELIST_PAINT,
+                        value=(canvas, x0 + 3, y0 + (h - 16) // 2, idx))
+                except Exception:
+                    pass
+
+        # -- cells ------------------------------------------------------
+        cells = self._row_cells(row)
+        layout = self._col_layout(w)
+        try:
+            ct.canvas_proc(canvas, ct.CANVAS_SET_FONT, text='default',
+                           color=fg, style=0)
+            # one measure for the vertical centering baseline
+            sz = ct.canvas_proc(canvas, ct.CANVAS_GET_TEXT_SIZE,
+                                text='Ag')
+            ty = y0 + max(0, (h - (sz[1] if sz else 13)) // 2)
+        except Exception:
+            ty = y0 + 5
+            sz = None
+        for text, (cx, cw, align) in zip(cells, layout):
+            if not text or cw <= 4:
+                continue
+            try:
+                tw = ct.canvas_proc(canvas, ct.CANVAS_GET_TEXT_SIZE,
+                                    text=text)[0]
+                # cheap ellipsis: only names/dates ever overflow; the
+                # text is trimmed in ~25% steps until it fits (a few
+                # measures at most, and only for overflowing cells).
+                while tw > cw and len(text) > 4:
+                    cut = max(4, (len(text) * 3) // 4)
+                    text = text[:cut - 1] + '\u2026'
+                    tw = ct.canvas_proc(canvas, ct.CANVAS_GET_TEXT_SIZE,
+                                        text=text)[0]
+                tx = cx + 4 if align != 'R' else cx + cw - 4 - tw
+                ct.canvas_proc(canvas, ct.CANVAS_TEXT, text=text,
+                               x=x0 + tx, y=ty)
+            except Exception:
+                continue
+
+        if Profiler.is_enabled():
+            Profiler.mark('dirs:ui_draw_item', time.perf_counter() - t0)
 
     def _update_counts(self):
         rows = self._rows
@@ -1247,7 +1804,9 @@ class DirCompareForm:
         """(Re)start the comparison for the two paths currently in the
         path edits. A still-running scan is cancelled first -- its
         worker keeps finishing its current file in the background (as a
-        daemon, harmless) while the new worker takes over the timer."""
+        daemon, harmless) while the new worker takes over the timer;
+        its profiling pieces are abandoned without a report (the new
+        scan resets the profiler anyway when it owns the batch)."""
         if self._torn or not self.h:
             return
         pl = self._ctl_val('ed_left').strip().strip('"').strip("'")
@@ -1263,15 +1822,47 @@ class DirCompareForm:
         self._dir_l = os.path.normpath(pl)
         self._dir_r = os.path.normpath(pr)
         self._quick_only = bool(_get_opt('dirs.quick_only', False))
+        self._method = _get_method()
 
         if self._worker is not None:
             self._worker.cancel()
+            _prof_abandon_scan(self._cmd, self._prof_token, self._worker)
+            self._prof_token = None
         recursive = self._ctl_val('chk_sub') == '1'
         mask = _split_mask(self._ctl_val('ed_mask'))
+
+        # Profiling gate + colors: _prof_begin_scan reloads the Command
+        # config FIRST (the same order as refresh_compare), so both the
+        # enable_profiling/enable_cprofile gates and the hunk colors
+        # below see the CURRENT options -- also on the very first scan
+        # after changing them.
+        token, cprof_scan = _prof_begin_scan(self._cmd)
+        self._prof_token = token
+        self._prof_cprof_scan = cprof_scan
+        # Colors for the drawn rows: the diff-tab hunk colors (the
+        # painter looks them up by the cfg-key names ST_COLOR_KEY
+        # maps statuses to) + the themed list/selection colors. A
+        # None hunk color (cannot resolve) simply leaves those rows
+        # uncolored -- never an error.
+        cfg = getattr(self._cmd, 'cfg', None) or {}
+        self._colors = {
+            'sel_bg': _theme_color('ListSelBg'),
+            'sel_font': _theme_color('ListSelFont'),
+            'bg': _theme_color('ListBg', 0xF0F0F0),
+            'font': _theme_color('ListFont', 0x000000),
+        }
+        for k in ('color_changed', 'color_deleted', 'color_added'):
+            v = cfg.get(k)
+            if isinstance(v, int):
+                self._colors[k] = v
+
         self._worker = _Scanner(self._dir_l, self._dir_r, recursive,
-                                mask, self._quick_only)
+                                mask, self._quick_only, self._method,
+                                cprof_scan)
         self._rows = []
         self._view = []
+        self._lb_n = 0
+        self._lb_key = None
         self._last_fill = -1
         self._scan_t0 = time.perf_counter()
         try:
@@ -1286,12 +1877,14 @@ class DirCompareForm:
             pass
         self._sb_text(1, _('Comparing...'))
         self._sb_text(2, '')
+        self._fill_list()          # empty the list right away
         self._worker.start()
         ct.timer_proc(ct.TIMER_START, self._on_timer, POLL_MS)
 
     def _on_timer(self, tag='', info=''):
         """Main-thread poll of the worker (timer_proc): refresh the
         progress line, stream rows into the list, finish up."""
+        t0 = time.perf_counter() if Profiler.is_enabled() else 0.0
         if self._torn:
             self._stop_timer()
             return
@@ -1305,6 +1898,8 @@ class DirCompareForm:
             self._fill_list()
             self._update_counts()
             self._sb_text(1, _('Scan failed: {}').format(w.fatal))
+            _prof_abandon_scan(self._cmd, self._prof_token, w)
+            self._prof_token = None
             return
         if not finished:
             self._sb_text(1, _('Comparing... {} / {}').format(
@@ -1312,6 +1907,9 @@ class DirCompareForm:
             if len(rows) - self._last_fill >= PARTIAL_FILL_STEP:
                 self._last_fill = len(rows)
                 self._fill_list(rows)
+            if Profiler.is_enabled():
+                Profiler.mark('dirs:ui_timer_tick',
+                              time.perf_counter() - t0)
             return
         # Finished (normally or cancelled): last full update.
         self._stop_timer()
@@ -1323,12 +1921,21 @@ class DirCompareForm:
         if w.cancelled():
             msg = _('Cancelled') if not rows else \
                 _('Cancelled ({} of {} rows)').format(len(rows), total)
+            _prof_abandon_scan(self._cmd, self._prof_token, w)
         else:
             msg = _('Done in {:.1f} s').format(elapsed)
             if w.walk_errors:
                 msg += '  ' + _('({} folders unreadable)').format(
                     len(w.walk_errors))
+            # Profiling epilogue at the natural end: section report
+            # first, then the two cProfile reports (main + scanner
+            # thread), then hand the profiler back if we took it.
+            _prof_finish_scan(self._cmd, self._prof_token, w,
+                              self._dir_l, self._dir_r)
+        self._prof_token = None
         self._sb_text(1, msg)
+        if Profiler.is_enabled():
+            Profiler.mark('dirs:ui_timer_tick', time.perf_counter() - t0)
 
     def _stop_timer(self):
         # NOTE: the interval argument is REQUIRED by timer_proc's
@@ -1408,7 +2015,8 @@ class DirCompareForm:
 
     def _on_header(self, id_dlg, id_ctl, data='', info=''):
         """Column header click: sort by that column; clicking again
-        toggles the direction (the caption carries the marker)."""
+        toggles the direction (the rebuilt header carries the marker,
+        aligned with the drawn cells -- same width table)."""
         try:
             col = int(data)
         except (TypeError, ValueError):
@@ -1419,11 +2027,13 @@ class DirCompareForm:
             self._sort_col = col
             self._sort_desc = False
         self._fill_list()
+        self._apply_header()
 
     def _sel_index(self):
         try:
-            return int(self._ctl_val('list'))
-        except (TypeError, ValueError):
+            i = ct.listbox_proc(self.h_list, ct.LISTBOX_GET_SEL)
+            return int(i) if i is not None else -1
+        except Exception:
             return -1
 
     def _on_list_dbl(self, id_dlg, id_ctl, data='', info=''):
@@ -1446,13 +2056,20 @@ class DirCompareForm:
         """Double-click semantics. File pairs (Identical or Different)
         open in a Differ 2 compare tab via the Command object; one-sided
         files open alone; folder pairs open a drill-down compare window;
-        one-sided folders open in the OS file manager."""
+        one-sided folders open in the OS file manager. The whole handoff
+        (opening the two editor tabs + set_files' own refresh) is one
+        profiler section -- its rows show what the double-click costs
+        on top of the tab compare's own refresh:* rows."""
         st = row['status']
         pl = self._path(row, 'l')
         pr = self._path(row, 'r')
         if st in (ST_SAME, ST_DIFF):
             if os.path.isfile(pl) and os.path.isfile(pr):
-                self._cmd.open_compare_pair(pl, pr)
+                Profiler.start('dirs:open_compare_pair')
+                try:
+                    self._cmd.open_compare_pair(pl, pr)
+                finally:
+                    Profiler.stop()
             else:
                 ct.msg_status(_('File changed on disk -- press Refresh'))
         elif st == ST_LONLY:
@@ -1628,9 +2245,9 @@ class DirCompareForm:
 
     def _refresh_row(self, row):
         """Re-evaluate one file row after a copy/delete action: re-stat
-        both sides, re-run the same tiered compare the scanner uses, and
-        patch the row in place (no full rescan). A row that vanished
-        from both sides is dropped."""
+        both sides, re-run the same compare (method included) the
+        scanner uses, and patch the row in place (no full rescan). A
+        row that vanished from both sides is dropped."""
         rel = row['rel']
         sl = _stat_side(os.path.join(self._dir_l, rel))
         sr = _stat_side(os.path.join(self._dir_r, rel))
@@ -1639,7 +2256,7 @@ class DirCompareForm:
                           if r['isdir'] or r['rel'] != rel]
         else:
             new_row = _file_row(self._dir_l, self._dir_r, rel, sl, sr,
-                                self._quick_only)
+                                self._quick_only, self._method)
             for i, r in enumerate(self._rows):
                 if not r['isdir'] and r['rel'] == rel:
                     self._rows[i] = new_row
@@ -1673,6 +2290,15 @@ class DirCompareForm:
         self._torn = True
         if self._worker is not None:
             self._worker.cancel()
+        # The scan this window started (if any) is abandoned: its
+        # profiler pieces are cancelled without a report, exactly like
+        # the tab compare's cancel path -- closing a window must never
+        # print a half-run report.
+        if self._prof_token is not None or self._prof_cprof_scan:
+            _prof_abandon_scan(self._cmd, self._prof_token,
+                               self._worker)
+            self._prof_token = None
+            self._prof_cprof_scan = False
         self._stop_timer()
         # Remember the window geometry -- a single-line "x,y,w,h"
         # string (lists would corrupt the settings file on the second
@@ -1715,10 +2341,15 @@ class DirCompareForm:
     def notify_app_exit(self):
         """App is exiting (Command.on_exit_pre -> close_all): stop the
         worker and the timer; no dialog calls -- the app destroys the
-        forms itself."""
+        forms itself. The scan is abandoned (profiling pieces cancelled
+        without a report, like every other abandonment path)."""
         self._app_exit = True
         if self._worker is not None:
             self._worker.cancel()
+        if self._prof_token is not None or self._prof_cprof_scan:
+            _prof_abandon_scan(self._cmd, self._prof_token, self._worker)
+            self._prof_token = None
+            self._prof_cprof_scan = False
         self._stop_timer_safe()
         self._torn = True
         self._freed = True
@@ -1792,8 +2423,14 @@ def _unregister_form(form):
 
 def compare_dialog(cmd, dir_l='', dir_r=''):
     """Menu entry: ask for two folders (history-remembered picker),
-    then open a compare window."""
-    res = _PickerDialog().show(dir_l, dir_r)
+    then open a compare window. The picker is a profiler section of
+    its own ('dirs:picker') -- a slow-to-open folder chooser would
+    otherwise hide inside the operation's wall time."""
+    Profiler.start('dirs:picker')
+    try:
+        res = _PickerDialog().show(dir_l, dir_r)
+    finally:
+        Profiler.stop()
     if res:
         compare_directories(cmd, res[0], res[1])
 
@@ -1818,7 +2455,11 @@ def compare_directories(cmd, dir_l, dir_r):
                    ct.MB_OK + ct.MB_ICONWARNING)
         return
     try:
-        form = DirCompareForm(cmd, dir_l, dir_r)
+        Profiler.start('dirs:form_build')
+        try:
+            form = DirCompareForm(cmd, dir_l, dir_r)
+        finally:
+            Profiler.stop()
     except Exception as ex:
         ct.msg_box(_('Cannot open the folder compare window:\n\n{}'
                      ).format(ex), ct.MB_OK + ct.MB_ICONERROR)
