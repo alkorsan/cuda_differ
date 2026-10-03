@@ -1,3 +1,38 @@
+2026.10.05 (10th release, by @alkorsan)
++ change: differ2.dirs.scan_threading default flipped 'pool' ->
+  'main' -- the update-9 A/B/C on the reporting box closed the
+  case the deep probe had opened. Same folders, profiling on:
+  'pool' 12.6 s (10 listings, avg 813 ms), 'serial' 13.0 s (avg
+  548 ms), 'main' 8.1 ms (avg 0.1 ms) -- a ~1500x gap between the
+  main thread and every background thread, with the deep probe
+  already naming the mechanism: a GIL convoy (listings on scan
+  threads waited up to ~412 ms to re-acquire the interpreter lock
+  after each metadata syscall, KERNEL 0.0 / USER 0.0 = pure wait,
+  process-wide for as long as the scan ran; the main thread paid
+  0.1 ms per listing with 0.0 ms hand-backs). The disk, the
+  folders, the filter stack, the listing call and the engine were
+  exonerated one by one across updates 6-9; the THREAD is the tax,
+  so the thread the scan runs on is now the DEFAULT: the whole
+  scan runs synchronously on the UI thread (window frozen for its
+  duration, rows at the end -- a fraction of a second for a
+  normal tree). The threaded shapes stay one option away for very
+  big trees, where rows streaming into a live, cancelable window
+  beat a frozen one even at a tenth of the speed:
+  * 'pool': scanner thread + scan pool (the engine as it was);
+  * 'serial': scanner thread alone (the shape cProfile forces).
+  New SCAN_MODE_DEFAULT constant: every fallback (missing option,
+  hand-edited bogus value, _Scanner's constructor default, the
+  facts block's workerless guess) lands there -- one line to flip
+  again. The facts block's 'scan mode:' line now says
+  'threading=main, the default' and names the pool shape 'the
+  threaded engine, for very big trees' (it no longer calls pool
+  the default). Option dialog: main listed first, comment
+  rewritten (the 8 ms vs 12.6 s measurement and the very-big-
+  trees guidance). readme: the engine chapter's verdict paragraph
+  + the profiling chapter's how-to-measure note + the option
+  entry; module docstring: the A/B/C numbers, the convoy
+  mechanism and the per-shape guidance in 'The scan engine'.
+
 2026.10.05 (9th release, by @alkorsan)
 + feature: option differ2.dirs.scan_threading -- the folder scan's
   threading SHAPE is switchable per scan, the missing control for

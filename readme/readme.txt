@@ -311,11 +311,13 @@ FindFirstFileW whose small buffer pays a fresh round trip every few
 entries -- on a source where a round trip is expensive (antivirus
 filter, network share, cloud placeholders) that difference is the
 scan. Anything unusual (other OS, long paths, API missing) silently
-falls back to os.scandir, which is always correct. Both trees, every
-subfolder, and the content tests for equal-size pairs then run
-CONCURRENTLY on a small thread pool, subfolders submitted the moment
-their parent's listing arrives (no waiting behind unrelated slow
-directories -- WinMerge feeds a worker-thread pool the same way).
+falls back to os.scandir, which is always correct. In the
+"parallel" scan shape (see differ2.dirs.scan_threading below) both
+trees, every subfolder, and the content tests for equal-size pairs
+run CONCURRENTLY on a small thread pool, subfolders submitted the
+moment their parent's listing arrives (no waiting behind unrelated
+slow directories -- WinMerge feeds a worker-thread pool the same
+way).
 The remaining variance is the file system's own cache: a first-ever
 compare of a tree pays the cold cost of every metadata call
 (antivirus pass, disk seeks, SMB round trips -- each can cost
@@ -378,6 +380,22 @@ its own copy of those numbers into the facts block's per-listing
 table (ms / KERNEL / USER / GIL / tid per directory), and the
 block prints the host (Windows build + service pack, python, cpus)
 plus the scanner thread's priority and token state.
+
+The verdict, and what it changed (update 10): the A/B/C over the
+three scan shapes on the reporting box closed the case -- same
+folders, profiling on: "parallel" 12.6 s (listings avg 813 ms),
+"serial" 13.0 s (avg 548 ms), "main" 8.1 ms (avg 0.1 ms). The deep
+probe had named the mechanism: a GIL convoy -- every background
+thread's listing waited up to ~412 ms to re-acquire the interpreter
+lock after each metadata syscall (KERNEL 0.0 / USER 0.0: pure
+wait), process-wide for as long as the scan ran, while the main
+thread paid 0.1 ms for the same calls. The disk, the folders, the
+filter stack, the listing call and the engine had been exonerated
+one by one; the THREAD was the tax. Consequence: "main" is now the
+DEFAULT scan shape (a normal tree freezes the window for a
+fraction of a second), and the threaded shapes are the opt-in for
+very big trees, where rows streaming into a live, cancelable
+window beat a frozen one even at a tenth of the speed.
 
 The window's controls:
 
@@ -519,8 +537,11 @@ purpose: cProfile traces only the thread that started it, so the pool
 threads would be invisible in the function report (the section report
 still attributes the parallel run) -- a profiled compare is therefore
 somewhat slower than a normal one. To MEASURE speed, profile with
-differ2.advanced.enable_profiling ON and enable_cprofile OFF: the
-section report is then clean AND the scan stays fully parallel. A
+differ2.advanced.enable_profiling ON and enable_cprofile OFF, and
+check the facts block's "scan mode:" line for the shape you meant
+to measure: the default is now the main-thread scan, so set
+differ2.dirs.scan_threading to "parallel" first when the threaded
+engine is the thing to measure. A
 scan cancelled by a rescan or a closing window prints nothing, like
 the tab compare's cancel path.
 
@@ -1511,18 +1532,26 @@ Folders section (see the "Compare folders" chapter above for details):
   antivirus-hooked opens).
   See the "Compare folders" chapter for the full trade-offs.
 - differ2.dirs.scan_threading: Folder scan threading (default:
-  parallel)
-  "parallel" is the engine as it always was: a scanner thread plus
-  a small pool walking both trees concurrently, rows streaming in
-  while it scans. "serial" walks on the scanner thread alone (no
-  pool). "main" runs the whole scan synchronously on the UI thread
-  -- a diagnostic mode: the window freezes for the scan's duration
-  (no repaint, no cancel, rows appear at the end), but if folders
-  that crawl in the threaded modes are instant in "main", the disk
-  and the filter stack are innocent and the tax follows the
-  threading; the profiling report's per-listing table then shows
-  which thread paid which directory. Do not leave "main" on for
-  everyday use.
+  main thread)
+  Which threads run the folder scan. "main" (the default) runs the
+  whole scan synchronously on the UI thread: the window freezes
+  for the scan's duration (no repaint, no cancel, rows appear at
+  the end). For a normal tree that freeze is a fraction of a
+  second -- and on boxes where background threads starve for the
+  interpreter lock while the UI is busy it is the only fast shape
+  at all: the measured case (Windows 7, no antivirus, GIL convoy
+  named by the deep probe) did the same folders in 8.1 ms on the
+  main thread vs 12.6 s on the scanner threads -- every background
+  listing waited ~200 ms to re-acquire the GIL (zero CPU burned),
+  while the main thread paid 0.1 ms per listing. "parallel" is the
+  engine for very big trees: a scanner thread plus a small pool
+  walking both trees concurrently, rows streaming into a live,
+  cancelable window -- switch to it when a walk takes so long that
+  a frozen window is worse than a slower walk. "serial" walks on
+  the scanner thread alone (the shape the cProfile layer forces).
+  The option is reloaded on every Refresh; the profiling report's
+  "scan mode:" line names the shape and the per-listing table
+  shows which thread paid which directory.
 
 
 == Diff algorithms and best practices ==

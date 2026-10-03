@@ -82,39 +82,68 @@ Folder rows take their mtime from the parent listing the same way;
 _stat_side survives only in the main thread's single-row refresh
 after a copy/delete action.
 
-The directory scans run CONCURRENTLY on a small thread pool
-(SCAN_POOL_THREADS), WinMerge-style (its scan also feeds a thread
-pool from a notification queue): both roots are submitted at once,
-and the moment a directory's listing arrives, its subfolders are
-submitted too -- no wave barrier, no scan ever waits behind an
-unrelated slow directory. The wall time approaches the longest
-CHAIN of directories plus one listing latency, not the sum of all
+In the THREADED shapes (option differ2.dirs.scan_threading 'pool'
+-- the opt-in engine for very big trees) the directory scans run
+CONCURRENTLY on a small thread pool (SCAN_POOL_THREADS),
+WinMerge-style (its scan also feeds a thread pool from a
+notification queue): both roots are submitted at once, and the
+moment a directory's listing arrives, its subfolders are submitted
+too -- no wave barrier, no scan ever waits behind an unrelated slow
+directory. The wall time approaches the longest CHAIN of
+directories plus one listing latency, not the sum of all
 directories. The equal-size content tests ride the same pool
 afterwards. On a fast local disk all this changes little; on a
-source with high per-call latency the difference is the scan. While
-the cProfile layer is on, the scan deliberately falls back to the
-serial one-thread mode: cProfile only traces the thread that
-started it, so pool threads would be invisible in the
-function-level report (the section report still attributes the
-parallel run via thread-safe standalone marks) -- a profiled scan
-is therefore somewhat slower than a normal one, on purpose.
+source with high per-call latency the difference is the scan --
+WHEN background threads get to run at full speed (see the update-10
+finding below for the box where they do not). While the cProfile
+layer is on, the scan deliberately falls back to the serial
+one-thread mode: cProfile only traces the thread that started it,
+so pool threads would be invisible in the function-level report
+(the section report still attributes the parallel run via
+thread-safe standalone marks) -- a profiled scan is therefore
+somewhat slower than a normal one, on purpose.
 
 The scan's threading SHAPE is switchable (option differ2.dirs.scan_
-threading) -- the control the update-8 finding asked for: a tax
-that appears only inside the real scan, on the scan's threads,
-while the same folder lists in ~0 ms from the main thread, cannot
-be diagnosed further without moving the work. Three shapes:
-'pool' (the default engine above), 'serial' (the scanner thread
-alone, no pool -- separates "the pool's concurrent bursts" from
-"any worker thread pays"), and 'main' (the whole scan
-SYNCHRONOUSLY on the UI thread: run() called inline, no worker
-thread, no timer ticks, no repaint, no cancel; rows appear at the
-end and the window freezes for the scan's duration). A fast 'main'
-run on folders that crawl in the threaded modes proves the disk
-and the filter stack innocent: the tax follows the threading, and
-the report's per-listing tid column shows exactly which thread
-paid which directory. 'main' is a diagnostic, not a fix: a huge
-tree would freeze the window for its whole walk.
+threading), and update 10 settled which shape deserves the default.
+The update-9 A/B/C on the reporting box (same folders, profiling
+on, Windows 7 / 4 cpus / no antivirus) closed the case the deep
+probe had opened:
+
+  pool    scan wall 12570 ms, 10 listings avg 813 ms
+  serial  scan wall 12989 ms, 10 listings avg 548 ms
+  main    scan wall     8.1 ms, 10 listings avg   0.1 ms
+
+The deep probe had already named the mechanism: on that box every
+background thread's listing waits up to ~200-412 ms to re-acquire
+the interpreter lock after each metadata syscall (GIL hand-back
+spikes, KERNEL 0.0 / USER 0.0 = pure wait, no CPU burned) while
+the UI thread runs its message loop -- a GIL convoy, process-wide
+for as long as the scan runs, and ~1500x slower than the same
+calls on the main thread (which pays 0.1 ms per listing, 0.0 ms
+hand-backs). The disk, the folders, the filter stack, the listing
+call and the engine were all exonerated across updates 6-9; the
+THREAD is the tax. Therefore:
+
+  main    (the DEFAULT) the whole scan runs SYNCHRONOUSLY on the
+          UI thread: run() called inline, no worker thread, no
+          timer ticks, no repaint, no cancel; rows appear at the
+          end and the window freezes for the scan's duration.
+          On a GIL-convoy box this is the only fast shape (8 ms
+          vs 12.6 s); on a healthy box the freeze is the whole
+          cost -- a normal tree scans in well under a second.
+  pool    the threaded engine: scanner thread + pool, rows
+          streaming into a live, cancelable window. The choice
+          for VERY BIG trees, where a frozen window for the
+          walk's whole duration is worse than a slower walk.
+  serial  the scanner thread alone, no pool -- kept for the
+          cProfile layer (which forces it) and for A/B-ing the
+          pool's concurrent bursts away.
+
+The option is reloaded on every start_scan (set it, press
+Refresh); the facts block prints a 'scan mode:' line naming the
+shape, and the per-listing tid column shows which thread paid
+which directory -- in 'main' runs every row shows the UI thread's
+one tid.
 
 The "same folders, 30 s today / 1 s tomorrow" effect is the file
 system, not growing code: each metadata call costs microseconds
@@ -193,15 +222,21 @@ ctypes / with profiling off.
 
 == Threading model ==================================================
 
-The scan runs on a daemon thread that touches ONLY the file system
-and its own state -- never the CudaText API (which is main-thread
-only). A per-window poll timer (timer_proc, ~200 ms) snapshots the
-worker's results under its lock and updates the list view on the main
-thread, so huge trees stream into the window while it stays fully
-responsive; closing the window or starting a rescan simply sets a
-cancel flag the worker checks between every file. Several compare
-windows can run scans at once -- each owns one worker, one timer and
-its own scan pool (the worker thread itself only coordinates).
+This is the THREADED engine (option differ2.dirs.scan_threading
+'pool'/'serial') -- the opt-in shape for very big trees since
+update 10. The scan runs on a daemon thread that touches ONLY the
+file system and its own state -- never the CudaText API (which is
+main-thread only). A per-window poll timer (timer_proc, ~200 ms)
+snapshots the worker's results under its lock and updates the list
+view on the main thread, so huge trees stream into the window
+while it stays fully responsive; closing the window or starting a
+rescan simply sets a cancel flag the worker checks between every
+file. Several compare windows can run scans at once -- each owns
+one worker, one timer and its own scan pool (the worker thread
+itself only coordinates). The DEFAULT shape ('main') has none of
+this machinery: run() is called inline on the UI thread, the
+window freezes for the scan's duration and rows appear at the end
+-- see "The scan engine" for why that trade-off won.
 
 == Profiling ========================================================
 
@@ -371,18 +406,30 @@ SCAN_POOL_THREADS = 8
 
 # Threading SHAPES of the folder scan (option differ2.dirs.scan_
 # threading; see the module docstring's "The scan engine"):
-#   pool    the scanner thread + the scan pool (the default engine)
+#   main    EVERYTHING synchronously on the MAIN thread: run() is
+#           called INLINE (never .start()), so the whole scan --
+#           self-test, deep probe, walks, rows -- runs on the thread
+#           that owns the UI. No worker thread, no pool, no timer,
+#           no repaint, no cancel: the window freezes for the scan's
+#           duration and rows appear at the end. THE DEFAULT since
+#           update 10: on boxes where background threads starve for
+#           the GIL while the UI is busy (the update-9/10 finding:
+#           the same folders 8 ms on main vs 12.6 s on the pool --
+#           a ~1500x gap) this is not just the fastest shape, it is
+#           the only fast one.
+#   pool    the scanner thread + the scan pool: both trees walked
+#           concurrently, rows streaming into a live window, cancel
+#           mid-scan -- the engine for VERY BIG trees, where a
+#           frozen window for minutes is worse than a slower walk
 #   serial  the scanner thread ALONE: the walk runs directory by
 #           directory on it, no pool (the cProfile layer's shape)
-#   main    EVERYTHING synchronously on the MAIN thread: no scanner
-#           thread, no pool, no timer, no repaint, no cancel -- a
-#           diagnostic mode (and the answer to boxes where worker
-#           threads are billed: run() is called INLINE, so the
-#           whole scan -- self-test, deep probe, walks, rows -- runs
-#           on the thread that owns the UI)
 SCAN_MODE_POOL = 'pool'
 SCAN_MODE_SERIAL = 'serial'
 SCAN_MODE_MAIN = 'main'
+# The default shape (update 10): 'main'. Every fallback below (a
+# missing option, a hand-edited bogus value) lands here -- one
+# constant so a future flip is a one-line change.
+SCAN_MODE_DEFAULT = SCAN_MODE_MAIN
 _SCAN_MODES = (SCAN_MODE_POOL, SCAN_MODE_SERIAL, SCAN_MODE_MAIN)
 
 HISTORY_MAX = 12               # remembered folder paths per side
@@ -1706,7 +1753,7 @@ class _Scanner(threading.Thread):
 
     def __init__(self, dir_l, dir_r, recursive, mask, quick_only,
                  method=METHOD_CONTENTS, cprofile_on=False,
-                 scan_mode=SCAN_MODE_POOL):
+                 scan_mode=SCAN_MODE_DEFAULT):
         super().__init__(daemon=True, name='Differ2DirCompare')
         self.dir_l = dir_l
         self.dir_r = dir_r
@@ -1715,12 +1762,14 @@ class _Scanner(threading.Thread):
         self.quick_only = quick_only
         self.method = method
         # Threading shape of this scan (differ2.dirs.scan_threading;
-        # see the module docstring). 'main' never .start()s the
-        # thread: the FORM calls run() inline so the whole scan runs
-        # on the main thread -- the attribute stays on the worker so
+        # see the module docstring). The default is 'main' (update
+        # 10): the FORM calls run() inline so the whole scan runs on
+        # the main thread -- the attribute stays on the worker so
         # the facts block can name the thread that paid each number.
+        # 'pool'/'serial' (the threaded engine, for very big trees)
+        # are the opt-in shapes.
         self.scan_mode = scan_mode if scan_mode in _SCAN_MODES \
-            else SCAN_MODE_POOL
+            else SCAN_MODE_DEFAULT
         # Scanner-thread cProfile layer (the 2nd profiler mode):
         # enabled by the FORM when the config double-gate is on. The
         # Profile object is created and enabled HERE, on the thread it
@@ -2451,9 +2500,10 @@ def _prof_facts_block(worker):
     # threading) -- which engine produced every number below; the
     # per-listing tid column then shows which thread paid which
     # directory. First thing after the host line so every pasted
-    # report names its own shape.
-    mode = getattr(worker, 'scan_mode', SCAN_MODE_POOL) \
-        if worker is not None else SCAN_MODE_POOL
+    # report names its own shape. Update 10: 'main' is the default;
+    # the threaded shapes are the opt-in for very big trees.
+    mode = getattr(worker, 'scan_mode', SCAN_MODE_DEFAULT) \
+        if worker is not None else SCAN_MODE_DEFAULT
     thr_nm = 'MAIN' if mode == SCAN_MODE_MAIN else 'SCANNER'
     if worker is not None and getattr(worker, 'cprofile_on', False):
         mode_txt = 'SERIAL on the {} thread (differ2.advanced.' \
@@ -2462,16 +2512,19 @@ def _prof_facts_block(worker):
                    'rescan to measure real speed'.format(thr_nm)
     elif mode == SCAN_MODE_MAIN:
         mode_txt = ('MAIN thread, synchronous (differ2.dirs.scan_'
-                    'threading=main): no worker thread, no pool, no '
-                    'UI ticks while scanning -- the window was frozen '
-                    'for the whole scan, rows appeared at the end')
+                    'threading=main, the default): no worker thread, '
+                    'no pool, no UI ticks while scanning -- the '
+                    'window was frozen for the whole scan, rows '
+                    'appeared at the end')
     elif mode == SCAN_MODE_SERIAL:
         mode_txt = ('SERIAL on the SCANNER thread (differ2.dirs.scan_'
                     'threading=serial): no pool, walk directory by '
                     'directory, UI ticks + row streaming as usual')
     else:
-        mode_txt = 'PARALLEL (scanner thread + scan pool of {}) -- ' \
-                   'the default engine'.format(SCAN_POOL_THREADS)
+        mode_txt = ('PARALLEL (scanner thread + scan pool of {}) -- '
+                    'the threaded engine, for very big trees (a '
+                    'frozen window there is worse than a slower '
+                    'walk)').format(SCAN_POOL_THREADS)
     lines.append('scan mode: ' + mode_txt)
 
     def _probe_verdict(root_ms, ctrl_ms):
@@ -3589,15 +3642,17 @@ class DirCompareForm:
         self._dir_r = os.path.normpath(pr)
         self._quick_only = bool(_get_opt('dirs.quick_only', False))
         self._method = _get_method()
-        # Threading shape of THIS scan (differ2.dirs.scan_threading;
-        # see the module docstring's "The scan engine"): 'pool' is the
-        # default engine, 'serial' walks on the scanner thread alone,
-        # 'main' runs the whole scan synchronously HERE. Reloaded per
-        # scan, so the three shapes can be A/B-ed from the same
-        # window (set the option, press Refresh).
-        mode = _get_opt('dirs.scan_threading', SCAN_MODE_POOL)
+        # Threading shape of THIS scan (differ2.dirs.scan_
+        # threading): 'main' (the DEFAULT since update 10) runs the
+        # whole scan synchronously HERE, 'serial' walks on the
+        # scanner thread alone, 'pool' is the full threaded engine
+        # -- both opt-in for very big trees, where a frozen window
+        # is worse than a slower background walk. Reloaded per
+        # scan, so the shapes can be A/B-ed from the same window
+        # (set the option, press Refresh).
+        mode = _get_opt('dirs.scan_threading', SCAN_MODE_DEFAULT)
         if mode not in _SCAN_MODES:
-            mode = SCAN_MODE_POOL
+            mode = SCAN_MODE_DEFAULT
         self._scan_mode = mode
 
         if self._worker is not None:

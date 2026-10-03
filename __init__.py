@@ -1322,33 +1322,37 @@ OPTS_META = [
      'chp': 'dirs',
      },
     {'opt': 'differ2.dirs.scan_threading',
-     'cmt': _('Folder scan threading (diagnostic)\n'
-              'Which threads run the folder scan. "Parallel" (the '
-              'default) is the fast engine: a scanner thread plus a '
-              'small pool walking both trees concurrently, rows '
-              'streaming into the window while it scans. "Serial" '
-              'runs the same walk on the scanner thread alone, one '
-              'directory at a time -- useful to separate "any worker '
-              'thread pays a tax" from "the pool\'s concurrent '
-              'bursts trigger something". "Main thread" runs the '
-              'WHOLE scan synchronously on the UI thread: no worker '
-              'thread, no pool, no cancel, and the window stays '
-              'frozen (no repaint, rows appear at the end) for the '
-              'scan\'s duration. That last mode is a diagnostic: '
-              'when a scan is mysteriously slow, a fast main-thread '
-              'run on the same folders proves the folders, the disk '
-              'and the filter stack innocent -- the tax then follows '
-              'the threading, and the profiling report (Plugins > '
-              'Differ 2 > enable_profiling) shows exactly which '
-              'thread paid which directory listing. Do not leave it '
-              'on for everyday use: a big tree freezes the window '
-              'for its whole walk.\n'
-              'Default: parallel.'),
-     'def': 'pool',
+     'cmt': _('Folder scan threading\n'
+              'Which threads run the folder scan. "Main thread" '
+              '(the default) runs the WHOLE scan synchronously on '
+              'the UI thread: no worker thread, no pool, no cancel, '
+              'and the window stays frozen (no repaint, rows appear '
+              'at the end) for the scan\'s duration. For a normal '
+              'tree that freeze is a fraction of a second -- and '
+              'on boxes where background threads starve for the '
+              'interpreter lock while the UI is busy (measured: '
+              'the same folders 8 ms on the main thread vs 12.6 s '
+              'on the scanner threads, every listing waiting '
+              '~200 ms to re-acquire the GIL) it is the only fast '
+              'shape at all. "Parallel" is the engine for VERY '
+              'BIG trees: a scanner thread plus a small pool '
+              'walking both trees concurrently, rows streaming '
+              'into a live, cancelable window -- slower per '
+              'listing on such boxes, but a walk of minutes '
+              'without a frozen window beats a faster one with '
+              'it. "Serial" runs the same walk on the scanner '
+              'thread alone, one directory at a time (the shape '
+              'the cProfile layer forces). The profiling report '
+              '(Plugins > Differ 2 > enable_profiling) names the '
+              'shape and shows which thread paid which directory '
+              'listing.\n'
+              'Default: main thread.'),
+     'def': 'main',
      'frm': 'str2s',
-     'dct': [('pool', _('Parallel (scanner thread + pool, the default)')),
-             ('serial', _('Serial (scanner thread, no pool)')),
-             ('main', _('Main thread (synchronous, diagnostic)'))],
+     'dct': [('main', _('Main thread (synchronous, the default)')),
+             ('pool', _('Parallel (scanner thread + pool, for very '
+                        'big trees)')),
+             ('serial', _('Serial (scanner thread, no pool)'))],
      'chp': 'dirs',
      },
 ]
