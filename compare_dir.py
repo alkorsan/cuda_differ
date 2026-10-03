@@ -58,37 +58,57 @@ corrects.
 
 == The scan engine (what a slow compare is made of) ================
 
-The walk is one flat os.scandir per directory (_scan_dir), NOT
-os.walk + a stat() per file: a scandir DirEntry carries the entry's
-size and mtime from the directory listing itself, so on Windows a
-full tree walk needs ZERO per-file stat() calls and no lstat() at
-all (os.walk + os.stat doubles the metadata syscalls -- on a source
-where every call costs 100-200 ms that is the whole scan). Folder
-rows take their mtime from the parent listing the same way;
+The walk is one flat listing per directory (_scan_dir), NOT os.walk
++ a stat() per file: the listing itself carries each entry's size
+and mtime, so a full tree walk needs ZERO per-file stat() calls and
+no lstat() at all (os.walk + os.stat doubles the metadata syscalls
+-- on a source where every call costs 100-200 ms that is the whole
+scan). On Windows the listing goes through the WinMerge-style bulk
+finder: FindFirstFileEx(FindExInfoBasic, ..., FIND_FIRST_EX_
+LARGE_FETCH) via ctypes -- the same call WinMerge's DirTravel.cpp
+makes -- which fetches the WHOLE directory in one 64 KB round trip
+and skips the 8.3 short-name lookup, where Python's os.scandir
+(plain FindFirstFileW, small buffer) pays a fresh round trip every
+few entries. That difference is a large part of "WinMerge is
+instant, other tools crawl" on high-latency sources (antivirus
+filter, network share, cloud placeholders). Anything unusual
+(non-Windows, missing API, long paths, an unexpected error) falls
+back to os.scandir, which is always correct -- just slower there.
+Folder rows take their mtime from the parent listing the same way;
 _stat_side survives only in the main thread's single-row refresh
 after a copy/delete action.
 
 The directory scans run CONCURRENTLY on a small thread pool
-(SCAN_POOL_THREADS): the two roots, then every subfolder found, are
-enumerated in parallel waves, and the equal-size content tests ride
-the same pool afterwards. On a fast local disk this changes little;
-on a source with high per-call latency (network share, cloud
-placeholder filter, antivirus on-access hooks) the wall time
-approaches the slowest single directory instead of the sum of all
-directories plus all file opens. While the cProfile layer is on, the
-scan deliberately falls back to the serial one-thread mode:
-cProfile only traces the thread that started it, so pool threads
-would be invisible in the function-level report (the section
-report still attributes the parallel run via thread-safe standalone
-marks).
+(SCAN_POOL_THREADS), WinMerge-style (its scan also feeds a thread
+pool from a notification queue): both roots are submitted at once,
+and the moment a directory's listing arrives, its subfolders are
+submitted too -- no wave barrier, no scan ever waits behind an
+unrelated slow directory. The wall time approaches the longest
+CHAIN of directories plus one listing latency, not the sum of all
+directories. The equal-size content tests ride the same pool
+afterwards. On a fast local disk all this changes little; on a
+source with high per-call latency the difference is the scan. While
+the cProfile layer is on, the scan deliberately falls back to the
+serial one-thread mode: cProfile only traces the thread that
+started it, so pool threads would be invisible in the
+function-level report (the section report still attributes the
+parallel run via thread-safe standalone marks) -- a profiled scan
+is therefore somewhat slower than a normal one, on purpose.
 
 The "same folders, 30 s today / 1 s tomorrow" effect is the file
 system, not growing code: each metadata call costs microseconds
 warm and can cost 100-200 ms cold (antivirus scanning the file, a
-spinning disk seeking, an SMB round trip). The engine halves the
-number of metadata calls and hides the rest behind concurrency, but
-the first-ever compare of a tree can still be slower than every
-later one -- the OS then has the metadata cached.
+spinning disk seeking, an SMB round trip) -- and a compare run
+right after copying/extracting the trees competes with the
+antivirus's background scan of those very files (the classic
+signature: the FIRST tree walks several times slower than the
+second, identical one, because the background scan finished by
+then). The engine minimizes the number of metadata round trips and
+hides the rest behind concurrency, but the first-ever compare of
+freshly copied folders can still be slower than every later one.
+For folders you compare often, excluding them (or the editor's
+Python) from real-time antivirus scanning removes that cost
+entirely.
 
 == Threading model ==================================================
 
@@ -201,7 +221,8 @@ import subprocess
 import sys
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, wait
+from concurrent.futures import (FIRST_COMPLETED, ThreadPoolExecutor,
+                                wait)
 
 import cudatext as ct
 import cudax_lib as ctx
@@ -674,6 +695,132 @@ def _mask_ok(name, mask):
 
 
 # ----------------------------------------------------------------------
+# Win32 bulk directory listing (the WinMerge enumeration pattern)
+# ----------------------------------------------------------------------
+#
+# Why this exists: on Windows, os.scandir opens the directory with a
+# plain FindFirstFileW, whose enumeration buffer is small -- on a
+# source where every metadata round trip is expensive (antivirus
+# filter pass, network share, cloud placeholders) the listing pays a
+# fresh round trip every few entries. WinMerge lists directories
+# with FindFirstFileEx(FindExInfoBasic, ..., FIND_FIRST_EX_
+# LARGE_FETCH): a 64 KB batch that returns the WHOLE directory in one
+# round trip, plus FindExInfoBasic skips the 8.3 short-name lookup
+# (Src/DirTravel.cpp, LoadFiles). That API choice is a large part of
+# "WinMerge is instant on folders where other tools crawl". The
+# finder below calls the same API through ctypes and returns each
+# entry with the same data scandir would have carried (name, dir/
+# reparse/device attribute bits, size, mtime); _scan_dir prefers it
+# and falls back to the plain scandir path on anything unusual
+# (non-Windows, missing API, very long paths). Testable everywhere:
+# the tests inject a fake finder with the same return shape.
+
+_WIN_FIND = None   # pattern -> (entries, error); set by _init_win_find
+
+
+def _init_win_find():
+    """Bind the WinMerge-style bulk FindFirstFileEx enumerator (Windows
+    only). On success _WIN_FIND is a callable of the directory search
+    pattern ('C:\\dir\\*') returning (entries, error): entries is a
+    list of {'name', 'is_dir', 'reparse', 'device', 'size', 'mtime'}
+    dicts ('.'/'..' excluded), error is an OSError for a failed
+    listing (partial entries are still returned; an existing EMPTY
+    directory is a normal empty result, not an error). Any problem
+    here leaves _WIN_FIND None -- the scandir path then stays in use,
+    which is always correct, just slower on high-latency sources."""
+    global _WIN_FIND
+    if os.name != 'nt':
+        return
+    try:
+        import ctypes
+        import ctypes.wintypes as wt
+
+        class _WFD(ctypes.Structure):        # WIN32_FIND_DATAW
+            _fields_ = [
+                ('dwFileAttributes', wt.DWORD),
+                ('ftCreationTime', wt.FILETIME),
+                ('ftLastAccessTime', wt.FILETIME),
+                ('ftLastWriteTime', wt.FILETIME),
+                ('nFileSizeHigh', wt.DWORD),
+                ('nFileSizeLow', wt.DWORD),
+                ('dwReserved0', wt.DWORD),
+                ('dwReserved1', wt.DWORD),
+                ('cFileName', ctypes.c_wchar * 260),
+                ('cAlternateFileName', ctypes.c_wchar * 14),
+            ]
+
+        k32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        k32.FindFirstFileExW.restype = ctypes.c_void_p
+        k32.FindFirstFileExW.argtypes = [
+            wt.LPCWSTR, ctypes.c_int, ctypes.c_void_p,
+            ctypes.c_int, ctypes.c_void_p, wt.DWORD]
+        k32.FindNextFileW.restype = wt.BOOL
+        k32.FindNextFileW.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        k32.FindClose.restype = wt.BOOL
+        k32.FindClose.argtypes = [ctypes.c_void_p]
+
+        invalid = ctypes.c_void_p(-1).value
+        find_ex_info_basic = 1     # FINDEX_INFO_LEVELS
+        find_ex_search_name_match = 0  # FINDEX_SEARCH_OPS
+        find_first_ex_large_fetch = 2  # FIND_FIRST_EX_FLAGS
+        file_attr_dir = 0x10
+        file_attr_device = 0x4
+        file_attr_reparse = 0x400
+        err_no_more_files = 18
+        err_file_not_found = 2     # empty existing dir's '*': normal
+
+        def find(pattern):
+            fd = _WFD()
+            h = k32.FindFirstFileExW(
+                pattern, find_ex_info_basic, ctypes.byref(fd),
+                find_ex_search_name_match, None, find_first_ex_large_fetch)
+            if not h or h == invalid:
+                err = ctypes.get_last_error()
+                if err == err_file_not_found:
+                    return [], None      # empty directory: not an error
+                return [], OSError(
+                    err, 'FindFirstFileExW failed: %s' % pattern)
+            entries = []
+            error = None
+            try:
+                while True:
+                    name = fd.cFileName
+                    if name != '.' and name != '..':
+                        ft = fd.ftLastWriteTime
+                        mtime = ((ft.dwHighDateTime << 32)
+                                 | ft.dwLowDateTime)
+                        mtime = mtime / 10000000.0 - 11644473600.0
+                        attr = fd.dwFileAttributes
+                        entries.append({
+                            'name': name,
+                            'is_dir': bool(attr & file_attr_dir),
+                            'reparse': bool(attr & file_attr_reparse),
+                            'device': bool(attr & file_attr_device),
+                            'size': (fd.nFileSizeHigh << 32)
+                                    | fd.nFileSizeLow,
+                            'mtime': mtime,
+                        })
+                    if not k32.FindNextFileW(h, ctypes.byref(fd)):
+                        err = ctypes.get_last_error()
+                        if err != err_no_more_files:
+                            # keep whatever was listed before the fault,
+                            # exactly like the scandir path does
+                            error = OSError(
+                                err, 'FindNextFileW failed: %s' % pattern)
+                        break
+            finally:
+                k32.FindClose(h)
+            return entries, error
+
+        _WIN_FIND = find
+    except Exception:
+        _WIN_FIND = None
+
+
+_init_win_find()
+
+
+# ----------------------------------------------------------------------
 # One-directory scan (the unit of work, serial or pool)
 # ----------------------------------------------------------------------
 
@@ -691,24 +838,72 @@ def _scan_dir(root, base, mask, cancel_evt, on_err):
 
     'base' is this directory's path RELATIVE to 'root' ('' = the root
     itself) -- the walk always knows where it is, no relpath() calls.
-    Size and mtime come from the scandir DirEntry: on Windows they
-    are part of the directory listing itself, so a whole tree walks
-    with ZERO per-file stat() calls and zero lstat() calls -- on a
-    source where every metadata syscall costs 100-200 ms (cold
-    antivirus pass, network share, cloud placeholder filter) that
-    alone halves the syscall count of the old os.walk + os.stat walk.
+    Size and mtime come straight from the directory listing: on
+    Windows either the WinMerge-style bulk finder (_WIN_FIND: one
+    64 KB round trip per directory, no short names, no per-entry
+    stat) or scandir's DirEntry (whose stat data the listing also
+    carries). A whole tree therefore walks with ZERO per-file stat()
+    calls and zero lstat() calls -- on a source where every metadata
+    syscall costs 100-200 ms (cold antivirus pass, network share,
+    cloud placeholder filter) that alone halves the syscall count of
+    the old os.walk + os.stat walk, and the bulk finder cuts the
+    per-entry round trips on top.
 
     Built as a pool job: a pure function of its arguments plus an
     error callback, cancellation checked at entry / between entries,
     and every OSError confined -- one unreadable entry or a listing
     that fails mid-way never aborts the directory, let alone the scan
-    (whatever the iterator yielded before the error is kept)."""
+    (whatever was listed before the error is kept)."""
     files = {}
     dirs = {}
     subdirs = []
     full = root if not base else os.path.join(root, base)
     if cancel_evt is not None and cancel_evt.is_set():
         return files, dirs, subdirs
+
+    entries = None
+    if _WIN_FIND is not None and len(full) < 240:
+        # WinMerge-style bulk listing (see _init_win_find's comment);
+        # paths that would need the \\?\ long-path prefix stay on the
+        # scandir path (which handles them itself).
+        try:
+            entries, err = _WIN_FIND(os.path.join(full, '*'))
+        except Exception:
+            entries = None               # unexpected: scandir fallback
+        else:
+            if err is not None:
+                on_err(err, full)
+    if entries is not None:
+        for e in entries:
+            if cancel_evt is not None and cancel_evt.is_set():
+                break
+            name = e['name']
+            if e['is_dir']:
+                rel = os.path.join(base, name)
+                dirs[os.path.normcase(rel)] = (rel, e['mtime'])
+                if not e['reparse']:
+                    subdirs.append(rel)  # symlinked dir: row, no descend
+                continue
+            if e['device']:
+                continue                 # NUL, CON and friends
+            if not _mask_ok(name, mask):
+                continue
+            rel = os.path.join(base, name)
+            if e['reparse']:
+                # A reparse entry that is not a directory (a symlinked
+                # FILE, mostly). The scandir path stats through the
+                # link and compares the TARGET -- one os.stat keeps
+                # the same semantics here.
+                try:
+                    st = os.stat(os.path.join(root, rel))
+                    info = (rel, st.st_size, st.st_mtime)
+                except OSError:
+                    info = (rel, -1, -1)
+            else:
+                info = (rel, e['size'], e['mtime'])
+            files[os.path.normcase(rel)] = info
+        return files, dirs, subdirs
+
     entries = []
     try:
         with os.scandir(full) as it:
@@ -859,39 +1054,39 @@ class _Scanner(threading.Thread):
     def _walks(self, pool):
         """Walk BOTH trees; returns (files_l, dirs_l, files_r, dirs_r).
 
-        With a pool: breadth-first WAVES of concurrent directory scans
-        -- wave 1 scans the two roots, wave 2 every subfolder wave 1
-        found, and so on (a wave's jobs all run at once; the next wave
-        is submitted when the whole wave finished). The wall time
-        therefore approaches the slowest directory per depth level
-        instead of the sum over all directories -- the win on sources
-        where every metadata call is expensive (network share, cloud
-        placeholders, antivirus). Without a pool (the cProfile layer
-        is on: it traces only THIS thread, so the scan runs serially
-        on purpose, or SCAN_POOL_THREADS is 1) the same _scan_dir
-        runs inline, the left tree first, then the right.
+        With a pool: SUBMIT-AS-DISCOVERED, no wave barrier -- both
+        roots are submitted at once, and the moment a directory's
+        listing arrives, its subfolders are submitted too (the pool
+        queue feeds itself; FIRST_COMPLETED processes results as they
+        land). No scan ever waits for an unrelated slow directory,
+        whatever the tree shape. The wall time therefore approaches
+        the longest CHAIN of directories, not the sum over all of
+        them -- the win on sources where every metadata call is
+        expensive (network share, cloud placeholders, antivirus).
+        Without a pool (the cProfile layer is on: it traces only THIS
+        thread, so the scan runs serially on purpose, or
+        SCAN_POOL_THREADS is 1) the same _scan_dir runs inline, the
+        left tree first, then the right.
 
         Per-side totals are booked as dirs:walk_left / dirs:walk_right
-        (thread-safe standalone marks; in the parallel mode the two
-        rows overlap in wall time -- both are honest).
+        (thread-safe standalone marks) when a side fully drains -- its
+        last outstanding job completed and discovered nothing new.
         """
         prof = Profiler.is_enabled()
-        roots = (('left', self.dir_l), ('right', self.dir_r))
-        files = {}
-        dirs = {}
-        for side, root in roots:
-            files[side] = {}
-            dirs[side] = {}
+        sides = ('left', 'right')
+        roots = {'left': self.dir_l, 'right': self.dir_r}
+        files = {s: {} for s in sides}
+        dirs = {s: {} for s in sides}
 
         if pool is None:
-            for side, root in roots:
+            for side in sides:
                 t0 = time.perf_counter()
                 stack = ['']
                 i = 0
                 while i < len(stack) and not self.cancelled():
                     base = stack[i]
                     i += 1
-                    f, d, subs = _scan_dir(root, base, self.mask,
+                    f, d, subs = _scan_dir(roots[side], base, self.mask,
                                            self.cancel_evt, self._walk_err)
                     files[side].update(f)
                     dirs[side].update(d)
@@ -902,21 +1097,24 @@ class _Scanner(threading.Thread):
                                              time.perf_counter() - t0)
             return files['left'], dirs['left'], files['right'], dirs['right']
 
-        t0s = {}
+        t0s = {s: time.perf_counter() for s in sides}
+        submitted = {s: 0 for s in sides}
+        completed = {s: 0 for s in sides}
         booked = set()
-        for side, _root in roots:
-            t0s[side] = time.perf_counter()
-        wave = [(side, '') for side, _root in roots]
-        while wave and not self.cancelled():
-            futs = {}
-            for side, base in wave:
-                root = self.dir_l if side == 'left' else self.dir_r
-                fut = pool.submit(_scan_dir, root, base, self.mask,
-                                  self.cancel_evt, self._walk_err)
-                futs[fut] = side
-            wait(list(futs))               # the whole wave (ALL_COMPLETED)
-            nxt = []
-            for fut, side in futs.items():
+        futs = {}
+
+        def submit(side, base):
+            fut = pool.submit(_scan_dir, roots[side], base, self.mask,
+                              self.cancel_evt, self._walk_err)
+            futs[fut] = side
+            submitted[side] += 1
+
+        for s in sides:
+            submit(s, '')
+        while futs and not self.cancelled():
+            done, _pending = wait(list(futs), return_when=FIRST_COMPLETED)
+            for fut in done:
+                side = futs.pop(fut)
                 try:
                     f, d, subs = fut.result()
                 except Exception:
@@ -924,16 +1122,18 @@ class _Scanner(threading.Thread):
                 files[side].update(f)
                 dirs[side].update(d)
                 if self.recursive and not self.cancelled():
-                    nxt.extend((side, s) for s in subs)
-            wave = nxt
-            for side, _root in roots:
-                if side not in booked and not any(w[0] == side
-                                                  for w in wave):
-                    booked.add(side)
-                    if prof:
-                        Profiler.mark_standalone(
-                            'dirs:walk_' + side,
-                            time.perf_counter() - t0s[side])
+                    for rel in subs:
+                        submit(side, rel)
+                completed[side] += 1
+                if completed[side] >= submitted[side]:
+                    # nothing outstanding, nothing new discovered: the
+                    # side's tree is fully walked
+                    if side not in booked:
+                        booked.add(side)
+                        if prof:
+                            Profiler.mark_standalone(
+                                'dirs:walk_' + side,
+                                time.perf_counter() - t0s[side])
         return files['left'], dirs['left'], files['right'], dirs['right']
 
     def _scan(self):

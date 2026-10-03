@@ -1,3 +1,36 @@
+2026.10.03 (4th release, by @alkorsan)
++ feature: WinMerge's directory-listing call. The user's profiling
+  showed the remaining 8 s was pure listing latency (9 x scandir
+  open ~200 ms each + ~33 entry reads ~117 ms each, all in the
+  walk) while WinMerge compares the same folders instantly. The
+  WinMerge source (Src/DirTravel.cpp, LoadFiles) revealed why: it
+  lists with FindFirstFileEx(FindExInfoBasic, ...,
+  FIND_FIRST_EX_LARGE_FETCH) -- one 64 KB round trip returns the
+  WHOLE directory and skips the 8.3 short-name lookup -- where
+  Python's os.scandir uses plain FindFirstFileW with a small buffer
+  (a fresh round trip every few entries). The plugin now calls the
+  exact same Win32 API through ctypes on Windows: one bulk round
+  trip per directory, size/mtime/attributes read straight from
+  WIN32_FIND_DATAW. Silent fallback to os.scandir everywhere else
+  (other OS, long paths, API unavailable, unexpected error) -- the
+  scandir path is unchanged and always correct.
++ change: barrier-free parallel walk. The pool previously scanned
+  in breadth-first WAVES (a wave waited for ALL its directories);
+  now a directory's subfolders are submitted the moment its own
+  listing arrives (FIRST_COMPLETED), like WinMerge's notification-
+  queue-fed worker pool. No scan ever waits behind an unrelated
+  slow directory; the wall time approaches the longest CHAIN of
+  directories plus one listing latency.
++ docs: profiling notes now say explicitly how to MEASURE speed:
+  enable_profiling ON + enable_cprofile OFF (clean section report
+  AND the scan stays fully parallel; the cProfile layer forces the
+  serial scan on purpose, so profiled runs are always slower than
+  real runs). Also documented: comparing freshly copied/extracted
+  folders competes with the antivirus's background scan of those
+  very files -- the classic signature is the FIRST tree walking
+  several times slower than the second, identical one (the user's
+  walk_left 4.5 s vs walk_right 1.2 s).
+
 2026.10.03 (3rd release, by @alkorsan)
 + fix: folder compare could take 20-30 s on the very same folders
   that later compared in 1 s. Profiling on the user's machine showed

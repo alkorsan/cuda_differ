@@ -297,20 +297,32 @@ same time -- compare two folders, then compare two other folders, and
 use both windows at once; closing one never touches the others.
 
 How the walk reads the disk (why the same folders can take 30 s once
-and 1 s the next time): every directory is listed once with scandir,
-and on Windows the listing itself already carries each entry's size
-and mtime -- the tree walks with ZERO extra per-file stat calls. The
-directory listings of both trees (and the content tests for equal-size
-pairs) run CONCURRENTLY on a small thread pool, so on a slow source
-(network share, cloud placeholder filter, antivirus scanning every
-metadata call) the wall time approaches the slowest single directory
-instead of the sum of all of them. The remaining variance is the file
-system's own cache: a first-ever compare of a tree pays the cold
-cost of every metadata call (antivirus pass, disk seeks, SMB round
-trips -- each can cost 100-200 ms), every later compare of the same
-tree finds it all cached by the OS and finishes near-instantly. When
-even that is too slow, the "Size and timestamp" method above removes
-the file reads too.
+and 1 s the next time): every directory is listed ONCE, bulk. On
+Windows the listing uses the same call WinMerge uses
+(FindFirstFileEx with FindExInfoBasic + FIND_FIRST_EX_LARGE_FETCH,
+via ctypes): one 64 KB round trip returns the WHOLE directory with
+every entry's size and mtime, and the 8.3 short-name lookup is
+skipped. Python's own os.scandir opens directories with a plain
+FindFirstFileW whose small buffer pays a fresh round trip every few
+entries -- on a source where a round trip is expensive (antivirus
+filter, network share, cloud placeholders) that difference is the
+scan. Anything unusual (other OS, long paths, API missing) silently
+falls back to os.scandir, which is always correct. Both trees, every
+subfolder, and the content tests for equal-size pairs then run
+CONCURRENTLY on a small thread pool, subfolders submitted the moment
+their parent's listing arrives (no waiting behind unrelated slow
+directories -- WinMerge feeds a worker-thread pool the same way).
+The remaining variance is the file system's own cache: a first-ever
+compare of a tree pays the cold cost of every metadata call
+(antivirus pass, disk seeks, SMB round trips -- each can cost
+100-200 ms), every later compare of the same tree finds it all
+cached by the OS and finishes near-instantly. Comparing folders you
+just copied/extracted competes with the antivirus's background scan
+of those very files -- the classic signature is the FIRST tree
+walking several times slower than the second, identical one. When
+even the cold runs are too slow, exclude the compared folders (or
+the editor's Python) from real-time antivirus scanning, or switch
+the compare method to "Size and timestamp" below.
 
 The window's controls:
 
@@ -404,8 +416,11 @@ While that layer is on, the scan runs in serial single-thread mode on
 purpose: cProfile traces only the thread that started it, so the pool
 threads would be invisible in the function report (the section report
 still attributes the parallel run) -- a profiled compare is therefore
-somewhat slower than a normal one. A scan cancelled by a rescan or a
-closing window prints nothing, like the tab compare's cancel path.
+somewhat slower than a normal one. To MEASURE speed, profile with
+differ2.advanced.enable_profiling ON and enable_cprofile OFF: the
+section report is then clean AND the scan stays fully parallel. A
+scan cancelled by a rescan or a closing window prints nothing, like
+the tab compare's cancel path.
 
 
 == Keyboard shortcuts ==
