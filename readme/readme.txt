@@ -261,33 +261,37 @@ fast: nothing is ever loaded into an editor and no diff algorithm
 runs. How a same-named pair is decided is chosen by the option
 "differ2.dirs.compare_method":
 
-- "Contents" (default): for each file present on both sides the
-  cheapest deciding test is applied, in order: different sizes ->
-  Different (no read at all); both empty -> Identical (no read);
-  small files (<=256 KB) -> one full MD5 per side (a single
-  sequential read); bigger files -> an MD5 of each side's head and
-  tail 64 KB chunks first (a head or tail change is caught after
-  reading at most 128 KB per side). Only when those samples match is
-  the full content of both files hashed, so an "Identical" verdict is
-  always proven byte for byte by default.
-- "Size and timestamp" (WinMerge's Quick method): equal size AND
-  equal mtime -> Identical, anything else -> Different. NO file is
-  ever opened -- the whole verdict comes from the directory listing
-  itself. Use this when file reads are expensive: files on a slow network
-  share, cloud-sync placeholders (OneDrive etc. -- opening one can
-  trigger a download), an antivirus hooking every open. The scan is
-  then pure directory listing, whatever the tree size. Trade-offs:
-  a file rewritten with size and mtime preserved can be missed, and
-  a merely touched file (same size, newer time) is flagged Different
-  without being read; the double-click compare never lies.
+- "Contents" (default) is WinMerge's "Quick contents" compare (the
+  same algorithm, from WinMerge's own ByteCompare.cpp): different
+  sizes -> Different (no read at all; the listing's own data decides);
+  both empty -> Identical (no read); otherwise both files are opened
+  ONCE each and compared in 32 KB chunks -- the first differing chunk
+  decides Different, a pair that matches chunk for chunk to the end
+  is Identical. No hash is ever computed (a chunk compare is a raw
+  memcmp, several times cheaper than MD5 over the same bytes), a
+  differing pair stops reading at its FIRST difference instead of
+  going to the end, and an "Identical" verdict is still proven byte
+  for byte.
+- "Size and timestamp" (WinMerge's "Modified date and size" method):
+  equal size AND equal mtime -> Identical, anything else ->
+  Different. NO file is ever opened -- the whole verdict comes from
+  the directory listing itself. Use this when file reads are
+  expensive: files on a slow network share, cloud-sync placeholders
+  (OneDrive etc. -- opening one can trigger a download), an antivirus
+  hooking every open. The scan is then pure directory listing,
+  whatever the tree size. Trade-offs: a file rewritten with size and
+  mtime preserved can be missed, and a merely touched file (same
+  size, newer time) is flagged Different without being read; the
+  double-click compare never lies.
 
 Timestamps are never trusted in the "Contents" method -- a copied
 file with a fresh mtime compares as identical, as it should. (The
-"Fast (sampling) compare" option differ2.dirs.quick_only skips the
-final full read -- the fastest mode for giant trees, at the
-documented cost that a change confined to the middle of a big file
-can be missed in the LIST; the double-click compare never misses
-anything.)
+"Fast (sampling) compare" option differ2.dirs.quick_only keeps files
+above 128 KB from being read whole: only each side's first and last
+64 KB windows are compared -- the fastest mode for giant trees, at
+the documented cost that a change confined to the middle of a big
+file can be missed in the LIST; the double-click compare never
+misses anything.)
 
 The scan runs on a background thread (the window stays responsive and
 rows stream in while it works -- watch the "Comparing... X / Y"
@@ -385,7 +389,7 @@ Working with rows:
   missing destination), Delete from left/right, open a side's file,
   show a side's file/folder in the OS file manager, copy a side's
   full path. Copy/delete of a FILE patches just that row in place
-  (re-stat + re-hash of that one pair -- no rescan); folder
+  (re-stat + re-compare of that one pair -- no rescan); folder
   operations rescan the tree. Everything asks for confirmation first
   (differ2.dirs.confirm_ops).
 - Keys: Enter opens the selected row (when the list has focus), F5
@@ -403,13 +407,23 @@ the plugin's own profiler (see the "Profiling" section of this readme
 for the general story). Turn on differ2.advanced.enable_profiling (and
 additionally differ2.advanced.enable_cprofile for the function-level
 layer), run a compare, and read the report in the console: the
-dirs:tier_* rows show the content-read time (huge values mean the
-file SOURCE is slow: network share, cloud placeholders downloading,
-antivirus -- switch the compare method to "Size and timestamp");
-dirs:walk_left/right show the directory-listing time; dirs:ui_* show
-the CudaText API time on the main thread; dirs:worker /
-dirs:scan_wall bracket the scanner thread and the whole operation.
-The cProfile layer runs on the scanner thread (the walk/hash work)
+dirs:listing rows show the directory-listing time (calls = listings,
+max = the single slowest listing -- pure metadata round-trip latency:
+disk, antivirus, network; huge values mean the SOURCE is slow, and
+any other tool pays the same on a cold tree); dirs:quick_content
+rows show the content-read time (huge values mean the file SOURCE is
+slow: network share, cloud placeholders downloading, antivirus --
+switch the compare method to "Size and timestamp");
+dirs:walk_left/right summarize each tree's walk; dirs:spawn_lag and
+dirs:finish_lag measure the kick-off and tick-adoption overheads, so
+walks + content + lags + ui rows add up to the dirs:scan_wall total;
+dirs:ui_* show the CudaText API time on the main thread.
+After the section report a compact "folder scan facts" block prints
+the same story in five lines: listings count with total/slowest/
+average latency, tree sizes, how many content pairs stopped at the
+first difference vs were read to the end, and whether the run was
+serial because the cProfile layer was on.
+The cProfile layer runs on the scanner thread (the walk/compare work)
 and prints its function report sorted by INTERNAL time
 (sort_key='time'), so the real bottleneck function sits at the top.
 While that layer is on, the scan runs in serial single-thread mode on
@@ -1386,24 +1400,27 @@ Toolbar section (see the "Toolbar" chapter above for details):
   button keeps its enabled-options counter).
 
 Folders section (see the "Compare folders" chapter above for details):
-- differ2.dirs.quick_only: Fast (sampling) folder compare (default: off)
-  When off, two same-sized files whose head/tail samples match get a
-  full content hash, so "Identical" is always proven byte for byte.
-  When on, matching samples are reported as Identical without the full
-  read -- the fastest mode for huge trees, at the cost that a change
-  confined to the middle of a big file (outside the 64 KB head/tail
-  chunks) can be missed in the LIST; the double-click side-by-side
-  compare never misses anything.
+- differ2.dirs.quick_only: Fast (sampling) folder compare (default:
+  off)
+  Applies to same-sized files above 128 KB in the "Contents" method.
+  When off, every pair is compared to the end, so "Identical" is
+  always proven byte for byte. When on, only each side's first and
+  last 64 KB windows are compared and matching samples are reported
+  as Identical -- the fastest mode for huge trees, at the cost that a
+  change confined to the middle of a big file can be missed in the
+  LIST; the double-click side-by-side compare never misses anything.
 - differ2.dirs.confirm_ops: Confirm copy and delete in the folder
   window (default: on)
   Ask before the folder window's context menu overwrites or deletes
   anything (Copy to left/right, Delete from left/right).
 - differ2.dirs.compare_method: Folder compare method (default:
   Contents)
-  "Contents" hashes file contents (tiered, proven identical);
-  "Size and timestamp" (WinMerge's Quick method) decides by size+mtime
-  alone and never opens a file -- the method for slow file sources
-  (network shares, cloud-sync placeholders, antivirus-hooked opens).
+  "Contents" is WinMerge's quick contents (32 KB chunk compare,
+  stops at the first difference, proven identical, no hashing);
+  "Size and timestamp" (WinMerge's "Modified date and size" method)
+  decides by size+mtime alone and never opens a file -- the method
+  for slow file sources (network shares, cloud-sync placeholders,
+  antivirus-hooked opens).
   See the "Compare folders" chapter for the full trade-offs.
 
 

@@ -19,42 +19,46 @@ the double-click. The scanner never loads a file into an editor and
 never runs a diff algorithm. Two compare methods are available
 (option differ2.dirs.compare_method):
 
-"contents" (default): for every file present on both sides the
-cheapest test that decides the question is applied, in this order
-(WinMerge-like "quick compare", but cheaper):
+"contents" (default) is WinMerge's "Quick contents" compare, built
+from WinMerge's own source (Src/CompareEngines/ByteCompare.cpp):
 
-  1. sizes differ            -> Different   (no read at all)
-  2. both empty              -> Identical   (no read at all)
-  3. size <= SMALL_FILE_FULL -> one MD5 of each file's full content
-     (a single sequential read per side; covers typical source files)
-  4. otherwise: "quick hash" = MD5 of the first + last HEAD_TAIL_CHUNK
-     bytes of each side. Quick hashes differ -> Different (two 128 KB
-     reads at most -- a different head or tail is caught without
-     touching the middle of the file).
-  5. quick hashes match: either accept it as Identical (the
-     "Fast (sampling) compare" option, differ2.dirs.quick_only -- the
-     speed-over-certainty mode), or finish the job with a full MD5 of
-     both sides so an Identical verdict is always content-proven
-     (default).
+  1. sizes differ -> Different   (no read at all; decided from the
+     listing's own data)
+  2. both empty   -> Identical   (no read at all)
+  3. otherwise    -> both files are opened ONCE and compared in
+     BYTE_CHUNK-sized reads (the same 32 KB buffers WinMerge's
+     ByteCompare uses): the first differing chunk decides Different,
+     two files that match chunk for chunk to the end are Identical.
+     No hash is ever computed -- a chunk compare is a C-speed memcmp,
+     several times cheaper than MD5 over the same bytes, and a
+     differing pair stops at its FIRST difference instead of reading
+     to the end (typical for edited source files, whose heads differ).
+     One sequential pass, one open per side: the cheapest byte-exact
+     test there is.
 
-"size_timestamp" (WinMerge's Quick method): equal size AND equal
-modification time -> Identical, different size or time -> Different.
-NO file is ever opened -- the verdict comes from the size/mtime data
-the directory listing itself carries. This is the method to use when
-content reads are expensive (files on a slow network share, cloud-sync
-placeholders that could trigger downloads, aggressive antivirus hooks
-on every open): the whole scan is then pure directory listing,
-whatever the tree size.
+The "Fast (sampling) compare" option (differ2.dirs.quick_only) keeps
+files above 2*HEAD_TAIL_CHUNK from being read whole: only each side's
+head and tail HEAD_TAIL_CHUNK bytes are compared (two windows, at
+most 128 KB per side) -- the speed-over-certainty mode. A change
+confined to the middle of a big file can then be missed in the LIST;
+the double-click compare still opens the real side-by-side diff,
+which never misses anything.
+
+"size_timestamp" (WinMerge's "Modified date and size" method): equal
+size AND equal modification time -> Identical, different size or
+time -> Different. NO file is ever opened -- the verdict comes from
+the size/mtime data the directory listing itself carries. This is
+the method to use when content reads are expensive (files on a slow
+network share, cloud-sync placeholders that could trigger downloads,
+aggressive antivirus hooks on every open): the whole scan is then
+pure directory listing, whatever the tree size.
 The trade-off is documented: a file rewritten while preserving its
 size and mtime can be missed, and a merely touched file (same size,
 newer mtime) is flagged Different without reading it -- double-click
 still opens the real compare, which never lies.
 
 Files that exist on one side only need no content test at all in either
-method. MD5 is used for speed (this is change detection, not security);
-a collision would need two files engineered to collide, and even then
-the worst case is a wrong "Identical" badge that the double-click diff
-corrects.
+method.
 
 == The scan engine (what a slow compare is made of) ================
 
@@ -135,16 +139,25 @@ like a tab compare does:
     pair -- wall time from the scan kick-off to the finished list),
     the scanner thread's steps as thread-safe standalone marks
     (dirs:walk_left/right, dirs:pair_keys, dirs:dir_rows,
-    dirs:file_rows) and per-tier content-test rows (dirs:tier_*),
+    dirs:file_rows, dirs:listing -- one row per directory listing,
+    whose max column is the single slowest listing's latency), the
+    content tests (dirs:quick_content, same shape), the wall-time
+    decomposition rows dirs:spawn_lag (ctor -> first line of the
+    worker thread: scheduling + kick-off) and dirs:finish_lag
+    (worker end -> the UI tick that adopted the result), and
     main-thread UI work (dirs:ui_*, dirs:picker, dirs:form_build,
     dirs:open_compare_pair) as sections/marks. The report prints at
-    the scan's natural end; a cancelled scan (rescan, window closed)
+    the scan's natural end, followed by the "folder scan facts"
+    block (see _prof_facts_block): listings count + their total/
+    slowest/average latency, tree sizes, how much content the
+    compare read, and whether the run was serial because the
+    cProfile layer was on. A cancelled scan (rescan, window closed)
     cancels its pending pieces and prints nothing, like the tab
     compare's cancel path.
   * the cProfile layer, additionally gated by
     differ2.advanced.enable_cprofile (same double gate as the tab
     compare): ONE profile, started INSIDE the scanner thread -- it
-    traces the actual walk/hash work, i.e. the part of a folder
+    traces the actual walk/compare work, i.e. the part of a folder
     compare that can actually be slow (the main thread's UI phases
     are already phase-measured by the section rows dirs:ui_*, and
     the main thread is what the tab compare's own cProfile layer
@@ -160,11 +173,12 @@ like a tab compare does:
     sorted by internal time (sort_key='time'), max_lines=100: the
     real bottleneck function sits at the top of the table.
 
-This is the tool to answer "why is my compare slow": the tier rows
-show the content-read time per method step, the walk rows the
-directory-listing time, the ui rows the CudaText API time, and the
-untracked gap between 'dirs:scan_wall' and 'dirs:worker' the timer
-quantum + thread scheduling.
+This is the tool to answer "why is my compare slow": the listing
+rows show the directory-listing latency (metadata round trips),
+the quick_content rows the content-read time, the ui rows the
+CudaText API time, and spawn_lag/finish_lag close the loop so that
+walks + content + lags + ui add up to the scan_wall total --
+whatever is left over is where to look next.
 
 == Row coloring =====================================================
 
@@ -214,7 +228,6 @@ never syncs anything behind the user's back.
 
 import base64
 import fnmatch
-import hashlib
 import os
 import shutil
 import subprocess
@@ -242,8 +255,10 @@ _ = get_translation(__file__)  # I18N
 MODULE_JSON = 'cuda_differ2.json'
 
 # Compare-speed constants (see the module docstring's "Speed model"):
-SMALL_FILE_FULL = 256 * 1024   # up to this size: one full-content MD5
-HEAD_TAIL_CHUNK = 64 * 1024    # bigger: MD5 of head + tail chunks first
+# BYTE_CHUNK is WinMerge's own quick-contents buffer size
+# (Src/CompareEngines/ByteCompare.cpp, WMCMPBUFF = 32 * KILO).
+BYTE_CHUNK = 32 * 1024        # quick-contents compare read size
+HEAD_TAIL_CHUNK = 64 * 1024   # quick_only sampling: head+tail window size
 
 # Concurrent directory scans / content tests inside one folder
 # compare (see the module docstring's "The scan engine"). Pure I/O
@@ -253,7 +268,6 @@ SCAN_POOL_THREADS = 8
 
 HISTORY_MAX = 12               # remembered folder paths per side
 POLL_MS = 200                  # worker -> UI poll period while scanning
-PARTIAL_FILL_STEP = 50         # new rows between two progressive refills
 ICON_CACHE_VER = '1'           # bump to force-renew the icon cache dir
 
 # Owner-drawn list metrics (the results list is a listbox_ex in
@@ -475,73 +489,135 @@ _ICONS_PNG = {
 
 
 # ----------------------------------------------------------------------
-# Hashing (the cheap "quick compare" primitives)
+# Content test (WinMerge's "quick contents", byte compare)
 # ----------------------------------------------------------------------
+#
+# Scan-facts counters: filled by the listing (_scan_dir) and the content
+# test (_quick_contents_equal) whenever the section profiler is enabled,
+# printed as the "folder scan facts" block at the scan's natural end.
+# They are the tool that separates "the plugin is slow" from "the disk
+# is slow": per-listing latency (pure metadata round-trip time), tree
+# size, and how much file content the compare actually had to read.
+# Booking is a handful of dict increments per directory / per pair; on
+# the pool threads they interleave only at that statement level, which
+# can lose a single increment in rare races -- diagnostics only, the
+# section rows stay exact.
 
-def _md5_file(path):
-    """Full-content MD5 of a file, read in 1 MB chunks."""
-    h = hashlib.md5()
-    with open(path, 'rb') as f:
-        while True:
-            b = f.read(1024 * 1024)
-            if not b:
-                break
-            h.update(b)
-    return h.digest()
-
-
-def _quick_hash(path, size):
-    """Sampling hash of a big file: MD5 over the first and the last
-    HEAD_TAIL_CHUNK bytes (a single read covers files smaller than the
-    chunk, which then degenerates to a full-content hash). 'size' is the
-    stat() size the sampling layout is computed from."""
-    h = hashlib.md5()
-    with open(path, 'rb') as f:
-        h.update(f.read(HEAD_TAIL_CHUNK))
-        if size > HEAD_TAIL_CHUNK:
-            f.seek(size - HEAD_TAIL_CHUNK)
-            h.update(f.read(HEAD_TAIL_CHUNK))
-    return h.digest()
+_SCAN_FACTS = {}
 
 
-def _contents_equal(pl, pr, size, quick_only):
+def _facts_reset():
+    """(Re)start the scan-facts counters (per profiled scan batch)."""
+    global _SCAN_FACTS
+    _SCAN_FACTS = {
+        'listings': 0,          # directory listings issued
+        'listing_ms': 0.0,      # their wall time, total
+        'listing_ms_max': 0.0,  # slowest single listing
+        'entries_l': 0, 'entries_r': 0, 'entries_x': 0,  # listed entries
+        'files_l': 0, 'files_r': 0,
+        'dirs_l': 0, 'dirs_r': 0,
+        'pairs': 0,             # equal-size content tests
+        'pairs_early': 0,       # stopped at the first differing chunk
+        'pairs_full': 0,        # read to the end (identical, or sampled)
+        'pair_bytes': 0,        # bytes read by content tests
+    }
+
+
+def _facts_add(**kw):
+    """_facts_add(listings=1, listing_ms=0.5, ...) -- bump counters."""
+    facts = _SCAN_FACTS
+    if not facts:
+        return
+    try:
+        for k, v in kw.items():
+            facts[k] = facts.get(k, 0) + v
+    except Exception:
+        pass
+
+
+_facts_reset()
+
+
+def _book_listing(dt, n_entries, side):
+    """One directory listing finished: profiler row + facts counters."""
+    if Profiler.is_enabled():
+        Profiler.mark_standalone('dirs:listing', dt, 1, dt)
+        _facts_add(listings=1, listing_ms=dt * 1000.0)
+        facts = _SCAN_FACTS
+        if dt * 1000.0 > facts.get('listing_ms_max', 0.0):
+            facts['listing_ms_max'] = dt * 1000.0
+        if side == 'left':
+            _facts_add(entries_l=n_entries)
+        elif side == 'right':
+            _facts_add(entries_r=n_entries)
+        else:
+            _facts_add(entries_x=n_entries)
+
+
+def _quick_contents_equal(pl, pr, size, quick_only, cancel_evt=None):
     """Content test for two same-sized files (the caller already knows
-    the sizes match and are > 0). Applies the tiered strategy from the
-    module docstring; returns True/False, or None when a side cannot be
-    read (the caller turns that into ST_ERR).
+    the sizes match and are > 0): WinMerge's "quick contents" byte
+    compare (Src/CompareEngines/ByteCompare.cpp) -- both files opened
+    ONCE, read in BYTE_CHUNK-sized pieces, the first differing piece
+    decides. Returns True/False, or None when a side cannot be read or
+    the scan was cancelled mid-compare (the caller turns that into
+    ST_ERR; a cancelled scan's rows are dropped anyway).
 
-    Every tier is booked to the profiler as a thread-safe standalone
-    row (dirs:tier_*) -- deliberately NOT a section: this runs on the
-    scanner thread, where pushing frames onto the shared section stack
+    'quick_only' keeps files bigger than 2*HEAD_TAIL_CHUNK from being
+    read whole: only the head and tail HEAD_TAIL_CHUNK windows are
+    compared (the old sampling mode, minus the hashing -- comparing the
+    windows directly is cheaper than MD5 over the same bytes and stops
+    at the first differing byte within a window).
+
+    Booked to the profiler as a thread-safe standalone row
+    (dirs:quick_content): deliberately NOT a section -- this runs on
+    the scan pool, where pushing frames onto the shared section stack
     would interleave with the main thread's sections (see
     profiling.py's mark_standalone). The timed stretch includes the
     open+read of BOTH sides, which is what a slow file source (network
     share, cloud placeholder, antivirus hook) shows up as."""
+    t0 = time.perf_counter()
+    n_bytes = 0
+    early = False
     try:
-        if size <= SMALL_FILE_FULL:
-            t0 = time.perf_counter()
-            eq = _md5_file(pl) == _md5_file(pr)
-            if Profiler.is_enabled():
-                Profiler.mark_standalone('dirs:tier_md5_small',
-                                         time.perf_counter() - t0)
-            return eq
-        t0 = time.perf_counter()
-        qeq = _quick_hash(pl, size) == _quick_hash(pr, size)
-        if Profiler.is_enabled():
-            Profiler.mark_standalone('dirs:tier_quick_hash',
-                                     time.perf_counter() - t0)
-        if not qeq:
-            return False
-        if quick_only:
-            return True
-        t0 = time.perf_counter()
-        eq = _md5_file(pl) == _md5_file(pr)
-        if Profiler.is_enabled():
-            Profiler.mark_standalone('dirs:tier_md5_full',
-                                     time.perf_counter() - t0)
-        return eq
+        with open(pl, 'rb') as fl, open(pr, 'rb') as fr:
+            if quick_only and size > 2 * HEAD_TAIL_CHUNK:
+                # sampling: head + tail windows only (see the docstring)
+                hl = fl.read(HEAD_TAIL_CHUNK)
+                hr = fr.read(HEAD_TAIL_CHUNK)
+                n_bytes += len(hl) + len(hr)
+                if hl != hr:
+                    early = True
+                    return False
+                fl.seek(size - HEAD_TAIL_CHUNK)
+                fr.seek(size - HEAD_TAIL_CHUNK)
+                tl = fl.read(HEAD_TAIL_CHUNK)
+                tr = fr.read(HEAD_TAIL_CHUNK)
+                n_bytes += len(tl) + len(tr)
+                if tl != tr:
+                    early = True
+                    return False
+                return True
+            while True:
+                if cancel_evt is not None and cancel_evt.is_set():
+                    return None
+                bl = fl.read(BYTE_CHUNK)
+                br = fr.read(BYTE_CHUNK)
+                n_bytes += len(bl) + len(br)
+                if bl != br:
+                    early = True
+                    return False  # first differing chunk: stop (WinMerge
+                if not bl:         # does the same in ByteCompare)
+                    return True    # both at EOF, equal all the way
     except OSError:
         return None
+    finally:
+        if Profiler.is_enabled():
+            dt = time.perf_counter() - t0
+            Profiler.mark_standalone('dirs:quick_content', dt, 1, dt)
+            kw = {'pairs': 1, 'pair_bytes': n_bytes}
+            kw['pairs_early' if early else 'pairs_full'] = 1
+            _facts_add(**kw)
 
 
 # ----------------------------------------------------------------------
@@ -617,18 +693,17 @@ def _file_row_base(dir_l, dir_r, rel, sl, sr, method):
         return row, None
 
     if method == METHOD_SIZE_TIME:
-        # WinMerge's Quick method: equal size + equal mtime ->
-        # Identical; anything else -> Different. No file is opened --
-        # the whole verdict comes from the listing's own data, which
-        # is what makes this method immune to slow opens (network,
-        # cloud placeholders, antivirus). The trade-off is documented
-        # in the option's comment; the double-click diff is the
-        # honest check.
-        t0 = time.perf_counter()
+        # WinMerge's "Modified date and size" method: equal size +
+        # equal mtime -> Identical; anything else -> Different. No file
+        # is ever opened -- the whole verdict comes from the listing's
+        # own data, which is what makes this method immune to slow
+        # opens (network, cloud placeholders, antivirus). The trade-off
+        # is documented in the option's comment; the double-click diff
+        # is the honest check. (Deliberately NOT booked to the profiler:
+        # timing a float compare would cost more than the work -- the
+        # dirs:listing rows and the scan-facts block tell this method's
+        # whole story, since the walk IS the scan here.)
         same = (sl[1] == sr[1])
-        if Profiler.is_enabled():
-            Profiler.mark_standalone('dirs:tier_timestamp',
-                                     time.perf_counter() - t0)
         row['status'] = ST_SAME if same else ST_DIFF
         return row, None
 
@@ -647,7 +722,8 @@ def _file_row(dir_l, dir_r, rel, sl, sr, quick_only, method):
     row, content = _file_row_base(dir_l, dir_r, rel, sl, sr, method)
     if content is None:
         return row
-    same = _contents_equal(content[0], content[1], content[2], quick_only)
+    same = _quick_contents_equal(content[0], content[1], content[2],
+                                 quick_only)
     if same is None:
         row['status'] = ST_ERR
     else:
@@ -824,7 +900,7 @@ _init_win_find()
 # One-directory scan (the unit of work, serial or pool)
 # ----------------------------------------------------------------------
 
-def _scan_dir(root, base, mask, cancel_evt, on_err):
+def _scan_dir(root, base, mask, cancel_evt, on_err, side=''):
     """Scan ONE directory of a compared tree. Returns (files, dirs,
     subdirs):
 
@@ -838,16 +914,22 @@ def _scan_dir(root, base, mask, cancel_evt, on_err):
 
     'base' is this directory's path RELATIVE to 'root' ('' = the root
     itself) -- the walk always knows where it is, no relpath() calls.
-    Size and mtime come straight from the directory listing: on
-    Windows either the WinMerge-style bulk finder (_WIN_FIND: one
-    64 KB round trip per directory, no short names, no per-entry
-    stat) or scandir's DirEntry (whose stat data the listing also
-    carries). A whole tree therefore walks with ZERO per-file stat()
-    calls and zero lstat() calls -- on a source where every metadata
-    syscall costs 100-200 ms (cold antivirus pass, network share,
-    cloud placeholder filter) that alone halves the syscall count of
-    the old os.walk + os.stat walk, and the bulk finder cuts the
-    per-entry round trips on top.
+    'side' ('left'/'right'/'') only feeds the scan-facts counters
+    (_SCAN_FACTS): which tree a listing belongs to. Size and mtime
+    come straight from the directory listing: on Windows either the
+    WinMerge-style bulk finder (_WIN_FIND: one 64 KB round trip per
+    directory, no short names, no per-entry stat) or scandir's
+    DirEntry (whose stat data the listing also carries). A whole tree
+    therefore walks with ZERO per-file stat() calls and zero lstat()
+    calls -- on a source where every metadata syscall costs 100-200 ms
+    (cold antivirus pass, network share, cloud placeholder filter)
+    that alone halves the syscall count of the old os.walk + os.stat
+    walk, and the bulk finder cuts the per-entry round trips on top.
+
+    The listing itself is timed and booked (dirs:listing + facts):
+    its per-call wall time is pure metadata round-trip latency -- the
+    number that separates "the disk/AV is slow" from "the plugin is
+    slow" in the profiling report.
 
     Built as a pool job: a pure function of its arguments plus an
     error callback, cancellation checked at entry / between entries,
@@ -867,7 +949,9 @@ def _scan_dir(root, base, mask, cancel_evt, on_err):
         # paths that would need the \\?\ long-path prefix stay on the
         # scandir path (which handles them itself).
         try:
+            t0 = time.perf_counter()
             entries, err = _WIN_FIND(os.path.join(full, '*'))
+            _book_listing(time.perf_counter() - t0, len(entries), side)
         except Exception:
             entries = None               # unexpected: scandir fallback
         else:
@@ -905,6 +989,7 @@ def _scan_dir(root, base, mask, cancel_evt, on_err):
         return files, dirs, subdirs
 
     entries = []
+    t0 = time.perf_counter()
     try:
         with os.scandir(full) as it:
             for entry in it:
@@ -913,6 +998,7 @@ def _scan_dir(root, base, mask, cancel_evt, on_err):
                     break
     except OSError as e:
         on_err(e, full)   # keep entries listed before the failure
+    _book_listing(time.perf_counter() - t0, len(entries), side)
     for entry in entries:
         if cancel_evt is not None and cancel_evt.is_set():
             break
@@ -1010,6 +1096,17 @@ class _Scanner(threading.Thread):
         self.finished = False
         self.fatal = None       # exception text of an aborted run
         self.walk_errors = []   # bounded list of (dirpath, message)
+        # Wall-time decomposition (see the docstring's "Profiling"):
+        # _t_spawn is taken HERE, on the main thread inside start_scan;
+        # run() books the lag until it actually starts as dirs:spawn_lag
+        # -- thread scheduling + anything the main thread still does
+        # before/around the start. run_end is stamped right before
+        # finished=True, and the UI timer books dirs:finish_lag for the
+        # tick quantum on top. Together with dirs:scan_wall/worker the
+        # report then accounts for EVERY millisecond of a slow scan.
+        self._t_spawn = time.perf_counter()
+        self.run_end = None
+        self.scanned_dirs = 0   # listings completed (progress line)
 
     # -- control (called from the main thread) ------------------------
 
@@ -1027,6 +1124,17 @@ class _Scanner(threading.Thread):
     # -- the work ------------------------------------------------------
 
     def run(self):
+        if Profiler.is_enabled():
+            # Time from the ctor (main thread, inside start_scan) until
+            # this thread actually runs: scheduling + the main thread's
+            # remaining kick-off work. On a healthy setup this is ~0;
+            # a large value means the scan started late, not that it ran
+            # slow -- the row keeps that question answerable.
+            lag = time.perf_counter() - self._t_spawn
+            try:
+                Profiler.mark_standalone('dirs:spawn_lag', lag, 1, lag)
+            except Exception:
+                pass
         pr = s = None
         if self.cprofile_on and Profiler.is_enabled():
             try:
@@ -1041,6 +1149,7 @@ class _Scanner(threading.Thread):
         finally:
             if pr is not None:
                 cancel_profiling(pr)  # just disable; the form prints it
+            self.run_end = time.perf_counter()
             with self.lock:
                 self.finished = True
 
@@ -1087,9 +1196,14 @@ class _Scanner(threading.Thread):
                     base = stack[i]
                     i += 1
                     f, d, subs = _scan_dir(roots[side], base, self.mask,
-                                           self.cancel_evt, self._walk_err)
+                                           self.cancel_evt, self._walk_err,
+                                           side)
                     files[side].update(f)
                     dirs[side].update(d)
+                    self.scanned_dirs += 1
+                    if Profiler.is_enabled():
+                        _facts_add(**{'files_' + side: len(f),
+                                      'dirs_' + side: len(d)})
                     if self.recursive:
                         stack.extend(subs)
                 if prof:
@@ -1105,7 +1219,7 @@ class _Scanner(threading.Thread):
 
         def submit(side, base):
             fut = pool.submit(_scan_dir, roots[side], base, self.mask,
-                              self.cancel_evt, self._walk_err)
+                              self.cancel_evt, self._walk_err, side)
             futs[fut] = side
             submitted[side] += 1
 
@@ -1121,6 +1235,10 @@ class _Scanner(threading.Thread):
                     continue   # _scan_dir books its own errors; paranoia
                 files[side].update(f)
                 dirs[side].update(d)
+                self.scanned_dirs += 1
+                if Profiler.is_enabled():
+                    _facts_add(**{'files_' + side: len(f),
+                                  'dirs_' + side: len(d)})
                 if self.recursive and not self.cancelled():
                     for rel in subs:
                         submit(side, rel)
@@ -1139,7 +1257,7 @@ class _Scanner(threading.Thread):
     def _scan(self):
         """Walk both trees, then build the rows. Every step is booked
         to the profiler as thread-safe standalone marks (this method
-        runs on the worker thread -- see the note in _contents_equal
+        runs on the worker thread -- see the note in _quick_contents_equal
         about why not sections). The walk and the equal-size content
         tests run on the scan pool (see the module docstring's "The
         scan engine"); with the cProfile layer active the pool is
@@ -1211,9 +1329,10 @@ class _Scanner(threading.Thread):
                 row, content = _file_row_base(self.dir_l, self.dir_r,
                                               rel, sl, sr, self.method)
                 if content is not None and pool is not None:
-                    pending[k] = pool.submit(_contents_equal,
+                    pending[k] = pool.submit(_quick_contents_equal,
                                              content[0], content[1],
-                                             content[2], self.quick_only)
+                                             content[2], self.quick_only,
+                                             self.cancel_evt)
                 decided.append((k, row, content))
                 n_files += 1
             for k, row, content in decided:
@@ -1227,19 +1346,20 @@ class _Scanner(threading.Thread):
                             same = None
                     else:
                         # serial mode (cProfile on / pool off)
-                        same = _contents_equal(content[0], content[1],
-                                               content[2], self.quick_only)
+                        same = _quick_contents_equal(
+                            content[0], content[1], content[2],
+                            self.quick_only, self.cancel_evt)
                     row['status'] = (ST_ERR if same is None
                                      else (ST_SAME if same else ST_DIFF))
                 with self.lock:
                     self.rows.append(row)
             if prof:
                 # NOTE: this stretch INCLUDES the content-test time (the
-                # dirs:tier_* rows are booked inside _contents_equal, on
-                # the pool threads -- thread-safe standalone marks);
-                # the row-building self time is the difference. Booked
-                # with the file count so the per-file average is
-                # readable in the report.
+                # dirs:quick_content rows are booked inside
+                # _quick_contents_equal, on the pool threads -- thread-
+                # safe standalone marks); the row-building self time is
+                # the difference. Booked with the file count so the
+                # per-file average is readable in the report.
                 Profiler.mark_standalone('dirs:file_rows',
                                          time.perf_counter() - t0, n_files)
         finally:
@@ -1315,6 +1435,7 @@ def _prof_begin_scan(cmd):
     if Profiler.is_enabled():
         if _prof_users == 0:
             reset_profiling()
+            _facts_reset()      # scan-facts counters follow the report
             _prof_enabled_here = enabled_here
             try:
                 cprof_scan = bool(cmd.cfg.get('enable_cprofile', False))
@@ -1323,6 +1444,62 @@ def _prof_begin_scan(cmd):
         _prof_users += 1
         token = Profiler.start_async_pair('dirs:scan_wall', 'dirs:worker')
     return token, cprof_scan
+
+
+def _prof_facts_block(worker):
+    """The 'folder scan facts' epilogue lines: what the scan-facts
+    counters say about THIS run (see _SCAN_FACTS). Printed right after
+    the section report -- deliberately compact, four statements that
+    answer the four questions every slow-compare report raises:
+
+      1. how many directory listings ran, and how much of the wall
+         time was pure listing latency (metadata round trips -- the
+         disk/antivirus/network, not plugin code: the same number any
+         other tool, WinMerge included, pays on a cold tree);
+      2. how big the trees were (entries / file rows / folder rows);
+      3. how much file CONTENT the compare had to read (pairs stopped
+         at the first differing chunk vs read to the end);
+      4. whether the scan ran serially because the cProfile layer was
+         on (the function-report mode -- slower on purpose; turn it
+         off to measure speed)."""
+    facts = _SCAN_FACTS
+    if not facts:
+        return ''
+    lines = ['--- Differ 2 folder scan facts ---']
+    n = facts.get('listings', 0)
+    ms = facts.get('listing_ms', 0.0)
+    mx = facts.get('listing_ms_max', 0.0)
+    if n:
+        avg = ms / n
+        lines.append(
+            'directory listings: {}, total {:.0f} ms, slowest {:.0f} ms, '
+            'avg {:.0f} ms -- pure metadata round-trip time (disk / '
+            'antivirus / network), not plugin code'.format(n, ms, mx, avg))
+    else:
+        lines.append('directory listings: 0')
+    lines.append(
+        'entries listed: {} left / {} right; file rows: {} left / {} '
+        'right; folder rows: {} / {}'.format(
+            facts.get('entries_l', 0), facts.get('entries_r', 0),
+            facts.get('files_l', 0), facts.get('files_r', 0),
+            facts.get('dirs_l', 0), facts.get('dirs_r', 0)))
+    pairs = facts.get('pairs', 0)
+    if pairs:
+        lines.append(
+            'content tests: {} equal-size pairs -- {} stopped at the '
+            'first difference, {} read to the end; {:.0f} KB read'.format(
+                pairs, facts.get('pairs_early', 0),
+                facts.get('pairs_full', 0),
+                facts.get('pair_bytes', 0) / 1024.0))
+    else:
+        lines.append('content tests: 0 (every pair was decided by '
+                     'size alone / one-sided)')
+    if worker is not None and getattr(worker, 'cprofile_on', False):
+        lines.append(
+            'scan mode: SERIAL (differ2.advanced.enable_cprofile is on) '
+            '-- set it off and rescan to run the parallel engine and '
+            'measure real speed')
+    return '\n'.join(lines)
 
 
 def _prof_finish_scan(cmd, token, worker, dir_l, dir_r):
@@ -1342,6 +1519,12 @@ def _prof_finish_scan(cmd, token, worker, dir_l, dir_r):
             profiling_report(
                 files=[('Left', dir_l), ('Right', dir_r)],
                 cprofile_was_on=bool(cprof_scan))
+        except Exception:
+            pass
+        try:
+            block = _prof_facts_block(worker)
+            if block:
+                print(block)
         except Exception:
             pass
     if cprof_scan:
@@ -2322,9 +2505,23 @@ class DirCompareForm:
             self._prof_token = None
             return
         if not finished:
-            self._sb_text(1, _('Comparing... {} / {}').format(
-                len(rows), total if total else '?'))
-            if len(rows) - self._last_fill >= PARTIAL_FILL_STEP:
+            if rows:
+                self._sb_text(1, _('Comparing... {} / {}').format(
+                    len(rows), total if total else '?'))
+            else:
+                # Walk phase: no rows exist yet (rows are built from
+                # the merged listings of BOTH trees), so the progress
+                # line counts what the walk has done instead -- the
+                # window then never looks stuck during a slow listing.
+                self._sb_text(1, _('Scanning folders... {} listed').format(
+                    getattr(w, 'scanned_dirs', 0)))
+            # Rows only ever grow during a scan, and _fill_list is
+            # INCREMENTAL (append-delta, same sort+filter): filling on
+            # every tick that has new rows is cheap and makes small
+            # trees (a handful of rows) appear as they are decided
+            # instead of all at once at the end. The timer period
+            # (POLL_MS) bounds the refill rate for huge trees.
+            if len(rows) != self._last_fill:
                 self._last_fill = len(rows)
                 self._fill_list(rows)
             if Profiler.is_enabled():
@@ -2333,6 +2530,16 @@ class DirCompareForm:
             return
         # Finished (normally or cancelled): last full update.
         self._stop_timer()
+        if Profiler.is_enabled() and getattr(w, 'run_end', None):
+            # Wall time from the worker's real end to THIS tick: the
+            # timer quantum + whatever kept the main thread busy --
+            # with dirs:spawn_lag this closes the loop on where every
+            # millisecond of dirs:scan_wall went.
+            try:
+                lag = time.perf_counter() - w.run_end
+                Profiler.mark('dirs:finish_lag', lag, 1, lag)
+            except Exception:
+                pass
         self._rows = rows
         self._last_fill = -1
         self._fill_list()

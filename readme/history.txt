@@ -1,3 +1,50 @@
+2026.10.03 (5th release, by @alkorsan)
++ feature: WinMerge's "quick contents" compare engine. The user's new
+  profiling (8 s first compare, 2 s later ones) showed the listings
+  themselves were down to 9 bulk calls but the "Contents" method still
+  read file pairs through a 3-tier MD5 pipeline (small files: full
+  MD5; big files: head+tail MD5 then, when samples matched, a FULL
+  MD5 re-read) -- up to three opens and two passes per side. Replaced
+  with what WinMerge actually does for folder compare
+  (Src/CompareEngines/ByteCompare.cpp): both files opened ONCE,
+  compared in 32 KB chunks (WinMerge's own WMCMPBUFF buffer size),
+  the FIRST differing chunk decides Different -- a memcmp instead of
+  a hash (several times cheaper over the same bytes), differing pairs
+  stop reading instead of going to the end, identical verdicts stay
+  byte-for-byte proven, and no hash is ever computed. Bench: a 200 KB
+  pair compares in ~0.04 ms warm. The "Fast (sampling) compare"
+  option (dirs.quick_only) keeps its documented meaning for files
+  above 128 KB: only each side's first and last 64 KB windows are
+  compared (directly now, still without hashing).
++ feature: per-listing latency diagnostics. Every directory listing
+  is timed and booked as a dirs:listing profiler row (calls =
+  listings, max = the slowest single listing) and counted into a new
+  "folder scan facts" block printed after the section report:
+  listings count with total/slowest/average latency (pure metadata
+  round-trip time -- the number any tool, WinMerge included, pays on
+  a cold tree), tree sizes (entries/files/folders per side), how many
+  content pairs stopped at the first difference vs were read to the
+  end and how many KB that read, and whether the run was serial
+  because the cProfile layer was on. This is the tool that separates
+  "the plugin is slow" from "the disk/antivirus is slow".
++ feature: full wall-time decomposition of a scan. New profiler rows
+  dirs:spawn_lag (scanner-thread creation -> its first line of code:
+  scheduling + the main thread's remaining kick-off work) and
+  dirs:finish_lag (worker end -> the UI tick that adopted the result)
+  close the accounting loop: walks + content + lags + ui rows now add
+  up to the dirs:scan_wall total, so the next report shows where
+  EVERY millisecond went (the user's 8.1 s report had ~3.3 s outside
+  the scanner's own 4.8 s profiled window -- these rows make such a
+  gap visible instead of mysterious).
++ change: rows stream into the list on EVERY UI tick that has new
+  rows (was: only every 50 new rows -- a small tree's rows all
+  appeared at the end). During the walk phase (before any row exists)
+  the status line now counts "Scanning folders... N listed" so the
+  window never looks stuck while a cold tree is being listed.
++ change: the per-file dirs:tier_timestamp mark is gone (timing a
+  float compare cost more than the work; the timestamp method's whole
+  story is the walk + facts block).
+
 2026.10.03 (4th release, by @alkorsan)
 + feature: WinMerge's directory-listing call. The user's profiling
   showed the remaining 8 s was pure listing latency (9 x scandir
