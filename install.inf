@@ -28,122 +28,132 @@ method=compare_with_next_tab
 
 [item5]
 section=commands
+caption=Differ 2\Compare two folders...
+method=compare_dirs
+
+[item6]
+section=commands
+caption=Differ 2\Compare current file's folder with folder...
+method=compare_dirs_current
+
+[item7]
+section=commands
 caption=Differ 2\Compare clipboard to selection
 method=compare_clip_sel
 
-[item6]
+[item8]
 section=commands
 caption=Differ 2\-
 method=_
 
-[item7]
+[item9]
 section=commands
 caption=Differ 2\Diff current document with file...
 method=diff_with
 
-[item8]
+[item10]
 section=commands
 caption=Differ 2\Diff current document with tab...
 method=diff_with_tab
 
-[item9]
+[item11]
 section=commands
 caption=Differ 2\-
 method=_
 
-[item10]
+[item12]
 section=commands
 caption=Differ 2\Recompare
 method=refresh_compare
 
-[item11]
+[item13]
 section=commands
 caption=Differ 2\Cancel compare
 method=cancel_compare
 
-[item12]
+[item14]
 section=commands
 caption=Differ 2\Cancel all compares
 method=cancel_all_compares
 
-[item13]
+[item15]
 section=commands
 caption=Differ 2\Resize editors to equal width
 method=resize_equal_width
 
 
 
-[item14]
+[item16]
 section=commands
 caption=Differ 2\Focus the opposite file
 method=set_focus_to_opposite_panel
 
-[item15]
+[item17]
 section=commands
 caption=Differ 2\Swap compared editors
 method=swap_view
 
-[item16]
+[item18]
 section=commands
 caption=Differ 2\-
 method=_
 
-[item17]
+[item19]
 section=commands
 caption=Differ 2\Select current difference
 method=select_current
 
-[item18]
+[item20]
 section=commands
 caption=Differ 2\Select all differences
 method=select_all_diff
 
-[item19]
+[item21]
 section=commands
 caption=Differ 2\-
 method=_
 
-[item20]
+[item22]
 section=commands
 caption=Differ 2\Jump to next difference
 method=jump_next
 
-[item21]
+[item23]
 section=commands
 caption=Differ 2\Jump to previous difference
 method=jump_prev
 
-[item22]
+[item24]
 section=commands
 caption=Differ 2\-
 method=_
 
-[item23]
+[item25]
 section=commands
 caption=Differ 2\Copy current difference to the right
 method=copy_right
 
-[item24]
+[item26]
 section=commands
 caption=Differ 2\Copy current difference to the left
 method=copy_left
 
-[item25]
+[item27]
 section=commands
 caption=Differ 2\Copy current line to the right
 method=copy_line_right
 
-[item26]
+[item28]
 section=commands
 caption=Differ 2\Copy current line to the left
 method=copy_line_left
 
-[item27]
+[item29]
 section=commands
 caption=Differ 2\-
 method=_
 
-[item28]
+[item30]
 section=commands
 caption=Differ 2\Config...
 method=change_config

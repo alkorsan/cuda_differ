@@ -1,3 +1,40 @@
+2026.10.03 (by @alkorsan)
++ feature: folder comparison, WinMerge-style (new module compare_dir.py).
+  "Compare two folders..." opens a non-modal compare window for two
+  picked folders; any number of windows can be open at once (compare
+  two folders, then two other folders, use both). The list shows every
+  file/subfolder with per-side sizes, timestamps and a status
+  (Different / Only left / Only right / Identical / Folder / Cannot
+  read), colored status icons, click-to-sort columns whose widths
+  survive refreshes, instant status filters (no rescan), a recursive
+  toggle, a WinMerge-style filename mask, a status bar with progress
+  and counts, editable side paths, Swap sides, a history-remembered
+  picker (last 12 folders per side), and per-window geometry saved
+  across sessions. The scan is a deliberately cheap first pass: sizes
+  first, then a single full MD5 for small files, then a head+tail
+  sampling hash for big ones, and only if the samples match a full
+  content hash -- never a diff algorithm, never an editor load; it
+  runs on a background thread so rows stream in and a rescan simply
+  cancels the previous run. Double-clicking a file row opens the pair
+  in a REAL Differ 2 compare tab (the moment the actual diff
+  algorithms run); double-clicking a both-sides folder row opens a
+  drill-down compare window for that subfolder pair. The right-click
+  menu offers WinMerge's core sync operations: copy file/folder to the
+  other side (copy2/copytree, confirmed), delete from either side
+  (confirmed), open a side's file, show a side in the OS file manager,
+  copy a side's path; file operations patch the affected row in place
+  (re-stat + re-hash of that one pair), folder operations rescan.
+  Command line: "cudatext -p=cuda_differ2#dir1#dir2" now auto-detects
+  folders and opens the compare window for them (two files keep the
+  old behavior); "-c=cuda_differ2,compare_dirs" opens the picker.
+  New options (config dialog chapter "dirs"): differ2.dirs.quick_only
+  (sampling compare -- skip the final full hash; off by default),
+  differ2.dirs.confirm_ops (confirm copy/delete; on by default).
+  New menu items: "Compare two folders...", "Compare current file's
+  folder with folder...". New shared entry point
+  Command.open_compare_pair(fn1, fn2) used by the folder window and
+  on_cli.
+
 2026.10.03 (by @badrelmers)
 - fix: switching CudaText sessions (the Sessions menu,
   app_proc(PROC_LOAD_SESSION), session-manager plugins) no longer deletes
@@ -22,56 +59,6 @@
   only the flag is cleared (the pass's dead-record cleanup must not run
   against an uncertain session state). readme documents the behavior in
   the "Compare tabs, restarts and session switches" chapter.
-
-- fix: compare colors no longer leak from the ORIGINAL published Differ
-  plugin into Differ 2 when both are installed and the original ran a
-  compare first in the same CudaText session. Root cause, verified in
-  the CudaText/ATSynEdit sources: bookmark kinds are APP-GLOBAL slots
-  (bookmark(BOOKMARK_SETUP, nkind, color) overwrites that kind's color
-  for the whole app, and ATSynEdit resolves every bookmark2 line's
-  background through it), and both plugins registered kinds 24/25/26 --
-  the original re-registers them with ITS theme colors on every compare
-  it runs, and Differ 2's config cache (settings mtime / theme names)
-  then had no reason to re-run its own BOOKMARK_SETUP, so every later
-  Differ 2 compare painted the original's colors. Fixes:
-  * the kind numbers move to the top of CudaText's 1..63 clamp range
-    (deleted/added/changed -> 61/62/63), far from the small numbers
-    plugins usually pick;
-  * the editor tags move off the original's 148/149 (DIFF_TAG -> 4082,
-    ignored-gap tag -> 4083), so each plugin's clear-by-tag no longer
-    wipes the other's marks when both paint the same editor;
-  * kind registration moves out of get_config() into the new
-    _register_bookmark_kinds(), which Command.__init__ calls at plugin
-    load and config() calls unconditionally before every compare --
-    re-registration is self-healing (even a future kind collision with
-    yet another plugin repairs itself on the next compare), and
-    get_config() is side-effect free again.
-
-- fix: removed the wrong assumption, stated in several comments and
-  enforced by dead code, that an untitled tab must be PROP_MODIFIED=True
-  for CudaText's session saver to back it up. That rule holds for FILE
-  tabs (their text is only stored in the session when modified) but NOT
-  for untitled tabs: DoOps_SaveSession ALWAYS stores an untitled tab's
-  text -- it forces 'modified' to true for them in the session file,
-  with the same rule for the first and the SECOND half of a split --
-  and DoOps_LoadSession brings untitled tabs back as modified whatever
-  the flag was. Code removed: on_close's app-exit branch no longer puts
-  the compare halves back to PROP_MODIFIED=True before the session
-  write (the exit 'Save tabs?' dialog has already run by the time
-  on_close fires, and the flag never gated untitled text anyway -- the
-  restore was a no-op). Comments corrected in on_close_pre (the halves
-  are modified as a side effect of being filled with content, not to
-  stay in the session; clearing the flag on clean tabs cannot drop
-  either half from the session) and on_save_pre (PROP_MODIFIED is left
-  untouched because it plays no role in session persistence -- its only
-  real job is driving the 'Save changes?' dialogs). The NECESSARY
-  PROP_MODIFIED uses stay: on_close_pre clearing the flag on clean
-  compare tabs (suppresses the 'Save changes?' close dialog),
-  compare_clip_sel clearing it on the two scratch tabs before closing
-  them (same dialog suppression), and _sync_to_original_by_id marking
-  an untitled ORIGINAL modified after a sync (dot on the tab +
-  'Save changes?' = Save-As on its later close, so the synced content
-  is not silently lost).
 
 2026.10.02 (by @badrelmers)
 * change: the plugin is renamed Differ 2 and fully de-conflicted from

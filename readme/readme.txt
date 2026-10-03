@@ -49,6 +49,11 @@ synced back to the original files automatically.
   the changed lines, never on the empty gap side, so the copy commands
   keep working right after a jump -- from the changed lines or from
   the line next to a gap.
+- Compares two FOLDERS in a WinMerge-style window: pick two folders
+  (or pass them on the command line) and get a fast side-by-side list
+  of what is identical, different, and unique to each side; double-
+  click any file to open it in a real Differ 2 compare tab. See the
+  "Compare folders" section below.
 
 The compare engine implements all the best-known diff algorithms, with a
 lot of improvements on top of each: two native ones running in compiled
@@ -95,6 +100,15 @@ Compare clipboard to selection
     right. Both sides use the focused editor's syntax highlighting,
     so the two halves render consistently. Also in the diff-tab
     context menu, right below "Compare with tab".
+
+Compare two folders...
+    Opens the folder-compare window for two folders you pick -- see
+    the "Compare folders" section below for the full story.
+
+Compare current file's folder with folder...
+    Same, but the left side is prefilled with the folder of the file
+    in the active tab (handy for "compare this file's project with
+    that backup" -- no typing, no browsing).
 
 Diff current document with file...
     Produces a unified diff (patch-style) of the active file and a file
@@ -224,6 +238,105 @@ Resize editors to equal width
     splitter. Also available at the end of the diff tab's right-click
     menu. Works on any split tab; reports a status message when the
     current tab is not split.
+
+
+== Compare folders ==
+
+"Plugins / Differ 2 / Compare two folders..." (or the command line --
+see below) opens a WinMerge-style folder comparison: a non-modal
+window listing every file and subfolder of the two trees, with the
+per-side sizes and timestamps and a status column:
+
+  Different     exists on both sides, content differs
+  Only left     exists only in the left folder
+  Only right    exists only in the right folder
+  Identical     exists on both sides, same content
+  Folder        exists on both sides (a folder row; its contents are
+                the rows below it)
+  Cannot read   stat/open failed (permissions, broken link...) --
+                always shown, whatever the filters say
+
+The FIRST pass is deliberately cheap so even huge trees fill the list
+fast: nothing is ever loaded into an editor and no diff algorithm
+runs. For each file present on both sides the cheapest deciding test
+is applied, in order: different sizes -> Different (no read at all);
+both empty -> Identical (no read); small files (<=256 KB) -> one full
+MD5 per side (a single sequential read); bigger files -> an MD5 of
+each side's head and tail 64 KB chunks first (a head or tail change is
+caught after reading at most 128 KB per side). Only when those samples
+match is the full content of both files hashed, so an "Identical"
+verdict is always proven byte for byte by default. Timestamps are
+never trusted -- a copied file with a fresh mtime compares as
+identical, as it should. (The "Fast (sampling) compare" option
+differ2.dirs.quick_only skips the final full read -- the fastest mode
+for giant trees, at the documented cost that a change confined to the
+middle of a big file can be missed in the LIST; the double-click
+compare never misses anything.)
+
+The scan runs on a background thread (the window stays responsive and
+rows stream in while it works -- watch the "Comparing... X / Y"
+progress line); a second scan can be started at any time, it simply
+cancels the first. Any number of compare windows can be open at the
+same time -- compare two folders, then compare two other folders, and
+use both windows at once; closing one never touches the others.
+
+The window's controls:
+
+- The two path edits are editable: type two paths and press Refresh
+  (or Enter) to compare them; the Browse buttons next to them open a
+  folder picker for that side.
+- Swap sides mirrors the whole comparison (left becomes right).
+- New compare... opens the picker dialog again -- the two combos
+  remember the last 12 folders used on each side.
+- The status filters (Different / Only left / Only right / Identical)
+  hide or show rows instantly, without rescanning. Uncheck
+  "Identical" for the usual "show me what matters" view.
+- The Subfolders checkbox switches between the full recursive tree
+  (default) and the two top folders only; changing it rescans.
+- The Mask edit filters files by wildcard pattern ("*.py; *.txt"),
+  WinMerge-style: matching files are compared, everything else is not
+  listed at all. It applies on Apply (or Enter when the list has
+  focus).
+- Click a column header to sort by that column (Name, Folder, Status,
+  left/right size or date); click again to reverse. Your manual column
+  width drags survive every list refresh.
+- The status bar shows the scan progress / result line on the left
+  and the counts (Different / Only left / Only right / Identical) on
+  the right.
+- The window remembers its size and position across sessions.
+
+Working with rows:
+
+- Double-click a Different or Identical file row (or select it and
+  press Enter): both files open in a real Differ 2 compare tab -- the
+  full side-by-side compare with highlighting, hunk jumping, copying,
+  everything. This is the moment the real diff algorithms run: the
+  folder scan itself never runs them.
+- Double-click a one-sided file row: the existing file opens alone in
+  an editor tab.
+- Double-click a Folder row (both sides): a drill-down -- a NEW
+  compare window opens scoped to that subfolder pair, so you can
+  compare a deep subfolder without typing paths.
+- Double-click a one-sided folder row: it opens in the OS file
+  manager.
+- Right-click a row for the WinMerge-style sync operations: Copy to
+  left/right (copy2 for files -- mtime preserved, so future compares
+  see the copy as identical; copytree for folders, only into a
+  missing destination), Delete from left/right, open a side's file,
+  show a side's file/folder in the OS file manager, copy a side's
+  full path. Copy/delete of a FILE patches just that row in place
+  (re-stat + re-hash of that one pair -- no rescan); folder
+  operations rescan the tree. Everything asks for confirmation first
+  (differ2.dirs.confirm_ops).
+- Keys: Enter opens the selected row (when the list has focus), F5
+  rescans, Esc closes the window.
+
+Notes: hidden files are included (like WinMerge); folder symlinks are
+never followed (no cycles), file symlinks compare their target's
+content; the filename mask is case-insensitive on Windows and
+case-sensitive on Linux/macOS, matching each file system's own
+behavior; unreadable folders are skipped and counted in the summary
+line instead of aborting the scan.
 
 
 == Keyboard shortcuts ==
@@ -655,13 +768,27 @@ You can start a comparison from the command line:
 
 This launches CudaText with the two given files opened in the Differ 2 plugin.
 
+Pass two FOLDERS instead, and the folder-compare window opens for
+them (the parameters are auto-detected):
+
+    cudatext -p=cuda_differ2#/path/to/left/folder#/path/to/right/folder
+
+As with filenames, paths with spaces must be passed inside quotes
+around the whole flag:
+
+    cudatext "-p=cuda_differ2#C:\my project#D:\backups\my project"
+
+The command-line also understands -c=cuda_differ2,compare_dirs to
+just open the folder picker dialog at startup (CudaText's generic
+-c= mechanism; see CudaText's own command-line documentation).
+
 
 == Options ==
 
 Open the options dialog via "Options / Settings-plugins / Differ 2 / Config"
 or "Plugins / Differ 2 / Config...".
 
-All options are stored in settings/cuda_differ2.json. The option names grouped into six categories: theme, algorithm, ignoreopt, advanced, micromap, toolbar.
+All options are stored in settings/cuda_differ2.json. The option names grouped into seven categories: theme, algorithm, ignoreopt, advanced, micromap, toolbar, dirs.
 
 Ignore options section (see the "Ignore options" chapter above for details):
 - differ2.ignoreopt.ignore_case: Ignore case (default: off)
@@ -1173,6 +1300,20 @@ Toolbar section (see the "Toolbar" chapter above for details):
   "→ Copy", "≡ Ignore 2/5 ▾", "★ Preset ▾", "⇋ Swap", "↔ Resize",
   "▦ View ▾", "⚙ Config"; when off, only the UTF-8 icons are shown (the Ignore
   button keeps its enabled-options counter).
+
+Folders section (see the "Compare folders" chapter above for details):
+- differ2.dirs.quick_only: Fast (sampling) folder compare (default: off)
+  When off, two same-sized files whose head/tail samples match get a
+  full content hash, so "Identical" is always proven byte for byte.
+  When on, matching samples are reported as Identical without the full
+  read -- the fastest mode for huge trees, at the cost that a change
+  confined to the middle of a big file (outside the 64 KB head/tail
+  chunks) can be missed in the LIST; the double-click side-by-side
+  compare never misses anything.
+- differ2.dirs.confirm_ops: Confirm copy and delete in the folder
+  window (default: on)
+  Ask before the folder window's context menu overwrites or deletes
+  anything (Copy to left/right, Delete from left/right).
 
 
 == Diff algorithms and best practices ==
