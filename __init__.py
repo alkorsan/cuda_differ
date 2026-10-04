@@ -1344,8 +1344,7 @@ OPTS_META = [
               'thread alone, one directory at a time (the shape '
               'the cProfile layer forces). The profiling report '
               '(Plugins > Differ 2 > enable_profiling) names the '
-              'shape and shows which thread paid which directory '
-              'listing.\n'
+              'scan shape in its facts block.\n'
               'Default: main thread.'),
      'def': 'main',
      'frm': 'str2s',

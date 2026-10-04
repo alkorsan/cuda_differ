@@ -299,25 +299,26 @@ progress line); a second scan can be started at any time, it simply
 cancels the first. Any number of compare windows can be open at the
 same time -- compare two folders, then compare two other folders, and
 use both windows at once; closing one never touches the others.
+(That is the OPT-IN "parallel" engine described under
+differ2.dirs.scan_threading below; by default the whole scan runs
+synchronously on the main thread, which measured fastest by far --
+see the option.)
 
 How the walk reads the disk (why the same folders can take 30 s once
-and 1 s the next time): every directory is listed ONCE, bulk. On
-Windows the listing uses the same call WinMerge uses
-(FindFirstFileEx with FindExInfoBasic + FIND_FIRST_EX_LARGE_FETCH,
-via ctypes): one 64 KB round trip returns the WHOLE directory with
-every entry's size and mtime, and the 8.3 short-name lookup is
-skipped. Python's own os.scandir opens directories with a plain
-FindFirstFileW whose small buffer pays a fresh round trip every few
-entries -- on a source where a round trip is expensive (antivirus
-filter, network share, cloud placeholders) that difference is the
-scan. Anything unusual (other OS, long paths, API missing) silently
-falls back to os.scandir, which is always correct. In the
-"parallel" scan shape (see differ2.dirs.scan_threading below) both
-trees, every subfolder, and the content tests for equal-size pairs
-run CONCURRENTLY on a small thread pool, subfolders submitted the
-moment their parent's listing arrives (no waiting behind unrelated
-slow directories -- WinMerge feeds a worker-thread pool the same
-way).
+and 1 s the next time): every directory is listed exactly ONCE with
+os.scandir, whose Windows DirEntry carries each entry's size and
+mtime from the listing itself -- a whole tree therefore walks with
+ZERO per-file stat() calls and no lstat() at all (an os.walk +
+os.stat walk doubles the metadata syscalls; on a source where a
+round trip is expensive -- antivirus filter, network share, cloud
+placeholders -- that difference is the scan). Folder mtimes come
+from the parent listing the same way. In the "parallel" scan shape
+both trees, every subfolder, and the content tests for equal-size
+pairs run CONCURRENTLY on a small thread pool, subfolders submitted
+the moment their parent's listing arrives (no waiting behind
+unrelated slow directories). The module is pure Python and pure
+os.scandir: no ctypes, no platform calls, identical on Windows,
+Linux and macOS.
 The remaining variance is the file system's own cache: a first-ever
 compare of a tree pays the cold cost of every metadata call
 (antivirus pass, disk seeks, SMB round trips -- each can cost
@@ -332,70 +333,30 @@ the compare method to "Size and timestamp" below.
 
 "But WinMerge is instant on the same folders": when every single
 listing costs 300-800 ms and another tool on the same folders is
-instant, the difference is usually the PROCESS, not the algorithm --
-the plugin already makes WinMerge's exact listing call. A real-time
-antivirus can bill every file operation of an unsigned python.exe
-while a signed, well-known executable passes its filter untouched:
-same calls, different process, a 100x different bill (the effect
-also hits loading the cProfile stdlib from such a drive -- seconds).
-The profiled scan measures this directly: the "metadata probe" in
-the facts block times round trips on the compared folder vs the
-system disk, in this process, and prints the verdict -- "that volume
-is slow" (exclude the volume), "this process pays the antivirus tax"
-(add CudaText and its Python to the AV exclusions; WinMerge never
-paid it), or "warm right now" (reproduce cold to see the cost).
+instant, the difference is usually the PROCESS, not the algorithm.
+A real-time antivirus can bill every file operation of an unsigned
+python.exe while a signed, well-known executable passes its filter
+untouched: same calls, different process, a 100x different bill.
+The report's dirs:listing rows show exactly what this process pays
+per round trip; for folders compared often, adding CudaText (with
+its Python) and the compared folders to the antivirus exclusions
+removes that cost entirely.
 
-And when the probe says the drive is FAST (scandir ~0 ms on the
-compared root, no antivirus in sight) but listings inside the scan
-still cost hundreds of milliseconds each, the folders are innocent:
-the tax is either the listing CALL's parameters or the THREAD the
-call runs on. The report measures the SAME folder from three
-corners, seconds apart, and prints a verdict that names the tax:
-"the listing CALL" (the default FindFirstFileExW parameters are the
-problem -- the engine probe already switched this session to the
-fastest correct variant), "the THREAD" (fast from the main thread,
-slow from the scanner thread), or "only the busy phase" (fast in
-isolation, slow while rows stream). The engine probe runs once per
-session on the first compare, on the main thread, and re-tunes the
-engine in place; on a healthy box it is sub-millisecond noise.
-
-When the verdict is "the THREAD", the deep probe takes over
-(update 8): the round-5 standalone probe proved everything is FAST
-outside the scan -- the call, the drive, cold dirs, fresh threads
--- so the tax needs the real scan context, and the deep probe
-measures inside it. Right after the self-test (same spot, scanner
-thread, main thread still quiet) it runs a battery of scandir +
-engine listing + fresh stats + a GIL re-acquire chain wrapped in
-the thread's kernel/user CPU delta, on the scanner thread AND on a
-fresh sibling thread SIMULTANEOUSLY, and once more right after.
-That splits the remaining question in one shot: the scanner thread
-paying while the simultaneous sibling does not means the tax is
-specific to that thread (per-thread context: token / priority /
-host scheduling); the sibling paying too means a process-wide
-moment. The mechanism gets its own line: a slow GIL hand-back is a
-GIL convoy; KERNEL CPU burned ~ the wall is a filter working on
-this thread's IRPs; a big wall with ~0 CPU and a fast hand-back is
-a call parked in the kernel. Every real walk listing also carries
-its own copy of those numbers into the facts block's per-listing
-table (ms / KERNEL / USER / GIL / tid per directory), and the
-block prints the host (Windows build + service pack, python, cpus)
-plus the scanner thread's priority and token state.
-
-The verdict, and what it changed (update 10): the A/B/C over the
-three scan shapes on the reporting box closed the case -- same
-folders, profiling on: "parallel" 12.6 s (listings avg 813 ms),
-"serial" 13.0 s (avg 548 ms), "main" 8.1 ms (avg 0.1 ms). The deep
-probe had named the mechanism: a GIL convoy -- every background
-thread's listing waited up to ~412 ms to re-acquire the interpreter
-lock after each metadata syscall (KERNEL 0.0 / USER 0.0: pure
-wait), process-wide for as long as the scan ran, while the main
-thread paid 0.1 ms for the same calls. The disk, the folders, the
-filter stack, the listing call and the engine had been exonerated
-one by one; the THREAD was the tax. Consequence: "main" is now the
-DEFAULT scan shape (a normal tree freezes the window for a
-fraction of a second), and the threaded shapes are the opt-in for
-very big trees, where rows streaming into a live, cancelable
-window beat a frozen one even at a tenth of the speed.
+The threading finding, and what it changed: profiling the same
+folders across the three scan shapes on a Windows 7 box (no
+antivirus) gave "parallel" 12.6 s (listings avg 813 ms), "serial"
+13.0 s (avg 548 ms), "main" 8.1 ms (avg 0.1 ms) -- and the
+measurement of the mechanism behind it: a GIL convoy -- every
+background thread's listing waited up to ~412 ms to re-acquire the
+interpreter lock after each metadata syscall (pure wait, zero CPU),
+process-wide for as long as the scan ran, while the main thread paid
+0.1 ms for the same calls. The disk, the folders, the filter stack
+and the listing call were exonerated one by one; the THREAD was the
+tax. Consequence: the main-thread scan is now the DEFAULT (a normal
+tree freezes the window for a fraction of a second), and the
+threaded shapes are the opt-in for very big trees, where rows
+streaming into a live, cancelable window beat a frozen one even at
+a tenth of the speed.
 
 The window's controls:
 
@@ -494,41 +455,18 @@ scan): their totals are per-thread walls, and the report prints the
 parallel overlap right under the sum line -- counting the overlap
 once, the SELF column totals ~100% of the outermost row in every
 scan mode; a serial scan simply sums to ~100%.
-Two diagnostic rows sit OUTSIDE the scan wall, booked before the
-scan starts: dirs:env_probe (two metadata round trips on the left
-folder vs one on the system disk -- the numbers that tell "that
-volume is slow" from "every file operation in this python.exe pays
-an antivirus tax while WinMerge's signed exe doesn't" from "caches
-are warm right now") and dirs:cprofile_import (the one-time cost of
-loading the cProfile stdlib, pre-warmed on the main thread so it
-cannot hide inside the scanner thread; seconds when CudaText's
-Python lives on a slow, filtered drive).
-Two more rows close the "engine experiment": dirs:engine_pick
-(once per session, main thread, BEFORE the scan -- every listing
-variant of the bulk finder timed on the left root; the fastest
-CORRECT one, entry names verified against os.scandir, becomes this
-session's engine) and dirs:selftest (scanner thread, booked by the
-worker right before the walk: the same root scandir'd and listed
-while the main thread is still quiet). Together with the first
-in-scan listing of each compared root ("root listings: left ... /
-right ..." in the facts block) they separate "the listing CALL is
-the tax" (a fast variant exists -- already switched to) from "the
-THREAD is" (fast on the main thread, slow from the scanner) from
-"only the busy phase is" (fast in isolation, slow while rows
-stream).
-One more row closes it (update 8): dirs:deep_probe -- the same
-battery as the self-test, plus a simultaneous fresh-thread sibling
-and a second one right after, plus the per-listing rows (kernel /
-user / GIL-handback / tid per directory) during the walk. See the
-engine chapter above for how to read it.
+One row sits OUTSIDE the scan wall, booked before the scan starts:
+dirs:cprofile_import (the one-time cost of loading the cProfile
+stdlib, pre-warmed on the main thread so it cannot hide inside the
+scanner thread; seconds when CudaText's Python lives on a slow,
+filtered drive).
 After the section report a compact "folder scan facts" block prints
-the same story in a few lines: the environment probe with its
-verdict, the engine line with the picked variant and its matrix,
-the worker self-test, the root listings, listings count with
-total/slowest/average latency, tree sizes (file and folder rows per
-side), how many content pairs stopped at the first difference vs
-were read to the end, and whether the run was serial because the
-cProfile layer was on.
+the same story in a few lines: the scan mode (which threading shape
+produced the numbers), listings count with total/slowest/average
+latency, tree sizes (file and folder rows per side), how many
+content pairs stopped at the first difference vs were read to the
+end, and whether the run was serial because the cProfile layer was
+on.
 The cProfile layer runs on the scanner thread (the walk/compare work)
 and prints its function report sorted by INTERNAL time
 (sort_key='time'), so the real bottleneck function sits at the top.
@@ -1540,7 +1478,7 @@ Folders section (see the "Compare folders" chapter above for details):
   second -- and on boxes where background threads starve for the
   interpreter lock while the UI is busy it is the only fast shape
   at all: the measured case (Windows 7, no antivirus, GIL convoy
-  named by the deep probe) did the same folders in 8.1 ms on the
+  confirmed by profiling) did the same folders in 8.1 ms on the
   main thread vs 12.6 s on the scanner threads -- every background
   listing waited ~200 ms to re-acquire the GIL (zero CPU burned),
   while the main thread paid 0.1 ms per listing. "parallel" is the
@@ -1550,8 +1488,7 @@ Folders section (see the "Compare folders" chapter above for details):
   a frozen window is worse than a slower walk. "serial" walks on
   the scanner thread alone (the shape the cProfile layer forces).
   The option is reloaded on every Refresh; the profiling report's
-  "scan mode:" line names the shape and the per-listing table
-  shows which thread paid which directory.
+  "scan mode:" line names the shape.
 
 
 == Diff algorithms and best practices ==

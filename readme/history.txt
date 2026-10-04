@@ -1,3 +1,26 @@
+2026.10.05 (11th release, by @alkorsan)
+- change: production cleanup -- the diagnostic machinery that hunted
+  the update-6..10 slow-scan mystery is removed now that the mystery
+  is solved (the GIL convoy; see the 10th release). Removed: the
+  Win32 ctypes bulk finder (FindFirstFileExW binding + the variant
+  matrix + the once-per-session engine probe + the worker
+  self-test + the deep probe with its GetThreadTimes / GIL-handback
+  / thread-token / sibling-thread batteries + the per-listing
+  kernel/user/GIL/tid table + the environment probe and all the
+  verdict lines). The walk is now pure os.scandir everywhere:
+  compare_dir.py has zero ctypes / Win32 dependencies and is
+  identical on Windows, Linux and macOS (on the main-thread scan --
+  the default -- scandir pays the same ~0.1 ms per listing the bulk
+  call did; on scan threads both paid the same GIL tax, so the
+  binding bought nothing). Kept: everything the tests earned -- the
+  zero-per-file-stat scandir walk, the main/pool/serial scan
+  shapes (differ2.dirs.scan_threading, 'main' default), WinMerge's
+  quick-contents byte compare, the compare_method option, the
+  section/cProfile profiling with span-nested rows (self times sum
+  to ~100%), the cProfile stdlib pre-warm, and the slim scan-facts
+  block (scan mode, listing latency, tree sizes, content tests).
+  compare_dir.py 4372 -> 3184 lines; all test suites re-run green.
+
 2026.10.05 (10th release, by @alkorsan)
 + change: differ2.dirs.scan_threading default flipped 'pool' ->
   'main' -- the update-9 A/B/C on the reporting box closed the
