@@ -1,3 +1,54 @@
+2026.10.05 (20th release, by @alkorsan)
+* fix: the third theme-consistency round (reported: "text font color of
+  hint in mask box in some themes is hard to read see pic / the box
+  background in grey theme is green, is there another theme color
+  better which work better for all themes? see pic / buttons color
+  does not use theme colors it s always grey"). All three fixed by
+  switching to the app's OWN control types instead of hand-theming
+  native ones:
+  (1) GREEN BOXES: the 19th release themed the input boxes from
+  ListBg -- but ListBg's built-in default (SetColor's nColorListBack,
+  proc_colors.pas) is LIGHT GREEN $b4d8a8, and the grey theme leaves
+  the key at that default, so every input box went green (the user
+  screenshot showed all three). The boxes are now the app's own
+  single-line input controls: the results dialog's three inputs are
+  one-line TATSynEdit editors the app themes ITSELF at creation with
+  the exact chain its own find dialog / command palette inputs use
+  (OtherTextFont/OtherTextBg -> EdTextFont/EdTextBg -- five call
+  sites in the app source); the picker's combos are colored with the
+  same chain. EdTextBg/EdTextFont are spelled out by every real
+  theme (light and dark) and their built-in defaults are plain light
+  gray, so the chain can never go green and always matches what the
+  user sees in the app's own inputs.
+  (2) HINT COLOR: a native TEdit's TextHint goes to Windows as
+  EM_SETCUEBANNER, and WINDOWS paints the cue banner in the system
+  gray -- no plugin API can recolor it, which is why the mask hint
+  was hard to read on dark themes. The one-line editor inputs paint
+  their hint THEMSELVES (OptTextHint, Colors.TextHintFont = clGray,
+  italic) -- exactly the placeholder style the app's find dialog and
+  command palette show, readable on every theme's input background.
+  Text I/O goes through the Editor() handle (the dialog API's 'val'
+  does not handle TATSynEdit); the UI font is pinned so the text
+  keeps its size; PROP_ONE_LINE gives the single-line behavior.
+  (3) BUTTONS: every button in both dialogs (toolbar, Browse, Apply,
+  Close, the picker's Compare/Cancel) is a non-flat button_ex
+  (TATButton): it paints its background, border and caption from the
+  UI theme (ButtonBgPassive / ButtonBorderPassive / ButtonFont via
+  ATFlatTheme, with themed hover states) -- a native TButton is drawn
+  by the OS visual style and stays system-gray in every theme.
+  button_ex fires the same on_change on click (proc_customdialog.pas
+  wires both button types to the same handler), so nothing else
+  changed.
+  Tests: GUI 341 checks (was 299) -- a new battery for the editor
+  inputs (kind, no manual color props, texthint, pinned UI font,
+  ModeOneLine, text round-trip through the Editor handle), one for
+  the themed buttons (all button_ex, none flat -- only the checks are
+  flat), and a GREY-THEME regression battery pinning ListBg at the
+  green $b4d8a8 default and proving the picker combos resolve to
+  EdTextBg instead; the dark-theme battery now defines the editor
+  pair like a real dark theme and re-asserts the inputs as
+  editor-backed.
+
 2026.10.05 (19th release, by @alkorsan)
 * fix: every dialog control now follows the UI theme in BLACK themes
   too (reported: "checkboxes text and status bar background and font

@@ -339,11 +339,68 @@ app's own wiring (formmain_themes.inc):
   statusbar font       StatusFont -> ButtonFont (= ATFlatTheme's
                        ColorFont, TATStatus's own default)
   statusbar borders    ButtonBorderPassive (as the app assigns)
-  folder inputs        ListBg / ListFont -> TabBg / TabFont -- NOT
-                       EdTextBg/EdTextFont: those are the UI theme's
-                       OPINION of the editor colors and their built-in
-                       defaults are LIGHT, so themes that skip them
-                       left the boxes white on a black UI
+  picker combos (bg)   OtherTextBg -> EdTextBg; (font) OtherTextFont
+                       -> EdTextFont -- the app's OWN chain for every
+                       single-line input it draws (form_find's find/
+                       replace boxes, the Command Palette input,
+                       CodeTreeFilterInput, the one-line dialog
+                       editors -- proc_customdialog.pas lines 745-746
+                       and four more call sites). NOT ListBg: that
+                       key's built-in default (SetColor nColorListBack,
+                       proc_colors.pas) is LIGHT GREEN $b4d8a8 -- a
+                       theme that does not spell ListBg out (the grey
+                       theme of the 6th-round report) rendered every
+                       input box green. OtherTextBg/OtherTextFont
+                       default to clNone (skipped by the guard) and
+                       EdTextBg/EdTextFont carry concrete defaults
+                       ($e4e4e4/$202020) AND are spelled out by every
+                       real theme -- a theme without them would paint
+                       the app's own find dialog just as broken, so
+                       the chain can never go green and never diverges
+                       from what the user sees in the app's own inputs.
+
+The results dialog's three inputs (ed_left/ed_right/ed_mask) go one
+step further and are one-line 'editor' controls (TATSynEdit) -- the
+control type the app itself builds its single-line inputs from:
+
+* the app themes them at creation (EditorApplyTheme +
+  DoControl_ApplyEditorProps's one-line branch: Colors.TextFont/
+  TextBG = OtherTextFont/OtherTextBg -> EdTextFont/EdTextBg) -- the
+  plugin passes NO color props for them at all;
+* the hint ('texthint' prop -> OptTextHint) is painted BY THE CONTROL
+  in Colors.TextHintFont (clGray, italic) -- exactly the placeholder
+  the app's find dialog and Command Palette show. A native TEdit
+  cannot do this: its TextHint goes to Windows as EM_SETCUEBANNER
+  and WINDOWS paints it in the system gray -- no plugin API can
+  recolor it (the 6th-round report: unreadable hints in dark
+  themes). clGray is readable on every theme's input bg (the app
+  ships it everywhere) and italic marks it as a hint;
+* 'font_name'/'font_size' pin the UI font: the dialog API creates
+  editors in the EDITOR font (EditorOps, monospaced) -- pinning
+  _ui_font()/_ui_font_pt() keeps the text at the size the boxes
+  always had;
+* one-line behavior needs PROP_ONE_LINE (True): ModeOneLine hides
+  the gutter/ruler/scrollbars, enforces a single line and centers
+  the text vertically (TATSynEdit.SetOneLine);
+* text I/O goes through Editor(handle) ('ed.set_text_all' /
+  'get_text_all'): the dialog API's 'val' does NOT handle TATSynEdit
+  (DoControl_SetStateFromString has no TATSynEdit branch) -- the
+  handles are cached in self._ed_handles and _ctl_val/_set_ctl_val
+  route editor-backed names transparently, so every existing call
+  site (start_scan, swap, Browse, mask) is unchanged.
+
+The BUTTONS are button_ex controls too -- non-flat TATButton: it
+paints its background in ATFlatTheme.ColorBgPassive, border in
+ColorBorderPassive, caption in ColorFont (all wired from the UI
+theme keys ButtonBgPassive/ButtonBorderPassive/ButtonFont, with
+ColorBgOver/ColorBorderOver on hover and ColorBgDisabled when off).
+A native TButton is drawn by the OS visual style and stays OS-gray
+in every theme (the 6th-round report: 'buttons color does not use
+theme colors it s always grey'); button_ex fires the very same
+'on_change' on click (proc_customdialog.pas wires both TButton and
+TATButton OnClick to DoOnChange), so the swap changes nothing in
+behavior. The filter CHECKS stay FLAT button_ex (see below) -- a
+check must not paint a button face.
 
 The status FILTER CHECKS are not native TCheckBox controls but flat
 button_ex buttons with chk_on/chk_off imagelist glyphs -- cuda_prefs'
@@ -1984,14 +2041,22 @@ class _PickerDialog:
             prop['color'] = bg
         ct.dlg_proc(self.h, ct.DLG_PROP_SET, prop=prop)
 
-        # Folder-input colors (5th dark-theme round: 'and also folder
-        # selector boxes'): the combos are native TComboBox controls
-        # and rendered system-white unless the plugin colors them.
-        # Same chain as the main window's edits -- ListBg first, NOT
-        # EdTextBg (that key's built-in default is light, and themes
-        # that skip it left the boxes white on a black UI).
-        ed_bg = _theme_color('ListBg', _theme_color('TabBg'))
-        ed_fg = _theme_color('ListFont', _theme_color('TabFont'))
+        # Folder-input colors (6th theme round: 'the box background in
+        # grey theme is green'). The combos are native TComboBox
+        # controls, so the plugin must color them itself -- with the
+        # app's OWN single-line-input chain OtherTextBg/OtherTextFont
+        # -> EdTextBg/EdTextFont (what form_find / the Command Palette
+        # / CodeTreeFilterInput / the one-line dialog editors all
+        # use). The 5th round's ListBg chain was wrong: ListBg's
+        # built-in default (nColorListBack, proc_colors.pas) is LIGHT
+        # GREEN $b4d8a8, and themes that skip the key (the grey
+        # theme) rendered the boxes GREEN. EdTextBg/EdTextFont are
+        # spelled out by every real theme (light and dark) and their
+        # built-in defaults are plain light gray -- a theme without
+        # them paints the app's own find dialog equally broken, so
+        # this chain can never go green and matches the app exactly.
+        ed_bg = _theme_color('OtherTextBg', _theme_color('EdTextBg'))
+        ed_fg = _theme_color('OtherTextFont', _theme_color('EdTextFont'))
 
         for i, (side, label, hist, init) in enumerate((
                 ('left',  _('Left folder (old):'),  hist_l, dir_l),
@@ -2013,7 +2078,11 @@ class _PickerDialog:
             # anchor is set. 'a_l': None clears the form-left anchor a
             # new control is born with -- without it the button keeps
             # left AND right anchors and stretches across the form.
-            self._add('button', 'brw_' + side, {
+            # button_ex (non-flat TATButton): themed bg/border/font
+            # (ATFlatTheme <- ButtonBgPassive/ButtonBorderPassive/
+            # ButtonFont); a native TButton stays OS-gray in every
+            # theme, and fires the same on_change on click.
+            self._add('button_ex', 'brw_' + side, {
                 'cap': _('Browse...'),
                 'w': self.BRW_W, 'h': 26,
                 'a_l': None, 'a_r': ('', ']'), 'sp_r': 12,
@@ -2042,7 +2111,8 @@ class _PickerDialog:
         # with a_l/a_t ('a_l': None, 'a_t': None) -- right+bottom
         # anchored, fixed size; a half-cleared pair stretches into a
         # button covering the whole dialog (the 12th-release bug).
-        self._add('button', 'cancel', {
+        # button_ex: themed button face (see the Browse comment).
+        self._add('button_ex', 'cancel', {
             'cap': _('Cancel'),
             'w': 90, 'h': 28,
             'a_l': None, 'a_t': None,
@@ -2050,7 +2120,7 @@ class _PickerDialog:
             'a_b': ('', ']'), 'sp_b': 12,
             'on_change': self._on_button,
         })
-        self._add('button', 'ok', {
+        self._add('button_ex', 'ok', {
             'cap': _('Compare'),
             'w': 100, 'h': 28,
             'a_l': None, 'a_t': None,
@@ -2300,8 +2370,11 @@ class DirCompareForm:
     background. The check state lives in the plugin (self._show /
     self._recursive; the dialog API's 'val' does not handle
     TATButton) -- _on_check flips it and _set_check_icon swaps the
-    glyph. See the module docstring's 'Theming' chapter for the
-    color chains.
+    glyph. The three path/mask inputs are one-line 'editor'
+    controls (_add_input: themed by the app, hint painted by the
+    control) and every BUTTON is a non-flat button_ex (themed face;
+    a native TButton stays OS-gray). See the module docstring's
+    'Theming' chapter for the color chains.
 
     The results list is an owner-drawn listbox_ex (LISTBOX_SET_DRAWN):
     the control never paints items itself, it calls on_draw_item for
@@ -2427,6 +2500,11 @@ class DirCompareForm:
         # here and the button just renders it (icon swap).
         self._recursive = True
         self._chk_handles = {}          # check name -> button handle
+        # Handles of the one-line 'editor' inputs (ed_left/ed_right/
+        # ed_mask): their text goes through Editor(handle) -- the
+        # dialog API's 'val' does not handle TATSynEdit (see
+        # _add_input); _ctl_val/_set_ctl_val route by this cache.
+        self._ed_handles = {}
         # Profiling state of the CURRENT scan (all None/False when the
         # config gate is off): the async-pair token + whether the
         # scanner thread started its own cProfile layer.
@@ -2524,6 +2602,51 @@ class DirCompareForm:
             except Exception:
                 pass
 
+    def _add_input(self, name, prop, text):
+        """One single-line INPUT: an 'editor' control (TATSynEdit) in
+        ModeOneLine -- the very control the app builds its own
+        single-line inputs from (the find dialog's boxes, the Command
+        Palette input; see the module docstring's Theming chapter).
+
+        Why not a native 'edit' (TEdit), the 6th theme round in a
+        row it bit us: (a) TEdit's TextHint goes to Windows as
+        EM_SETCUEBANNER and WINDOWS paints the cue in the system
+        gray -- no plugin API can recolor it, so the hints were
+        reported unreadable on dark themes; TATSynEdit paints its
+        OptTextHint itself in Colors.TextHintFont (clGray, italic,
+        exactly the app's own placeholder look). (b) the box bg had
+        to be themed by hand and the ListBg chain went green on
+        themes that skip that key; the app themes the editor ITSELF
+        at creation (EditorApplyTheme + the one-line branch:
+        OtherText* -> EdText*), so no color props are passed at all.
+
+        PROP_ONE_LINE gives the single-line behavior (gutter/
+        scrollbars hidden, one line enforced, text centered).
+        The UI font is pinned (dialog editors are born in the
+        EDITOR's monospaced font) so the text keeps the size the
+        TEdit boxes always had. 'val' does not handle TATSynEdit:
+        the handle is cached in _ed_handles, the text goes through
+        Editor.set_text_all, and _ctl_val/_set_ctl_val route
+        editor-backed names the same way -- no call site changes."""
+        prop = dict(prop)
+        prop['font_name'] = _ui_font()[0]
+        prop['font_size'] = _ui_font_pt()
+        n = self._add('editor', name, prop)
+        try:
+            h = ct.dlg_proc(self.h, ct.DLG_CTL_HANDLE, name=name)
+            ed = ct.Editor(h)
+            try:
+                ed.set_prop(ct.PROP_ONE_LINE, True)
+            except Exception:
+                pass        # pre-PROP_ONE_LINE build: multiline, but all
+            self._ed_handles[name] = h   # the text/hint logic still works
+            ed.set_text_all(text)
+        except Exception:
+            # Pre-Editor API: the control renders and shows the hint;
+            # only programmatic text is lost (Browse/swap re-set it).
+            self._ed_handles.pop(name, None)
+        return n
+
     def _build(self):
         self.h = ct.dlg_proc(0, ct.DLG_CREATE)
         h = self.h
@@ -2561,17 +2684,21 @@ class DirCompareForm:
             pass  # icons are decoration; the Status column carries the info
 
         tcol = self._text_color()
-        # Input-box colors. NOT EdTextBg: that key is the UI theme's
-        # OPINION of the editor background and its built-in default
-        # is LIGHT ($e4e4e4) -- themes that don't spell it out left
-        # the folder boxes WHITE on a black UI (5th-round report:
-        # 'and also folder selector boxes'). ListBg is a core key every
-        # real theme defines (dark in dark themes, light in light
-        # ones), TabBg the form's own color as the last resort.
-        ed_bg = _theme_color('ListBg', _theme_color('TabBg'))
-        ed_fg = _theme_color('ListFont', _theme_color('TabFont'))
+        # NO input-box colors here anymore: the three inputs are
+        # one-line 'editor' controls themed BY THE APP at creation
+        # (OtherText* -> EdText* -- _add_input), the fix for the
+        # 6th-round green boxes (ListBg's built-in default is green
+        # $b4d8a8) and the unreadable TEdit hints.
 
         # -- Row A: toolbar buttons ------------------------------------
+        # button_ex (non-flat TATButton): themed face -- bg
+        # ButtonBgPassive, border ButtonBorderPassive, caption
+        # ButtonFont, all through ATFlatTheme, with the app's hover
+        # colors on mouse-over (a native TButton is drawn by the OS
+        # and stays gray in every theme -- the 6th-round report:
+        # 'buttons color does not use theme colors it s always
+        # grey'). Same on_change, same geometry -- the swap is
+        # invisible to behavior.
         prev = None
         for name, cap, w in self.TOOLBAR_BTNS:
             p = {
@@ -2584,9 +2711,9 @@ class DirCompareForm:
                 p['a_l'] = ('', '[')
             else:
                 p['a_l'] = (prev, ']')
-            self._add('button', name, p)
+            self._add('button_ex', name, p)
             prev = name
-        self._add('button', 'btn_close', {
+        self._add('button_ex', 'btn_close', {
             'cap': _('Close'), 'w': 80, 'h': 26,
             'a_l': None, 'a_r': ('', ']'),
             'a_t': ('', '['), 'sp_t': 8, 'sp_r': 10,
@@ -2594,23 +2721,21 @@ class DirCompareForm:
         })
 
         # -- Row B: the two sides' paths -------------------------------
+        # One-line 'editor' inputs (see _add_input): themed by the
+        # app, hint painted by the control, text via Editor handle.
         ed_prop = {'w': self.PATH_W, 'h': 26, 'a_t': ('btn_new', ']'),
                    'sp_t': 8}
-        if ed_bg is not None:
-            ed_prop['color'] = ed_bg
-        if ed_fg is not None:
-            ed_prop['font_color'] = ed_fg
         p = dict(ed_prop)
         p.update({'a_l': ('', '['), 'sp_l': 10,
-                  'val': self._dir_l, 'texthint': _('left folder')})
-        self._add('edit', 'ed_left', p)
-        self._add('button', 'btn_lbrw', {
+                  'texthint': _('left folder')})
+        self._add_input('ed_left', p, self._dir_l)
+        self._add('button_ex', 'btn_lbrw', {
             'cap': _('Browse...'), 'w': self.BRW_W, 'h': 26,
             'a_l': ('ed_left', ']'), 'sp_l': 6,
             'a_t': ('btn_new', ']'), 'sp_t': 8,
             'on_change': self._on_button,
         })
-        self._add('button', 'btn_rbrw', {
+        self._add('button_ex', 'btn_rbrw', {
             'cap': _('Browse...'), 'w': self.BRW_W, 'h': 26,
             'a_l': None, 'a_r': ('', ']'), 'sp_r': 10,
             'a_t': ('btn_new', ']'), 'sp_t': 8,
@@ -2618,8 +2743,8 @@ class DirCompareForm:
         })
         p = dict(ed_prop)
         p.update({'a_l': None, 'a_r': ('btn_rbrw', '['), 'sp_r': 6,
-                  'val': self._dir_r, 'texthint': _('right folder')})
-        self._add('edit', 'ed_right', p)
+                  'texthint': _('right folder')})
+        self._add_input('ed_right', p, self._dir_r)
 
         # -- Row C: filters (left) | Mask + Apply (right) --------------
         # Left group: the four status filters + Subfolders, chained
@@ -2661,22 +2786,23 @@ class DirCompareForm:
         }, True)
         # Right group (right-anchored chain: Apply at the edge, the
         # mask edit and its label to its left; every a_l cleared).
-        self._add('button', 'btn_apply', {
+        self._add('button_ex', 'btn_apply', {
             'cap': _('Apply'), 'w': 70, 'h': 24,
             'a_l': None, 'a_r': ('', ']'), 'sp_r': 10,
             'a_t': ('ed_left', ']'), 'sp_t': 8,
             'on_change': self._on_button,
         })
-        p = {'w': 170, 'h': 22,
+        # The mask input: a one-line 'editor' like the path boxes
+        # (themed + self-painted hint -- _add_input). h 26 (was 22:
+        # TATSynEdit's chrome needs the path boxes' height) and the
+        # label at sp_t 12 still centers on it exactly (12+10 ==
+        # 9+13); the row bottom stays clear of the list's sp_t 44.
+        p = {'w': 170, 'h': 26,
              'a_l': None,
              'a_r': ('btn_apply', '['), 'sp_r': 6,
              'a_t': ('ed_left', ']'), 'sp_t': 9,
              'texthint': _('*.py; *.txt')}
-        if ed_bg is not None:
-            p['color'] = ed_bg
-        if ed_fg is not None:
-            p['font_color'] = ed_fg
-        self._add('edit', 'ed_mask', p)
+        self._add_input('ed_mask', p, '')
         self._add('label', 'lab_mask', {
             'cap': _('Mask:'), 'h': 20, 'autosize': True, 'w': 44,
             'a_l': None,
@@ -2785,8 +2911,18 @@ class DirCompareForm:
             'on_mouse_move': self._on_mouse_move,
             'on_mouse_up': self._on_mouse_up,
         }
-        li_bg = _theme_color('TreeBg', _theme_color('ListBg', ed_bg))
-        li_fg = _theme_color('TreeFont', _theme_color('ListFont', ed_fg))
+        # The list's colors: TreeBg/TreeFont (the treeview pair --
+        # what CudaText maps listbox_ex onto), ListBg/ListFont next,
+        # the input chain (OtherText* -> EdText*) as the innermost
+        # fallback -- the old innermost was the (deleted) TEdit box
+        # color; this one is the app's own single-line-input color
+        # and can never go green (see _add_input).
+        li_bg = _theme_color('TreeBg', _theme_color(
+            'ListBg', _theme_color('OtherTextBg',
+                                   _theme_color('EdTextBg'))))
+        li_fg = _theme_color('TreeFont', _theme_color(
+            'ListFont', _theme_color('OtherTextFont',
+                                     _theme_color('EdTextFont'))))
         if li_bg is not None:
             p['color'] = li_bg
         if li_fg is not None:
@@ -3433,6 +3569,18 @@ class DirCompareForm:
     # ------------------------------------------------------------------
 
     def _ctl_val(self, name):
+        """A control's value, editor-backed names included: the three
+        inputs are one-line TATSynEdit controls whose 'val' the dialog
+        API does not handle (DoControl_SetStateFromString has no
+        TATSynEdit branch) -- their text lives behind the cached
+        Editor handle (_add_input), every other control reads the
+        API's 'val' as before."""
+        h = self._ed_handles.get(name)
+        if h:
+            try:
+                return ct.Editor(h).get_text_all()
+            except Exception:
+                return ''
         try:
             return ct.dlg_proc(self.h, ct.DLG_CTL_PROP_GET,
                                name=name).get('val', '')
@@ -3440,6 +3588,15 @@ class DirCompareForm:
             return ''
 
     def _set_ctl_val(self, name, val):
+        """Write a control's value (editor-backed names through
+        Editor.set_text_all -- see _ctl_val)."""
+        h = self._ed_handles.get(name)
+        if h:
+            try:
+                ct.Editor(h).set_text_all(val)
+                return
+            except Exception:
+                pass
         try:
             ct.dlg_proc(self.h, ct.DLG_CTL_PROP_SET, name=name,
                         prop={'val': val})

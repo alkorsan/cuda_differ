@@ -369,6 +369,25 @@ The window's controls:
 - The two path edits are editable: type two paths and press Refresh
   (or Enter) to compare them; the Browse buttons next to them open a
   folder picker for that side.
+- ALL BUTTONS follow the UI theme (toolbar, Browse, Apply, the
+  picker dialog's Compare/Cancel): they are the app's themed button
+  controls, painted in the theme's button background / border / font
+  colors with themed hover states -- a native OS button stays
+  system-gray in every theme, which was the look before.
+- The three input boxes (both paths + Mask) are the app's OWN
+  single-line input controls -- the same control the find dialog and
+  the command palette use: the theme colors them itself with the
+  theme's input colors (the exact chain CudaText wires for its own
+  inputs), so they match every theme, light, dark or grey -- an
+  earlier release painted them from a theme key whose built-in
+  default is light GREEN, which is how a grey theme turned them
+  green. Their placeholder hints ("left folder", "*.py; *.txt") are
+  painted by the control itself in the same muted italic style the
+  app's own inputs use -- readable on every theme (a native edit's
+  hint is drawn by Windows in a fixed system gray, which is what
+  made them hard to read in dark themes). Typing, selection,
+  copy/paste and the caret behave like any CudaText input; the text
+  keeps the UI font size.
 - Swap sides mirrors the whole comparison (left becomes right).
 - New compare... opens the picker dialog again -- the two combos
   remember the last 12 folders used on each side. The dialog is
@@ -379,8 +398,10 @@ The window's controls:
   width: the row labels are pinned to the wider caption's live
   width after the build, so both combos start at the same x and end
   at the same right-anchored Browse button. The boxes follow the UI
-  theme in dark themes too (the theme's list colors -- never the
-  light editor-color default that left them white on black themes).
+  theme in dark themes too -- colored with the app's own input-color
+  chain (OtherTextBg -> EdTextBg), the very pair the find dialog's
+  boxes use, never a theme key that could fall back to a light or
+  green built-in default.
 - The status filters (Different / Only left / Only right / Identical)
   hide or show rows instantly, without rescanning. Uncheck
   "Identical" for the usual "show me what matters" view. The check
