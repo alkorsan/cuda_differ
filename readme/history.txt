@@ -1,3 +1,70 @@
+2026.10.05 (14th release, by @alkorsan)
+* change: WinMerge-style TREE view for the folder-compare results.
+  A recursive scan's rows are no longer one flat table: folders are
+  FOLDED by default, and the user expands them INLINE -- the
+  children appear indented under the folder row, in the SAME window
+  (reported: "when a folder compare find a folder he list it, but i
+  need to click it to see its content and it opens in a new view, i
+  want it to be like winmerge ... folded by default then i click an
+  arrow then the folder is expanded and its content become visible
+  inside te same window"). How a folder opens:
+  - click the arrow at the row's left edge (a U+2192/U+2193 glyph
+    drawn in the tree gutter -- the SAME Arrows block as the header
+    sort markers, i.e. glyphs the reporting box's font really has;
+    the old U+25B4/U+25BE triangles rendered as tofu);
+  - or double-click the folder row (anywhere outside the arrow --
+    the dbl handler leaves arrow-zone clicks to on_click, and a
+    0.5 s echo guard keeps the double-click's second on_click from
+    undoing the first one's toggle);
+  - or select it and press Enter;
+  - or the context menu: new Expand / Collapse item on the folder
+    plus Expand all / Collapse all for the whole tree.
+  The expansion state is keyed by the folder's rel path: it
+  survives sort/filter changes and rescans of the same pair, and is
+  cleared when the compared pair itself changes. Folders WITHOUT
+  scanned children (Subfolders off, or truly empty) keep the old
+  double-click behavior (drill-down window / file manager).
+  Implementation notes: the flat row list is unchanged (the scanner
+  is untouched); _build_view walks it as a tree (children grouped by
+  the row's 'dir' field), sorting each level with the SAME _sort_key
+  the flat list used; a folder whose own row is filtered out stays
+  visible as a CONTAINER while anything below it is visible (else
+  hiding 'Identical' would hide a folder's Different children too);
+  _fill_list rebuilds the listbox whenever the view changed and
+  skips it entirely when nothing on screen changed (streamed rows
+  under collapsed folders cause no repaint churn), restores the
+  selection by row IDENTITY and keeps the scroll position; the
+  painter draws arrow + status icon + indented name with separate
+  offsets (also fixes the latent pre-tree overlap of icon at x0+3
+  and name text at x0+4) and calibrates the click hit test's
+  geometry (header height, row left edge) from the first drawn row;
+  on_click arrives as (x, y) in client coords (the same event
+  cuda_prefs/cuda_tabs_list use) and the handler cross-checks the
+  click's row band so header clicks can never toggle the selected
+  folder.
+* change: the 'Sort by' combo + direction button (added in the 12th
+  release on the assumption that the listbox header does not render
+  on the reporting box) are REMOVED -- the header renders and sorts
+  correctly there (reported: "the header already sort correctly the
+  columns, so the new box is useless"). Header click-sort is the
+  only sort UI again; the list's top spacing shrinks back to the
+  filter row's.
+* change: the header's sort-direction marker is the U+2191/U+2193
+  arrow pair, not the ASCII ' ^' / ' v' (reported: "use up/down sort
+  arrows not v ^").
+* tests: the GUI suite's sort battery dropped the combo/button
+  checks and gained header-driven Name asc/desc + arrow-glyph +
+  gone-for-good checks; the old drill-down test became the tree
+  battery -- folded by default, inline expand (no new window),
+  children under the folder with depth 1 + indented fallback
+  caption, selection follows the toggled row, arrow-zone single
+  click, the double-click echo, click outside the zone, header-band
+  click, Enter toggle, menu Expand/Expand all/Collapse all,
+  expansion survives a rescan, and the drill-down window still
+  opens for a childless folder (Subfolders off). 194 checks green;
+  scanner/span/import suites unchanged and green.
+
+
 2026.10.05 (13th release, by @alkorsan)
 * fix: the 12th release broke both folder-compare dialogs on real
   CudaText builds (reported: the picker showed ONE BIG CANCEL BUTTON

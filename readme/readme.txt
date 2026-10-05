@@ -245,7 +245,10 @@ Resize editors to equal width
 "Plugins / Differ 2 / Compare two folders..." (or the command line --
 see below) opens a WinMerge-style folder comparison: a non-modal
 window listing every file and subfolder of the two trees, with the
-per-side sizes and timestamps and a status column:
+per-side sizes and timestamps and a status column. The results are
+shown as a TREE, WinMerge-style: folders are folded by default and
+expand INLINE (see "Working with rows" below) -- the children appear
+indented under the folder row, in the same window.
 
   Different     exists on both sides, content differs
   Only left     exists only in the left folder
@@ -374,21 +377,22 @@ The window's controls:
   hide or show rows instantly, without rescanning. Uncheck
   "Identical" for the usual "show me what matters" view.
 - The Subfolders checkbox switches between the full recursive tree
-  (default) and the two top folders only; changing it rescans.
+  (default) and the two top folders only; changing it rescans. With
+  subfolders ON, every folder row is folded by default; with
+  subfolders OFF, folder rows have no scanned children and
+  double-click keeps the old drill-down behavior.
 - The Mask edit (on the right of the filter row) filters files by
   wildcard pattern ("*.py; *.txt"), WinMerge-style: matching files
   are compared, everything else is not listed at all. It applies on
   Apply (or Enter when the list has focus).
-- Sorting works two ways, always in sync: click a column header
-  (Name, Folder, Status, left/right size or date) where headers
-  render, or use the always-visible "Sort by" combo + direction
-  button on the row below the filters -- some CudaText builds do
-  not render the listbox header at all, and the combo/button are
-  the only sort UI there. The direction marker is plain ASCII
-  (^ / v): the Unicode triangles used before rendered as hollow
-  boxes on real UI fonts. Column widths are DPI-scaled (Name
+- Sorting is the column header's own click-sort (Name, Folder,
+  Status, left/right size or date): click a column to sort by it,
+  click again to reverse. The direction marker is the Unicode arrow
+  pair (U+2191 / U+2193). Column widths are DPI-scaled (Name
   stretches with the window) so the header and the drawn rows stay
-  aligned and dates never clip at 125% scaling.
+  aligned and dates never clip at 125% scaling. In the tree view the
+  sort orders every level (a folder's children among themselves),
+  exactly like the old flat list ordered the whole table.
 - The status bar shows the scan progress / result line on the left
   and the counts (Different / Only left / Only right / Identical) on
   the right.
@@ -423,11 +427,20 @@ Working with rows:
   folder scan itself never runs them.
 - Double-click a one-sided file row: the existing file opens alone in
   an editor tab.
-- Double-click a Folder row (both sides): a drill-down -- a NEW
-  compare window opens scoped to that subfolder pair, so you can
-  compare a deep subfolder without typing paths.
-- Double-click a one-sided folder row: it opens in the OS file
-  manager.
+- FOLDERS EXPAND INLINE (WinMerge tree mode): click the arrow at the
+  row's left edge, double-click the folder row, or select it and
+  press Enter -- the folder's rows appear indented right below it,
+  IN THE SAME WINDOW (no new window). Click again (arrow or
+  double-click) to fold it back. The context menu adds Expand /
+  Collapse for the clicked folder plus Expand all / Collapse all
+  for the whole tree. The expansion state is remembered per folder
+  across rescans of the same pair.
+- Double-click a folder row WITHOUT scanned children (Subfolders
+  off, or a truly empty pair): a drill-down -- a NEW compare window
+  opens scoped to that subfolder pair.
+- Double-click a one-sided folder row without scanned children: it
+  opens in the OS file manager (with children it expands inline,
+  like any folder).
 - Right-click a row for the WinMerge-style sync operations: Copy to
   left/right (copy2 for files -- mtime preserved, so future compares
   see the copy as identical; copytree for folders, only into a
@@ -437,8 +450,9 @@ Working with rows:
   (re-stat + re-compare of that one pair -- no rescan); folder
   operations rescan the tree. Everything asks for confirmation first
   (differ2.dirs.confirm_ops).
-- Keys: Enter opens the selected row (when the list has focus), F5
-  rescans, Esc closes the window.
+- Keys: Enter opens the selected row -- or expands/collapses it when
+  it is a folder with scanned children (when the list has focus),
+  F5 rescans, Esc closes the window.
 
 Notes: hidden files are included (like WinMerge); folder symlinks are
 never followed (no cycles), file symlinks compare their target's

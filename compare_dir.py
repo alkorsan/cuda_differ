@@ -285,8 +285,14 @@ WinMerge/Beyond-Compare-style row colors.
 == Windows / instances =============================================
 
 Every compare is a separate NON-MODAL dlg_proc form: run as many
-folder compares side by side as you like (double-clicking a folder row
-opens a drill-down compare of that folder pair in a new window, too).
+folder compares side by side as you like. A recursive scan's results
+are shown as a WinMerge-style TREE: every folder is folded by
+default; clicking its arrow, double-clicking it, pressing Enter or
+the context menu expands it INLINE -- the children appear indented
+under the folder row, in the same window (no drill-down windows;
+those remain only for folders without scanned children, i.e. with
+Subfolders off or truly empty folders). Sorting is the column
+header's own click-sort (the marker is the U+2191/U+2193 arrow).
 Forms register themselves in the module-level _forms list (which keeps
 their Python objects -- and thus their timer callbacks -- alive);
 on_close tears a form down: cancel the worker, stop the timer, save
@@ -1923,16 +1929,23 @@ _ICON_OF = {
     ST_DIR_RONLY: 'ronly',
 }
 
-# Sort-direction marker appended to the header caption of the sort
-# column (and shown on the direction button). Deliberately PLAIN
-# ASCII: the geometric triangles used before (U+25B4/U+25BE) are
-# missing from real-world UI fonts -- on the reporting box every
-# marker rendered as a hollow box (tofu).
-_SORT_MARK = {False: ' ^', True: ' v'}
+# Tree-mode metrics (base 96-DPI pixels; _ui_scale multiplies them at
+# paint time like every other raw-pixel metric): per-level indent,
+# the expand-arrow zone, and the icon/text x-offsets inside the Name
+# cell. Drawn as glyphs from the SAME Arrows block as _SORT_MARK
+# (U+2192/U+2193) -- the geometric triangles U+25B4/U+25BE render as
+# tofu on real-world UI fonts.
+TREE_INDENT = 14         # per tree level
+ARROW_W = 16             # hit zone of the expand arrow
+GUTTER_ICON = 18         # status icon x inside the Name cell
+GUTTER_TEXT = 36         # name text x inside the Name cell
 
-# Caption of the direction toggle button (ASCII for the same reason
-# as _SORT_MARK).
-_SORT_DIR_CAP = {False: '^', True: 'v'}
+# Sort-direction marker appended to the header caption of the sort
+# column: the U+2191/U+2193 arrows (the user-requested glyphs -- the
+# geometric triangles used before, U+25B4/U+25BE, are missing from
+# real-world UI fonts and rendered as tofu boxes; plain ASCII 'v'/'^'
+# render everywhere but were rejected as too crude).
+_SORT_MARK = {False: ' \u2191', True: ' \u2193'}
 
 
 class DirCompareForm:
@@ -1948,11 +1961,12 @@ class DirCompareForm:
       [ left path edit          ][Browse...]  [ right path edit   ][Br...]
       [x]Different [x]Only left [x]Only right [x]Identical [x]Subfolders
                                     Mask:[ edit ][ Apply ]
-      Sort by:[ combo ][^]
       +--------------------------------------------------------------+
       | Name | Folder | Status | Left size | Left date | R.size | R.date |
-      | (owner-drawn listbox_ex, stretches with the form; every row  |
-      |  is painted here with its status color -- see below)         |
+      | (owner-drawn listbox_ex, stretches with the form; WinMerge-  |
+      |  style tree: folders folded by default, arrow/dbl-click/Enter|
+      |  expands them INLINE -- children appear indented below the   |
+      |  folder row, in the same window)                             |
       +--------------------------------------------------------------+
       [ status line / progress                    ][ counts          ]
 
@@ -1961,17 +1975,27 @@ class DirCompareForm:
 
     The results list is an owner-drawn listbox_ex (LISTBOX_SET_DRAWN):
     the control never paints items itself, it calls on_draw_item for
-    every visible row and the form paints background + icon + all
-    cells -- which is what makes the full-line status colors possible
-    (the dialog API's listview has no per-row colors at all). The
-    colors are the diff-tab hunk colors (color_changed / color_deleted
-    / color_added of Command.cfg), so a row's color matches exactly
-    what its double-clicked compare tab paints. The built-in column
-    header is driven with the same pixel widths the painter uses, so
-    header clicks (sorting) align with the drawn cells -- but the
-    header does not render on every CudaText build, so the visible
-    'Sort by' combo + direction button (Row C) mirror and drive the
-    same state everywhere.
+    every visible row and the form paints background + arrow + icon +
+    all cells -- which is what makes the full-line status colors
+    possible (the dialog API's listview has no per-row colors at
+    all). The colors are the diff-tab hunk colors (color_changed /
+    color_deleted / color_added of Command.cfg), so a row's color
+    matches exactly what its double-clicked compare tab paints. The
+    built-in column header is driven with the same pixel widths the
+    painter uses, so header clicks (sorting -- the ONLY sort UI, the
+    marker is the U+2191/U+2193 arrow) align with the drawn cells.
+
+    TREE MODE (WinMerge): a recursive scan's flat row list is
+    displayed as a tree -- each level sorted by the current column
+    exactly like the old flat list, every folder FOLDED until the
+    user expands it (click its arrow / double-click it / press Enter /
+    the context menu); the children then appear indented under the
+    folder row IN THIS WINDOW. A folder whose rows are all filtered
+    out stays visible as long as anything below it is visible (a
+    container); folders without scanned children (Subfolders off, or
+    empty) keep the old double-click behavior -- a drill-down window /
+    the file manager. The expansion state is keyed by rel path and
+    survives rescans of the same folder pair.
     """
 
     DEF_W = 940
@@ -2015,6 +2039,20 @@ class DirCompareForm:
         self._scan_t0 = 0.0
         self._sort_col = 1              # default: Folder, ascending
         self._sort_desc = False
+        # Tree state (see the class docstring "TREE MODE"): expanded
+        # folder rel paths -- keyed by path so it survives sort/filter
+        # changes and rescans of the same pair (cleared when the
+        # compared pair itself changes). _arrow_echo suppresses the
+        # second on_click of a double-click on the expand arrow
+        # (the dbl handler leaves arrow clicks to on_click). _hdr_h
+        # (listbox header height in px) and _row_x0 (a row's left
+        # edge) are calibrated from the painter and turn the click's
+        # (x, y) into a row + arrow-zone hit test.
+        self._expand = set()
+        self._exp_roots = None          # (dir_l, dir_r) _expand is for
+        self._arrow_echo = (-1, 0.0)    # (view index, perf_counter)
+        self._hdr_h = None
+        self._row_x0 = 0
         self._quick_only = bool(_get_opt('dirs.quick_only', False))
         self._method = _get_method()
         self._show = {                  # status filter checkboxes
@@ -2036,9 +2074,6 @@ class DirCompareForm:
         self.ctl = {}                   # name -> control index
         self.ctl_rev = {}               # control index -> name
         self._icon_idx = {}             # icon name -> imagelist index
-        self._lb_n = 0                  # items currently in the listbox
-        self._lb_key = None             # (sort_col, desc, filter tuple)
-                                            # the listbox was filled for
         # Teardown flags (each stage runs at most once)
         self._torn = False              # worker cancelled, timer stopped
         self._freed = False             # DLG_FREE scheduled/done
@@ -2198,37 +2233,6 @@ class DirCompareForm:
             'font_color': tcol,
         })
 
-        # -- Row D: the always-visible sort pair ------------------------
-        # Column combo + direction button on their own row below the
-        # filters: the listbox header that used to be the only sort UI
-        # does not render on every CudaText build (on the reporting box
-        # the header never appears, so header clicks cannot sort there)
-        # -- the combo/button work everywhere and mirror the header
-        # state where it does render. A row of their own because the
-        # filters + sort pair + mask group do NOT fit side by side at
-        # the default width (they need ~1000px of a 940px window and
-        # overlapped even with the anchors right).
-        self._add('label', 'lab_sort', {
-            'cap': _('Sort by:'), 'h': 20, 'autosize': True, 'w': 56,
-            'a_l': ('', '['), 'sp_l': 10,
-            'a_t': ('ed_left', ']'), 'sp_t': 38,
-            'font_color': tcol,
-        })
-        self._add('combo', 'sort_col', {
-            'w': 150, 'h': 24,
-            'a_l': ('lab_sort', ']'), 'sp_l': 6,
-            'a_t': ('ed_left', ']'), 'sp_t': 36,
-            'items': '\t'.join(cap for cap, _a, _w in _LIST_COLUMNS),
-            'val': _LIST_COLUMNS[self._sort_col][0],
-            'on_change': self._on_sort_col,
-        })
-        self._add('button', 'btn_sort_dir', {
-            'cap': _SORT_DIR_CAP[self._sort_desc], 'w': 34, 'h': 24,
-            'a_l': ('sort_col', ']'), 'sp_l': 6,
-            'a_t': ('ed_left', ']'), 'sp_t': 36,
-            'on_change': self._on_button,
-        })
-
         # -- Statusbar (created before the list: the list anchors to it) --
         self._add('statusbar', 'sbar', {
             'h': 26,
@@ -2267,8 +2271,9 @@ class DirCompareForm:
         p = {
             'a_l': ('', '['), 'sp_l': 10,
             'a_r': ('', ']'), 'sp_r': 10,
-            'a_t': ('ed_left', ']'), 'sp_t': 68,   # clears Row D (36+24)
+            'a_t': ('ed_left', ']'), 'sp_t': 40,   # clears Row C (10+20)
             'a_b': ('sbar', '['), 'sp_b': 4,
+            'on_click': self._on_list_click,
             'on_click_dbl': self._on_list_dbl,
             'on_click_header': self._on_header,
             'on_menu': self._on_list_menu,
@@ -2443,68 +2448,157 @@ class DirCompareForm:
 
     def _fill_list(self, rows=None):
         """Filter+sort 'rows' (default: the finished self._rows) into
-        the owner-drawn list. The listbox only holds one caption string
-        per row (the joined cells -- what a non-drawn fallback would
-        show); the painted content comes from self._view, so keeping
-        the two in sync is this method's whole job. Refills are
-        INCREMENTAL while a scan streams rows in (same sort+filter ->
-        the new view extends the old one -> only the delta is appended,
-        one LISTBOX_ADD per new row); a sort or filter change rebuilds
-        the list from scratch and restores the selection."""
+        the owner-drawn list, arranged as the WinMerge-style tree (see
+        _build_view). The listbox only holds one caption string per row
+        (the joined cells + the depth indent -- what a non-drawn
+        fallback would show); the painted content comes from
+        self._view, so keeping the two in sync is this method's whole
+        job.
+
+        The list is REBUILT whenever the view changes (the old
+        append-only incremental fill could not express tree mode: a
+        streamed row can appear anywhere in the tree -- under a
+        collapsed folder it changes nothing visible, under an
+        expanded one it lands in the middle of the list). An
+        UNCHANGED view skips the rebuild entirely -- with a collapsed
+        default, most streamed rows change nothing on screen, and a
+        collapsed tree keeps the visible row count small, so the
+        rebuild stays cheap exactly when it runs often. The selection
+        follows its row by identity (wherever the rebuild moved it)
+        and the scroll position is kept."""
         if self._torn or not self.h_list:
             return
         if rows is None:
             rows = self._rows
         t0 = time.perf_counter()
-        view = [r for r in rows if self._filter_ok(r)]
-        view.sort(key=self._sort_key)
-        if self._sort_desc:
-            view.reverse()
+        view = self._build_view(rows)
 
-        key = (self._sort_col, self._sort_desc,
-               tuple(sorted(self._show.items())))
         old_view = self._view
-        keep_sel = self._sel_index()
-
-        incremental = (
-            key == self._lb_key and
-            len(view) >= len(old_view) and
-            all(view[i] is old_view[i] for i in range(len(old_view)))
-        )
+        # An unchanged view (identity + order, and the listbox really
+        # holds it) skips the whole listbox rebuild: while a scan
+        # streams, most new rows land under COLLAPSED folders and
+        # change nothing on screen -- re-adding an identical item list
+        # every tick would only churn repaints. The count check keeps
+        # the skip honest (start_scan resets _view without touching
+        # the control -- a fresh scan MUST clear the old rows).
         try:
-            if incremental:
-                for r in view[self._lb_n:]:
-                    ct.listbox_proc(self.h_list, ct.LISTBOX_ADD,
-                                    index=-1, text=self._item_caption(r))
-                self._lb_n = len(view)
-                # Selection: an unchanged prefix keeps the selection
-                # valid -- nothing to restore while streaming.
-            else:
-                ct.listbox_proc(self.h_list, ct.LISTBOX_DELETE_ALL)
-                for r in view:
-                    ct.listbox_proc(self.h_list, ct.LISTBOX_ADD,
-                                    index=-1, text=self._item_caption(r))
-                self._lb_n = len(view)
-                self._lb_key = key
-                if 0 <= keep_sel < self._lb_n:
-                    ct.listbox_proc(self.h_list, ct.LISTBOX_SET_SEL,
-                                    index=keep_sel)
+            lb_n = int(ct.listbox_proc(self.h_list, ct.LISTBOX_GET_COUNT))
+        except Exception:
+            lb_n = -1
+        if (lb_n == len(old_view) and
+                len(view) == len(old_view) and
+                all(a is b for a, b in zip(view, old_view))):
+            self._view = view
+            if Profiler.is_enabled():
+                dt = time.perf_counter() - t0
+                Profiler.mark('dirs:ui_fill_list', dt, 0, t0=t0)
+            return
+
+        sel_row = None
+        i = self._sel_index()
+        if 0 <= i < len(old_view):
+            sel_row = old_view[i]
+        top = -1
+        try:
+            top = int(ct.listbox_proc(self.h_list, ct.LISTBOX_GET_TOP))
+        except Exception:
+            top = -1
+        try:
+            ct.listbox_proc(self.h_list, ct.LISTBOX_DELETE_ALL)
+            for r in view:
+                ct.listbox_proc(self.h_list, ct.LISTBOX_ADD,
+                                index=-1, text=self._item_caption(r))
+            # Selection: the SAME row object, wherever it landed
+            # (identity, not index -- a toggle moves rows around).
+            if sel_row is not None:
+                for j, r in enumerate(view):
+                    if r is sel_row:
+                        ct.listbox_proc(self.h_list, ct.LISTBOX_SET_SEL,
+                                        index=j)
+                        break
+            # Scroll: keep the first visible row (clamped to the new
+            # count) so toggling does not jump the list to the top.
+            if top > 0:
+                ct.listbox_proc(self.h_list, ct.LISTBOX_SET_TOP,
+                                index=min(top, max(0, len(view) - 1)))
         except Exception:
             pass
         self._view = view
         if Profiler.is_enabled():
             dt = time.perf_counter() - t0
-            Profiler.mark('dirs:ui_fill_list', dt,
-                          len(view) - len(old_view) if incremental
-                          else len(view), t0=t0)
+            Profiler.mark('dirs:ui_fill_list', dt, len(view), t0=t0)
+
+    def _build_view(self, rows):
+        """The display order of 'rows': a depth-first walk of the
+        folder tree, each level sorted by the current column exactly
+        like the old flat list (folders and files interleaved -- the
+        Status severity table puts plain folders last, and the sort
+        semantics must not change between the flat and tree display),
+        folders expanded only when their rel path is in self._expand.
+        Every visited row carries the display fields the painter and
+        the click hit test read:
+
+          '_d'   depth (0 = directly under the compared roots)
+          '_hk'  folder HAS scanned children (the arrow is drawn)
+          '_ex'  folder is expanded (the arrow points down)
+
+        A folder whose own row is filtered out stays visible as a
+        CONTAINER while anything below it is visible (without this,
+        hiding 'Identical' would hide a folder's Different children
+        too -- the flat list never did that); a folder with nothing
+        visible inside is hidden with its subtree. Rows are the scan's
+        own dicts (shared with self._rows) -- the display fields are
+        recomputed on every fill, never persisted."""
+        kids = {}
+        for r in rows:
+            kids.setdefault(r['dir'], []).append(r)
+        view = []
+
+        def level(rel, depth):
+            items = list(kids.get(rel, ()))
+            items.sort(key=self._sort_key)
+            if self._sort_desc:
+                items.reverse()
+            for r in items:
+                has_kids = bool(kids.get(r['rel']))
+                r['_d'] = depth
+                r['_hk'] = has_kids
+                r['_ex'] = has_kids and r['rel'] in self._expand
+                if not self._filter_ok(r):
+                    if not (r['_hk'] and self._subtree_visible(r['rel'],
+                                                                kids)):
+                        continue     # hidden folder, nothing visible inside
+                    # else: keep it as the container of visible rows
+                view.append(r)
+                if r['_ex']:
+                    level(r['rel'], depth + 1)
+
+        level('', 0)
+        return view
+
+    def _subtree_visible(self, rel, kids):
+        """Any row at or below 'rel' passes the current filter? (Only
+        called for folders whose own row was filtered out -- see
+        _build_view's container rule.)"""
+        for r in kids.get(rel, ()):
+            if self._filter_ok(r):
+                return True
+            if r['isdir'] and self._subtree_visible(r['rel'], kids):
+                return True
+        return False
 
     @staticmethod
     def _item_caption(r):
-        """The listbox item string of a row: cells joined by COL_SEP.
-        The drawn list never shows it (the painter draws the cells one
-        by one); it exists for the non-drawn fallback and for
-        copy/paste friendliness of the raw control content."""
-        return COL_SEP.join(DirCompareForm._row_cells(r))
+        """The listbox item string of a row: cells joined by COL_SEP,
+        the Name cell indented by two spaces per tree level. The drawn
+        list never shows it (the painter draws the cells one by one);
+        it exists for the non-drawn fallback and for copy/paste
+        friendliness of the raw control content."""
+        cells = DirCompareForm._row_cells(r)
+        d = r.get('_d', 0)
+        if d:
+            cells = ('  ' * d + cells[0],) + cells[1:]
+        return COL_SEP.join(cells)
 
     # ------------------------------------------------------------------
     # Row painting (owner-drawn listbox_ex)
@@ -2513,12 +2607,16 @@ class DirCompareForm:
     def _on_draw_item(self, id_dlg, id_ctl, data='', info=''):
         """LISTBOX_SET_DRAWN painter: draws one row -- background
         (status color: the SAME colors the diff tabs paint their hunks
-        with), status icon, and the seven cells at _col_layout offsets.
+        with), the tree gutter (expand arrow + status icon), and the
+        seven cells at _col_layout offsets (the Name cell shifted and
+        narrowed by the gutter + the row's tree indent).
 
         Runs inside the control's paint cycle: only canvas_proc /
         imagelist_proc calls here (paint-only, no re-entrant repaints),
         and it must stay fast (every repaint of every visible row goes
-        through here -- ~15 API calls per row).
+        through here -- ~15 API calls per row). As a side effect it
+        calibrates the click hit test's geometry (header height, row
+        left edge) -- one-time, two API calls.
         """
         try:
             index = int(data.get('index', -1))
@@ -2535,6 +2633,19 @@ class DirCompareForm:
         w, h = x1 - x0, y1 - y0
         if w <= 0 or h <= 0:
             return
+
+        # One-time calibration for _on_list_click's (x, y) hit test:
+        # the header height from the drawn row's own position. The
+        # geometry never changes after build, so once is enough.
+        self._row_x0 = x0
+        if self._hdr_h is None:
+            try:
+                ih = ct.listbox_proc(self.h_list, ct.LISTBOX_GET_ITEM_H)
+                top = ct.listbox_proc(self.h_list, ct.LISTBOX_GET_TOP)
+                if ih:
+                    self._hdr_h = max(0, y0 - (index - int(top)) * int(ih))
+            except Exception:
+                self._hdr_h = None
 
         st = row['status']
         t0 = time.perf_counter() if Profiler.is_enabled() else 0.0
@@ -2564,19 +2675,16 @@ class DirCompareForm:
         except Exception:
             return
 
-        # -- status icon in the gutter before the Name column ---------
-        icon = _ICON_OF.get(st)
-        if icon is not None:
-            idx = self._icon_idx.get(icon, -1)
-            if idx is not None and idx >= 0 and self.h_imglist:
-                try:
-                    ct.imagelist_proc(
-                        self.h_imglist, ct.IMAGELIST_PAINT,
-                        value=(canvas, x0 + 3, y0 + (h - 16) // 2, idx))
-                except Exception:
-                    pass
+        # -- tree gutter: arrow + status icon, then the cells ---------
+        # [arrow][icon][name...] all shifted by the row's depth (the
+        # arrow only on folders with scanned children). Icon and text
+        # have separate offsets -- the pre-tree code painted the icon
+        # at x0+3 with the Name text at x0+4, i.e. ON TOP of it.
+        depth = row.get('_d', 0)
+        ind = int(TREE_INDENT * _ui_scale()) * depth
+        ax = x0 + 2 + ind
+        ix = x0 + int(GUTTER_ICON * _ui_scale()) + ind
 
-        # -- cells ------------------------------------------------------
         cells = self._row_cells(row)
         layout = self._col_layout(w)
         try:
@@ -2589,7 +2697,33 @@ class DirCompareForm:
         except Exception:
             ty = y0 + 5
             sz = None
-        for text, (cx, cw, align) in zip(cells, layout):
+
+        if row.get('_hk'):
+            # the expand arrow -- same Arrows block as the header's
+            # sort marker (U+2192 collapsed / U+2193 expanded)
+            try:
+                ct.canvas_proc(canvas, ct.CANVAS_TEXT,
+                               text='\u2193' if row.get('_ex')
+                               else '\u2192', x=ax, y=ty)
+            except Exception:
+                pass
+
+        icon = _ICON_OF.get(st)
+        if icon is not None:
+            idx = self._icon_idx.get(icon, -1)
+            if idx is not None and idx >= 0 and self.h_imglist:
+                try:
+                    ct.imagelist_proc(
+                        self.h_imglist, ct.IMAGELIST_PAINT,
+                        value=(canvas, ix, y0 + (h - 16) // 2, idx))
+                except Exception:
+                    pass
+
+        # the Name cell loses the gutter + indent to the ellipsis too
+        gut = int(GUTTER_TEXT * _ui_scale()) + ind
+        for i, (text, (cx, cw, align)) in enumerate(zip(cells, layout)):
+            if i == 0:
+                cx, cw = cx + gut, cw - gut
             if not text or cw <= 4:
                 continue
             try:
@@ -2673,6 +2807,12 @@ class DirCompareForm:
             return
         self._dir_l = os.path.normpath(pl)
         self._dir_r = os.path.normpath(pr)
+        # Tree state: expansion survives rescans of the SAME pair
+        # (Refresh / filter changes / swap-back all keep it); a NEW
+        # pair starts folded everywhere.
+        if self._exp_roots != (self._dir_l, self._dir_r):
+            self._expand.clear()
+            self._exp_roots = (self._dir_l, self._dir_r)
         self._quick_only = bool(_get_opt('dirs.quick_only', False))
         self._method = _get_method()
         # Threading shape of THIS scan (differ2.dirs.scan_
@@ -2735,8 +2875,6 @@ class DirCompareForm:
                                 cprof_scan, scan_mode=mode)
         self._rows = []
         self._view = []
-        self._lb_n = 0
-        self._lb_key = None
         self._last_fill = -1
         self._scan_t0 = time.perf_counter()
         try:
@@ -2894,10 +3032,6 @@ class DirCompareForm:
             self.start_scan()
         elif name == 'btn_close':
             self.close()
-        elif name == 'btn_sort_dir':
-            self._sort_desc = not self._sort_desc
-            self._fill_list()
-            self._sync_sort_controls()
         elif name == 'btn_apply':
             self.start_scan()
         elif name in ('btn_lbrw', 'btn_rbrw'):
@@ -2945,10 +3079,11 @@ class DirCompareForm:
 
     def _on_header(self, id_dlg, id_ctl, data='', info=''):
         """Column header click: sort by that column; clicking again
-        toggles the direction (the rebuilt header carries the marker,
-        aligned with the drawn cells -- same width table). The combo
-        and the direction button mirror the new state (they are the
-        only sort UI on builds where the header does not render)."""
+        toggles the direction (the rebuilt header carries the U+2191/
+        U+2193 marker, aligned with the drawn cells -- same width
+        table). This is the ONLY sort UI (the Sort-by combo of the
+        12th/13th releases was removed: the header renders and sorts
+        on real builds, so the box was redundant)."""
         try:
             col = int(data)
         except (TypeError, ValueError):
@@ -2959,35 +3094,7 @@ class DirCompareForm:
             self._sort_col = col
             self._sort_desc = False
         self._fill_list()
-        self._sync_sort_controls()
-
-    def _on_sort_col(self, id_dlg, id_ctl, data='', info=''):
-        """The 'Sort by' combo: pick a column (captions are the plain
-        _LIST_COLUMNS names -- no sort marker). An unknown value (typed
-        free text) is ignored, keeping the current sort."""
-        cap = self._ctl_val('sort_col')
-        for i, (c, _a, _w) in enumerate(_LIST_COLUMNS):
-            if c == cap:
-                if i != self._sort_col:
-                    self._sort_col = i
-                    self._sort_desc = False
-                    self._fill_list()
-                    self._sync_sort_controls()
-                return
-
-    def _sync_sort_controls(self):
-        """Push the current sort state to the header, the combo and
-        the direction button -- one source of truth, three views."""
         self._apply_header()
-        self._set_ctl_val('sort_col',
-                          _LIST_COLUMNS[self._sort_col][0])
-        try:
-            # a button's caption is the 'cap' prop (a 'val' write is
-            # a no-op on buttons)
-            ct.dlg_proc(self.h, ct.DLG_CTL_PROP_SET, name='btn_sort_dir',
-                        prop={'cap': _SORT_DIR_CAP[self._sort_desc]})
-        except Exception:
-            pass
 
     def _sel_index(self):
         try:
@@ -2996,8 +3103,116 @@ class DirCompareForm:
         except Exception:
             return -1
 
+    # ------------------------------------------------------------------
+    # Tree mode: expand / collapse (WinMerge-style, inline)
+    # ------------------------------------------------------------------
+
+    def _toggle_expand(self, row):
+        """Show/hide a folder's rows inline. The state is keyed by the
+        folder's rel path, so it survives sort/filter changes and
+        rescans of the same pair (see start_scan)."""
+        if self._torn:
+            return
+        rel = row['rel']
+        if rel in self._expand:
+            self._expand.discard(rel)
+        else:
+            self._expand.add(rel)
+        self._fill_list()
+
+    def _expand_all(self):
+        if self._torn:
+            return
+        self._expand = {r['rel'] for r in self._rows if r['isdir']}
+        self._fill_list()
+
+    def _collapse_all(self):
+        if self._torn:
+            return
+        self._expand.clear()
+        self._fill_list()
+
+    def _in_arrow(self, row, x):
+        """Is client-x inside the row's expand-arrow zone? (The zone
+        the painter draws the U+2192/U+2193 glyph into, widened to
+        ARROW_W for an easy hit.)"""
+        ax = self._row_x0 + 2 + \
+            int(TREE_INDENT * _ui_scale()) * row.get('_d', 0)
+        return ax <= x <= ax + int(ARROW_W * _ui_scale())
+
+    def _row_at_y(self, idx, y):
+        """Is client-y inside row idx's band? Separates row clicks
+        from clicks on the listbox header (which shares the control's
+        client area -- whether the header also fires on_click is a
+        TATListbox detail this check must not depend on). The header
+        height comes from the painter's one-time calibration; until
+        then (nothing drawn yet) the check trusts the selection."""
+        if self._hdr_h is None:
+            return True
+        try:
+            ih = int(ct.listbox_proc(self.h_list, ct.LISTBOX_GET_ITEM_H))
+            top = int(ct.listbox_proc(self.h_list, ct.LISTBOX_GET_TOP))
+            if ih <= 0:
+                return True
+        except Exception:
+            return True
+        row_top = self._hdr_h + (idx - top) * ih
+        return row_top <= y < row_top + ih
+
+    def _on_list_click(self, id_dlg, id_ctl, data='', info=''):
+        """Single click on the list (data = (x, y) in the control's
+        client coords -- the same event cuda_prefs/cuda_tabs_list
+        use). A click on a folder row's expand arrow toggles the
+        folder inline -- WinMerge's tree behavior; anything else just
+        selects (the control's own behavior, nothing to do here).
+
+        A double-click fires on_click for its FIRST press, and
+        possibly again for the second (LCL detail); _on_list_dbl
+        leaves arrow-zone clicks to THIS handler, so a repeat on the
+        same row within the double-click quantum is the echo, not a
+        new toggle (else expand+echo would cancel out)."""
+        if self._torn:
+            return
+        idx = self._sel_index()
+        if not (0 <= idx < len(self._view)):
+            return
+        row = self._view[idx]
+        if not row['isdir'] or not row.get('_hk'):
+            return
+        try:
+            x, y = int(data[0]), int(data[1])
+        except (TypeError, ValueError, IndexError):
+            return
+        if not self._in_arrow(row, x) or not self._row_at_y(idx, y):
+            return
+        now = time.perf_counter()
+        if self._arrow_echo[0] == idx and now - self._arrow_echo[1] < 0.5:
+            return     # the double-click's second press
+        self._arrow_echo = (idx, now)
+        self._toggle_expand(row)
+
     def _on_list_dbl(self, id_dlg, id_ctl, data='', info=''):
-        self._open_selected()
+        """Double-click (data = (x, y) client coords). Folder rows
+        with scanned children expand/collapse INLINE -- the content
+        appears under the folder in THIS window (the user-requested
+        WinMerge behavior; the old drill-down window remains only for
+        folders without scanned children). Arrow-zone double-clicks
+        are left to _on_list_click: it already toggled on the first
+        press, and toggling again here would undo it. File rows keep
+        the open/compare handoff."""
+        idx = self._sel_index()
+        if not (0 <= idx < len(self._view)):
+            return
+        row = self._view[idx]
+        if row['isdir'] and row.get('_hk'):
+            try:
+                x = int(data[0])
+            except (TypeError, ValueError, IndexError):
+                x = None
+            if x is None or not self._in_arrow(row, x):
+                self._toggle_expand(row)
+            return
+        self._open_row(row)
 
     def _open_selected(self):
         idx = self._sel_index()
@@ -3013,10 +3228,13 @@ class DirCompareForm:
         return os.path.join(base, row['rel'])
 
     def _open_row(self, row):
-        """Double-click semantics. File pairs (Identical or Different)
-        open in a Differ 2 compare tab via the Command object; one-sided
-        files open alone; folder pairs open a drill-down compare window;
-        one-sided folders open in the OS file manager. The whole handoff
+        """Double-click / Enter semantics. File pairs (Identical or
+        Different) open in a Differ 2 compare tab via the Command
+        object; one-sided files open alone; folders with scanned
+        children expand/collapse INLINE (tree mode); folders without
+        scanned children (Subfolders off, or empty) keep the old
+        behavior -- a drill-down compare window for a pair, the OS
+        file manager for a one-sided folder. The whole handoff
         (opening the two editor tabs + set_files' own refresh) is one
         profiler section -- its rows show what the double-click costs
         on top of the tab compare's own refresh:* rows."""
@@ -3038,12 +3256,16 @@ class DirCompareForm:
         elif st == ST_RONLY:
             if os.path.isfile(pr):
                 ct.file_open(pr)
-        elif st == ST_DIR:
-            compare_directories(self._cmd, pl, pr)
-        elif st == ST_DIR_LONLY:
-            _open_in_file_manager(pl)
-        elif st == ST_DIR_RONLY:
-            _open_in_file_manager(pr)
+        elif st in (ST_DIR, ST_DIR_LONLY, ST_DIR_RONLY):
+            if row.get('_hk'):
+                # the scan already walked inside: expand inline
+                self._toggle_expand(row)
+            elif st == ST_DIR:
+                compare_directories(self._cmd, pl, pr)
+            elif st == ST_DIR_LONLY:
+                _open_in_file_manager(pl)
+            else:
+                _open_in_file_manager(pr)
         elif st == ST_ERR:
             if os.path.isfile(pl):
                 ct.file_open(pl)
@@ -3083,6 +3305,15 @@ class DirCompareForm:
             add(_('Compare (open in diff tab)'),
                 lambda: self._open_row(row),
                 st in (ST_SAME, ST_DIFF, ST_ERR))
+            ct.menu_proc(hm, ct.MENU_ADD, caption='-')
+        else:
+            # Tree-mode actions (folders): inline expand/collapse of
+            # this folder + the global pair, WinMerge's menu items
+            if row.get('_hk'):
+                add(_('Collapse') if row.get('_ex') else _('Expand'),
+                    lambda: self._toggle_expand(row))
+            add(_('Expand all'), self._expand_all)
+            add(_('Collapse all'), self._collapse_all)
             ct.menu_proc(hm, ct.MENU_ADD, caption='-')
         add(_('Copy to right'), lambda: self._act_copy(row, True), copy_r_ok)
         add(_('Copy to left'), lambda: self._act_copy(row, False), copy_l_ok)
