@@ -416,11 +416,14 @@ The window's controls:
   list's own header, the command palette and every themed control
   use (the "ui_font_name" / "ui_font_size" options), NOT some
   smaller default: the painter SETS that font on the canvas (name
-  and point size, the app's own DoScaleFont chain), the row height
-  auto-fits it exactly like every built-in CudaText list, and every
-  metric that must fit the glyphs (column widths, the tree gutter
-  with its +/- markers) grows with it. Set a 14 pt UI font and the
-  whole list scales up to it, rows included.
+  and point size, the app's own DoScaleFont chain), and the row
+  HEIGHT follows it too -- the control's own auto-fit where that
+  fits, and where it does not (builds whose list theme ignores the
+  UI font size) the painter measures the glyphs it just drew and
+  raises the row height to fit them, so the text is never eaten.
+  Every metric that must fit the glyphs (column widths, the tree
+  gutter with its +/- markers) grows with it. Set a 14 pt UI font
+  and the whole list scales up to it, rows included.
 - The status bar shows the scan progress / result line on the left
   and the counts (Different / Only left / Only right / Identical) on
   the right. Its cells carry no defined width: the status cell

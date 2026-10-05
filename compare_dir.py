@@ -303,10 +303,15 @@ builds evidently skip the preset, so an empty-name CANVAS_SET_FONT
 left the canvas at the LCL default GUI font (~75-80% of the UI
 size). Passing the values is build-proof: on builds WITH the preset
 the same numbers are written twice, on builds without it the fix is
-the values themselves. The row height stays the control's own: with
-no LISTBOX_SET_ITEM_H it auto-fits to the themed font on every paint
-(UpdateItemHeight -> GetItemHeightDefault), which is the same chain
-the explicit size replicates. What IS the plugin's business is every
+the values themselves. The row height keeps the control's own
+auto-fit wherever that band fits the drawn text -- and the painter
+GUARDS it where it does not: it measures the glyphs it just drew and
+raises ItemHeight to measured+2px when the auto-fit band is tighter
+(the reported build's auto-fit rides the same broken theme chain
+that swallowed the preset, so the band stayed 9pt-sized under the
+grown font and ate the text; LISTBOX_SET_ITEM_H freezes the
+auto-fit, never shrinks, never fires on a healthy build -- see
+_fit_item_h). What IS the plugin's business is every
 pixel metric that must fit that text -- column widths, the tree
 gutter, the expand-marker zone -- all scaled by _px_scale() =
 DPI factor x UI-font factor (_font_scale, from ui_font_size and the
@@ -423,17 +428,23 @@ ICON_CACHE_VER = '1'           # bump to force-renew the icon cache dir
 
 # Owner-drawn list metrics (the results list is a listbox_ex in
 # LISTBOX_SET_DRAWN mode -- see the module docstring "Row coloring").
-# The ROW HEIGHT is NOT set by the plugin at all: TATListbox auto-fits
-# it to the UI font on every paint (ATFlatControls atlistbox.pas,
-# Paint -> UpdateItemHeight -> GetItemHeightDefault =
+# The ROW HEIGHT defaults to the control's own auto-fit (ATFlatControls
+# atlistbox.pas, Paint -> UpdateItemHeight -> GetItemHeightDefault =
 # CanvasFontSizeToPixels(DoScaleFont(theme font)) * Max(96, PPI) div
-# 96) -- the exact height every CudaText list (command palette,
-# tab list) uses. A fixed LISTBOX_SET_ITEM_H would freeze the rows at
-# OUR estimate and clip the text on every box whose UI font is bigger
-# than the 9pt default -- the 15th release did exactly that, and the
-# reported box drew 9pt-ish rows under a much larger UI font.
-# LISTBOX_GET_ITEM_H (used by the painter's hit-test calibration and
-# _row_at_y) always returns the live auto-fitted value.
+# 96) -- the exact height every CudaText list (command palette, tab
+# list) uses. But the auto-fit rides the THEME font, and the reported
+# build's theme chain ignores the UI font size (the same broken chain
+# that swallowed the canvas preset -- 4 reports in a row now), so the
+# painter GUARDS the band instead of trusting it: it measures the
+# glyphs it actually draws and raises ItemHeight to fit when the band
+# is tighter (LISTBOX_SET_ITEM_H -- SetItemHeight sets
+# FItemHeightIsFixed, freezing the auto-fit; measured, never guessed,
+# never shrinks, never fires where the auto-fit already fits -- see
+# _fit_item_h). A fixed height as the ONLY mechanism (the 15th
+# release) froze the rows at OUR estimate on every box; the guard
+# keeps the control's value everywhere it works. LISTBOX_GET_ITEM_H
+# (used by the painter's hit-test calibration and _row_at_y) always
+# returns the live value, auto-fitted or guarded.
 
 # Column separator for the listbox items/header. A control character
 # is used (not '|'): item captions are built from real file names,
@@ -2173,8 +2184,10 @@ class DirCompareForm:
     OS DPI before the saved geometry is re-applied, and _px_scale()
     -- DPI x UI-font factor -- does the same for the raw-pixel metrics
     that bypass DLG_SCALE: list columns, tree gutter, status cells.
-    The row height is not ours at all: TATListbox auto-fits it to the
-    UI font, and the painter draws with the font the control preset):
+    The row height is the control's own auto-fit, which the painter
+    both feeds (it SETS the UI font before drawing) and guards (it
+    measures the drawn glyphs and raises ItemHeight when the
+    auto-fit band is tighter -- see _fit_item_h):
 
       [ New compare... ][ Swap sides ][ Refresh ]            [ Close ]
       [ left path edit          ][Browse...]  [ right path edit   ][Br...]
@@ -2286,12 +2299,16 @@ class DirCompareForm:
         # left edge / width) are calibrated from the painter and turn
         # the click's (x, y) into a row + marker-zone hit test -- and
         # the mouse events' x into a column-boundary one.
+        # _item_h_fix: the row height the painter's guard raised the
+        # band to (None = the control's own auto-fit already fit the
+        # drawn font -- see _fit_item_h).
         self._expand = set()
         self._exp_roots = None          # (dir_l, dir_r) _expand is for
         self._arrow_echo = (-1, 0.0)    # (view index, perf_counter)
         self._hdr_h = None
         self._row_x0 = 0
         self._row_w = 0
+        self._item_h_fix = None
         # Column-resize state (see the class docstring "COLUMN
         # RESIZE"): the live pixel widths of the six fixed columns
         # (Name stretches -- _col_spec), None while no drag runs;
@@ -2560,11 +2577,13 @@ class DirCompareForm:
         self._add('listbox_ex', 'list', p)
         self.h_list = ct.dlg_proc(h, ct.DLG_CTL_HANDLE, name='list')
         try:
-            # NOTE: no LISTBOX_SET_ITEM_H -- the row height stays
-            # AUTO-FIT to the UI font (TATListbox.UpdateItemHeight on
-            # every paint; see the metrics comment at the top). A fixed
-            # height was the 15th-release bug: rows stayed ~9pt-sized
-            # while the themed text outgrew them (the reported box).
+            # NOTE: no LISTBOX_SET_ITEM_H here -- the row height starts
+            # as the control's own AUTO-FIT and the painter GUARDS it
+            # from the first drawn row on (_fit_item_h: measured glyph
+            # box + 2px, only when the auto-fit band is tighter -- the
+            # 15th release's fixed height froze every box at OUR
+            # estimate; the guard keeps the control's value wherever
+            # it already fits).
             ct.listbox_proc(self.h_list, ct.LISTBOX_SET_COLUMN_SEP,
                             text=COL_SEP)
             ct.listbox_proc(self.h_list, ct.LISTBOX_SET_COLUMNS,
@@ -3068,10 +3087,17 @@ class DirCompareForm:
             ct.canvas_proc(canvas, ct.CANVAS_SET_FONT,
                            text=_ui_font()[0],
                            color=fg, size=_ui_font_pt(), style=0)
-            # one measure for the vertical centering baseline
+            # one measure, two jobs: the vertical centering baseline
+            # AND the row-height guard -- the measured glyph box is
+            # the ground truth the row BAND must fit (see _fit_item_h:
+            # the 4th-round report -- big font, small band, text
+            # eaten -- is fixed right here, from this very number)
             sz = ct.canvas_proc(canvas, ct.CANVAS_GET_TEXT_SIZE,
                                 text='Ag')
-            ty = y0 + max(0, (h - (sz[1] if sz else 13)) // 2)
+            th = sz[1] if sz else 0
+            if th:
+                self._fit_item_h(th)
+            ty = y0 + max(0, (h - (th or 13)) // 2)
         except Exception:
             ty = y0 + 5
             sz = None
@@ -3132,6 +3158,48 @@ class DirCompareForm:
         if Profiler.is_enabled():
             dt = time.perf_counter() - t0
             Profiler.mark('dirs:ui_draw_item', dt, t0=t0)
+
+    def _fit_item_h(self, text_h):
+        """Grow the list's row height to fit the glyphs the painter
+        draws -- the height half of the font fix.
+
+        The 17th release made the painter SET the UI font explicitly
+        (the reported build's TATListbox neither presets the canvas
+        font nor carries the UI size in its theme), so the text grew
+        -- but the row BAND still came from the control's own
+        auto-fit, GetItemHeightDefault over the THEME font, which on
+        that same build stays at the small default: big glyphs in a
+        9pt-sized band, the text eaten top and bottom (4th-round
+        report: 'the list items height does not grow when font grow').
+
+        Self-correcting and MEASURED, not guessed: the painter passes
+        the very glyph box it just drew (CANVAS_GET_TEXT_SIZE under
+        the font it just SET -- real font, real DPI, real point size),
+        and only when the band is tighter than that box + 2px does it
+        raise ItemHeight (LISTBOX_SET_ITEM_H; SetItemHeight sets
+        FItemHeightIsFixed, the auto-fit freezes and the value rules
+        from then on -- the control repaints once and every later
+        pass finds the height already fitting, so this fires at most
+        once per window). Never shrinks, and never fires on a healthy
+        build: the app's own auto-fit is CanvasFontSizeToPixels(pt) *
+        Max(96, PPI) div 96 = (1.8*pt + 2)*k px against a real glyph
+        box of ~1.35*pt*k px -- the +2*k padding covers the +2 guard
+        for every k >= 1 and every normal font, so a build whose
+        auto-fit already fits is never touched. The hit tests need no
+        change: _row_at_y and the painter's calibration read
+        GET_ITEM_H live, and the header height they derive from the
+        first row is independent of the item height. _item_h_fix
+        remembers the applied height (None = never needed) for the
+        functional tests."""
+        try:
+            need = int(text_h) + 2
+            cur = ct.listbox_proc(self.h_list, ct.LISTBOX_GET_ITEM_H)
+            if cur is not None and need > int(cur):
+                ct.listbox_proc(self.h_list, ct.LISTBOX_SET_ITEM_H,
+                                index=need)
+                self._item_h_fix = need
+        except Exception:
+            pass
 
     def _update_counts(self):
         rows = self._rows

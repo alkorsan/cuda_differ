@@ -1,3 +1,36 @@
+2026.10.05 (18th release, by @alkorsan)
+* fix: the row height now grows with the drawn font (reported: "the
+  list items height does not grow when font grow so text become eaten
+  see pic") -- the 17th release made the painter SET the UI font, so
+  the glyphs grew, but the row BAND still came from TATListbox's own
+  auto-fit (GetItemHeightDefault over the THEME font), which on the
+  reported build rides the same broken chain that swallowed the
+  canvas preset: the theme there ignores the UI font size, so the
+  band stayed 9pt-sized under the much bigger glyphs and ate them
+  top and bottom. The painter now GUARDS the height, measured not
+  guessed: it measures the very glyphs it just drew
+  (CANVAS_GET_TEXT_SIZE under the font it just SET -- real font,
+  real DPI, real points) and raises ItemHeight to measured+2px when
+  the auto-fit band is tighter (LISTBOX_SET_ITEM_H; SetItemHeight
+  sets FItemHeightIsFixed, so the value rules from then on and the
+  guard fires at most once per window). Never shrinks and never
+  fires on a healthy build: the app's own auto-fit is
+  (1.8*pt + 2)*ppi/96 px against a real glyph box of ~1.35*pt*k --
+  the built-in padding covers the +2 guard for every k >= 1 and
+  every normal font. The click hit tests ride the live GET_ITEM_H,
+  so they follow the raised band automatically.
+Tests: GUI suite 266 checks (was 260) -- a new v8 battery (the stub
+pins the listbox theme to the stale 9pt default, emulating the
+reported build): the band is 18px before the first paint, the
+painter raises it to the measured fit (14pt glyphs 20px -> 22px),
+LISTBOX_SET_ITEM_H froze it, a later paint fires no more (no
+oscillation), the live GET_ITEM_H serves the guarded height, and at
+the DEFAULT font the guard stays silent (the band already fits);
+the stub's DLG_CTL_HANDLE no longer collides across forms (two
+compare windows' lists shared one state); the healthy 14pt check
+now doubles as the guard-does-not-fire regression. Scanner/span/
+import unchanged and green; pyflakes/vermin 3.6/static_check clean.
+
 2026.10.05 (17th release, by @alkorsan)
 * fix: the rows STILL rendered small on the reporter's build (reported:
   "list items still use small font not ui font see pic") -- the 16th
