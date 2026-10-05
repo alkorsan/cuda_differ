@@ -265,7 +265,12 @@ theme presets):
   Different             -> color_changed  (the changed-hunks color)
   Only left (+folders)  -> color_deleted  (the deleted-hunks color)
   Only right (+folders) -> color_added    (the added-hunks color)
-  Identical / Folder    -> no fill (the theme list background)
+  Identical / Folder    -> no fill (the theme's TreeBg -- the exact
+                          color the listbox control paints its own
+                          background with, so uncolored rows are
+                          indistinguishable from the empty list area;
+                          the dialog listbox takes its background from
+                          TreeBg, NOT from the control's color prop)
 
 So a file painted yellow in the folder list is painted yellow line
 by line when double-clicked into a compare tab; a red "only left"
@@ -374,9 +379,9 @@ ICON_CACHE_VER = '1'           # bump to force-renew the icon cache dir
 
 # Owner-drawn list metrics (the results list is a listbox_ex in
 # LISTBOX_SET_DRAWN mode -- see the module docstring "Row coloring"):
-# one row's height, and the icon gutter before the first column.
+# one row's height (in 96-DPI base pixels; _ui_scale multiplies it at
+# build time, like every other raw-pixel metric below).
 LIST_ITEM_H = 26
-ICON_GUTTER = 22
 
 # Column separator for the listbox items/header. A control character
 # is used (not '|'): item captions are built from real file names,
@@ -442,14 +447,18 @@ METHOD_SIZE_TIME = 'size_timestamp'
 # The two sides' size/date columns mirror WinMerge's "Left/Right
 # size/date" layout; the Folder column keeps the Name column clean
 # ("Name" is the base name, "Folder" the path below the compared roots).
+# Widths are 96-DPI BASE pixels -- _col_spec/_col_layout multiply them
+# by _ui_scale() so the cells keep fitting the (DPI-scaled) control
+# font on high-DPI boxes (the reporting box ellipsized every date at
+# 125% DPI with the raw 96-DPI widths).
 _LIST_COLUMNS = (
     (_('Name'), 'L', 230),
     (_('Folder'), 'L', 170),
     (_('Status'), 'L', 110),
     (_('Left size'), 'R', 85),
-    (_('Left date'), 'L', 125),
+    (_('Left date'), 'L', 140),
     (_('Right size'), 'R', 85),
-    (_('Right date'), 'L', 125),
+    (_('Right date'), 'L', 140),
 )
 
 
@@ -498,6 +507,44 @@ def _theme_color(key, fallback=None):
     except Exception:
         pass
     return fallback
+
+
+_UI_SCALE = None
+
+
+def _ui_scale():
+    """The scale factor the form's DLG_SCALE call applies (1.0 when it
+    cannot be measured). CudaText scales a dialog by
+    Screen.PixelsPerInch/96: control geometry AND control fonts grow
+    by that factor. Everything the plugin passes through dlg_proc
+    (anchors, autosize labels, w/h of controls) is scaled by the
+    form's own DLG_SCALE -- but the raw pixel values handed to
+    listbox_proc / statusbar_proc (column widths, item height, status
+    cell sizes) BYPASS it, while the text drawn into them does not.
+    Unscaled, a 125%-DPI box draws 1.25x-wide text into 96-DPI
+    columns: the date cells were the first casualty ('2026-10-04 …'
+    ellipsized on the reporting box).
+
+    Measured, not configured: a throwaway 96x96 probe form is
+    DLG_SCALEd and read back, so the factor is whatever the HOST
+    actually applies (a no-op DLG_SCALE -- older builds, the test
+    simulator -- yields exactly 1.0). Cached per process; never
+    raises (any probe failure sticks to 1.0 = today's layout)."""
+    global _UI_SCALE
+    if _UI_SCALE is None:
+        try:
+            h = ct.dlg_proc(0, ct.DLG_CREATE)
+            try:
+                ct.dlg_proc(h, ct.DLG_PROP_SET, prop={'w': 96, 'h': 96})
+                ct.dlg_proc(h, ct.DLG_SCALE)
+                d = ct.dlg_proc(h, ct.DLG_PROP_GET) or {}
+                w = float(d.get('w', 96) or 96)
+            finally:
+                ct.dlg_proc(h, ct.DLG_FREE)
+            _UI_SCALE = max(1.0, w / 96.0)
+        except Exception:
+            _UI_SCALE = 1.0
+    return _UI_SCALE
 
 
 def _fmt_size(n):
@@ -1608,9 +1655,21 @@ class _PickerDialog:
     or clicking Compare validates both paths -- a bad path pops a
     message box and keeps the dialog open -- then hides the form, which
     ends DLG_SHOW_MODAL (the cudatext.py modal wait polls the form's
-    'vis' prop). show() returns (left, right) or None."""
+    'vis' prop). show() returns (left, right) or None.
 
-    W = 580          # fixed size: DBORDER_DIALOG is not resizable
+    Resizable (DBORDER_SIZE): the combos stretch between the labels
+    and the Browse buttons; the size is remembered in the settings
+    (dirs.picker_geom, "w,h") and re-applied after DLG_SCALE. The
+    layout is DLG_SCALEd like the main window -- without it a 125%-DPI
+    box keeps 96-DPI label widths under a bigger font and clips the
+    captions (the reported "Left folder (ol" bug)."""
+
+    W = 640
+    H = 150
+    MIN_W = 560
+    MIN_H = 140
+    LABEL_W = 150          # "Right folder (new):" fits at 96 DPI
+    BRW_W = 90
     ROW_Y0 = 12
     ROW_DY = 34
 
@@ -1646,8 +1705,9 @@ class _PickerDialog:
         prop = {
             'cap': _('Differ 2: compare folders'),
             'w': self.W,
-            'h': 152,
-            'border': ct.DBORDER_DIALOG,
+            'h': self.H,
+            'w_min': self.MIN_W, 'h_min': self.MIN_H,
+            'border': ct.DBORDER_SIZE,   # resizable; combos stretch
         }
         if bg is not None:
             prop['color'] = bg
@@ -1656,36 +1716,86 @@ class _PickerDialog:
         for i, (side, label, hist, init) in enumerate((
                 ('left',  _('Left folder (old):'),  hist_l, dir_l),
                 ('right', _('Right folder (new):'), hist_r, dir_r))):
-            y = self.ROW_Y0 + i * self.ROW_DY
+            top = ('', '[') if i == 0 else ('left', ']')
+            sp_t = self.ROW_Y0 if i == 0 else self.ROW_DY - 26
             self._add('label', 'lab_' + side, {
                 'cap': label,
-                'x': 12, 'y': y + 5, 'w': 108, 'h': 20,
-                'autosize': False,
+                'w': self.LABEL_W, 'h': 20,
+                'a_l': ('', '['), 'sp_l': 12,
+                'a_t': top, 'sp_t': sp_t + 5,
                 'font_color': _theme_color('TabFont'),
             })
             self._add('combo', side, {
-                'x': 124, 'y': y, 'w': 344, 'h': 26,
+                'w': 330, 'h': 26,
+                'a_l': ('lab_' + side, ']'), 'sp_l': 4,
+                'a_r': ('brw_' + side, '['), 'sp_r': 6,
+                'a_t': top, 'sp_t': sp_t,
                 'items': '\t'.join(hist),
                 'val': init,
                 'texthint': _('Type or pick a folder'),
             })
             self._add('button', 'brw_' + side, {
                 'cap': _('Browse...'),
-                'x': 478, 'y': y, 'w': 90, 'h': 26,
+                'w': self.BRW_W, 'h': 26,
+                'a_r': ('', ']'), 'sp_r': 12,
+                'a_t': top, 'sp_t': sp_t,
                 'on_change': self._on_button,
             })
 
-        y = self.ROW_Y0 + 2 * self.ROW_DY + 10
         self._add('button', 'ok', {
             'cap': _('Compare'),
-            'x': self.W - 200, 'y': y, 'w': 90, 'h': 28,
+            'w': 100, 'h': 28,
+            'a_r': ('cancel', '['), 'sp_r': 8,
+            'a_b': ('', ']'), 'sp_b': 12,
             'on_change': self._on_button,
         })
         self._add('button', 'cancel', {
             'cap': _('Cancel'),
-            'x': self.W - 104, 'y': y, 'w': 90, 'h': 28,
+            'w': 90, 'h': 28,
+            'a_r': ('', ']'), 'sp_r': 12,
+            'a_b': ('', ']'), 'sp_b': 12,
             'on_change': self._on_button,
         })
+        # Scale the built layout to the OS DPI (the main window has
+        # always done this; the picker's fixed 96-DPI geometry is what
+        # clipped the labels on high-DPI boxes), THEN re-apply the
+        # saved size: it was captured post-scale, so applying it after
+        # DLG_SCALE never double-scales (same order as the main
+        # window's geometry).
+        ct.dlg_proc(self.h, ct.DLG_SCALE)
+        geom = self._restore_geom()
+        if geom:
+            try:
+                ct.dlg_proc(self.h, ct.DLG_PROP_SET, prop=geom)
+            except Exception:
+                pass
+
+    # -- geometry persistence ------------------------------------------
+
+    @staticmethod
+    def _restore_geom():
+        """Saved picker size ("w,h" string) as a prop dict, or None.
+        Single-line string for the same reason as the main window's
+        geometry (cudax_lib's flat-key updater)."""
+        g = _get_opt('dirs.picker_geom', '')
+        if isinstance(g, str) and g:
+            try:
+                w, h = (int(v) for v in g.split(','))
+                if w >= _PickerDialog.MIN_W and h >= _PickerDialog.MIN_H:
+                    return {'w': w, 'h': h}
+            except (TypeError, ValueError):
+                pass
+        return None
+
+    @staticmethod
+    def _save_geom(h):
+        try:
+            d = ct.dlg_proc(h, ct.DLG_PROP_GET) or {}
+            w, hh = int(d.get('w', 0)), int(d.get('h', 0))
+            if w >= _PickerDialog.MIN_W and hh >= _PickerDialog.MIN_H:
+                _set_opt('dirs.picker_geom', '%d,%d' % (w, hh))
+        except Exception:
+            pass
 
     # -- events ----------------------------------------------------------
 
@@ -1721,6 +1831,7 @@ class _PickerDialog:
                        ct.MB_OK + ct.MB_ICONWARNING)
             return
         self._remember(pl, pr)
+        self._save_geom(self.h)
         self.result = (pl, pr)
         ct.dlg_proc(self.h, ct.DLG_HIDE)
 
@@ -1781,7 +1892,16 @@ _ICON_OF = {
     ST_DIR_RONLY: 'ronly',
 }
 
-_SORT_MARK = {False: ' \u25b4', True: ' \u25be'}  # small up/down triangles
+# Sort-direction marker appended to the header caption of the sort
+# column (and shown on the direction button). Deliberately PLAIN
+# ASCII: the geometric triangles used before (U+25B4/U+25BE) are
+# missing from real-world UI fonts -- on the reporting box every
+# marker rendered as a hollow box (tofu).
+_SORT_MARK = {False: ' ^', True: ' v'}
+
+# Caption of the direction toggle button (ASCII for the same reason
+# as _SORT_MARK).
+_SORT_DIR_CAP = {False: '^', True: 'v'}
 
 
 class DirCompareForm:
@@ -1789,12 +1909,14 @@ class DirCompareForm:
     them at once -- see the module docstring).
 
     Layout (all sizes are base pixels; DLG_SCALE adjusts them to the
-    OS DPI before the saved geometry is re-applied):
+    OS DPI before the saved geometry is re-applied, and _ui_scale()
+    does the same for the raw-pixel metrics that bypass DLG_SCALE --
+    list columns, item height, status cells):
 
       [ New compare... ][ Swap sides ][ Refresh ]            [ Close ]
       [ left path edit          ][Browse...]  [ right path edit   ][Br...]
-      [x]Different [x]Only left [x]Only right [x]Identical
-                        [x]Subfolders  Mask:[ edit ][ Apply ]
+      [x]Different [x]Only left [x]Only right [x]Identical [x]Subfolders
+         Sort by:[ combo ][^]                 Mask:[ edit ][ Apply ]
       +--------------------------------------------------------------+
       | Name | Folder | Status | Left size | Left date | R.size | R.date |
       | (owner-drawn listbox_ex, stretches with the form; every row  |
@@ -1814,7 +1936,10 @@ class DirCompareForm:
     / color_added of Command.cfg), so a row's color matches exactly
     what its double-clicked compare tab paints. The built-in column
     header is driven with the same pixel widths the painter uses, so
-    header clicks (sorting) align with the drawn cells.
+    header clicks (sorting) align with the drawn cells -- but the
+    header does not render on every CudaText build, so the visible
+    'Sort by' combo + direction button (Row C) mirror and drive the
+    same state everywhere.
     """
 
     DEF_W = 940
@@ -1916,7 +2041,9 @@ class DirCompareForm:
             'w': self.DEF_W, 'h': self.DEF_H,
             'w_min': self.MIN_W, 'h_min': self.MIN_H,
             'border': ct.DBORDER_SIZE,
-            'taskbar': 2,          # never a separate taskbar entry
+            'taskbar': 1,          # own OS taskbar entry: the window
+                                    # is restorable/pinnable like a
+                                    # normal app window
             'keypreview': True,    # form-level Enter/Esc/F5 (on_key_down)
             'on_close': self._on_close,
             'on_key_down': self._on_key,
@@ -1980,7 +2107,15 @@ class DirCompareForm:
                   'val': self._dir_r, 'texthint': _('right folder')})
         self._add('edit', 'ed_right', p)
 
-        # -- Row C: filters + subfolders + mask ------------------------
+        # -- Row C: filters | sort controls | mask (right) --------------
+        # Left group: the four status filters + Subfolders. Middle:
+        # the always-visible sort pair (column combo + direction
+        # button) -- the listbox header that used to be the only sort
+        # UI does not render on every CudaText build (on the reporting
+        # box the header never appears, so header clicks cannot sort
+        # there); the combo/button work everywhere and mirror the
+        # header state on builds where the header does render. Right,
+        # anchored to the form's right edge: Mask + Apply.
         prev = None
         for name, cap, checked in self.FILTER_CHECKS:
             p = {
@@ -2006,13 +2141,36 @@ class DirCompareForm:
             'act': True,      # without it the toggle would do nothing
             'on_change': self._on_check,
         })
-        self._add('label', 'lab_mask', {
-            'cap': _('Mask:'), 'h': 20, 'autosize': True, 'w': 44,
-            'a_l': ('chk_sub', ']'), 'sp_l': 20,
+        self._add('label', 'lab_sort', {
+            'cap': _('Sort by:'), 'h': 20, 'autosize': True, 'w': 56,
+            'a_l': ('chk_sub', ']'), 'sp_l': 24,
             'a_t': ('ed_left', ']'), 'sp_t': 12,
             'font_color': tcol,
         })
-        p = {'w': 170, 'h': 22, 'a_l': ('lab_mask', ']'), 'sp_l': 6,
+        self._add('combo', 'sort_col', {
+            'w': 150, 'h': 24,
+            'a_l': ('lab_sort', ']'), 'sp_l': 6,
+            'a_t': ('ed_left', ']'), 'sp_t': 8,
+            'items': '\t'.join(cap for cap, _a, _w in _LIST_COLUMNS),
+            'val': _LIST_COLUMNS[self._sort_col][0],
+            'on_change': self._on_sort_col,
+        })
+        self._add('button', 'btn_sort_dir', {
+            'cap': _SORT_DIR_CAP[self._sort_desc], 'w': 34, 'h': 24,
+            'a_l': ('sort_col', ']'), 'sp_l': 6,
+            'a_t': ('ed_left', ']'), 'sp_t': 8,
+            'on_change': self._on_button,
+        })
+        # Right group (right-anchored chain: Apply at the edge, the
+        # mask edit and its label to its left).
+        self._add('button', 'btn_apply', {
+            'cap': _('Apply'), 'w': 70, 'h': 24,
+            'a_r': ('', ']'), 'sp_r': 10,
+            'a_t': ('ed_left', ']'), 'sp_t': 8,
+            'on_change': self._on_button,
+        })
+        p = {'w': 170, 'h': 22,
+             'a_r': ('btn_apply', '['), 'sp_r': 6,
              'a_t': ('ed_left', ']'), 'sp_t': 9,
              'texthint': _('*.py; *.txt')}
         if ed_bg is not None:
@@ -2020,11 +2178,11 @@ class DirCompareForm:
         if ed_fg is not None:
             p['font_color'] = ed_fg
         self._add('edit', 'ed_mask', p)
-        self._add('button', 'btn_apply', {
-            'cap': _('Apply'), 'w': 70, 'h': 24,
-            'a_l': ('ed_mask', ']'), 'sp_l': 6,
-            'a_t': ('ed_left', ']'), 'sp_t': 8,
-            'on_change': self._on_button,
+        self._add('label', 'lab_mask', {
+            'cap': _('Mask:'), 'h': 20, 'autosize': True, 'w': 44,
+            'a_r': ('ed_mask', '['), 'sp_r': 6,
+            'a_t': ('ed_left', ']'), 'sp_t': 12,
+            'font_color': tcol,
         })
 
         # -- Statusbar (created before the list: the list anchors to it) --
@@ -2037,10 +2195,12 @@ class DirCompareForm:
         try:
             ct.statusbar_proc(self.h_sb, ct.STATUSBAR_ADD_CELL, tag=1)
             ct.statusbar_proc(self.h_sb, ct.STATUSBAR_ADD_CELL, tag=2)
+            sb_s = _ui_scale()   # cell sizes are raw pixels like the
+                                 # list columns -- scale them too
             ct.statusbar_proc(self.h_sb, ct.STATUSBAR_SET_CELL_SIZE,
-                              tag=1, value=430)
+                              tag=1, value=int(430 * sb_s))
             ct.statusbar_proc(self.h_sb, ct.STATUSBAR_SET_CELL_SIZE,
-                              tag=2, value=560)
+                              tag=2, value=int(560 * sb_s))
             sb_bg = _theme_color('StatusBg', _theme_color('ListBg'))
             sb_fg = _theme_color('StatusFont', _theme_color('ListFont'))
             if sb_bg is not None:
@@ -2070,8 +2230,8 @@ class DirCompareForm:
             'on_menu': self._on_list_menu,
             'on_draw_item': self._on_draw_item,
         }
-        li_bg = _theme_color('ListBg', ed_bg)
-        li_fg = _theme_color('ListFont', ed_fg)
+        li_bg = _theme_color('TreeBg', _theme_color('ListBg', ed_bg))
+        li_fg = _theme_color('TreeFont', _theme_color('ListFont', ed_fg))
         if li_bg is not None:
             p['color'] = li_bg
         if li_fg is not None:
@@ -2080,7 +2240,7 @@ class DirCompareForm:
         self.h_list = ct.dlg_proc(h, ct.DLG_CTL_HANDLE, name='list')
         try:
             ct.listbox_proc(self.h_list, ct.LISTBOX_SET_ITEM_H,
-                            index=LIST_ITEM_H)
+                            index=int(LIST_ITEM_H * _ui_scale()))
             ct.listbox_proc(self.h_list, ct.LISTBOX_SET_COLUMN_SEP,
                             text=COL_SEP)
             ct.listbox_proc(self.h_list, ct.LISTBOX_SET_COLUMNS,
@@ -2171,21 +2331,28 @@ class DirCompareForm:
         order: 0 (= auto-stretch) for Name, the fixed pixel width for
         every other column. The header splits its captions over these
         same widths; _col_layout derives the drawn cells' offsets from
-        the same table -- one source of truth for all three."""
-        return [0] + [w for _cap, _align, w in _LIST_COLUMNS[1:]]
+        the same table -- one source of truth for all three. Widths
+        are _ui_scale()d: LISTBOX_SET_COLUMNS bypasses the form's
+        DLG_SCALE while the list's font does not."""
+        s = _ui_scale()
+        return [0] + [int(w * s) for _cap, _align, w in _LIST_COLUMNS[1:]]
 
     def _col_layout(self, width):
         """Drawn-cell layout for a row 'width' pixels wide: a list of
         (x, w, align) per column, mirroring LISTBOX_SET_COLUMNS'
         semantics (fixed widths taken from the right edge of the given
-        width; Name gets the remainder)."""
-        fixed = [w for _cap, _align, w in _LIST_COLUMNS[1:]]
+        width; Name gets the remainder). Scaled by _ui_scale() like
+        _col_spec, so the drawn cells land exactly under the header
+        columns on high-DPI boxes too."""
+        s = _ui_scale()
+        fixed = [int(w * s) for _cap, _align, w in _LIST_COLUMNS[1:]]
         name_w = max(60, width - sum(fixed) - 4)
         out = [(0, name_w, 'L')]
         x = name_w + 2
         for (_cap, align, w) in _LIST_COLUMNS[1:]:
-            out.append((x, w - 6, align))
-            x += w
+            cw = int(w * s)
+            out.append((x, cw - 6, align))
+            x += cw
         return out
 
     def _sort_key(self, r):
@@ -2497,12 +2664,22 @@ class DirCompareForm:
         # maps statuses to) + the themed list/selection colors. A
         # None hunk color (cannot resolve) simply leaves those rows
         # uncolored -- never an error.
+        # 'bg' MUST be the color the listbox control paints its own
+        # background with. The dialog API's listbox_ex takes its
+        # background from the theme's TreeBg (CudaText maps the
+        # dialog listbox onto the treeview colors), NOT from the
+        # control's 'color' prop -- so uncolored rows (identical
+        # files, plain folders) painted with anything else show up
+        # as a tint. On the reporting box ListBg-themed F0F0F0 rows
+        # sat on a white list: every identical file looked grey.
         cfg = getattr(self._cmd, 'cfg', None) or {}
         self._colors = {
             'sel_bg': _theme_color('ListSelBg'),
             'sel_font': _theme_color('ListSelFont'),
-            'bg': _theme_color('ListBg', 0xF0F0F0),
-            'font': _theme_color('ListFont', 0x000000),
+            'bg': _theme_color('TreeBg',
+                               _theme_color('ListBg', 0xE4E4E4)),
+            'font': _theme_color('TreeFont',
+                                 _theme_color('ListFont', 0x000000)),
         }
         for k in ('color_changed', 'color_deleted', 'color_added'):
             v = cfg.get(k)
@@ -2673,6 +2850,10 @@ class DirCompareForm:
             self.start_scan()
         elif name == 'btn_close':
             self.close()
+        elif name == 'btn_sort_dir':
+            self._sort_desc = not self._sort_desc
+            self._fill_list()
+            self._sync_sort_controls()
         elif name == 'btn_apply':
             self.start_scan()
         elif name in ('btn_lbrw', 'btn_rbrw'):
@@ -2721,7 +2902,9 @@ class DirCompareForm:
     def _on_header(self, id_dlg, id_ctl, data='', info=''):
         """Column header click: sort by that column; clicking again
         toggles the direction (the rebuilt header carries the marker,
-        aligned with the drawn cells -- same width table)."""
+        aligned with the drawn cells -- same width table). The combo
+        and the direction button mirror the new state (they are the
+        only sort UI on builds where the header does not render)."""
         try:
             col = int(data)
         except (TypeError, ValueError):
@@ -2732,7 +2915,35 @@ class DirCompareForm:
             self._sort_col = col
             self._sort_desc = False
         self._fill_list()
+        self._sync_sort_controls()
+
+    def _on_sort_col(self, id_dlg, id_ctl, data='', info=''):
+        """The 'Sort by' combo: pick a column (captions are the plain
+        _LIST_COLUMNS names -- no sort marker). An unknown value (typed
+        free text) is ignored, keeping the current sort."""
+        cap = self._ctl_val('sort_col')
+        for i, (c, _a, _w) in enumerate(_LIST_COLUMNS):
+            if c == cap:
+                if i != self._sort_col:
+                    self._sort_col = i
+                    self._sort_desc = False
+                    self._fill_list()
+                    self._sync_sort_controls()
+                return
+
+    def _sync_sort_controls(self):
+        """Push the current sort state to the header, the combo and
+        the direction button -- one source of truth, three views."""
         self._apply_header()
+        self._set_ctl_val('sort_col',
+                          _LIST_COLUMNS[self._sort_col][0])
+        try:
+            # a button's caption is the 'cap' prop (a 'val' write is
+            # a no-op on buttons)
+            ct.dlg_proc(self.h, ct.DLG_CTL_PROP_SET, name='btn_sort_dir',
+                        prop={'cap': _SORT_DIR_CAP[self._sort_desc]})
+        except Exception:
+            pass
 
     def _sel_index(self):
         try:

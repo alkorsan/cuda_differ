@@ -1,3 +1,43 @@
+2026.10.05 (12th release, by @alkorsan)
+* fix: folder-compare GUI round, from the user's screenshots:
+  - the picker dialog ("Differ 2: compare folders") is now RESIZABLE
+    (DBORDER_SIZE, the combos stretch between the labels and the
+    Browse buttons, 560x140 minimum) and its size is remembered
+    (differ2.dirs.picker_geom); the layout is DLG_SCALEd like the
+    main window, which also fixes the eaten label text ("Left
+    folder (ol" / "Right folder (n") on high-DPI boxes -- the labels
+    were 96-DPI-fixed and the DPI-scaled font clipped them;
+  - the sort-direction marker is now plain ASCII (' ^' / ' v') on
+    the header and the new direction button: the Unicode triangles
+    (U+25B4/U+25BE) used before are missing from real-world UI fonts
+    and rendered as hollow boxes (tofu);
+  - new always-visible sort UI: a "Sort by" combo + direction button
+    in the filter row (middle), because the listbox header does not
+    render on every CudaText build -- on such builds header clicks
+    cannot sort at all. The combo, the button and the header mirror
+    one shared sort state;
+  - Mask: label + edit + Apply moved to the RIGHT edge of the filter
+    row (right-anchored chain), away from the checkboxes;
+  - identical files and plain folders are painted in the list's OWN
+    background color (the theme's TreeBg -- what the listbox control
+    paints itself with), no longer in ListBg: on light themes the
+    old fill showed as a grey tint over a white list, so every
+    identical file looked colored;
+  - the compare window now has its own OS taskbar entry
+    ('taskbar': 1): restorable/pinnable like a normal app window;
+  - DPI-safe raw-pixel metrics: the listbox column widths, row
+    height and statusbar cell sizes are multiplied by the factor
+    DLG_SCALE itself applies (measured once per process with a
+    96x96 probe form) -- they bypass DLG_SCALE while the control
+    font does not, so at 125% DPI every date cell was ellipsized
+    ('2026-10-04 ...'). Date columns also widened 125 -> 140 base
+    px. Anything unmeasurable degrades to 1.0 = the old layout.
+  Tests: the GUI simulator gained the picker-resize/remember round,
+  the ASCII-marker check, the sort combo/button battery, the
+  mask/apply anchor checks, the TreeBg plain-row paint check, the
+  taskbar=1 check and the forced-125% scale battery (columns, item
+  height, Name remainder, build wiring).
+
 2026.10.05 (11th release, by @alkorsan)
 - change: production cleanup -- the diagnostic machinery that hunted
   the update-6..10 slow-scan mystery is removed now that the mystery

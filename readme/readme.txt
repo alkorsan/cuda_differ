@@ -365,24 +365,36 @@ The window's controls:
   folder picker for that side.
 - Swap sides mirrors the whole comparison (left becomes right).
 - New compare... opens the picker dialog again -- the two combos
-  remember the last 12 folders used on each side.
+  remember the last 12 folders used on each side. The dialog is
+  resizable (the combos stretch with it) and its size is remembered
+  across sessions; the layout is DPI-scaled, so the labels keep
+  their full text ("Left folder (old):" / "Right folder (new):") on
+  high-DPI screens too.
 - The status filters (Different / Only left / Only right / Identical)
   hide or show rows instantly, without rescanning. Uncheck
   "Identical" for the usual "show me what matters" view.
 - The Subfolders checkbox switches between the full recursive tree
   (default) and the two top folders only; changing it rescans.
-- The Mask edit filters files by wildcard pattern ("*.py; *.txt"),
-  WinMerge-style: matching files are compared, everything else is not
-  listed at all. It applies on Apply (or Enter when the list has
-  focus).
-- Click a column header to sort by that column (Name, Folder, Status,
-  left/right size or date); click again to reverse. Column widths are
-  fixed (Name stretches with the window) so the header always aligns
-  with the drawn rows.
+- The Mask edit (on the right of the filter row) filters files by
+  wildcard pattern ("*.py; *.txt"), WinMerge-style: matching files
+  are compared, everything else is not listed at all. It applies on
+  Apply (or Enter when the list has focus).
+- Sorting works two ways, always in sync: click a column header
+  (Name, Folder, Status, left/right size or date) where headers
+  render, or use the always-visible "Sort by" combo + direction
+  button in the filter row -- some CudaText builds do not render
+  the listbox header at all, and the combo/button are the only sort
+  UI there. The direction marker is plain ASCII (^ / v): the
+  Unicode triangles used before rendered as hollow boxes on real
+  UI fonts. Column widths are DPI-scaled (Name stretches with the
+  window) so the header and the drawn rows stay aligned and dates
+  never clip at 125% scaling.
 - The status bar shows the scan progress / result line on the left
   and the counts (Different / Only left / Only right / Identical) on
   the right.
-- The window remembers its size and position across sessions.
+- The window remembers its size and position across sessions and
+  has its own OS taskbar entry (restorable/pinnable like a normal
+  application window).
 
 Row colors (the whole line, WinMerge/Beyond-Compare style): every row
 is painted with the SAME colors the diff tabs use for their hunks, so
@@ -392,8 +404,11 @@ will paint:
   Different      the changed-lines color (color_changed)
   Only left      the deleted-lines color (color_deleted)
   Only right     the added-lines color (color_added)
-  Identical /    no fill (the theme's list background) -- that is
-  Folder         what makes the colored rows pop
+  Identical /    no fill -- painted in the list's OWN background
+  Folder         color (the theme's TreeBg), so identical rows are
+                 indistinguishable from the empty list area: no
+                 grey-on-white tint, and that is what makes the
+                 colored rows pop
 
 The selected row shows the theme's list-selection colors instead
 (selection wins, like in an editor). The colors follow the
