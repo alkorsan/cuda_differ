@@ -1,3 +1,37 @@
+2026.10.05 (27th release, by @alkorsan)
+* fix: files and folders with the status "Cannot read" had no row
+  color and no count in the status bar (report: 'files or folders with
+  status "cannot read" must be colourised in red and shown in status
+  bar like the other statuses'). They now paint RED: a new color_error
+  slot joins the compare-color system -- a red per theme family
+  (white #ff9999, grey #e68080, black #8c3a3a), clearly deeper than
+  the deleted pink so an unreadable row never reads as a one-sided
+  one; it is configurable like every other color (Custom mode:
+  differ2.theme.error_color, empty fills from the preset). The status
+  bar's counts line closes with "Cannot read: N" -- always shown,
+  zero included, like every other status; a folder rolled up to
+  "Cannot read" counts and paints red too (the painter reads the
+  rolled-up status first, so color, caption and counters can never
+  disagree).
+* add: "Open containing folder (left)/(right)" in the dir-compare
+  context menu (report: 'add "open containing folder" to context menu
+  of dir compare for all folders and files'). Offered for every row --
+  file or folder, any status -- one item per side that exists (a
+  both-sides row has two different containing folders, one per tree).
+  It reveals the item SELECTED in its parent folder: Explorer's
+  /select on Windows, Finder's open -R on macOS, the plain containing
+  folder on Linux (xdg-open has no selection verb). A row whose
+  containing folder is gone since the scan falls back to the plain
+  opener, which reports it in its own error box. Nothing was removed:
+  the existing per-side open / show-in-file-manager / copy-path items
+  stay as they were.
+* change: the Browse buttons of the compare view's path row and of
+  the folder picker read "..." instead of "Browse..." (report:
+  'change browse... text to ...'). The drawn buttons are measured
+  from the caption as before, so the compact label keeps its own
+  width at every font/DPI; nothing else about the buttons moved (the
+  anchors, the 50/50 path split, the folder picker they open).
+
 2026.10.05 (26th release, by @alkorsan)
 * fix: a folder with mixed content showed "Mixed" -- the user's rule
   is stricter and simpler (report: "when a folder have identical and

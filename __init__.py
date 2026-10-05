@@ -482,7 +482,7 @@ _PROPS_TO_COPY = [
 #   auto   detect the light family of the current UI theme and use its
 #          preset (the default)
 #   white/black/grey   use that family's preset unconditionally
-#   custom   use the six differ2.theme.*_color options; empty slots are
+#   custom   use the seven differ2.theme.*_color options; empty slots are
 #          filled from the auto-detected preset
 # ----------------------------------------------------------------------------
 # UI-theme name -> light family the preset colors are tuned for ('' is
@@ -515,6 +515,11 @@ _COLOR_PRESETS = {
         'changed': '#f8dfad',
         'added': '#b3ffb3',
         'deleted': '#ffc4c4',
+        # error: a RED, clearly deeper than the deleted pink so an
+        # unreadable row never reads as a one-sided one (27th release:
+        # 'files or folders with status "cannot read" must be
+        # colourised in red')
+        'error': '#ff9999',
         'gap': '#e3e3e3',
         'ignored': '#ffffff',
         'ignored_gap': '#ffffff',
@@ -526,6 +531,7 @@ _COLOR_PRESETS = {
         'changed': '#ebd493',
         'added': '#a2e3a2',
         'deleted': '#f4b6b6',
+        'error': '#e68080',      # white's #ff9999 deepened ~25
         'gap': '#cdcdcd',
         'ignored': None,
         'ignored_gap': None,
@@ -535,6 +541,9 @@ _COLOR_PRESETS = {
         'changed': '#55482e',
         'added': '#2d5230',
         'deleted': '#5c3232',
+        # brighter than the deleted maroon so the red reads as an
+        # ERROR on dark lists while white captions keep ~3:1 on it
+        'error': '#8c3a3a',
         'gap': '#3d3d3d',
         'ignored': None,
         'ignored_gap': None,
@@ -542,10 +551,13 @@ _COLOR_PRESETS = {
 }
 
 # Preset key -> config key (the one difference: 'gap' -> 'color_gaps').
+# 'error' has no diff-tab counterpart -- only the folder-compare view
+# reads color_error (the red of Cannot-read rows).
 _PRESET_CFG_KEYS = {
     'changed': 'color_changed',
     'added': 'color_added',
     'deleted': 'color_deleted',
+    'error': 'color_error',
     'gap': 'color_gaps',
     'ignored': 'color_ignored',
     'ignored_gap': 'color_ignored_gap',
@@ -615,7 +627,8 @@ def _detect_theme_type():
 
 
 def _preset_colors(theme_type):
-    """The six compare colors (ints) of a preset family. None entries
+    """The preset compare colors (ints) of a preset family (the six
+    hunk colors + the folder view's error red). None entries
     resolve to the live editor background, so ignored differences always
     blend into the active theme."""
     preset = _COLOR_PRESETS[theme_type]
@@ -638,14 +651,14 @@ OPTS_META = [
     # --- chapter "theme": colors used to paint the compare view ----------
     {'opt': 'differ2.theme.color_theme',
      'cmt': _('Color theme\n'
-              'Which compare colors to use. The six color options below '
+              'Which compare colors to use. The seven color options below '
               'only apply in the "Custom" mode.\n'
               '- Auto-detect -- detect the light family of the current UI '
               'theme (by theme name, luminance of the editor background as '
               'fallback) and use its preset. Recommended.\n'
               '- White / Grey / Black -- use that family\'s preset colors, '
               'tuned for white / light-grey / dark editor backgrounds.\n'
-              '- Custom -- use the six color options below; each option '
+              '- Custom -- use the seven color options below; each option '
               'left empty is filled from the auto-detected preset.\n'
               'Note: in the Grey and Black presets the ignored-difference '
               'colors always resolve to the live editor background, so '
@@ -693,6 +706,18 @@ OPTS_META = [
               'Also colors the char-level highlights inside deleted lines, '
               'the margin markers, the micromap highlights and the overview '
               'panel.\n'
+              'Only used when "Color theme" is Custom; leave empty to fill '
+              'this slot from the auto-detected preset.'),
+     'def': '',
+     'frm': '#rgb-e',
+     'chp': 'theme',
+     },
+    {'opt': 'differ2.theme.error_color',
+     'cmt': _('Color of unreadable items (folder compare)\n'
+              'Background color the folder-compare view paints the rows '
+              'whose item could not be read -- files and folders with the '
+              'status "Cannot read" (stat or open failed, permissions, '
+              'broken link...). A red tint in every preset family.\n'
               'Only used when "Color theme" is Custom; leave empty to fill '
               'this slot from the auto-detected preset.'),
      'def': '',
@@ -6773,13 +6798,13 @@ class Command:
         rewrite at any time.)"""
 
         def get_theme():
-            """Resolve the six compare colors from the 'color_theme'
+            """Resolve the preset compare colors from the 'color_theme'
             option (see the _COLOR_PRESETS / _detect_theme_type block at
             module level):
 
             - 'auto' -- preset of the detected theme family;
             - 'white'/'grey'/'black' -- that family's preset;
-            - 'custom' -- the six differ2.theme.*_color options, each
+            - 'custom' -- the seven differ2.theme.*_color options, each
               option left EMPTY filled from the auto-detected preset
               (a half-configured custom theme never falls back to
               nothing).
@@ -6829,6 +6854,8 @@ class Command:
                 t['color_added'],
             'color_deleted':
                 t['color_deleted'],
+            'color_error':
+                t['color_error'],
             'color_gaps':
                 t['color_gaps'],
             'color_ignored':

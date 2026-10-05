@@ -274,11 +274,12 @@ indented under the folder row, in the same window.
   Folder        a folder with nothing compared inside yet (empty, or
                 while the scan has not reached it)
   Cannot read   stat/open failed (permissions, broken link...) --
-                always shown, whatever the filters say. A folder
-                reads "Cannot read" when its only comparable content
-                is unreadable, or when everything KNOWN inside is
-                identical but something could not be read (cannot
-                claim "Identical", nothing known to differ)
+                always shown, whatever the filters say, and painted
+                RED (the error color, color_error -- see "Row colors"
+                below). A folder reads "Cannot read" when its only
+                comparable content is unreadable, or when everything
+                KNOWN inside is identical but something could not be
+                read (cannot claim "Identical", nothing known to differ)
 
 A folder's Status cell and row color always describe its CONTENT:
 pure captions only on uniform content, any mix reads "Different"
@@ -397,7 +398,8 @@ The window's controls:
   never overlap on a small window, and each keeps half the row at
   every size. Type two paths and press Refresh (or Enter) to compare
   them; the Browse buttons next to them open a folder picker for
-  that side. A window too small for its own rows is not offered:
+  that side (their caption is the compact "..."). A window too
+  small for its own rows is not offered:
   the minimum width is computed from the rows' measured content at
   the current UI font, and a remembered window size below it opens
   at the default size instead.
@@ -540,11 +542,13 @@ The window's controls:
   tree gutter with its +/- markers) grows with it. Set a 14 pt UI
   font and the whole list scales up to it, rows included.
 - The status bar shows the scan progress / result line on the left
-  and the counts (Different / Only left / Only right / Identical) on
-  the right. The counters follow what the Status column SHOWS: a
-  folder rolled up to "Different" counts as Different, a uniform
-  only-left folder counts as Only left -- the counters never
-  disagree with the cells. Its cells carry no
+  and the counts (Different / Only left / Only right / Identical /
+  Cannot read) on the right. The counters follow what the Status
+  column SHOWS: a folder rolled up to "Different" counts as
+  Different, a uniform only-left folder counts as Only left, an
+  unreadable item counts as Cannot read -- the counters never
+  disagree with the cells, and every status is always listed (zero
+  included) like the others. Its cells carry no
   defined width: the status cell
   auto-fits its text and the counts cell stretches over the rest of
   the bar, so both shrink and grow with the dialog; the bar grows
@@ -576,6 +580,12 @@ will paint:
   Different      the changed-lines color (color_changed)
   Only left      the deleted-lines color (color_deleted)
   Only right     the added-lines color (color_added)
+  Cannot read    the error color (color_error) -- a RED tint in
+                 every theme family, clearly deeper than the
+                 deleted pink so an unreadable row never reads as a
+                 one-sided one; it has no diff-tab counterpart, it
+                 is the folder view's own color (configurable in
+                 Custom mode via differ2.theme.error_color)
   Identical /    no fill -- painted in the list's OWN background
   Folder         color (the theme's TreeBg), so identical rows are
                  indistinguishable from the empty list area: no
@@ -590,9 +600,10 @@ painted with the changed color and reads "Different" -- you can see
 a folder matters without expanding it; a folder whose contents are
 all identical reads "Identical" (no fill); a folder whose content is
 ALL one-sided reads "Only left"/"Only right" in the deleted/added
-color (see the status table above for the full rules). Folder rows
-always carry the FOLDER icon: the icon tells the kind, the color and
-caption tell the status.
+color (see the status table above for the full rules); a folder
+rolled up to "Cannot read" paints red like an unreadable file. Folder
+rows always carry the FOLDER icon: the icon tells the kind, the color
+and caption tell the status.
 
 The selected row shows the theme's list-selection colors instead
 (selection wins, like in an editor). The colors follow the
@@ -626,7 +637,13 @@ Working with rows:
   see the copy as identical; copytree for folders, only into a
   missing destination), Delete from left/right, open a side's file,
   show a side's file/folder in the OS file manager, copy a side's
-  full path. Copy/delete of a FILE patches just that row in place
+  full path, and Open containing folder (left/right) -- the OS
+  file manager opens at the item's PARENT with the item SELECTED
+  where the platform can: Explorer's /select on Windows, Finder's
+  open -R on macOS, the plain folder on Linux (xdg-open has no
+  selection verb). It is offered for every row -- files and
+  folders, any status -- one item per side that exists. Copy/delete
+  of a FILE patches just that row in place
   (re-stat + re-compare of that one pair -- no rescan); folder
   operations rescan the tree. Everything asks for confirmation first
   (differ2.dirs.confirm_ops).
@@ -1179,19 +1196,19 @@ Theme section:
       grey; syn -> white); unknown/custom themes fall back to the
       luminance of the editor background. Recommended.
     * white -- preset tuned for white editor backgrounds:
-      changed #f8dfad, added #b3ffb3, deleted #ffc4c4, gap #e3e3e3,
-      ignored and ignored gap #ffffff.
+      changed #f8dfad, added #b3ffb3, deleted #ffc4c4, error #ff9999,
+      gap #e3e3e3, ignored and ignored gap #ffffff.
     * grey -- preset tuned for light-grey editor backgrounds (#E0E0E0,
       like the green/navy themes): the white family's colors deepened
       ~25 units, so they keep their contrast against grey.
     * black -- preset tuned for dark editor backgrounds (muted, so the
       diff blocks do not glare on dark themes).
-    * custom -- use the six color options below; every option left
+    * custom -- use the seven color options below; every option left
       empty is filled from the auto-detected preset, so a
       half-configured custom theme never falls back to nothing.
   In the grey and black presets the ignored-difference colors resolve to
   the live editor background, so ignored regions blend into the active
-  theme. The six color options below only apply in the "custom" mode.
+  theme. The seven color options below only apply in the "custom" mode.
 - differ2.theme.changed_color: Color of changed lines
   Background color for lines that were modified (replaced with different
   content). Also colors the char-level highlights inside modified lines,
@@ -1208,6 +1225,14 @@ Theme section:
   Background color for lines that exist only in the left file (removed).
   Also colors the char-level highlights inside deleted lines, the margin
   markers, the micromap highlights and the overview panel.
+  Only used when "Color theme" is custom; leave empty to fill this slot
+  from the auto-detected preset.
+- differ2.theme.error_color: Color of unreadable items (folder compare)
+  Background color the folder-compare view paints the rows whose item
+  could not be read -- files and folders with the status "Cannot read"
+  (stat or open failed, permissions, broken link...). A red tint in
+  every preset family, distinct from the deleted pink. It has no
+  diff-tab counterpart: only the folder view reads it.
   Only used when "Color theme" is custom; leave empty to fill this slot
   from the auto-detected preset.
 - differ2.theme.gap_color: Color of inter-line gap background

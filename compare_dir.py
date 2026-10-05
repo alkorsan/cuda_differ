@@ -265,6 +265,11 @@ theme presets):
   Different             -> color_changed  (the changed-hunks color)
   Only left (+folders)  -> color_deleted  (the deleted-hunks color)
   Only right (+folders) -> color_added    (the added-hunks color)
+  Cannot read (+folders rolled up to it)
+                        -> color_error   (a RED tint in every theme
+                          family; the 27th release: 'files or folders
+                          with status "cannot read" must be colourised
+                          in red')
   Identical / Folder    -> no fill (the theme's TreeBg -- the exact
                           color the listbox control paints its own
                           background with, so uncolored rows are
@@ -481,6 +486,16 @@ the affected row in place (re-stat + re-hash of just that pair, which
 is instant for the size test and one small read otherwise); folder
 operations restart the scan (the tree shape changed). The window
 never syncs anything behind the user's back.
+
+The menu also offers "Open containing folder (left/right)" for every
+row -- file or folder, any status, one item per side that exists (the
+27th release: 'add "open containing folder" to context menu of dir
+compare for all folders and files'). It reveals the item SELECTED in
+its parent folder (_reveal_in_file_manager): Explorer's /select on
+Windows, Finder's open -R on macOS, the plain containing folder on
+Linux (xdg-open has no selection verb). A row whose containing folder
+is gone since the scan falls back to the plain opener, which reports
+it in its own error box.
 """
 
 import base64
@@ -713,12 +728,20 @@ STATUS_SEVERITY = {
 # mixed-content folder gets the changed color -- exactly what its
 # 'Different' caption claims (26th release: 'it must show diferent
 # and colorize the row with the different color').
+#
+# color_error does not exist in the diff tabs -- it is the dir view's
+# own preset slot (a red per theme family, see __init__.py's
+# _COLOR_PRESETS), added in the 27th release: 'files or folders with
+# status "cannot read" must be colourised in red'. A folder whose
+# rollup reads Cannot read paints red like an unreadable file --
+# the painter reads _es first, so both go through this one entry.
 ST_COLOR_KEY = {
     ST_DIFF:      'color_changed',
     ST_LONLY:     'color_deleted',
     ST_DIR_LONLY: 'color_deleted',
     ST_RONLY:     'color_added',
     ST_DIR_RONLY: 'color_added',
+    ST_ERR:       'color_error',
 }
 
 # Compare methods (differ2.dirs.compare_method).
@@ -1444,6 +1467,43 @@ def _open_in_file_manager(path):
             subprocess.Popen(['open', path])
         else:
             subprocess.Popen(['xdg-open', path])
+    except Exception as ex:
+        ct.msg_box(_('Cannot open in file manager:\n{}\n\n{}').format(
+            path, ex), ct.MB_OK + ct.MB_ICONERROR)
+
+
+def _reveal_in_file_manager(path):
+    """Open the OS file manager at the folder CONTAINING 'path', with
+    'path' itself selected where the platform can (the 27th release:
+    'add "open containing folder" to context menu of dir compare for
+    all folders and files').
+
+    Explorer /select,<path> on Windows (selects the item in its parent
+    -- for a folder row this selects the folder in the compare root,
+    for a file row the file in its folder); 'open -R' on macOS (Finder
+    reveals and selects); on Linux xdg-open has no selection verb, so
+    the containing folder opens plain. The item itself need not exist
+    (a row can go stale after the scan) -- the containing folder is
+    what gets opened; when even that folder is gone, the plain opener
+    runs and reports it in its own error box.
+    """
+    folder = os.path.dirname(path)
+    if not folder or not os.path.isdir(folder):
+        _open_in_file_manager(path)
+        return
+    try:
+        if sys.platform.startswith('win'):
+            # explorer's select switch wants the whole '/select,<path>'
+            # as one command line, quotes around a path with spaces; it
+            # also exits nonzero even on success -- nothing is checked.
+            subprocess.Popen('explorer /select,"{}"'.format(path))
+        elif sys.platform == 'darwin':
+            try:
+                subprocess.Popen(['open', '-R', path])
+            except Exception:
+                subprocess.Popen(['open', folder])
+        else:
+            subprocess.Popen(['xdg-open', folder])
     except Exception as ex:
         ct.msg_box(_('Cannot open in file manager:\n{}\n\n{}').format(
             path, ex), ct.MB_OK + ct.MB_ICONERROR)
@@ -2577,7 +2637,11 @@ class _PickerDialog:
     MIN_W = 560
     MIN_H = 140
     LABEL_W = 150          # "Right folder (new):" fits at 96 DPI
-    BRW_W = 90
+    # pre-DLG_SCALE fallback only -- sync() re-measures from the live
+    # caption; with the "..." caption (27th release: 'change browse...
+    # text to ...') the measured width is the real one, this just keeps
+    # the pre-sync fallback in the same ballpark.
+    BRW_W = 50
     ROW_Y0 = 12
     ROW_DY = 34
 
@@ -2674,14 +2738,17 @@ class _PickerDialog:
             # left AND right anchors and stretches across the form.
             # A DRAWN button (see the probe block above): themed face
             # + measured width, like every button in the main window.
+            # Caption "..." (27th release: 'change browse... text to
+            # ...') -- the compact folder-picker button; the probe and
+            # sync() measure it like any other caption.
             self._drawn['brw_' + side] = _DrawnBtn(
-                self, 'brw_' + side, _('Browse...'), {
+                self, 'brw_' + side, _('...'), {
                     'w': self.BRW_W, 'h': 26,
                     'a_l': None, 'a_r': ('', ']'), 'sp_r': 12,
                     'a_t': top, 'sp_t': sp_t,
                 },
                 self._on_button, colors=_pal,
-                text_w=_probe_text_w(self.h, _('Browse...'),
+                text_w=_probe_text_w(self.h, _('...'),
                                      self._probe_gap),
             )
             # the only control meant to stretch: BOTH a_l (label's
@@ -3105,7 +3172,10 @@ class DirCompareForm:
     # PATH_GAP is the centered splitter's width.
     PATH_W = 330
     PATH_GAP = 12
-    BRW_W = 82
+    # pre-DLG_SCALE fallback only -- the drawn buttons re-measure from
+    # the "..." caption in sync() (27th release: 'change browse... text
+    # to ...').
+    BRW_W = 50
 
     # Row C (filters). The checks are DRAWN toggles now (_DrawnBtn
     # chk mode): the click fires on_click, the state lives here
@@ -3401,12 +3471,12 @@ class DirCompareForm:
         ed_prop = {'w': self.PATH_W, 'h': 26, 'a_t': ('btn_new', ']'),
                    'sp_t': 8}      # w: pre-DLG_SCALE fallback only --
                                    # the stretch anchors decide live
-        _btn('btn_lbrw', _('Browse...'), {
+        _btn('btn_lbrw', _('...'), {
             'w': self.BRW_W, 'h': 26,
             'a_l': None, 'a_r': ('sp_mid', '['), 'sp_r': 0,
             'a_t': ('btn_new', ']'), 'sp_t': 8,
         })
-        _btn('btn_rbrw', _('Browse...'), {
+        _btn('btn_rbrw', _('...'), {
             'w': self.BRW_W, 'h': 26,
             'a_l': ('sp_mid', ']'), 'sp_l': 0,
             'a_r': None,
@@ -4451,7 +4521,7 @@ class DirCompareForm:
         # its cell says Different, and that is the whole rule: the
         # counters never disagree with the Status column.
         rows = self._rows
-        n_diff = n_l = n_r = n_same = 0
+        n_diff = n_l = n_r = n_same = n_err = 0
         for r in rows:
             st = r.get('_es', r['status'])
             if st == ST_DIFF:
@@ -4460,11 +4530,19 @@ class DirCompareForm:
                 n_l += 1
             elif st in (ST_RONLY, ST_DIR_RONLY):
                 n_r += 1
+            elif st == ST_ERR:
+                n_err += 1
             elif st in (ST_SAME, ST_DIR):
                 n_same += 1
+        # 'Cannot read' is a first-class status in the bar like the
+        # others (27th release: 'shown in status bar like the other
+        # statuses') -- always shown, zero included, so the bar never
+        # hides a status the way the pre-27th bar did (err rows fell
+        # into no bucket at all).
         self._sb_text(2, _('Different: {}   Only left: {}   '
-                           'Only right: {}   Identical: {}').format(
-                               n_diff, n_l, n_r, n_same))
+                           'Only right: {}   Identical: {}   '
+                           'Cannot read: {}').format(
+                               n_diff, n_l, n_r, n_same, n_err))
 
     def _sb_text(self, tag, text):
         if self.h_sb:
@@ -4592,7 +4670,8 @@ class DirCompareForm:
             'font': _theme_color('TreeFont',
                                  _theme_color('ListFont', 0x000000)),
         }
-        for k in ('color_changed', 'color_deleted', 'color_added'):
+        for k in ('color_changed', 'color_deleted', 'color_added',
+                  'color_error'):
             v = cfg.get(k)
             if isinstance(v, int):
                 self._colors[k] = v
@@ -5226,6 +5305,20 @@ class DirCompareForm:
         add(_('Delete from left'), lambda: self._act_delete(row, 'l'), has_l)
         add(_('Delete from right'), lambda: self._act_delete(row, 'r'),
             has_r)
+        ct.menu_proc(hm, ct.MENU_ADD, caption='-')
+        # Open containing folder (27th release: 'add "open containing
+        # folder" to context menu of dir compare for all folders and
+        # files'): every row, file or folder, whatever its status --
+        # each side that exists gets its own item (a both-sides row has
+        # two different containing folders, one per tree). It reveals
+        # the item SELECTED in its parent: the file in its folder, a
+        # folder in the compared root.
+        if has_l:
+            add(_('Open containing folder (left)'),
+                lambda: _reveal_in_file_manager(pl))
+        if has_r:
+            add(_('Open containing folder (right)'),
+                lambda: _reveal_in_file_manager(pr))
         ct.menu_proc(hm, ct.MENU_ADD, caption='-')
         if isdir:
             if has_l:
