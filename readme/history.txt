@@ -1,3 +1,90 @@
+2026.10.05 (21st release, by @alkorsan)
+* fix: six reported folder-compare GUI problems, all in one round.
+  (1) IDENTICAL FOLDERS said "Folder": the rolled-up folder status
+  (the worst status of a folder's subtree) was only set when it was
+  WORSE than "Identical" -- a folder whose whole subtree compared
+  identical kept the plain "Folder" caption. The rollup bar is now
+  "plain Folder" instead of "Identical" (one comparison widened in
+  _build_view), so an all-identical folder reads "Identical", sorts
+  with the identical files and follows the "Identical" filter; a
+  folder with differences inside still reads "Different", and a
+  folder with nothing scanned below (empty, or mid-scan) keeps the
+  honest "Folder".
+  (2) THE NAME COLUMN VANISHED on a shrunken window: TATListbox's
+  own column split gives the auto-stretch column Max(0, ClientWidth
+  - fixed sum) -- with the six fixed columns summing past a narrow
+  list, Name went to ZERO pixels (source-verified atlistbox.pas).
+  The plugin now pushes the EFFECTIVE widths: Name has a guaranteed
+  floor (140 base px, DPI/font-scaled), and when the fixed sum would
+  eat past it the FIXED columns are scaled down proportionally --
+  the file name stays visible and every column stays on screen. The
+  header, the drawn rows and the drag hit tests all read the same
+  effective set, and the form's on_resize re-derives it live.
+  (3) THE PATH BOXES had fixed 330px widths: they needed 856px and
+  overlapped from the 700px floor down (the report: "the path box
+  should shrink and grow with the window, and each one must occupy
+  50% width of the line ... when window is small they overlap on
+  each other"). The row is now pure anchors: a tiny label CENTERED
+  on the form (a_l=('', '-') -- the LCL asrCenter anchor), each
+  Browse button against its side, each path edit STRETCHING from its
+  window edge to its Browse button -- symmetric geometry, so both
+  edits are exactly half the row at EVERY width and can never
+  overlap. The Mask edit stretches the same way (its fixed 170px was
+  the filter row's last collision), and the minimum window width is
+  now COMPUTED from the rows' measured content at the current font
+  (a remembered window below it opens at the default size -- a
+  programmatic PROP_SET bypasses the form's constraints, so the
+  guard runs at the restore).
+  (4) BUTTON TEXT WAS EATEN FROM THE START: fixed button widths met
+  bigger fonts and longer translations. Every button's width is now
+  MEASURED in the UI font through a hidden probe button whose
+  'autosize' re-trigger runs the app's own TATButton.SetAutoSize math
+  -- caption + symmetric padding, never a clipped glyph at any
+  font/DPI/translation.
+  (5) BUTTON TEXT INVISIBLE on a dark theme: the app's themed button
+  (button_ex/TATButton) paints bg/border/caption STRICTLY from the
+  global ATFlatTheme keys, and a theme that defines the dark
+  ButtonBgPassive without ButtonFont leaves the caption at the dark
+  built-in default $202020 (proc_colors.pas) -- dark-on-dark. No
+  dialog prop can reach those painted surfaces (proc_customdialog
+  creates TATButton bare; 'color'/'font_color' set Control.Color /
+  Font.Color, which the paint overwrites).
+  (6) BUTTONS HARD TO TELL FROM INPUT BOXES: both were flat
+  theme-colored rectangles.
+  (5)+(6) fixed together by making every button and filter toggle a
+  DRAWN control (_DrawnBtn): a one-item owner-drawn listbox whose
+  whole face the plugin paints -- face = a 10% blend of the window's
+  own background toward its text color (pressed 24%, hover 17%),
+  border = 38%, caption = the window's own text color, all derived
+  from the TabBg/TabFont pair that a usable theme cannot get wrong:
+  readable in EVERY theme by construction, clearly distinct from
+  both the window and the paper-colored input boxes (a button reads
+  as a button), with hover and pressed shading via the mouse events
+  every control kind receives. The filter checks are the same drawn
+  control in flat mode: the window's own color shows through, the
+  checkbox glyph is drawn on the canvas (scaling with the font -- a
+  fixed 16px PNG cannot), the caption in the window's text color.
+  The single drawn item's band is pinned >= the control height so no
+  theme-colored underfill shows; repaints ride the documented
+  LISTBOX_SET_ITEM_H invalidate-on-change (formmain_py_api.inc).
+* tests: GUI suite 456 checks (was 341) -- identical-folder battery
+  (all-identical subtree -> "Identical" + _es=ST_SAME + identical
+  sort slot; empty folder keeps "Folder"), Name-floor battery
+  (window 940/860/760 at forced 125%: Name >= floor, the seven
+  columns FIT the list, on_resize re-pushes, widening restores),
+  50/50 path battery (five window widths: equal edit widths, no
+  overlap, symmetric halves), drawn-button battery (kind/drawn/
+  measured widths/caption painted/face+border on canvas, hover-
+  pressed repaint counter, click routes through the original
+  handler), broken-button dark theme (ButtonFont left dark: palette
+  still TabFont-based, face != ButtonBgPassive), grey-theme face
+  distinctness, computed width floor (mask usable at w_min), saved
+  geometry below the floor dropped; the checks/toolbar batteries
+  re-based from button_ex to the drawn controls; ctstub: '-'
+  anchors center over the target (asrCenter semantics), LISTBOX_
+  SET_ITEM_H invalidation counter, resize() helper. Scanner/span/
+  import suites unchanged and green; static_check clean.
+
 2026.10.05 (20th release, by @alkorsan)
 * fix: the third theme-consistency round (reported: "text font color of
   hint in mask box in some themes is hard to read see pic / the box

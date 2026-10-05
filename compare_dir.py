@@ -389,29 +389,47 @@ control type the app itself builds its single-line inputs from:
   route editor-backed names transparently, so every existing call
   site (start_scan, swap, Browse, mask) is unchanged.
 
-The BUTTONS are button_ex controls too -- non-flat TATButton: it
-paints its background in ATFlatTheme.ColorBgPassive, border in
-ColorBorderPassive, caption in ColorFont (all wired from the UI
-theme keys ButtonBgPassive/ButtonBorderPassive/ButtonFont, with
-ColorBgOver/ColorBorderOver on hover and ColorBgDisabled when off).
-A native TButton is drawn by the OS visual style and stays OS-gray
-in every theme (the 6th-round report: 'buttons color does not use
-theme colors it s always grey'); button_ex fires the very same
-'on_change' on click (proc_customdialog.pas wires both TButton and
-TATButton OnClick to DoOnChange), so the swap changes nothing in
-behavior. The filter CHECKS stay FLAT button_ex (see below) -- a
-check must not paint a button face.
+The BUTTONS are DRAWN buttons (_DrawnBtn) -- one-item owner-drawn
+listbox_ex controls whose whole face is the plugin's. Why not the
+control kinds the API offers (three rounds of reports -- 'always
+grey', then 'text is invisible' on dark themes, then 'hard to
+differentiate a button from an input box'):
+* 'button' (native TButton) is drawn by the OS visual style and
+  stays OS-gray in every theme;
+* 'button_ex' (non-flat TATButton) paints bg/border/caption STRICTLY
+  from the GLOBAL ATFlatTheme (wired from the UI theme keys
+  ButtonBgPassive/ButtonBorderPassive/ButtonFont,
+  formmain_themes.inc). A theme that defines the dark ButtonBgPassive
+  but not ButtonFont leaves the caption at the built-in dark default
+  $202020 (proc_colors.pas nColorText) -- INVISIBLE on the dark face
+  (the 21st report), and NO dialog prop or button_proc action can
+  reach those painted surfaces (proc_customdialog.pas creates
+  TATButton bare; 'color'/'font_color' set Control.Color/Font.Color,
+  which DoPaintTo overwrites);
+* 'label' is fully colorable but cannot center its caption
+  (TLabel support in proc_customdialog.pas: ex0 = right-align only).
+So each drawn button paints its face in a color DERIVED from the
+form's own TabBg/TabFont pair (_btn_palette: face = 10% blend of the
+form bg toward its text color, pressed 24%, hover 17%, border 38%),
+caption in the form's own text color -- readable in EVERY theme by
+construction, distinct from both the form and the paper-colored
+'editor' inputs (a button reads as a button), with hover and pressed
+shading through the on_mouse_enter/exit/down/up events every control
+kind gets. The width is MEASURED -- a hidden button_ex probe
+(_add_probe) whose 'autosize' re-trigger measures the caption in the
+themed UI font (TATButton.SetAutoSize, the app's own math), so no
+caption can ever be eaten at any font/DPI/translation.
 
-The status FILTER CHECKS are not native TCheckBox controls but flat
-button_ex buttons with chk_on/chk_off imagelist glyphs -- cuda_prefs'
-own pattern: under Windows visual styles the OS theme draws a native
-checkbox's caption and ignores Font.Color, so the captions stayed
-black on black themes (the 5th-round report). TATButton paints its
-caption in the themed UI font color and flat paints no background at
-all, so the form's themed color shows through; the check STATE lives
-in the plugin (self._show / self._recursive) because the dialog API's
-'val' does not handle TATButton -- _on_check flips the state and
-swaps the glyph.
+The status FILTER CHECKS are the same _DrawnBtn in flat 'chk' mode:
+the form's own color shows through (no button face -- a check must
+not look like a button), the glyph is a hand-drawn checkbox (box +
+check stroke on the canvas, scaling with _px_scale -- a fixed 16px
+PNG cannot), and the caption is the form's own text color (a native
+TCheckBox draws its caption through the OS theme and ignores
+Font.Color, the 5th-round black-on-black captions). The check STATE
+lives in the plugin (self._show / self._recursive) because the
+dialog API's 'val' does not handle TATButton -- _on_check flips the
+state and _set_chk_state re-renders the drawn glyph.
 
 == Windows / instances =============================================
 
@@ -626,6 +644,18 @@ _LIST_COLUMNS = (
 MIN_COL_W = 24
 MAX_COL_W = 600
 
+# The Name column's guaranteed floor, in the same base pixels (21st
+# release: 'when compare dir window is shrinked the name column
+# become invisible, it must have a minimum width so it can be always
+# visible'). TATListbox.UpdateColumnWidths gives a 0-sized auto
+# column Max(0, ClientWidth - fixed sum) -- with the six fixed
+# columns summing past a narrow list, Name went to ZERO pixels and
+# vanished (atlistbox.pas, source-verified). _effective_cols instead
+# shrinks the FIXED columns proportionally so Name never drops below
+# this floor: the file name is the one cell a shrunken window must
+# still show.
+NAME_MIN_W = 140
+
 
 # ----------------------------------------------------------------------
 # Options / small helpers
@@ -690,6 +720,377 @@ def _theme_color(key, fallback=None):
     except Exception:
         pass
     return fallback
+
+
+def _blend(c1, c2, k):
+    """Per-channel linear blend of two CudaText color ints (k=0 ->
+    c1, k=1 -> c2). Channel-agnostic about the byte order: both
+    inputs come from -- and the result goes back to -- the same
+    color API, so whether ints are RGB or BGR cancels out."""
+    out = 0
+    for shift in (16, 8, 0):
+        a = (int(c1) >> shift) & 255
+        b = (int(c2) >> shift) & 255
+        out |= int(a + (b - a) * k) << shift
+    return out
+
+
+def _btn_palette():
+    """The DRAWN buttons' color set, derived from the form's OWN
+    background/font pair -- the one pair a usable theme cannot get
+    wrong (the form is painted with it and every label on it is
+    readable by definition). NOT from the Button* trio: TATButton
+    paints bg/border/caption strictly from the global ATFlatTheme
+    (wired ButtonBgPassive/ButtonBorderPassive/ButtonFont,
+    formmain_themes.inc), and themes that define the dark bg but not
+    the font leave ButtonFont at its built-in dark default $202020
+    (proc_colors.pas nColorText) -- dark-on-dark captions, the 21st
+    release's 'the text is invisible' report; no dialog prop can
+    reach those painted surfaces (proc_customdialog.pas creates
+    TATButton bare; button_proc has no color action; 'color' /
+    'font_color' set Control.Color/Font.Color, which the paint
+    overwrites). Deriving from TabBg/TabFont instead makes the face
+    a subtle shade of the form toward its text color: distinct from
+    BOTH the form and the one-line 'editor' inputs (the paper-colored
+    EdTextBg), with a clearly darker border -- a button that reads
+    as one in every theme, light or dark."""
+    bg = _theme_color('TabBg', _theme_color('ListBg'))
+    fg = _theme_color('TabFont', _theme_color('ListFont'))
+    if bg is None:
+        bg = 0xF0F0F0
+    if fg is None:
+        fg = 0x000000
+    return {
+        'bg': bg,
+        'fg': fg,
+        'face': _blend(bg, fg, 0.10),
+        'face_hover': _blend(bg, fg, 0.17),
+        'face_down': _blend(bg, fg, 0.24),
+        'border': _blend(bg, fg, 0.38),
+        'flat_hover': _blend(bg, fg, 0.06),
+    }
+
+
+# Symmetric left/right padding inside a drawn button, and the drawn
+# checkbox glyph's base size, in 96-DPI/9pt pixels (scaled by
+# _px_scale like every other pixel metric).
+BTN_PAD_X = 16
+CHK_GLYPH = 13
+
+
+def _chk_glyph_px():
+    """The drawn checkbox glyph's side in live pixels (clamped: tiny
+    at the smallest fonts, capped so a 3x UI font cannot blow the
+    row apart)."""
+    return max(9, min(26, int(CHK_GLYPH * _px_scale())))
+
+
+def _add_probe(add):
+    """Create the hidden measuring probe on a form ('add' is the
+    dialog's own _add -- it registers the name and returns the index
+    exactly like every other control). A button_ex whose autosize is
+    re-triggered per measurement: TATButton.SetAutoSize (the
+    'autosize' prop) measures the CURRENT caption in the themed UI
+    font and sets Width := text + GapForAutoSize -- the app's own
+    button math, reused as a ruler. Hidden ('vis': False) and
+    out of the tab order."""
+    add('button_ex', '_probe', {
+        'cap': '', 'w': 4, 'h': 6, 'vis': False,
+        'a_l': ('', '['), 'a_t': ('', '['), 'sp_l': 0, 'sp_t': 0,
+    })
+
+
+def _probe_gap(h):
+    """The probe button's own overhead (GapForAutoSize) in pixels, or
+    None when the probe cannot measure (the caller then falls back to
+    a width estimate). SetAutoSize(True) re-measures on every call --
+    TATButton.SetAutoSize has no same-value early exit -- so the
+    empty caption pins the gap itself."""
+    try:
+        ct.dlg_proc(h, ct.DLG_CTL_PROP_SET, name='_probe',
+                    prop={'cap': ''})
+        ct.dlg_proc(h, ct.DLG_CTL_PROP_SET, name='_probe',
+                    prop={'autosize': True})
+        d = ct.dlg_proc(h, ct.DLG_CTL_PROP_GET, name='_probe') or {}
+        return max(0, int(d.get('w', 0) or 0))
+    except Exception:
+        return None
+
+
+def _probe_text_w(h, cap, gap):
+    """A caption's width in live pixels via the probe (see
+    _add_probe), gap-corrected; len*7 when measuring is impossible
+    (pre-autosize builds: the drawn buttons then simply run a touch
+    wide -- they can never CLIP, the width is ours)."""
+    if gap is None:
+        return len(cap) * 7
+    try:
+        ct.dlg_proc(h, ct.DLG_CTL_PROP_SET, name='_probe',
+                    prop={'cap': cap})
+        ct.dlg_proc(h, ct.DLG_CTL_PROP_SET, name='_probe',
+                    prop={'autosize': True})
+        d = ct.dlg_proc(h, ct.DLG_CTL_PROP_GET, name='_probe') or {}
+        return max(0, int(d.get('w', 0) or 0) - gap)
+    except Exception:
+        return len(cap) * 7
+
+
+class _DrawnBtn:
+    """One THEMED-BY-US button: a single-item owner-drawn listbox_ex.
+
+    Why not the obvious controls (three button rounds of reports --
+    'always grey', then 'text is invisible' on dark themes, then
+    'hard to differentiate a button from an input box'):
+    * 'button' (native TButton) is drawn by the OS visual style and
+      stays gray in every theme.
+    * 'button_ex' (TATButton) paints bg/border/caption STRICTLY from
+      the global ATFlatTheme; a theme that defines ButtonBgPassive
+      but not ButtonFont leaves the caption at the dark built-in
+      default -> invisible on dark faces, and no dialog prop or
+      button_proc action reaches those surfaces (source-verified:
+      proc_customdialog.pas creates TATButton bare; atbuttons.pas
+      DoPaintTo reads only Theme^).
+    * 'label' is fully colorable but cannot center its caption
+      (TLabel support in proc_customdialog.pas: ex0 = right-align
+      only) -- no button look.
+
+    A one-item drawn listbox gives the plugin the WHOLE face:
+    * colors from _btn_palette() -- derived from the form's own
+      bg/font pair, guaranteed contrast in every theme (the 5th
+      report), a distinct face + border vs both the form and the
+      paper-colored input boxes (the 6th);
+    * the caption CENTERED, in the UI font, width MEASURED through
+      the hidden probe (the app's own autosize math) -- text can
+      never be eaten from either end (the 4th), at any font/DPI and
+      in any translation;
+    * hover / pressed feedback (on_mouse_enter/exit/down/up are
+      wired for every control kind -- proc_customdialog.pas wires
+      TControlHack(Ctl).OnMouseEnter/Leave/Down/Up/Move);
+    * 'chk' mode: the flat toggle of the filter row -- form-colored
+      face, a hand-drawn checkbox glyph that scales with the font
+      (the old 16px PNG could not), state kept by the owner.
+
+    The single item's band is pinned >= the control's pixel height
+    (sync), so the drawn item covers the whole control and none of
+    TATListbox's theme-colored underfill shows. repaint() is the
+    documented-cheap invalidate for a drawn listbox: SetItemHeight
+    invalidates but early-exits on equal values (atlistbox.pas), so
+    a +-1 jitter is always a real repaint of the tiny control."""
+
+    def __init__(self, owner, name, cap, prop, on_click, mode='btn',
+                 checked=False, colors=None, text_w=None):
+        self.owner = owner
+        self.name = name
+        self.cap = cap
+        self.mode = mode
+        self.checked = checked
+        self.colors = colors or _btn_palette()
+        self.hover = False
+        self.pressed = False
+        self.h_ctl = 0
+        self._ih = 0              # pinned item band (0 = not synced)
+        self._text_w = text_w     # measured caption px (None: est.)
+        prop = dict(prop)
+        prop.update({
+            # the caption also rides the item text: on a build where
+            # LISTBOX_SET_DRAWN is missing the control degrades to a
+            # plain listbox that still shows the caption
+            'on_draw_item': self._ev_draw,
+            'on_click': on_click,
+            'on_mouse_enter': self._ev_enter,
+            'on_mouse_exit': self._ev_exit,
+            'on_mouse_down': self._ev_down,
+            'on_mouse_up': self._ev_up,
+        })
+        owner._add('listbox_ex', name, prop)
+        try:
+            self.h_ctl = ct.dlg_proc(owner.h, ct.DLG_CTL_HANDLE,
+                                     name=name)
+        except Exception:
+            self.h_ctl = 0
+        try:
+            ct.listbox_proc(self.h_ctl, ct.LISTBOX_ADD, index=-1,
+                            text=cap)
+            ct.listbox_proc(self.h_ctl, ct.LISTBOX_SET_DRAWN, index=1)
+        except Exception:
+            pass    # pre-listbox_proc build: plain listbox fallback
+
+    # -- geometry ------------------------------------------------------
+
+    def width_px(self):
+        """The measured pixel width: caption + symmetric padding (+
+        the glyph and its gaps in chk mode)."""
+        s = _px_scale()
+        tw = self._text_w if self._text_w is not None \
+            else len(self.cap) * 7
+        if self.mode == 'chk':
+            g = _chk_glyph_px()
+            return (tw + int(BTN_PAD_X * s) + g +
+                    int(6 * s) + int(4 * s))
+        return tw + 2 * int(BTN_PAD_X * s)
+
+    def sync(self):
+        """Post-DLG_SCALE pinning (the build-time 'w' was dlg units
+        that the scale pass has applied; the real pixel width is
+        re-set here, like the saved-geometry restore does): the
+        measured width, then the item band from the control's LIVE
+        pixel height so the single drawn item covers the face."""
+        try:
+            ct.dlg_proc(self.owner.h, ct.DLG_CTL_PROP_SET,
+                        name=self.name, prop={'w': self.width_px()})
+        except Exception:
+            pass
+        try:
+            d = ct.dlg_proc(self.owner.h, ct.DLG_CTL_PROP_GET,
+                            name=self.name) or {}
+            hh = int(d.get('h', 0) or 0)
+            if hh > 0:
+                self._ih = hh + 4
+                ct.listbox_proc(self.h_ctl, ct.LISTBOX_SET_ITEM_H,
+                                index=self._ih)
+        except Exception:
+            pass
+
+    # -- state / repaint -------------------------------------------------
+
+    def set_checked(self, on):
+        """Render the toggle state (chk mode); no-op for plain
+        buttons."""
+        if self.mode != 'chk' or self.checked == bool(on):
+            return
+        self.checked = bool(on)
+        self.repaint()
+
+    def repaint(self):
+        if not self.h_ctl or not self._ih or \
+                getattr(self.owner, '_torn', False):
+            return
+        try:
+            ct.listbox_proc(self.h_ctl, ct.LISTBOX_SET_ITEM_H,
+                            index=self._ih + 1)
+            ct.listbox_proc(self.h_ctl, ct.LISTBOX_SET_ITEM_H,
+                            index=self._ih)
+        except Exception:
+            pass
+
+    # -- events ------------------------------------------------------------
+
+    def _ev_draw(self, id_dlg, id_ctl, data='', info=''):
+        if not isinstance(data, dict):
+            return
+        try:
+            if int(data.get('index', -1)) != 0:
+                return
+        except (TypeError, ValueError):
+            return
+        rect = data.get('rect')
+        canvas = data.get('canvas')
+        if canvas is not None and rect is not None:
+            self._paint(canvas, rect)
+
+    def _ev_enter(self, id_dlg, id_ctl, data='', info=''):
+        if not self.hover:
+            self.hover = True
+            self.repaint()
+
+    def _ev_exit(self, id_dlg, id_ctl, data='', info=''):
+        if self.hover or self.pressed:
+            self.hover = False
+            self.pressed = False
+            self.repaint()
+
+    def _ev_down(self, id_dlg, id_ctl, data='', info=''):
+        if isinstance(data, dict):
+            try:
+                if int(data.get('btn', -1)) == 0:
+                    self.pressed = True
+                    self.repaint()
+            except (TypeError, ValueError):
+                pass
+
+    def _ev_up(self, id_dlg, id_ctl, data='', info=''):
+        if self.pressed:
+            self.pressed = False
+            self.repaint()
+
+    # -- painting ------------------------------------------------------
+
+    def _paint(self, canvas, rect):
+        x0, y0, x1, y1 = rect
+        w, h = x1 - x0, y1 - y0
+        if w <= 0 or h <= 0:
+            return
+        pal = self.colors
+        try:
+            if self.mode == 'chk':
+                # flat toggle: the form's own color shows through, a
+                # whisper of tint on hover/press -- matches the row's
+                # other flat furniture (labels, edits' chrome)
+                face = pal['flat_hover'] \
+                    if (self.hover or self.pressed) else pal['bg']
+                ct.canvas_proc(canvas, ct.CANVAS_SET_BRUSH,
+                               color=face, style=ct.BRUSH_SOLID)
+                ct.canvas_proc(canvas, ct.CANVAS_RECT_FILL,
+                               x=x0, y=y0, x2=x1, y2=y1)
+            else:
+                # the button face: a shade of the form toward its text
+                # color, pressed > hover > passive, plus the border
+                # that makes it read as a button next to the
+                # paper-colored input boxes
+                face = pal['face_down'] if self.pressed else \
+                    (pal['face_hover'] if self.hover else pal['face'])
+                ct.canvas_proc(canvas, ct.CANVAS_SET_BRUSH,
+                               color=face, style=ct.BRUSH_SOLID)
+                ct.canvas_proc(canvas, ct.CANVAS_RECT_FILL,
+                               x=x0, y=y0, x2=x1, y2=y1)
+                ct.canvas_proc(canvas, ct.CANVAS_SET_BRUSH,
+                               color=pal['border'],
+                               style=ct.BRUSH_SOLID)
+                ct.canvas_proc(canvas, ct.CANVAS_RECT_FRAME,
+                               x=x0, y=y0, x2=x1 - 1, y2=y1 - 1)
+
+            # caption: the UI font, SET like the row painter sets it
+            # (build-proof: never trust a preset), centered on the
+            # face (left of it in chk mode, after the glyph)
+            ct.canvas_proc(canvas, ct.CANVAS_SET_FONT,
+                           text=_ui_font()[0], color=pal['fg'],
+                           size=_ui_font_pt(), style=0)
+            sz = ct.canvas_proc(canvas, ct.CANVAS_GET_TEXT_SIZE,
+                                text=self.cap) or (0, 0)
+            tw, th = int(sz[0]), int(sz[1])
+            ty = y0 + max(0, (h - th) // 2)
+            if self.mode == 'chk':
+                g = _chk_glyph_px()
+                s = _px_scale()
+                gx = x0 + int(BTN_PAD_X * s) // 2
+                gy = y0 + max(0, (h - g) // 2)
+                # the box...
+                ct.canvas_proc(canvas, ct.CANVAS_SET_BRUSH,
+                               color=pal['border'],
+                               style=ct.BRUSH_SOLID)
+                ct.canvas_proc(canvas, ct.CANVAS_RECT_FRAME,
+                               x=gx, y=gy, x2=gx + g, y2=gy + g)
+                # ...and the check stroke when on
+                if self.checked:
+                    ct.canvas_proc(canvas, ct.CANVAS_SET_PEN,
+                                   color=pal['fg'],
+                                   size=max(1, g // 7),
+                                   style=ct.PEN_STYLE_SOLID)
+                    m = max(2, g // 4)
+                    ct.canvas_proc(canvas, ct.CANVAS_LINE,
+                                   x=gx + m, y=gy + g // 2,
+                                   x2=gx + g // 2, y2=gy + g - m)
+                    ct.canvas_proc(canvas, ct.CANVAS_LINE,
+                                   x=gx + g // 2, y=gy + g - m,
+                                   x2=gx + g - m, y2=gy + m)
+                tx = gx + g + int(6 * s)
+            else:
+                tx = x0 + max(0, (w - tw) // 2)
+            if self.cap:
+                ct.canvas_proc(canvas, ct.CANVAS_TEXT,
+                               text=self.cap, x=tx, y=ty)
+        except Exception:
+            return
 
 
 _UI_SCALE = None
@@ -2006,6 +2407,10 @@ class _PickerDialog:
         self.result = None
         self.ctl = {}       # name -> control index
         self.ctl_rev = {}   # control index -> name
+        self._drawn = {}    # name -> _DrawnBtn (the 21st release:
+                            # the picker's four buttons are drawn
+                            # buttons, themed like the main window's)
+        self._probe_gap = None   # filled by _build (hidden probe)
 
     # -- helpers -------------------------------------------------------
 
@@ -2058,6 +2463,16 @@ class _PickerDialog:
         ed_bg = _theme_color('OtherTextBg', _theme_color('EdTextBg'))
         ed_fg = _theme_color('OtherTextFont', _theme_color('EdTextFont'))
 
+        # The measuring probe + the drawn-button palette (the same
+        # machinery as the main window's rows -- see _DrawnBtn): the
+        # picker's four buttons are DRAWN buttons, so their captions
+        # are guaranteed readable (the form's own bg/font pair, not
+        # the theme's Button* trio) and their widths MEASURED (no
+        # eaten text), in every theme and at any UI font.
+        _add_probe(self._add)
+        self._probe_gap = _probe_gap(self.h)
+        _pal = _btn_palette()
+
         for i, (side, label, hist, init) in enumerate((
                 ('left',  _('Left folder (old):'),  hist_l, dir_l),
                 ('right', _('Right folder (new):'), hist_r, dir_r))):
@@ -2078,17 +2493,18 @@ class _PickerDialog:
             # anchor is set. 'a_l': None clears the form-left anchor a
             # new control is born with -- without it the button keeps
             # left AND right anchors and stretches across the form.
-            # button_ex (non-flat TATButton): themed bg/border/font
-            # (ATFlatTheme <- ButtonBgPassive/ButtonBorderPassive/
-            # ButtonFont); a native TButton stays OS-gray in every
-            # theme, and fires the same on_change on click.
-            self._add('button_ex', 'brw_' + side, {
-                'cap': _('Browse...'),
-                'w': self.BRW_W, 'h': 26,
-                'a_l': None, 'a_r': ('', ']'), 'sp_r': 12,
-                'a_t': top, 'sp_t': sp_t,
-                'on_change': self._on_button,
-            })
+            # A DRAWN button (see the probe block above): themed face
+            # + measured width, like every button in the main window.
+            self._drawn['brw_' + side] = _DrawnBtn(
+                self, 'brw_' + side, _('Browse...'), {
+                    'w': self.BRW_W, 'h': 26,
+                    'a_l': None, 'a_r': ('', ']'), 'sp_r': 12,
+                    'a_t': top, 'sp_t': sp_t,
+                },
+                self._on_button, colors=_pal,
+                text_w=_probe_text_w(self.h, _('Browse...'),
+                                     self._probe_gap),
+            )
             # the only control meant to stretch: BOTH a_l (label's
             # right) and a_r (Browse's left) -- the two fixed controls
             # it sits between.
@@ -2111,23 +2527,28 @@ class _PickerDialog:
         # with a_l/a_t ('a_l': None, 'a_t': None) -- right+bottom
         # anchored, fixed size; a half-cleared pair stretches into a
         # button covering the whole dialog (the 12th-release bug).
-        # button_ex: themed button face (see the Browse comment).
-        self._add('button_ex', 'cancel', {
-            'cap': _('Cancel'),
-            'w': 90, 'h': 28,
-            'a_l': None, 'a_t': None,
-            'a_r': ('', ']'), 'sp_r': 12,
-            'a_b': ('', ']'), 'sp_b': 12,
-            'on_change': self._on_button,
-        })
-        self._add('button_ex', 'ok', {
-            'cap': _('Compare'),
-            'w': 100, 'h': 28,
-            'a_l': None, 'a_t': None,
-            'a_r': ('cancel', '['), 'sp_r': 8,
-            'a_b': ('', ']'), 'sp_b': 12,
-            'on_change': self._on_button,
-        })
+        # DRAWN buttons (see the Browse comment): readable captions +
+        # measured widths in every theme.
+        self._drawn['cancel'] = _DrawnBtn(
+            self, 'cancel', _('Cancel'), {
+                'w': 90, 'h': 28,
+                'a_l': None, 'a_t': None,
+                'a_r': ('', ']'), 'sp_r': 12,
+                'a_b': ('', ']'), 'sp_b': 12,
+            },
+            self._on_button, colors=_pal,
+            text_w=_probe_text_w(self.h, _('Cancel'), self._probe_gap),
+        )
+        self._drawn['ok'] = _DrawnBtn(
+            self, 'ok', _('Compare'), {
+                'w': 100, 'h': 28,
+                'a_l': None, 'a_t': None,
+                'a_r': ('cancel', '['), 'sp_r': 8,
+                'a_b': ('', ']'), 'sp_b': 12,
+            },
+            self._on_button, colors=_pal,
+            text_w=_probe_text_w(self.h, _('Compare'), self._probe_gap),
+        )
         # Scale the built layout to the OS DPI (the main window has
         # always done this; the picker's fixed 96-DPI geometry is what
         # clipped the labels on high-DPI boxes), THEN re-apply the
@@ -2141,8 +2562,11 @@ class _PickerDialog:
                 ct.dlg_proc(self.h, ct.DLG_PROP_SET, prop=geom)
             except Exception:
                 pass
-        # LAST, with the layout final (DLG_SCALE applied, saved size
-        # restored): pin both row labels to one width so the two
+        # LAST, with the layout final: pin the drawn buttons' measured
+        # pixel widths and item bands (same as the main window).
+        for b in self._drawn.values():
+            b.sync()
+        # and pin both row labels to one width so the two
         # combos render equally wide.
         self._equalize_labels()
 
@@ -2342,9 +2766,9 @@ class DirCompareForm:
     auto-fit band is tighter -- see _fit_item_h):
 
       [ New compare... ][ Swap sides ][ Refresh ]            [ Close ]
-      [ left path edit          ][Browse...]  [ right path edit   ][Br...]
+      [ left path edit           ][Browse...] [ right path edit      ][Br...]
       [x]Different [x]Only left [x]Only right [x]Identical [x]Subfolders
-                                    Mask:[ edit ][ Apply ]
+                              Mask:[ stretch edit ][ Apply ]
       +--------------------------------------------------------------+
       | Name | Folder | Status | Left size | Left date | R.size | R.date |
       | (owner-drawn listbox_ex, stretches with the form; WinMerge-  |
@@ -2358,23 +2782,44 @@ class DirCompareForm:
     The path edits are editable on purpose: type two paths and press
     Refresh (or Enter) to compare them without reopening any dialog.
 
+    FLEX LAYOUT (21st release): nothing on the form has a live width
+    that can collide with anything else. The two path edits STRETCH
+    -- each between its form edge and its Browse button -- and the
+    Browse buttons sit against a tiny label CENTERED on the form
+    (a_l=('', '-') = the LCL asrCenter anchor), so each edit is
+    exactly half the row at EVERY window width (the report: 'each
+    one must occupy 50% width of the line ... when window is small
+    they overlap on each other'). The mask edit stretches between
+    the checks and Apply the same way. The list's Name column keeps
+    a guaranteed floor (NAME_MIN_W -- _effective_cols) and the
+    form's on_resize re-derives the column split; a restored
+    geometry below the (font-scaled) w_min floor is dropped.
+
     THEMING: every color comes from the UI theme through
     _theme_color, whose clNone guard is the difference between
     'not themed' and a literal $1FFFFFFF passed to a color API (the
-    5th-round white statusbar). The five status-filter checks are
-    flat button_ex buttons with chk_on/chk_off imagelist glyphs, not
-    native TCheckBox controls: Windows visual styles draw a native
-    checkbox caption through the OS theme and ignore Font.Color, so
-    the captions stayed black on black themes, while TATButton paints
-    its caption in the themed UI font color over the form's themed
-    background. The check state lives in the plugin (self._show /
-    self._recursive; the dialog API's 'val' does not handle
-    TATButton) -- _on_check flips it and _set_check_icon swaps the
-    glyph. The three path/mask inputs are one-line 'editor'
-    controls (_add_input: themed by the app, hint painted by the
-    control) and every BUTTON is a non-flat button_ex (themed face;
-    a native TButton stays OS-gray). See the module docstring's
-    'Theming' chapter for the color chains.
+    5th-round white statusbar). EVERY button and toggle is a
+    _DrawnBtn -- a one-item owner-drawn listbox whose face, border,
+    caption color, hover/press shading and width are ALL the
+    plugin's: TATButton (button_ex) paints strictly from the GLOBAL
+    ATFlatTheme, so a theme that defines ButtonBgPassive without
+    ButtonFont leaves captions at the dark built-in default
+    (invisible on dark faces -- the 21st report) and no dialog prop
+    can reach those painted surfaces; a native TCheckBox draws its
+    caption through the OS theme and ignores Font.Color (the 5th
+    round); a native TButton stays OS-gray. The drawn buttons'
+    palette derives from the form's OWN bg/font pair (TabBg/TabFont
+    -- _btn_palette): readable on every theme, and the face+border
+    are distinct from both the form and the paper-colored 'editor'
+    inputs, so a button reads as a button (the 21st report's last
+    item). Widths are MEASURED through a hidden probe button's
+    autosize (the app's own font math -- _add_probe), so captions
+    can never be eaten. The toggle state lives in the plugin
+    (self._show / self._recursive) -- _on_check flips it and
+    _set_chk_state re-renders the drawn glyph. The three path/mask
+    inputs are one-line 'editor' controls (_add_input: themed by
+    the app, hint painted by the control). See the module
+    docstring's 'Theming' chapter for the color chains.
 
     The results list is an owner-drawn listbox_ex (LISTBOX_SET_DRAWN):
     the control never paints items itself, it calls on_draw_item for
@@ -2416,6 +2861,12 @@ class DirCompareForm:
     as 'dirs.col_widths' at window close and resettable from the
     context menu. A move without the button held ends the drag (the
     release happened outside the control -- the state string's 'L').
+    The pushed widths are the EFFECTIVE set (_effective_cols): on a
+    window too narrow for the fixed sum plus NAME_MIN_W the fixed
+    columns are scaled down proportionally, so the Name column is
+    always visible (the 21st report: it went to ZERO -- TATListbox
+    gives an auto column Max(0, ClientWidth - fixed sum)); the
+    form's on_resize re-derives the split for the header.
     """
 
     DEF_W = 940
@@ -2423,23 +2874,31 @@ class DirCompareForm:
     MIN_W = 700
     MIN_H = 380
 
-    # Row A (toolbar buttons) -- fixed widths, chained left to right.
+    # Row A (toolbar buttons) -- the w values are pre-DLG_SCALE
+    # FALLBACKS only: every button's real width is MEASURED (the
+    # hidden probe -- see _DrawnBtn), so no caption can ever clip.
     TOOLBAR_BTNS = (
         ('btn_new', _('New compare...'), 130),
         ('btn_swap', _('Swap sides'), 100),
         ('btn_refresh', _('Refresh'), 100),
     )
 
-    # Row B (path edits) -- fixed widths, the right pair anchored to
-    # the form's right edge (fixed widths instead of stretching anchors
-    # avoid circular left/right anchor chains; the list takes the flex).
+    # Row B (path edits): both editors STRETCH -- left one between
+    # the form's left edge and its Browse button, right one between
+    # its Browse button and the form's right edge -- and the two
+    # Browse buttons sit against a tiny label CENTERED on the form
+    # (a_l=('', '-')), so the two editors are exactly half the row
+    # each at EVERY window width (21st report: 'each one must occupy
+    # 50% width of the line'). PATH_W is the pre-DLG_SCALE fallback;
+    # PATH_GAP is the centered splitter's width.
     PATH_W = 330
+    PATH_GAP = 12
     BRW_W = 82
 
-    # Row C (filters). NOTE 'act': True is required on every check
-    # control (set in _build): without it CudaText does not fire
-    # on_change when the user (un)checks the box -- the API doc:
-    # "act: active state... control's value change fires events".
+    # Row C (filters). The checks are DRAWN toggles now (_DrawnBtn
+    # chk mode): the click fires on_click, the state lives here
+    # (self._show / self._recursive) exactly as in the button_ex
+    # rounds -- only the renderer changed.
     FILTER_CHECKS = (
         ('chk_diff', _('Different'), True),
         ('chk_lonly', _('Only left'), True),
@@ -2493,13 +2952,17 @@ class DirCompareForm:
         self._show = {                  # status filter checkboxes
             ST_DIFF: True, ST_LONLY: True, ST_RONLY: True, ST_SAME: True,
         }
-        # The Subfolders toggle + the check handles. The checks are
-        # button_ex controls now (themed -- see _add_check): a native
-        # TCheckBox has no usable state channel in the dialog API
-        # ('val' does not handle TATButton), so the LIVE state lives
-        # here and the button just renders it (icon swap).
+        # The Subfolders toggle + the drawn-button registry. The
+        # checks are _DrawnBtn toggles now (see _build Row C): the
+        # LIVE state lives here (self._show / self._recursive) and
+        # the drawn glyph just renders it -- a native TCheckBox has
+        # no usable state channel in the dialog API ('val' does not
+        # handle TATButton) and its caption ignores Font.Color under
+        # Windows visual styles.
         self._recursive = True
-        self._chk_handles = {}          # check name -> button handle
+        self._drawn = {}                 # name -> _DrawnBtn
+        self._probe_gap = None           # filled by _build (probe)
+        self._floor_px = 0               # measured w_min floor (build)
         # Handles of the one-line 'editor' inputs (ed_left/ed_right/
         # ed_mask): their text goes through Editor(handle) -- the
         # dialog API's 'val' does not handle TATSynEdit (see
@@ -2545,62 +3008,6 @@ class DirCompareForm:
 
     def _text_color(self):
         return _theme_color('TabFont', _theme_color('ListFont', 0x000000))
-
-    def _add_check(self, name, prop, checked):
-        """One THEMED checkbox: a flat button_ex with a checkbox glyph
-        from the window imagelist -- the app's own pattern (cuda_prefs
-        renders its options-dialog bools this way).
-
-        Why not a native 'check' control: under Windows visual styles
-        the OS theme draws the TCheckBox caption and ignores
-        Font.Color (the dialog API's font_color prop is a plain
-        Font.Color assignment) -- the captions stayed black on black
-        themes while every themed control around them went light
-        (5th-round report: 'checkboxes text ... does not use theme
-        colors'). TATButton instead paints its caption in
-        ATFlatTheme.ColorFont (the themed UI font color, wired from
-        ButtonFont) and the flat style paints no background at all,
-        so the form's themed color shows through.
-
-        The state is OURS (self._show / self._recursive): the dialog
-        API's 'val' does not handle TATButton, and there is no
-        BTN_SET_CHECKABLE to let TATButton own it either -- so
-        _on_check flips the Python state and _set_check_icon renders
-        it. The icon order in _build's imagelist load fixes the
-        indices (_icon_idx['chk_on'/'chk_off']).
-
-        autosize comes LAST, through a second PROP_SET: TATButton's
-        SetAutoSize measures the caption in the themed font plus the
-        just-attached icon (BTNKIND_TEXT_ICON_HORZ: text+gap+icon),
-        so the button must already know its kind and imagelist."""
-        n = self._add('button_ex', name, prop)
-        try:
-            h = ct.dlg_proc(self.h, ct.DLG_CTL_HANDLE, name=name)
-            self._chk_handles[name] = h
-            ct.button_proc(h, ct.BTN_SET_FLAT, True)
-            ct.button_proc(h, ct.BTN_SET_KIND, ct.BTNKIND_TEXT_ICON_HORZ)
-            if self.h_imglist:
-                ct.button_proc(h, ct.BTN_SET_IMAGELIST, self.h_imglist)
-            self._set_check_icon(name, checked)
-            ct.dlg_proc(self.h, ct.DLG_CTL_PROP_SET, index=n,
-                        prop={'autosize': True})
-        except Exception:
-            # Pre-button_proc builds: the button still shows its
-            # caption and still fires on_change -- only the glyph and
-            # the fitted width are lost.
-            pass
-        return n
-
-    def _set_check_icon(self, name, on):
-        """Render a check's state as the chk_on/chk_off imagelist
-        glyph (no-op when the imagelist or the icon is missing)."""
-        h = self._chk_handles.get(name, 0)
-        idx = self._icon_idx.get('chk_on' if on else 'chk_off', -1)
-        if h and idx is not None and idx >= 0:
-            try:
-                ct.button_proc(h, ct.BTN_SET_IMAGEINDEX, idx)
-            except Exception:
-                pass
 
     def _add_input(self, name, prop, text):
         """One single-line INPUT: an 'editor' control (TATSynEdit) in
@@ -2654,7 +3061,13 @@ class DirCompareForm:
         prop = {
             'cap': _('Compare folders'),
             'w': self.DEF_W, 'h': self.DEF_H,
-            'w_min': self.MIN_W, 'h_min': self.MIN_H,
+            # The width floor carries the UI-FONT factor (DLG_SCALE
+            # already covers the DPI half): the row-C checks autosize
+            # to their captions, and a 14pt box needs ~1.5x the 9pt
+            # floor or the rows collide no matter how flexible the
+            # layout is. _restore_geom clamps to the same value.
+            'w_min': int(self.MIN_W * max(1.0, _font_scale())),
+            'h_min': self.MIN_H,
             'border': ct.DBORDER_SIZE,
             'taskbar': 1,          # own OS taskbar entry: the window
                                     # is restorable/pinnable like a
@@ -2662,21 +3075,22 @@ class DirCompareForm:
             'keypreview': True,    # form-level Enter/Esc/F5 (on_key_down)
             'on_close': self._on_close,
             'on_key_down': self._on_key,
+            'on_resize': self._on_resize,   # re-derive the column split
         }
         bg = _theme_color('TabBg', _theme_color('ListBg'))
         if bg is not None:
             prop['color'] = bg
         ct.dlg_proc(h, ct.DLG_PROP_SET, prop=prop)
 
-        # Per-window imagelist (owned by the form -> freed with it).
-        # Built FIRST: both the row icons (the list's painter) and the
-        # checkbox glyphs (the button_ex checks below) come from it.
+        # Per-window imagelist (owned by the form -> freed with it):
+        # the ROW icons the list's painter draws (the 21st release's
+        # drawn checkbox toggles paint their glyph on the canvas
+        # instead -- it scales with the font, a fixed 16px PNG cannot).
         try:
             paths = _icon_paths()
             self.h_imglist = ct.imagelist_proc(0, ct.IMAGELIST_CREATE,
                                                value=self.h)
-            for name in ('same', 'diff', 'lonly', 'ronly', 'folder', 'err',
-                         'chk_on', 'chk_off'):
+            for name in ('same', 'diff', 'lonly', 'ronly', 'folder', 'err'):
                 idx = ct.imagelist_proc(self.h_imglist, ct.IMAGELIST_ADD,
                                         value=paths[name])
                 self._icon_idx[name] = idx if idx is not None else -1
@@ -2690,126 +3104,196 @@ class DirCompareForm:
         # 6th-round green boxes (ListBg's built-in default is green
         # $b4d8a8) and the unreadable TEdit hints.
 
+        # The measuring probe (see _add_probe) and the drawn buttons'
+        # shared palette: every button and toggle below is a
+        # _DrawnBtn -- a one-item owner-drawn listbox whose face,
+        # border, caption, hover and width are ALL the plugin's (the
+        # 21st release: TATButton's global-theme colors left captions
+        # invisible on dark themes and its fixed widths ate captions
+        # -- see the class docstring).
+        _add_probe(self._add)
+        self._probe_gap = _probe_gap(h)
+        pal = _btn_palette()
+
+        def _btn(name, cap, prop, mode='btn', checked=False):
+            b = _DrawnBtn(self, name, cap, prop,
+                          self._on_check if mode == 'chk'
+                          else self._on_button,
+                          mode=mode, checked=checked, colors=pal,
+                          text_w=_probe_text_w(h, cap, self._probe_gap))
+            self._drawn[name] = b
+            return b
+
         # -- Row A: toolbar buttons ------------------------------------
-        # button_ex (non-flat TATButton): themed face -- bg
-        # ButtonBgPassive, border ButtonBorderPassive, caption
-        # ButtonFont, all through ATFlatTheme, with the app's hover
-        # colors on mouse-over (a native TButton is drawn by the OS
-        # and stays gray in every theme -- the 6th-round report:
-        # 'buttons color does not use theme colors it s always
-        # grey'). Same on_change, same geometry -- the swap is
-        # invisible to behavior.
+        # DRAWN buttons (_DrawnBtn): the app's own button control
+        # (button_ex / TATButton) paints strictly from the GLOBAL
+        # ATFlatTheme -- themed faces on good themes, but a theme
+        # that defines ButtonBgPassive without ButtonFont leaves the
+        # caption at the dark built-in default: invisible on the dark
+        # face (the 21st report), and no dialog prop reaches those
+        # painted surfaces. The drawn button's face/border/caption
+        # come from the form's own bg/font pair instead, and its
+        # width is MEASURED (the hidden probe), so the caption can
+        # never be eaten (the 21st report's 4th item). Same
+        # name/on_click routing as the old button_ex -- the handlers
+        # do not change.
         prev = None
         for name, cap, w in self.TOOLBAR_BTNS:
             p = {
                 'cap': cap, 'w': w, 'h': 26,
                 'a_t': ('', '['), 'sp_t': 8,
                 'sp_l': 10 if prev is None else 8,
-                'on_change': self._on_button,
             }
             if prev is None:
                 p['a_l'] = ('', '[')
             else:
                 p['a_l'] = (prev, ']')
-            self._add('button_ex', name, p)
+            _btn(name, cap, p)
             prev = name
-        self._add('button_ex', 'btn_close', {
-            'cap': _('Close'), 'w': 80, 'h': 26,
+        _btn('btn_close', _('Close'), {
+            'w': 80, 'h': 26,
             'a_l': None, 'a_r': ('', ']'),
             'a_t': ('', '['), 'sp_t': 8, 'sp_r': 10,
-            'on_change': self._on_button,
         })
 
         # -- Row B: the two sides' paths -------------------------------
-        # One-line 'editor' inputs (see _add_input): themed by the
-        # app, hint painted by the control, text via Editor handle.
+        # 50/50 BY ANCHOR, not by fixed widths (21st report: 'the path
+        # box in dir compare window should shrink and grow with the
+        # window, and each one must occupy 50% width of the line ...
+        # they have fixed width, and when window is small they overlap
+        # on each other'). The old 330px-fixed pair needed 856px and
+        # overlapped from the 700px floor down. The anchor skeleton:
+        #   [ed_left stretch][btn_lbrw] <sp_mid> [btn_rbrw][ed_right stretch]
+        # with sp_mid a tiny label CENTERED on the form (a_l=('', '-')
+        # is the LCL asrCenter anchor -- the control is centered over
+        # the target, proc_customdialog.pas maps '-' to asrCenter).
+        # Each Browse button sits against the spacer's outer side,
+        # and each editor STRETCHES from its form edge to its Browse
+        # button -- symmetric geometry, so both editors are exactly
+        # (W - 2*10 - GAP - 2*6 - 2*brw_w)/2 wide at EVERY window
+        # width: no overlap possible, equal halves by construction.
+        # (Creation order: spacer, then BOTH Browse buttons, then the
+        # editors -- an anchor target must exist when the anchor is
+        # set, and each editor's a_r/a_l targets its Browse button.)
+        self._add('label', 'sp_mid', {
+            'cap': '', 'w': self.PATH_GAP, 'h': 8,
+            'a_l': ('', '-'), 'sp_l': 0,
+            'a_t': ('btn_new', ']'), 'sp_t': 14,
+        })
         ed_prop = {'w': self.PATH_W, 'h': 26, 'a_t': ('btn_new', ']'),
-                   'sp_t': 8}
+                   'sp_t': 8}      # w: pre-DLG_SCALE fallback only --
+                                   # the stretch anchors decide live
+        _btn('btn_lbrw', _('Browse...'), {
+            'w': self.BRW_W, 'h': 26,
+            'a_l': None, 'a_r': ('sp_mid', '['), 'sp_r': 0,
+            'a_t': ('btn_new', ']'), 'sp_t': 8,
+        })
+        _btn('btn_rbrw', _('Browse...'), {
+            'w': self.BRW_W, 'h': 26,
+            'a_l': ('sp_mid', ']'), 'sp_l': 0,
+            'a_r': None,
+            'a_t': ('btn_new', ']'), 'sp_t': 8,
+        })
         p = dict(ed_prop)
         p.update({'a_l': ('', '['), 'sp_l': 10,
+                  'a_r': ('btn_lbrw', '['), 'sp_r': 6,
                   'texthint': _('left folder')})
         self._add_input('ed_left', p, self._dir_l)
-        self._add('button_ex', 'btn_lbrw', {
-            'cap': _('Browse...'), 'w': self.BRW_W, 'h': 26,
-            'a_l': ('ed_left', ']'), 'sp_l': 6,
-            'a_t': ('btn_new', ']'), 'sp_t': 8,
-            'on_change': self._on_button,
-        })
-        self._add('button_ex', 'btn_rbrw', {
-            'cap': _('Browse...'), 'w': self.BRW_W, 'h': 26,
-            'a_l': None, 'a_r': ('', ']'), 'sp_r': 10,
-            'a_t': ('btn_new', ']'), 'sp_t': 8,
-            'on_change': self._on_button,
-        })
         p = dict(ed_prop)
-        p.update({'a_l': None, 'a_r': ('btn_rbrw', '['), 'sp_r': 6,
+        p.update({'a_l': ('btn_rbrw', ']'), 'sp_l': 6,
+                  'a_r': ('', ']'), 'sp_r': 10,
                   'texthint': _('right folder')})
         self._add_input('ed_right', p, self._dir_r)
 
         # -- Row C: filters (left) | Mask + Apply (right) --------------
         # Left group: the four status filters + Subfolders, chained
-        # left to right. Right group, anchored to the form's right
-        # edge: Mask + Apply (the requested placement). Each right-
-        # group control clears the a_l a new control is born with --
-        # left AND right anchors on the same control mean STRETCH, and
-        # a half-cleared control becomes a bar across the whole form
-        # (the 12th-release giant-button bug).
-        #
-        # The checks themselves are THEMED button_ex buttons with
-        # checkbox glyphs, not native TCheckBox controls (5th
-        # dark-theme round: 'checkboxes text ... does not use theme
-        # colors'): under Windows visual styles a native checkbox
-        # draws its caption through the OS theme and ignores
-        # Font.Color, so the text stayed black-on-dark. The app's own
-        # options dialog (cuda_prefs) solves it exactly this way --
-        # TATButton paints the caption in the themed UI font color
-        # (ATFlatTheme.ColorFont) and the flat style leaves the form
-        # background visible. See _add_check.
+        # left to right (DRAWN toggles now -- see Row A; a native
+        # TCheckBox draws its caption through the OS theme and ignores
+        # Font.Color, the 5th-round black-on-black captions, and the
+        # 20th-release button_ex glyphs rode the same global theme
+        # that goes invisible on dark faces). The toggle state is
+        # OURS (self._show / self._recursive) exactly as before:
+        # _on_check flips it and re-renders the drawn glyph.
+        # Right group: Apply at the form's right edge, the mask edit
+        # STRETCHING from the checks to it (its old fixed 170px was
+        # the row's only collision left -- the stretch makes Row C
+        # overlap-free at the 700px floor too), the label riding the
+        # mask's left edge.
         prev = None
         for name, cap, checked in self.FILTER_CHECKS:
-            p = {
-                'cap': cap, 'act': True, 'h': 24,
-                'a_t': ('ed_left', ']'), 'sp_t': 10,
-                'on_change': self._on_check,
-            }
+            p = {'cap': cap, 'h': 24,
+                 'a_t': ('ed_left', ']'), 'sp_t': 10}
             if prev is None:
                 p.update({'a_l': ('', '['), 'sp_l': 10})
             else:
                 p.update({'a_l': (prev, ']'), 'sp_l': 12})
-            self._add_check(name, p, checked)
+            _btn(name, cap, p, mode='chk', checked=checked)
             prev = name
-        self._add_check('chk_sub', {
-            'cap': _('Subfolders'), 'act': True, 'h': 24,
+        _btn('chk_sub', _('Subfolders'), {
+            'h': 24,
             'a_l': ('chk_same', ']'), 'sp_l': 24,
             'a_t': ('ed_left', ']'), 'sp_t': 10,
-            'on_change': self._on_check,
-        }, True)
-        # Right group (right-anchored chain: Apply at the edge, the
-        # mask edit and its label to its left; every a_l cleared).
-        self._add('button_ex', 'btn_apply', {
-            'cap': _('Apply'), 'w': 70, 'h': 24,
+        }, mode='chk', checked=True)
+        _btn('btn_apply', _('Apply'), {
+            'w': 70, 'h': 24,
             'a_l': None, 'a_r': ('', ']'), 'sp_r': 10,
             'a_t': ('ed_left', ']'), 'sp_t': 8,
-            'on_change': self._on_button,
         })
         # The mask input: a one-line 'editor' like the path boxes
         # (themed + self-painted hint -- _add_input). h 26 (was 22:
         # TATSynEdit's chrome needs the path boxes' height) and the
         # label at sp_t 12 still centers on it exactly (12+10 ==
         # 9+13); the row bottom stays clear of the list's sp_t 44.
+        # The chain runs left to right -- chk_sub -> label -> edit ->
+        # Apply -- and the edit STRETCHES between the label and
+        # Apply: Row C is overlap-free at the 700px floor (the old
+        # fixed 170px edit was the row's last collision), and on a
+        # wide window the mask grows with it.
+        self._add('label', 'lab_mask', {
+            'cap': _('Mask:'), 'h': 20, 'autosize': True, 'w': 44,
+            'a_l': ('chk_sub', ']'), 'sp_l': 20,
+            'a_t': ('ed_left', ']'), 'sp_t': 12,
+            'font_color': tcol,
+        })
         p = {'w': 170, 'h': 26,
-             'a_l': None,
+             'a_l': ('lab_mask', ']'), 'sp_l': 6,
              'a_r': ('btn_apply', '['), 'sp_r': 6,
              'a_t': ('ed_left', ']'), 'sp_t': 9,
              'texthint': _('*.py; *.txt')}
         self._add_input('ed_mask', p, '')
-        self._add('label', 'lab_mask', {
-            'cap': _('Mask:'), 'h': 20, 'autosize': True, 'w': 44,
-            'a_l': None,
-            'a_r': ('ed_mask', '['), 'sp_r': 6,
-            'a_t': ('ed_left', ']'), 'sp_t': 12,
-            'font_color': tcol,
-        })
+
+        # The honest WIDTH FLOOR (all rows are measured now): the
+        # buttons autosize to the UI font, so a fixed 700-unit floor
+        # cannot guarantee a fit at 14pt -- the floor is the widest
+        # row's MEASURED content (Row C: the five checks + the mask
+        # group; Row A: the toolbar + Close; Row B: both Browse
+        # buttons + a usable 120px minimum per path edit), never
+        # below the classic MIN_W. Re-pushed as 'w_min' in dlg units
+        # (DLG_SCALE multiplies it by the DPI factor _ui_scale --
+        # dividing the measured pixels by the same factor converts)
+        # and stashed in px for the saved-geometry guard below.
+        try:
+            s = _ui_scale() or 1.0
+            row_c = sum(self._drawn[n].width_px() for n in
+                        ('chk_diff', 'chk_lonly', 'chk_ronly',
+                         'chk_same', 'chk_sub'))
+            row_c += (10 + 12 * 3 + 24)          # the checks' spacings
+            row_c += 20 + _probe_text_w(h, _('Mask:'),
+                                        self._probe_gap) + 4 + 6
+            row_c += 60                          # a usable mask minimum
+            row_c += self._drawn['btn_apply'].width_px() + 6 + 10
+            row_a = 10 + 8 * (len(self.TOOLBAR_BTNS) - 1) + 10
+            row_a += sum(self._drawn[n].width_px()
+                         for n, _c, _w in self.TOOLBAR_BTNS)
+            row_a += self._drawn['btn_close'].width_px()
+            row_b = (2 * self._drawn['btn_lbrw'].width_px() +
+                     self.PATH_GAP + 2 * 10 + 2 * 6 + 2 * 120)
+            self._floor_px = max(int(self.MIN_W * max(1.0, _font_scale())
+                                     * s), row_a, row_b, row_c) + 16
+            ct.dlg_proc(h, ct.DLG_PROP_SET,
+                        prop={'w_min': int(self._floor_px / s) + 1})
+        except Exception:
+            self._floor_px = 0   # the classic fixed floor stands
 
         # -- Statusbar (created before the list: the list anchors to it) --
         # TATStatus renders its cells in the themed UI font (like the
@@ -2956,13 +3440,26 @@ class DirCompareForm:
 
         # Scale the built layout to the OS DPI, then re-apply the saved
         # window geometry (saved values were captured post-scale, so
-        # applying them after DLG_SCALE never double-scales).
+        # applying them after DLG_SCALE never double-scales). A saved
+        # window NARROWER than the measured floor is dropped (the
+        # report's overlapping small window: a programmatic PROP_SET
+        # bypasses the form's w_min constraints -- this is where the
+        # floor is actually enforced for restored windows).
         ct.dlg_proc(h, ct.DLG_SCALE)
-        if geom:
+        if geom and int(geom.get('w', 0) or 0) >= \
+                max(self._floor_px, int(self.MIN_W * max(1.0,
+                    _font_scale()) * _ui_scale())):
             try:
                 ct.dlg_proc(h, ct.DLG_PROP_SET, prop=geom)
             except Exception:
                 pass
+        # LAST, with the layout final (DLG_SCALE applied, saved size
+        # restored): pin every drawn button's measured pixel width and
+        # its item band (see _DrawnBtn.sync -- the build-time 'w' was
+        # dlg units the scale pass has applied; from here the widths
+        # are live pixels, like the saved geometry itself).
+        for b in self._drawn.values():
+            b.sync()
 
     def _restore_geom(self):
         # Stored as a single-line "x,y,w,h" STRING, not a list:
@@ -2970,11 +3467,24 @@ class DirCompareForm:
         # values (a list value written twice would corrupt the JSON --
         # the second update leaves the old multi-line block's orphan
         # lines behind).
+        #
+        # The floor is in the same LIVE PIXELS the saved values are:
+        # w_min (set in _build with the font factor) times the DPI
+        # factor _ui_scale() = exactly what DLG_SCALE makes of it. The
+        # old raw comparison let a too-small saved window through on
+        # any DPI>100% box (700 px < 875 px at 125%) -- the small
+        # window the 21st report's screenshots show, with the fixed
+        # 330px path boxes overlapping. A saved size below the floor
+        # is DROPPED (the default size opens instead): a programmatic
+        # PROP_SET bypasses the form's constraints, so this guard is
+        # the only place the floor is enforced for restored windows.
         g = _get_opt('dirs.win_geom', '')
         if isinstance(g, str) and g:
             try:
                 x, y, w, h = (int(v) for v in g.split(','))
-                if w >= self.MIN_W and h >= self.MIN_H:
+                if w >= int(self.MIN_W * max(1.0, _font_scale())
+                            * _ui_scale()) \
+                        and h >= int(self.MIN_H * _ui_scale()):
                     return {'x': x, 'y': y, 'w': w, 'h': h}
             except (TypeError, ValueError):
                 pass
@@ -3031,26 +3541,66 @@ class DirCompareForm:
 
     def _col_spec(self):
         """Column widths for LISTBOX_SET_COLUMNS, in _LIST_COLUMNS
-        order: 0 (= auto-stretch) for Name, the live per-window pixel
-        width of every fixed column (drag-resizable -- see the class
-        docstring "COLUMN RESIZE"; defaults from _LIST_COLUMNS,
-        persisted across sessions as 'dirs.col_widths'). The header
-        splits its captions over these same widths; _col_layout
-        derives the drawn cells' offsets from the same list -- one
-        source of truth for all three."""
-        return [0] + list(self._col_w)
+        order -- all SEVEN as explicit pixel widths, from
+        _effective_cols over the list's LIVE width (the header splits
+        its captions over exactly these numbers, and the drawn cells
+        use the very same list via _col_layout, so header and rows
+        cannot drift apart). The drag-resizable widths behind them
+        live in self._col_w (persisted across sessions as
+        'dirs.col_widths'); _on_resize re-pushes this spec whenever
+        the window's width change makes the effective set move."""
+        return self._effective_cols(self._list_px_w())
+
+    def _effective_cols(self, width):
+        """The seven on-screen column widths for a row 'width' pixels
+        wide -- the single source of truth for the pushed column spec
+        (the header), the painter's cell layout (_col_layout) and the
+        drag hit tests. Name gets everything the six fixed columns
+        leave -- but never less than NAME_MIN_W: when the fixed sum
+        would eat past that floor (a shrunken window -- the 21st
+        release report), the FIXED columns are scaled down
+        proportionally instead, so the name stays visible and every
+        column stays on screen. On a wide window the result is the
+        plain stretch split and the proportional factor is 1."""
+        try:
+            width = int(width)
+        except (TypeError, ValueError):
+            width = 0
+        avail = width - 4
+        fixed = list(self._col_w)
+        name_min = int(NAME_MIN_W * _px_scale())
+        s = sum(fixed)
+        if avail < 60:
+            # degenerate (pre-layout call, collapsed window): the
+            # raw desired widths -- the next real paint re-derives
+            return [max(name_min, 60)] + fixed
+        if s + name_min > avail and s > 0:
+            k = float(avail - name_min) / s
+            fixed = [int(w * k) for w in fixed]
+        name_w = avail - sum(fixed)
+        return [name_w] + fixed
+
+    def _list_px_w(self):
+        """The list control's live pixel width (PROP_GET returns the
+        control's real geometry), 0 when unavailable (the caller's
+        effective set then degrades to the desired widths -- the next
+        on_resize/paint corrects it)."""
+        try:
+            d = ct.dlg_proc(self.h, ct.DLG_CTL_PROP_GET, name='list')
+            return int(d.get('w', 0) or 0)
+        except Exception:
+            return 0
 
     def _col_layout(self, width):
         """Drawn-cell layout for a row 'width' pixels wide: a list of
         (x, w, align) per column, mirroring LISTBOX_SET_COLUMNS'
-        semantics (fixed widths taken from the right edge of the given
-        width; Name gets the remainder) and the live _col_w the header
-        was last pushed -- so the drawn cells land exactly under the
-        header columns, at any DPI and after any drag."""
-        name_w = max(60, width - sum(self._col_w) - 4)
-        out = [(0, name_w, 'L')]
-        x = name_w + 2
-        for (_cap, align, _w), cw in zip(_LIST_COLUMNS[1:], self._col_w):
+        pushed widths (both come from _effective_cols -- one source
+        of truth) so the drawn cells land exactly under the header
+        columns, at any DPI, after any drag and at any window width."""
+        eff = self._effective_cols(width)
+        out = [(0, eff[0], 'L')]
+        x = eff[0] + 2
+        for (_cap, align, _w), cw in zip(_LIST_COLUMNS[1:], eff[1:]):
             out.append((x, cw - 6, align))
             x += cw
         return out
@@ -3058,7 +3608,10 @@ class DirCompareForm:
     def _apply_cols(self):
         """Push the current column widths to the control: the header
         re-splits its captions over the very same widths. Called at
-        build and after every drag step (also by _reset_cols)."""
+        build, after every drag step, by _reset_cols and by
+        _on_resize (a width change moves the effective split -- see
+        _effective_cols: a shrunken window scales the fixed columns
+        down so Name keeps its floor)."""
         if self._torn or not self.h_list:
             return
         try:
@@ -3068,6 +3621,18 @@ class DirCompareForm:
                             text=self._header_text())
         except Exception:
             pass
+
+    def _on_resize(self, id_dlg, id_ctl, data='', info=''):
+        """Form resize (the dialog API's form-level on_resize event):
+        the one layout piece that depends on the live WIDTH is the
+        column split -- the effective widths are re-derived and
+        re-pushed, so the header never sits on a stale split (the
+        rows themselves re-derive per painted row in _col_layout).
+        Everything else on the form is fully anchored and follows the
+        resize by itself."""
+        if self._torn:
+            return
+        self._apply_cols()
 
     def _sort_key(self, r):
         c = self._sort_col
@@ -3215,9 +3780,12 @@ class DirCompareForm:
           '_es'  folder's ROLLED-UP status: the worst status found in
                  its subtree (the row color + Status caption + the
                  Status-column sort key -- WinMerge's 'a folder that
-                 contains a difference is Different'); only set when
-                 the result is worse than 'Identical', so plain
-                 folders keep their own 'Folder' look
+                 contains a difference is Different', and the 21st
+                 release's converse: a folder whose whole subtree is
+                 'Identical' shows 'Identical' too, not 'Folder');
+                 set whenever the rollup beats a plain 'Folder', i.e.
+                 only a folder with NOTHING scanned below (or an
+                 empty one) keeps the plain 'Folder' look
 
         The rollup is computed over the WHOLE subtree (visible rows
         or not) BEFORE the walk: hidden-but-present differences must
@@ -3259,7 +3827,18 @@ class DirCompareForm:
         for r in rows:
             if r['isdir']:
                 w = memo.get(r['rel'])
-                if w is not None and sev.get(w, 99) < sev[ST_SAME]:
+                # The bar is ST_DIR, not ST_SAME (21st release: 'when
+                # folders are identical, the status column shows
+                # "folder" instead of "identical"'): a both-sides
+                # folder whose whole subtree rolled up to ST_SAME now
+                # carries _es=ST_SAME -> the Status cell says
+                # 'Identical', the row sorts with the identical files
+                # and the filter's 'Identical' checkbox governs it.
+                # One-sided folders are unaffected (their rollup can
+                # never reach ST_SAME -- their own status already sits
+                # above it in the severity table), so the delta of the
+                # widened bar is EXACTLY the all-identical subtree.
+                if w is not None and sev.get(w, 99) < sev[ST_DIR]:
                     r['_es'] = w
                 else:
                     r.pop('_es', None)   # stale value from an old fill
@@ -3867,16 +4446,24 @@ class DirCompareForm:
             'chk_ronly': ST_RONLY, 'chk_same': ST_SAME,
         }
         if name in mapping:
-            # button_ex checks carry no 'val' (see _add_check): the
+            # the drawn toggles carry no 'val' (see _DrawnBtn): the
             # click ITSELF is the toggle -- flip the Python state and
-            # re-render the glyph.
+            # re-render the drawn glyph.
             self._show[mapping[name]] = not self._show[mapping[name]]
-            self._set_check_icon(name, self._show[mapping[name]])
+            self._set_chk_state(name, self._show[mapping[name]])
             self._fill_list()
         elif name == 'chk_sub':
             self._recursive = not self._recursive
-            self._set_check_icon('chk_sub', self._recursive)
+            self._set_chk_state('chk_sub', self._recursive)
             self.start_scan()
+
+    def _set_chk_state(self, name, on):
+        """Render a filter toggle's state on its drawn button (the
+        glyph is painted by _DrawnBtn; a missing button -- a degraded
+        build -- just skips the repaint)."""
+        b = self._drawn.get(name)
+        if b is not None:
+            b.set_checked(on)
 
     def _on_key(self, id_dlg, id_ctl, data='', info=''):
         """Form-level keys (keypreview=True). id_ctl is the key code.

@@ -253,12 +253,13 @@ indented under the folder row, in the same window.
   Different     exists on both sides, content differs
   Only left     exists only in the left folder
   Only right    exists only in the right folder
-  Identical     exists on both sides, same content
-  Folder        exists on both sides (a folder row; its contents are
-                the rows below it). A folder's Status cell and color
-                show the worst status INSIDE it (a folder containing
-                a different file reads "Different") -- the plain
-                "Folder" means everything below it is identical
+  Identical     exists on both sides, same content -- a FOLDER row
+                reads "Identical" when everything inside it is
+                identical (rolled up from its whole subtree)
+  Folder        a folder with nothing compared inside yet (empty, or
+                while the scan has not reached it). A folder's Status
+                cell and color show the worst status INSIDE it (a
+                folder containing a different file reads "Different")
   Cannot read   stat/open failed (permissions, broken link...) --
                 always shown, whatever the filters say
 
@@ -366,14 +367,34 @@ a tenth of the speed.
 
 The window's controls:
 
-- The two path edits are editable: type two paths and press Refresh
-  (or Enter) to compare them; the Browse buttons next to them open a
-  folder picker for that side.
-- ALL BUTTONS follow the UI theme (toolbar, Browse, Apply, the
-  picker dialog's Compare/Cancel): they are the app's themed button
-  controls, painted in the theme's button background / border / font
-  colors with themed hover states -- a native OS button stays
-  system-gray in every theme, which was the look before.
+- The two path edits split the row exactly 50/50 and shrink and
+  grow with the window (each stretches from its window edge to its
+  Browse button, and the two Browse buttons sit symmetrically around
+  the window's middle) -- no fixed widths anywhere, so they can
+  never overlap on a small window, and each keeps half the row at
+  every size. Type two paths and press Refresh (or Enter) to compare
+  them; the Browse buttons next to them open a folder picker for
+  that side. A window too small for its own rows is not offered:
+  the minimum width is computed from the rows' measured content at
+  the current UI font, and a remembered window size below it opens
+  at the default size instead.
+- ALL BUTTONS are painted by the plugin (toolbar, Browse, Apply,
+  Close, the picker dialog's Compare/Cancel, the filter checks):
+  their face is a subtle shade of the window's own background toward
+  its text color, with a clearly darker border, the caption centered
+  in the UI font, and hover / pressed shading. Three problems of the
+  stock controls disappear at once: a native OS button stays
+  system-gray in every theme; the app's themed button control paints
+  strictly from the global button-theme keys, so a theme that sets
+  the dark button background without the button font leaves the
+  caption at a dark built-in default -- INVISIBLE text (reported on
+  a dark theme); and fixed button widths ate long captions from the
+  start. The plugin-painted buttons derive every color from the
+  window's own background/text pair (readable in EVERY theme by
+  construction) and their widths are MEASURED in the UI font (the
+  app's own autosize math), so no caption can ever be clipped --
+  and the face+border are clearly distinct from both the window and
+  the paper-colored input boxes, so a button reads as a button.
 - The three input boxes (both paths + Mask) are the app's OWN
   single-line input controls -- the same control the find dialog and
   the command palette use: the theme colors them itself with the
@@ -405,9 +426,10 @@ The window's controls:
 - The status filters (Different / Only left / Only right / Identical)
   hide or show rows instantly, without rescanning. Uncheck
   "Identical" for the usual "show me what matters" view. The check
-  marks are themed buttons with a checkbox glyph (flat, the UI font
-  color), so their captions stay readable in black themes too -- a
-  native checkbox caption ignores the font color on Windows and
+  marks are the plugin-painted flat toggles (a hand-drawn checkbox
+  glyph that scales with the UI font + the caption in the window's
+  own text color), so their captions stay readable in every theme --
+  a native checkbox caption ignores the font color on Windows and
   would render black-on-black.
 - The Subfolders checkbox switches between the full recursive tree
   (default) and the two top folders only; changing it rescans. With
@@ -417,7 +439,9 @@ The window's controls:
 - The Mask edit (on the right of the filter row) filters files by
   wildcard pattern ("*.py; *.txt"), WinMerge-style: matching files
   are compared, everything else is not listed at all. It applies on
-  Apply (or Enter when the list has focus).
+  Apply (or Enter when the list has focus). The edit stretches with
+  the window -- wide windows give it more room, small ones take it
+  back, and the row never collides with the filters.
 - Sorting is the column header's own click-sort (Name, Folder,
   Status, left/right size or date): click a column to sort by it,
   click again to reverse. The direction marker is the Unicode arrow
@@ -433,7 +457,12 @@ The window's controls:
   line between two columns (the cursor turns into a left-right
   split arrow) and drag -- the column left of the boundary follows
   the mouse,
-  live; Name always takes whatever space the other columns leave.
+  live; Name always takes whatever space the other columns leave,
+  and never less than its guaranteed minimum: on a window too
+  narrow for all six fixed columns plus that minimum, the FIXED
+  columns are scaled down proportionally instead, so the file name
+  is always visible (the stock listbox would give the Name column
+  zero pixels there) and every column stays on screen.
   Widths are clamped (a column cannot shrink under its caption or
   grow past half the list), remembered across sessions like the
   window size, and the context menu's "Reset column widths" puts
