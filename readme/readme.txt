@@ -255,7 +255,10 @@ indented under the folder row, in the same window.
   Only right    exists only in the right folder
   Identical     exists on both sides, same content
   Folder        exists on both sides (a folder row; its contents are
-                the rows below it)
+                the rows below it). A folder's Status cell and color
+                show the worst status INSIDE it (a folder containing
+                a different file reads "Different") -- the plain
+                "Folder" means everything below it is identical
   Cannot read   stat/open failed (permissions, broken link...) --
                 always shown, whatever the filters say
 
@@ -392,7 +395,18 @@ The window's controls:
   stretches with the window) so the header and the drawn rows stay
   aligned and dates never clip at 125% scaling. In the tree view the
   sort orders every level (a folder's children among themselves),
-  exactly like the old flat list ordered the whole table.
+  exactly like the old flat list ordered the whole table. Folders
+  sort by their ROLLED-UP status (see the row-colors note below), so
+  the Status column's order always matches what the rows show.
+- The columns are RESIZABLE with the mouse: press near a boundary
+  line between two columns (the cursor turns into a vertical split)
+  and drag -- the column left of the boundary follows the mouse,
+  live; Name always takes whatever space the other columns leave.
+  Widths are clamped (a column cannot shrink under its caption or
+  grow past half the list), remembered across sessions like the
+  window size, and the context menu's "Reset column widths" puts
+  the defaults back. (The dialog API's listbox header itself is not
+  draggable -- that is why the grab zones run through the rows.)
 - The status bar shows the scan progress / result line on the left
   and the counts (Different / Only left / Only right / Identical) on
   the right.
@@ -414,6 +428,16 @@ will paint:
                  grey-on-white tint, and that is what makes the
                  colored rows pop
 
+A FOLDER row carries the worst status of its subtree (WinMerge's
+rolled-up result): a folder that merely CONTAINS a different file
+is painted with the changed color and its Status cell reads
+"Different" -- you can see a folder matters without expanding it --
+while a folder whose contents are all identical stays plain
+("Folder", no fill). One-sided folders keep their deleted/added
+color and "Only left/right" caption. Folder rows always carry the
+FOLDER icon: the icon tells the kind, the color and caption tell the
+status.
+
 The selected row shows the theme's list-selection colors instead
 (selection wins, like in an editor). The colors follow the
 "Color theme" option like everywhere else in the plugin.
@@ -427,14 +451,14 @@ Working with rows:
   folder scan itself never runs them.
 - Double-click a one-sided file row: the existing file opens alone in
   an editor tab.
-- FOLDERS EXPAND INLINE (WinMerge tree mode): click the arrow at the
-  row's left edge, double-click the folder row, or select it and
-  press Enter -- the folder's rows appear indented right below it,
-  IN THE SAME WINDOW (no new window). Click again (arrow or
-  double-click) to fold it back. The context menu adds Expand /
-  Collapse for the clicked folder plus Expand all / Collapse all
-  for the whole tree. The expansion state is remembered per folder
-  across rescans of the same pair.
+- FOLDERS EXPAND INLINE (WinMerge tree mode): click the + marker at
+  the row's left edge (it flips to - when expanded), double-click
+  the folder row, or select it and press Enter -- the folder's rows
+  appear indented right below it, IN THE SAME WINDOW (no new
+  window). Click again (marker or double-click) to fold it back.
+  The context menu adds Expand / Collapse for the clicked folder
+  plus Expand all / Collapse all for the whole tree. The expansion
+  state is remembered per folder across rescans of the same pair.
 - Double-click a folder row WITHOUT scanned children (Subfolders
   off, or a truly empty pair): a drill-down -- a NEW compare window
   opens scoped to that subfolder pair.

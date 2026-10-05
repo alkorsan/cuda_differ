@@ -1,3 +1,66 @@
+2026.10.05 (15th release, by @alkorsan)
+* add: the compare list's columns are RESIZABLE with the mouse
+  (requested: "i cannot resize the columns, i want to be able to
+  resize them with mouse drag and drop, maybe api allow it or we
+  can use separator which allow to resize"). The dialog API's
+  listbox header cannot be dragged, but the listbox control DOES
+  deliver on_mouse_down / on_mouse_move / on_mouse_up (data =
+  {'btn','state','x','y'} in client coords -- verified against
+  proc_customdialog.pas: every control gets the handlers), so the
+  six internal column boundaries are grab zones in the rows area:
+  a left press within ~6 px of a boundary (hovering one flips the
+  cursor to CURSOR_V_SPLIT -- the generic 'cursor' control prop)
+  starts a drag; the column LEFT of the boundary follows the mouse
+  live (LISTBOX_SET_COLUMNS re-pushed every step, the header
+  re-split over the same widths; boundary 1 adjusts Folder
+  inversely since Name is the stretch column), clamped to 24..600
+  base px per column. A move without the left button held ends the
+  drag (the state string carries 'L' exactly while the button is
+  down -- a release outside the control can otherwise stick the
+  drag to the cursor). Widths persist as 'dirs.col_widths' (base
+  96-DPI values, saved with the window geometry at close,
+  sanitized/clamped on load) and the context menu gains "Reset
+  column widths". _col_spec/_col_layout moved from module-table
+  math to per-window live widths (self._col_w) -- one source of
+  truth for the header, the drawn cells and the drag hit test.
+* change: the folder expand marker is the ASCII '+' / '-' pair, not
+  the U+2192/U+2193 arrows (requested: "for folder expand icon use
+  + and -"). ASCII renders in every font, and the arrows were wide
+  enough on large-font boxes to collide with the folder icon at
+  GUTTER_ICON. The header's sort marker keeps the U+2191/U+2193
+  arrows. Hit zone unchanged.
+* change: a FOLDER row now carries the worst status of its subtree,
+  WinMerge's rolled-up result (reported: "when folder contente are
+  diferent the parent folder must use the changed color not the
+  identical color"). A folder that merely CONTAINS a different file
+  is painted with color_changed and its Status cell reads
+  "Different"; a folder whose contents are all identical keeps the
+  plain look ("Folder", no fill). The rollup runs in _build_view
+  over the WHOLE subtree (visible rows or not -- hidden differences
+  still color the container keeping them reachable), memoized per
+  rel path, and only results worse than "Identical" are stored
+  (plain folders keep their own look). The Status-column sort key
+  uses the rolled-up status too, so the sort order matches the
+  displayed text. One-sided folders: the rolled-up 'lonly'/'ronly'
+  wins over their own dir_lonly/dir_ronly -- same color, same
+  caption as before.
+* change: folder rows ALWAYS paint the folder icon (reported:
+  "folder icon must always use folder icon not arrows"); one-sided
+  folders no longer swap it for the file-status icon -- color and
+  caption carry the sidedness, the icon carries the kind.
+* tests: GUI suite gained the drag battery (press-on-boundary
+  narrows/widens the right column, live LISTBOX_SET_COLUMNS, MIN
+  clamp, no-button move ends the drag, right-button/off-boundary
+  presses start nothing, V-split hover cursor on/off, menu reset)
+  and the persistence battery (drag -> close -> settings value ->
+  fresh window restores; junk and out-of-range col_widths sanitize
+  on load); the rolled-up battery (sub _es=diff + color_changed
+  fill + "Different" caption, osame plain, one-sided folder rolls
+  up to lonly with the FOLDER icon and color_deleted, cfg colors
+  survive rescans, '+'/'-' glyph checks, status sort by _es);
+  253 checks green (was 194). scanner/span/import unchanged.
+
+
 2026.10.05 (14th release, by @alkorsan)
 * change: WinMerge-style TREE view for the folder-compare results.
   A recursive scan's rows are no longer one flat table: folders are

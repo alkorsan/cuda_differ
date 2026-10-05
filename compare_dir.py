@@ -282,17 +282,27 @@ the dialog API's listview has no per-row colors at all --
 owner-drawing was the only way to give the folder list
 WinMerge/Beyond-Compare-style row colors.
 
+A FOLDER row carries the worst status of its subtree (WinMerge's
+rolled-up result): a folder that only CONTAINS a different file is
+painted with color_changed and its Status cell reads "Different",
+while a folder whose contents are all identical stays plain. Folders
+always carry the folder icon -- one-sided folders communicate their
+sidedness by color and caption, not by swapping the icon.
+
 == Windows / instances =============================================
 
 Every compare is a separate NON-MODAL dlg_proc form: run as many
 folder compares side by side as you like. A recursive scan's results
 are shown as a WinMerge-style TREE: every folder is folded by
-default; clicking its arrow, double-clicking it, pressing Enter or
-the context menu expands it INLINE -- the children appear indented
+default; clicking its +/- marker, double-clicking it, pressing Enter
+or the context menu expands it INLINE -- the children appear indented
 under the folder row, in the same window (no drill-down windows;
 those remain only for folders without scanned children, i.e. with
 Subfolders off or truly empty folders). Sorting is the column
-header's own click-sort (the marker is the U+2191/U+2193 arrow).
+header's own click-sort (the marker is the U+2191/U+2193 arrow); the
+column WIDTHS are drag-resizable -- press near a boundary line in
+the list (the cursor turns into a V-split) and drag; the widths are
+remembered across sessions and resettable from the context menu.
 Forms register themselves in the module-level _forms list (which keeps
 their Python objects -- and thus their timer callbacks -- alive);
 on_close tears a form down: cancel the worker, stop the timer, save
@@ -456,7 +466,9 @@ METHOD_SIZE_TIME = 'size_timestamp'
 # Widths are 96-DPI BASE pixels -- _col_spec/_col_layout multiply them
 # by _ui_scale() so the cells keep fitting the (DPI-scaled) control
 # font on high-DPI boxes (the reporting box ellipsized every date at
-# 125% DPI with the raw 96-DPI widths).
+# 125% DPI with the raw 96-DPI widths). They are also only the
+# DEFAULTS: the fixed columns are drag-resizable (see _on_mouse_down)
+# and persist across sessions as 'dirs.col_widths' (base values).
 _LIST_COLUMNS = (
     (_('Name'), 'L', 230),
     (_('Folder'), 'L', 170),
@@ -466,6 +478,13 @@ _LIST_COLUMNS = (
     (_('Right size'), 'R', 85),
     (_('Right date'), 'L', 140),
 )
+
+# Drag-resize clamps for a fixed column, in the same base 96-DPI
+# pixels: below MIN the header caption would clip, above MAX one
+# column would eat the list. Name is never resized directly -- it is
+# the stretch column and takes whatever the fixed columns leave.
+MIN_COL_W = 24
+MAX_COL_W = 600
 
 
 # ----------------------------------------------------------------------
@@ -1917,7 +1936,10 @@ class _PickerDialog:
 # The compare window
 # ----------------------------------------------------------------------
 
-# Which icon (by _ICONS_PNG name) each row status uses.
+# Which icon (by _ICONS_PNG name) each FILE row status uses. Folder
+# rows always paint the folder icon (see the painter) -- a one-sided
+# folder must not swap it for a file icon: its color and Status
+# caption carry the sidedness, the icon carries the KIND.
 _ICON_OF = {
     ST_SAME:      'same',
     ST_DIFF:      'diff',
@@ -1925,18 +1947,21 @@ _ICON_OF = {
     ST_RONLY:     'ronly',
     ST_ERR:       'err',
     ST_DIR:       'folder',
-    ST_DIR_LONLY: 'lonly',
-    ST_DIR_RONLY: 'ronly',
+    ST_DIR_LONLY: 'folder',
+    ST_DIR_RONLY: 'folder',
 }
 
 # Tree-mode metrics (base 96-DPI pixels; _ui_scale multiplies them at
 # paint time like every other raw-pixel metric): per-level indent,
-# the expand-arrow zone, and the icon/text x-offsets inside the Name
-# cell. Drawn as glyphs from the SAME Arrows block as _SORT_MARK
-# (U+2192/U+2193) -- the geometric triangles U+25B4/U+25BE render as
-# tofu on real-world UI fonts.
+# the expand-marker zone, and the icon/text x-offsets inside the Name
+# cell. The expand marker is the ASCII '+'/'-' pair -- narrow glyphs
+# every font has (the 14th release drew U+2192/U+2193 arrows there,
+# wide enough on large-font boxes to collide with the folder icon at
+# GUTTER_ICON, and the geometric triangles U+25B4/U+25BE render as
+# tofu on real-world UI fonts). The header's sort marker keeps the
+# U+2191/U+2193 arrows.
 TREE_INDENT = 14         # per tree level
-ARROW_W = 16             # hit zone of the expand arrow
+ARROW_W = 16             # hit zone of the +/- expand marker
 GUTTER_ICON = 18         # status icon x inside the Name cell
 GUTTER_TEXT = 36         # name text x inside the Name cell
 
@@ -1964,9 +1989,10 @@ class DirCompareForm:
       +--------------------------------------------------------------+
       | Name | Folder | Status | Left size | Left date | R.size | R.date |
       | (owner-drawn listbox_ex, stretches with the form; WinMerge-  |
-      |  style tree: folders folded by default, arrow/dbl-click/Enter|
+      |  style tree: folders folded by default, +/-/dbl-click/Enter |
       |  expands them INLINE -- children appear indented below the   |
-      |  folder row, in the same window)                             |
+      |  folder row, in the same window; column boundaries are       |
+      |  drag-resizable -- see COLUMN RESIZE below)                  |
       +--------------------------------------------------------------+
       [ status line / progress                    ][ counts          ]
 
@@ -1975,27 +2001,44 @@ class DirCompareForm:
 
     The results list is an owner-drawn listbox_ex (LISTBOX_SET_DRAWN):
     the control never paints items itself, it calls on_draw_item for
-    every visible row and the form paints background + arrow + icon +
+    every visible row and the form paints background + marker + icon +
     all cells -- which is what makes the full-line status colors
     possible (the dialog API's listview has no per-row colors at
     all). The colors are the diff-tab hunk colors (color_changed /
     color_deleted / color_added of Command.cfg), so a row's color
-    matches exactly what its double-clicked compare tab paints. The
-    built-in column header is driven with the same pixel widths the
-    painter uses, so header clicks (sorting -- the ONLY sort UI, the
-    marker is the U+2191/U+2193 arrow) align with the drawn cells.
+    matches exactly what its double-clicked compare tab paints; a
+    FOLDER row is painted with the worst status of its subtree
+    (WinMerge's rolled-up result -- a folder merely CONTAINING a
+    different file is "Different"), and folders always carry the
+    folder icon. The built-in column header is driven with the same
+    pixel widths the painter uses, so header clicks (sorting -- the
+    ONLY sort UI, the marker is the U+2191/U+2193 arrow) align with
+    the drawn cells.
 
     TREE MODE (WinMerge): a recursive scan's flat row list is
     displayed as a tree -- each level sorted by the current column
     exactly like the old flat list, every folder FOLDED until the
-    user expands it (click its arrow / double-click it / press Enter /
-    the context menu); the children then appear indented under the
-    folder row IN THIS WINDOW. A folder whose rows are all filtered
-    out stays visible as long as anything below it is visible (a
-    container); folders without scanned children (Subfolders off, or
-    empty) keep the old double-click behavior -- a drill-down window /
-    the file manager. The expansion state is keyed by rel path and
-    survives rescans of the same folder pair.
+    user expands it (click its +/- marker / double-click it / press
+    Enter / the context menu); the children then appear indented
+    under the folder row IN THIS WINDOW. A folder whose rows are all
+    filtered out stays visible as long as anything below it is
+    visible (a container); folders without scanned children
+    (Subfolders off, or empty) keep the old double-click behavior --
+    a drill-down window / the file manager. The expansion state is
+    keyed by rel path and survives rescans of the same folder pair.
+
+    COLUMN RESIZE: the dialog API's listbox header cannot be dragged,
+    but the control DOES deliver on_mouse_down/up/move (data =
+    {'btn','state','x','y'} client coords) over its rows area. The
+    six internal column boundaries run through the rows; a left
+    press within ~6px of one (the hover shows the V-split cursor)
+    starts a drag that adjusts the column to its left -- boundary 1
+    (Name|Folder) inversely narrows Folder, since Name is the stretch
+    column. Widths are clamped to MIN/MAX_COL_W, pushed live via
+    LISTBOX_SET_COLUMNS (+ the header re-split over them), persisted
+    as 'dirs.col_widths' at window close and resettable from the
+    context menu. A move without the button held ends the drag (the
+    release happened outside the control -- the state string's 'L').
     """
 
     DEF_W = 940
@@ -2043,16 +2086,27 @@ class DirCompareForm:
         # folder rel paths -- keyed by path so it survives sort/filter
         # changes and rescans of the same pair (cleared when the
         # compared pair itself changes). _arrow_echo suppresses the
-        # second on_click of a double-click on the expand arrow
-        # (the dbl handler leaves arrow clicks to on_click). _hdr_h
-        # (listbox header height in px) and _row_x0 (a row's left
-        # edge) are calibrated from the painter and turn the click's
-        # (x, y) into a row + arrow-zone hit test.
+        # second on_click of a double-click on the expand marker
+        # (the dbl handler leaves marker clicks to on_click). _hdr_h
+        # (listbox header height in px) and _row_x0/_row_w (a row's
+        # left edge / width) are calibrated from the painter and turn
+        # the click's (x, y) into a row + marker-zone hit test -- and
+        # the mouse events' x into a column-boundary one.
         self._expand = set()
         self._exp_roots = None          # (dir_l, dir_r) _expand is for
         self._arrow_echo = (-1, 0.0)    # (view index, perf_counter)
         self._hdr_h = None
         self._row_x0 = 0
+        self._row_w = 0
+        # Column-resize state (see the class docstring "COLUMN
+        # RESIZE"): the live pixel widths of the six fixed columns
+        # (Name stretches -- _col_spec), None while no drag runs;
+        # _drag = (col index, sign, press x, width at press), _zone =
+        # the cursor is currently over a boundary (edge-triggered
+        # cursor updates).
+        self._col_w = self._load_col_w()
+        self._drag = None
+        self._zone = False
         self._quick_only = bool(_get_opt('dirs.quick_only', False))
         self._method = _get_method()
         self._show = {                  # status filter checkboxes
@@ -2278,6 +2332,11 @@ class DirCompareForm:
             'on_click_header': self._on_header,
             'on_menu': self._on_list_menu,
             'on_draw_item': self._on_draw_item,
+            # column-resize drag (on_mouse_down starts it, move
+            # tracks it, up ends it -- see the class docstring)
+            'on_mouse_down': self._on_mouse_down,
+            'on_mouse_move': self._on_mouse_move,
+            'on_mouse_up': self._on_mouse_up,
         }
         li_bg = _theme_color('TreeBg', _theme_color('ListBg', ed_bg))
         li_fg = _theme_color('TreeFont', _theme_color('ListFont', ed_fg))
@@ -2374,35 +2433,65 @@ class DirCompareForm:
         except Exception:
             pass
 
-    @staticmethod
-    def _col_spec():
-        """Column widths for LISTBOX_SET_COLUMNS, in _LIST_COLUMNS
-        order: 0 (= auto-stretch) for Name, the fixed pixel width for
-        every other column. The header splits its captions over these
-        same widths; _col_layout derives the drawn cells' offsets from
-        the same table -- one source of truth for all three. Widths
-        are _ui_scale()d: LISTBOX_SET_COLUMNS bypasses the form's
-        DLG_SCALE while the list's font does not."""
+    def _load_col_w(self):
+        """Pixel widths of the six FIXED columns (Name stretches: 0
+        in _col_spec). Defaults come from _LIST_COLUMNS; a saved
+        'dirs.col_widths' (base 96-DPI values, written at window
+        close -- see _teardown) overrides them, sanitized per column
+        (a hand-edited junk value must not break the layout). Scaled
+        by _ui_scale() here, ONCE: _col_spec/_col_layout and the
+        drag hit tests all share the same pixel values."""
+        base = [w for _c, _a, w in _LIST_COLUMNS[1:]]
+        g = _get_opt('dirs.col_widths', '')
+        if isinstance(g, str) and g:
+            try:
+                v = [int(x) for x in g.split(',')]
+            except ValueError:
+                v = None
+            if v is not None and len(v) == len(base):
+                base = [min(MAX_COL_W, max(MIN_COL_W, x)) for x in v]
         s = _ui_scale()
-        return [0] + [int(w * s) for _cap, _align, w in _LIST_COLUMNS[1:]]
+        return [int(w * s) for w in base]
+
+    def _col_spec(self):
+        """Column widths for LISTBOX_SET_COLUMNS, in _LIST_COLUMNS
+        order: 0 (= auto-stretch) for Name, the live per-window pixel
+        width of every fixed column (drag-resizable -- see the class
+        docstring "COLUMN RESIZE"; defaults from _LIST_COLUMNS,
+        persisted across sessions as 'dirs.col_widths'). The header
+        splits its captions over these same widths; _col_layout
+        derives the drawn cells' offsets from the same list -- one
+        source of truth for all three."""
+        return [0] + list(self._col_w)
 
     def _col_layout(self, width):
         """Drawn-cell layout for a row 'width' pixels wide: a list of
         (x, w, align) per column, mirroring LISTBOX_SET_COLUMNS'
         semantics (fixed widths taken from the right edge of the given
-        width; Name gets the remainder). Scaled by _ui_scale() like
-        _col_spec, so the drawn cells land exactly under the header
-        columns on high-DPI boxes too."""
-        s = _ui_scale()
-        fixed = [int(w * s) for _cap, _align, w in _LIST_COLUMNS[1:]]
-        name_w = max(60, width - sum(fixed) - 4)
+        width; Name gets the remainder) and the live _col_w the header
+        was last pushed -- so the drawn cells land exactly under the
+        header columns, at any DPI and after any drag."""
+        name_w = max(60, width - sum(self._col_w) - 4)
         out = [(0, name_w, 'L')]
         x = name_w + 2
-        for (_cap, align, w) in _LIST_COLUMNS[1:]:
-            cw = int(w * s)
+        for (_cap, align, _w), cw in zip(_LIST_COLUMNS[1:], self._col_w):
             out.append((x, cw - 6, align))
             x += cw
         return out
+
+    def _apply_cols(self):
+        """Push the current column widths to the control: the header
+        re-splits its captions over the very same widths. Called at
+        build and after every drag step (also by _reset_cols)."""
+        if self._torn or not self.h_list:
+            return
+        try:
+            ct.listbox_proc(self.h_list, ct.LISTBOX_SET_COLUMNS,
+                            text=self._col_spec())
+            ct.listbox_proc(self.h_list, ct.LISTBOX_SET_HEADER,
+                            text=self._header_text())
+        except Exception:
+            pass
 
     def _sort_key(self, r):
         c = self._sort_col
@@ -2411,7 +2500,12 @@ class DirCompareForm:
         if c == 1:
             return (r['dir'].lower(), r['name'].lower())
         if c == 2:
-            return (STATUS_SEVERITY.get(r['status'], 99), r['rel'].lower())
+            # folders sort by their ROLLED-UP status (_es -- see
+            # _build_view): the Status cell shows it, so the sort and
+            # the display must agree (a red 'Different' folder sorts
+            # with the differences, not with the plain folders)
+            return (STATUS_SEVERITY.get(r.get('_es', r['status']), 99),
+                    r['rel'].lower())
         if c == 3:
             return (r['size_l'] if r['size_l'] is not None else -1,)
         if c == 4:
@@ -2424,10 +2518,11 @@ class DirCompareForm:
 
     @staticmethod
     def _row_cells(r):
+        st = r.get('_es', r['status'])   # folders: rolled-up status
         return (
             r['name'],
             r['dir'],
-            STATUS_CAPTION.get(r['status'], r['status']),
+            STATUS_CAPTION.get(st, st),
             '' if r['isdir'] else _fmt_size(r['size_l']),
             _fmt_date(r['mtime_l']),
             '' if r['isdir'] else _fmt_size(r['size_r']),
@@ -2539,8 +2634,18 @@ class DirCompareForm:
         the click hit test read:
 
           '_d'   depth (0 = directly under the compared roots)
-          '_hk'  folder HAS scanned children (the arrow is drawn)
-          '_ex'  folder is expanded (the arrow points down)
+          '_hk'  folder HAS scanned children (the +/- marker is drawn)
+          '_ex'  folder is expanded (the marker is '-')
+          '_es'  folder's ROLLED-UP status: the worst status found in
+                 its subtree (the row color + Status caption + the
+                 Status-column sort key -- WinMerge's 'a folder that
+                 contains a difference is Different'); only set when
+                 the result is worse than 'Identical', so plain
+                 folders keep their own 'Folder' look
+
+        The rollup is computed over the WHOLE subtree (visible rows
+        or not) BEFORE the walk: hidden-but-present differences must
+        still color the container that keeps them reachable.
 
         A folder whose own row is filtered out stays visible as a
         CONTAINER while anything below it is visible (without this,
@@ -2552,6 +2657,37 @@ class DirCompareForm:
         kids = {}
         for r in rows:
             kids.setdefault(r['dir'], []).append(r)
+
+        # Rolled-up folder status (the '_es' field above): worst
+        # status of the folder's own row and everything under it,
+        # memoized per rel path (each rel is unique -- the kids graph
+        # is a well-founded tree by construction). Severity order =
+        # STATUS_SEVERITY, i.e. the display's order of interesting.
+        sev = STATUS_SEVERITY
+        memo = {}
+
+        def rollup(rel, own):
+            w, ws = own, sev.get(own, 99)
+            for r in kids.get(rel, ()):
+                cw = rollup(r['rel'], r['status']) \
+                    if r['isdir'] else r['status']
+                cs = sev.get(cw, 99)
+                if cs < ws:
+                    w, ws = cw, cs
+            memo[rel] = w
+            return w
+
+        for r in rows:
+            if r['isdir'] and r['rel'] not in memo:
+                rollup(r['rel'], r['status'])
+        for r in rows:
+            if r['isdir']:
+                w = memo.get(r['rel'])
+                if w is not None and sev.get(w, 99) < sev[ST_SAME]:
+                    r['_es'] = w
+                else:
+                    r.pop('_es', None)   # stale value from an old fill
+
         view = []
 
         def level(rel, depth):
@@ -2607,9 +2743,11 @@ class DirCompareForm:
     def _on_draw_item(self, id_dlg, id_ctl, data='', info=''):
         """LISTBOX_SET_DRAWN painter: draws one row -- background
         (status color: the SAME colors the diff tabs paint their hunks
-        with), the tree gutter (expand arrow + status icon), and the
-        seven cells at _col_layout offsets (the Name cell shifted and
-        narrowed by the gutter + the row's tree indent).
+        with, and for a FOLDER the worst status of its subtree -- see
+        _build_view's rollup), the tree gutter (+/- marker + status
+        icon; folders ALWAYS the folder icon), and the seven cells at
+        _col_layout offsets (the Name cell shifted and narrowed by
+        the gutter + the row's tree indent).
 
         Runs inside the control's paint cycle: only canvas_proc /
         imagelist_proc calls here (paint-only, no re-entrant repaints),
@@ -2637,7 +2775,11 @@ class DirCompareForm:
         # One-time calibration for _on_list_click's (x, y) hit test:
         # the header height from the drawn row's own position. The
         # geometry never changes after build, so once is enough.
+        # _row_x0/_row_w also feed the column-resize drag's boundary
+        # hit test (they DO move on a form resize -- hence refreshed
+        # on every painted row, not just the first).
         self._row_x0 = x0
+        self._row_w = w
         if self._hdr_h is None:
             try:
                 ih = ct.listbox_proc(self.h_list, ct.LISTBOX_GET_ITEM_H)
@@ -2660,7 +2802,9 @@ class DirCompareForm:
             bg = col.get('sel_bg')
             fg = col.get('sel_font')
         else:
-            bg = col.get(ST_COLOR_KEY.get(st, ''), )
+            # est: the folder's rolled-up status (worst of its
+            # subtree) -- plain rows fall back to their own status
+            bg = col.get(ST_COLOR_KEY.get(row.get('_es', st), ''))
             fg = col.get('font')
         if bg is None:
             bg = col.get('bg', 0xF0F0F0)
@@ -2675,11 +2819,11 @@ class DirCompareForm:
         except Exception:
             return
 
-        # -- tree gutter: arrow + status icon, then the cells ---------
-        # [arrow][icon][name...] all shifted by the row's depth (the
-        # arrow only on folders with scanned children). Icon and text
-        # have separate offsets -- the pre-tree code painted the icon
-        # at x0+3 with the Name text at x0+4, i.e. ON TOP of it.
+        # -- tree gutter: +/- marker + status icon, then the cells ---
+        # [+/-][icon][name...] all shifted by the row's depth (the
+        # marker only on folders with scanned children). Icon and
+        # text have separate offsets -- the pre-tree code painted the
+        # icon at x0+3 with the Name text at x0+4, i.e. ON TOP of it.
         depth = row.get('_d', 0)
         ind = int(TREE_INDENT * _ui_scale()) * depth
         ax = x0 + 2 + ind
@@ -2699,16 +2843,20 @@ class DirCompareForm:
             sz = None
 
         if row.get('_hk'):
-            # the expand arrow -- same Arrows block as the header's
-            # sort marker (U+2192 collapsed / U+2193 expanded)
+            # the +/- expand marker (ASCII -- see the TREE_* metrics
+            # comment: arrows can collide with the folder icon on
+            # large-font boxes, triangles render as tofu)
             try:
                 ct.canvas_proc(canvas, ct.CANVAS_TEXT,
-                               text='\u2193' if row.get('_ex')
-                               else '\u2192', x=ax, y=ty)
+                               text='-' if row.get('_ex') else '+',
+                               x=ax, y=ty)
             except Exception:
                 pass
 
-        icon = _ICON_OF.get(st)
+        # folders ALWAYS paint the folder icon (a one-sided folder's
+        # color + Status caption carry the sidedness); files paint
+        # their own status icon
+        icon = 'folder' if row['isdir'] else _ICON_OF.get(st)
         if icon is not None:
             idx = self._icon_idx.get(icon, -1)
             if idx is not None and idx >= 0 and self.h_imglist:
@@ -3133,9 +3281,9 @@ class DirCompareForm:
         self._fill_list()
 
     def _in_arrow(self, row, x):
-        """Is client-x inside the row's expand-arrow zone? (The zone
-        the painter draws the U+2192/U+2193 glyph into, widened to
-        ARROW_W for an easy hit.)"""
+        """Is client-x inside the row's expand-marker zone? (The zone
+        the painter draws the +/- glyph into, widened to ARROW_W for
+        an easy hit.)"""
         ax = self._row_x0 + 2 + \
             int(TREE_INDENT * _ui_scale()) * row.get('_d', 0)
         return ax <= x <= ax + int(ARROW_W * _ui_scale())
@@ -3159,18 +3307,142 @@ class DirCompareForm:
         row_top = self._hdr_h + (idx - top) * ih
         return row_top <= y < row_top + ih
 
+    # ------------------------------------------------------------------
+    # Column resize (mouse drag on the boundary lines)
+    # ------------------------------------------------------------------
+
+    def _boundaries(self):
+        """Client-x positions of the six internal column boundaries
+        (Name|Folder, Folder|Status, ..., Right size|Right date), or
+        None until a row has been painted (the painter calibrates
+        _row_x0/_row_w; the built-in header is not addressable, so
+        the boundaries live in the rows area)."""
+        if self._row_w <= 0:
+            return None
+        lay = self._col_layout(self._row_w)
+        return [self._row_x0 + cx for (cx, _cw, _al) in lay[1:]]
+
+    def _boundary_at(self, x):
+        """The boundary number (1..6, leftmost wins) whose x is
+        within the grab tolerance of a left press, or None."""
+        bs = self._boundaries()
+        if not bs:
+            return None
+        tol = int(6 * _ui_scale())
+        for i, bx in enumerate(bs):
+            if abs(x - bx) <= tol:
+                return i + 1
+        return None
+
+    def _set_cursor(self, v_split):
+        """Show/restore the V-split resize cursor on the list
+        (edge-triggered from _on_mouse_move -- cheap on hover, and
+        skipped entirely on builds without the cursor prop)."""
+        self._zone = v_split
+        try:
+            ct.dlg_proc(self.h, ct.DLG_CTL_PROP_SET, name='list',
+                        prop={'cursor': ct.CURSOR_V_SPLIT if v_split
+                              else ct.CURSOR_DEFAULT})
+        except Exception:
+            pass
+
+    def _on_mouse_down(self, id_dlg, id_ctl, data='', info=''):
+        """Left press near an internal column boundary starts a
+        column-RESIZE drag (the dialog API's listbox header cannot be
+        dragged; the control does deliver mouse events over its rows,
+        where the boundary lines run). data =
+        {'btn': 0/1/2, 'state': 's/c/a/L/...', 'x': int, 'y': int}.
+        Boundary 1 (Name|Folder) adjusts Folder INVERSELY -- Name is
+        the stretch column and grows with the freed space; boundary
+        j>=2 adjusts the column to its left."""
+        if self._torn or not self.h_list:
+            return
+        if not isinstance(data, dict):
+            return
+        try:
+            if int(data.get('btn', -1)) != 0:    # left button only
+                return
+            x = int(data.get('x', -1))
+        except (TypeError, ValueError):
+            return
+        j = self._boundary_at(x)
+        if j is None:
+            return
+        if j == 1:
+            k, sign = 0, -1
+        else:
+            k, sign = j - 2, 1
+        self._drag = (k, sign, x, self._col_w[k])
+        if not self._zone:
+            self._set_cursor(True)   # a fast press may skip the hover
+
+    def _on_mouse_move(self, id_dlg, id_ctl, data='', info=''):
+        """Hover: show the V-split cursor over a boundary
+        (edge-triggered: the prop is touched only when the zone is
+        entered/left; steady hovering costs one comparison). Drag:
+        move the boundary with the mouse, clamped to
+        MIN_COL_W..MAX_COL_W, pushed live via _apply_cols. A move
+        without the left button held ENDS the drag -- the release
+        happened outside the control, and without this check the drag
+        would stick to the cursor (the state string carries 'L'
+        exactly while the button is down)."""
+        if self._torn or not self.h_list:
+            return
+        if not isinstance(data, dict):
+            return
+        try:
+            x = int(data.get('x', -1))
+            held = 'L' in str(data.get('state', ''))
+        except (TypeError, ValueError):
+            return
+        if self._drag is None:
+            if not held:
+                in_zone = self._boundary_at(x) is not None
+                if in_zone != self._zone:
+                    self._set_cursor(in_zone)
+            return
+        if not held:
+            self._drag = None          # released outside the control
+            return
+        k, sign, x0, w0 = self._drag
+        s = _ui_scale()
+        new_w = int(min(MAX_COL_W * s,
+                        max(MIN_COL_W * s, w0 + sign * (x - x0))))
+        if new_w != self._col_w[k]:
+            self._col_w[k] = new_w
+            self._apply_cols()
+
+    def _on_mouse_up(self, id_dlg, id_ctl, data='', info=''):
+        """Ends a column-resize drag. The widths persist with the
+        window geometry at close (see _teardown), not per drag step --
+        settings writes stay rare."""
+        self._drag = None
+
+    def _reset_cols(self):
+        """Context-menu action: restore the default column widths
+        (dragged widths are per-window live state and session-
+        persisted only at close -- this resets both the window and,
+        via the close-time save, the session)."""
+        if self._torn:
+            return
+        s = _ui_scale()
+        self._col_w = [int(w * s) for _c, _a, w in _LIST_COLUMNS[1:]]
+        self._apply_cols()
+
     def _on_list_click(self, id_dlg, id_ctl, data='', info=''):
         """Single click on the list (data = (x, y) in the control's
         client coords -- the same event cuda_prefs/cuda_tabs_list
-        use). A click on a folder row's expand arrow toggles the
+        use). A click on a folder row's +/- expand marker toggles the
         folder inline -- WinMerge's tree behavior; anything else just
         selects (the control's own behavior, nothing to do here).
 
         A double-click fires on_click for its FIRST press, and
         possibly again for the second (LCL detail); _on_list_dbl
-        leaves arrow-zone clicks to THIS handler, so a repeat on the
+        leaves marker-zone clicks to THIS handler, so a repeat on the
         same row within the double-click quantum is the echo, not a
-        new toggle (else expand+echo would cancel out)."""
+        new toggle (else expand+echo would cancel out). Column
+        boundary presses are handled by _on_mouse_down and never land
+        in the marker zone (it sits at the row's left edge)."""
         if self._torn:
             return
         idx = self._sel_index()
@@ -3196,7 +3468,7 @@ class DirCompareForm:
         with scanned children expand/collapse INLINE -- the content
         appears under the folder in THIS window (the user-requested
         WinMerge behavior; the old drill-down window remains only for
-        folders without scanned children). Arrow-zone double-clicks
+        folders without scanned children). Marker-zone double-clicks
         are left to _on_list_click: it already toggled on the first
         press, and toggling again here would undo it. File rows keep
         the open/compare handoff."""
@@ -3347,6 +3619,8 @@ class DirCompareForm:
         if has_r:
             add(_('Copy right path'),
                 lambda: ct.app_proc(ct.PROC_SET_CLIP, pr))
+        ct.menu_proc(hm, ct.MENU_ADD, caption='-')
+        add(_('Reset column widths'), self._reset_cols)
 
         pos = None
         try:
@@ -3493,13 +3767,22 @@ class DirCompareForm:
         self._stop_timer()
         # Remember the window geometry -- a single-line "x,y,w,h"
         # string (lists would corrupt the settings file on the second
-        # write, see _restore_geom).
+        # write, see _restore_geom). The drag-resized column widths
+        # go the same way, as base 96-DPI values (the scale of a
+        # future session may differ).
         if not self._app_exit and self.h:
             try:
                 d = ct.dlg_proc(self.h, ct.DLG_PROP_GET)
                 _set_opt('dirs.win_geom',
                          ','.join(str(d.get(k, 0))
                                   for k in ('x', 'y', 'w', 'h')))
+            except Exception:
+                pass
+            try:
+                s = _ui_scale()
+                _set_opt('dirs.col_widths',
+                         ','.join(str(int(round(w / s)))
+                                  for w in self._col_w))
             except Exception:
                 pass
         _unregister_form(self)
