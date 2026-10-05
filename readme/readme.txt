@@ -395,6 +395,15 @@ The window's controls:
   app's own autosize math), so no caption can ever be clipped --
   and the face+border are clearly distinct from both the window and
   the paper-colored input boxes, so a button reads as a button.
+  Each drawn button is a one-item owner-drawn listbox, and its
+  single item's band is pinned to EXACTLY the control's pixel
+  height: the listbox's built-in "content does not fit" rule
+  (ItemCount*ItemHeight > Height) never switches on, so the
+  control's themed scrollbar (a track of a second color + arrow
+  buttons) can never appear beside the face -- every button shows
+  ONE background color and no arrows, and the hover/pressed
+  repaint steps the band DOWN a pixel first, so even a repaint can
+  never flash that scrollbar in.
 - The three input boxes (both paths + Mask) are the app's OWN
   single-line input controls -- the same control the find dialog and
   the command palette use: the theme colors them itself with the

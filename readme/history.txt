@@ -1,3 +1,22 @@
+2026.10.05 (22nd release, by @alkorsan)
+* fix: the drawn buttons showed TWO background colors and strange
+  arrows along their right edge (report: "the new buttons style is
+  worst, now they have two backgrounds colors and they have an
+  strange arrows near it, it should have only one background color
+  and no arrows"). The drawn button is a one-item owner-drawn
+  listbox, and the v11 build pinned the item's band to the
+  control's height + 4px: TATListbox's auto-scrollbar rule
+  (ItemCount*ItemHeight > Height -- the FULL height, source-
+  verified atlistbox.pas UpdateScrollbars) switched on and the
+  control painted its themed vertical scrollbar (a light track +
+  arrow buttons) down every button's right edge. The band is now
+  pinned to EXACTLY the control's pixel height: the rule stays
+  false (no scrollbar strip, no arrows) while the band still
+  covers the whole face (DoPaintTo paints item 0 over
+  (0,0,ClientWidth,ItemHeight)) -- one background color per
+  button. The hover/pressed repaint jitter now steps DOWN a pixel
+  first, so a repaint can never flash the scrollbar either.
+
 2026.10.05 (21st release, by @alkorsan)
 * fix: six reported folder-compare GUI problems, all in one round.
   (1) IDENTICAL FOLDERS said "Folder": the rolled-up folder status

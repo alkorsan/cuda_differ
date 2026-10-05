@@ -418,7 +418,13 @@ shading through the on_mouse_enter/exit/down/up events every control
 kind gets. The width is MEASURED -- a hidden button_ex probe
 (_add_probe) whose 'autosize' re-trigger measures the caption in the
 themed UI font (TATButton.SetAutoSize, the app's own math), so no
-caption can ever be eaten at any font/DPI/translation.
+caption can ever be eaten at any font/DPI/translation. The single
+item's band is pinned to EXACTLY the control's pixel height
+(_DrawnBtn.sync): TATListbox's auto-scrollbar rule
+(ItemCount*ItemHeight > Height, the full height) stays false and
+the band still covers the whole face -- ONE background color, no
+scrollbar strip, no arrow buttons (the 22nd-release report: a +4px
+pin had put a themed scrollbar down every button's right edge).
 
 The status FILTER CHECKS are the same _DrawnBtn in flat 'chk' mode:
 the form's own color shows through (no button face -- a check must
@@ -870,12 +876,21 @@ class _DrawnBtn:
       face, a hand-drawn checkbox glyph that scales with the font
       (the old 16px PNG could not), state kept by the owner.
 
-    The single item's band is pinned >= the control's pixel height
-    (sync), so the drawn item covers the whole control and none of
-    TATListbox's theme-colored underfill shows. repaint() is the
-    documented-cheap invalidate for a drawn listbox: SetItemHeight
-    invalidates but early-exits on equal values (atlistbox.pas), so
-    a +-1 jitter is always a real repaint of the tiny control."""
+    The single item's band is pinned to EXACTLY the control's pixel
+    height (sync) -- never a pixel more. TATListbox pre-fills its
+    whole face with the theme's list bg, then paints item 0's band
+    over (0, 0, ClientWidth, ItemHeight) (DoPaintTo): a band of
+    exactly h covers the entire face (no underfill strip), while
+    UpdateScrollbars' auto rule (ItemCount*ItemHeight > Height,
+    the FULL height, not ClientHeight) stays false -- the themed
+    scrollbar strip (its light track + arrow buttons) can never
+    appear beside the face, so the button keeps ONE background
+    color and no arrows (the 22nd-release report: the v11 pin of
+    h+4 put that strip down the right edge of every button).
+    repaint() is the documented-cheap invalidate for a drawn
+    listbox: SetItemHeight invalidates but early-exits on equal
+    values (atlistbox.pas), so a -1 jitter is always a real
+    repaint of the tiny control."""
 
     def __init__(self, owner, name, cap, prop, on_click, mode='btn',
                  checked=False, colors=None, text_w=None):
@@ -945,7 +960,17 @@ class _DrawnBtn:
                             name=self.name) or {}
             hh = int(d.get('h', 0) or 0)
             if hh > 0:
-                self._ih = hh + 4
+                # EXACTLY the live pixel height, never hh+N: the
+                # scrollbar rule is ItemCount*ItemHeight > Height
+                # (atlistbox.pas UpdateScrollbars, the FULL height),
+                # so hh+4 flashed the themed scrollbar -- a second
+                # background (its track) plus its arrow buttons
+                # down the right edge of every button. hh alone
+                # keeps 1*hh > hh false AND covers the whole face
+                # (DoPaintTo paints item 0's band at
+                # (0,0,ClientWidth,ItemHeight) over the theme's
+                # pre-filled bg): one color, no arrows.
+                self._ih = hh
                 ct.listbox_proc(self.h_ctl, ct.LISTBOX_SET_ITEM_H,
                                 index=self._ih)
         except Exception:
@@ -966,8 +991,14 @@ class _DrawnBtn:
                 getattr(self.owner, '_torn', False):
             return
         try:
+            # jitter DOWNWARD (hh-1 then hh): both calls land before
+            # the next paint, but should anything ever pump messages
+            # between them, the transient state must be the invisible
+            # one -- a 1px underfill -- never hh+1, which flips
+            # ItemCount*ItemHeight > Height true and flashes the
+            # scrollbar the sync() comment describes.
             ct.listbox_proc(self.h_ctl, ct.LISTBOX_SET_ITEM_H,
-                            index=self._ih + 1)
+                            index=max(1, self._ih - 1))
             ct.listbox_proc(self.h_ctl, ct.LISTBOX_SET_ITEM_H,
                             index=self._ih)
         except Exception:
