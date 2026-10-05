@@ -1,3 +1,24 @@
+2026.10.05 (23rd release, by @alkorsan)
+* fix: the drawn buttons' captions sat on a SECOND, darker
+  rectangle -- "one background on the button and one on the text"
+  (report: "the arrows have gone, but the buttons still have two
+  backgrounds, one on the button and one on the text, see pic, the
+  one on text is not necesary"; the v12 fix had removed the
+  scrollbar strip and its arrows, but the caption box remained).
+  Root cause, source-verified: the canvas's text call is LCL
+  Canvas.TextOut, which fills the glyphs' rectangle with the
+  canvas's CURRENT brush before drawing the text -- and the border
+  frame drawn just before the caption leaves that brush at the
+  border color, so every caption (buttons AND the filter toggles)
+  painted on an opaque border-colored box. The painter now re-sets
+  the brush to the exact face color right before the text call:
+  the caption's rectangle lands in the face color pixel-for-pixel
+  and disappears -- one background per button, none on the text,
+  in passive/hover/pressed alike. (A transparent brush would have
+  worked too but would leak into the next paint pass, silently
+  nulling the listbox control's own pre-fill and border fill,
+  which set the brush COLOR only -- never the style.)
+
 2026.10.05 (22nd release, by @alkorsan)
 * fix: the drawn buttons showed TWO background colors and strange
   arrows along their right edge (report: "the new buttons style is

@@ -403,7 +403,16 @@ The window's controls:
   buttons) can never appear beside the face -- every button shows
   ONE background color and no arrows, and the hover/pressed
   repaint steps the band DOWN a pixel first, so even a repaint can
-  never flash that scrollbar in.
+  never flash that scrollbar in. The caption itself paints on that
+  same ONE background: the canvas's text call fills the glyphs'
+  rectangle with the canvas's CURRENT brush color before drawing
+  (LCL TextOut semantics), so the painter re-sets that brush to
+  the face color right before the caption -- the border frame
+  leaves it at the border color, which showed as a second, darker
+  box tightly behind every button text (reported: "one background
+  on the button and one on the text"). The caption's own rectangle
+  now lands in the face color pixel-for-pixel: one background per
+  button, none on the text, in passive/hover/pressed alike.
 - The three input boxes (both paths + Mask) are the app's OWN
   single-line input controls -- the same control the find dialog and
   the command palette use: the theme colors them itself with the

@@ -425,6 +425,12 @@ item's band is pinned to EXACTLY the control's pixel height
 the band still covers the whole face -- ONE background color, no
 scrollbar strip, no arrow buttons (the 22nd-release report: a +4px
 pin had put a themed scrollbar down every button's right edge).
+And the caption itself paints on that same ONE background: LCL
+TextOut fills the glyphs' rectangle with the canvas's current
+brush, so the painter re-sets the brush to the face color right
+before the text call (the border frame leaves it at the border
+color -- the 23rd-release report saw that as 'one background on
+the button and one on the text').
 
 The status FILTER CHECKS are the same _DrawnBtn in flat 'chk' mode:
 the form's own color shows through (no button face -- a check must
@@ -844,9 +850,10 @@ def _probe_text_w(h, cap, gap):
 class _DrawnBtn:
     """One THEMED-BY-US button: a single-item owner-drawn listbox_ex.
 
-    Why not the obvious controls (three button rounds of reports --
+    Why not the obvious controls (four button rounds of reports --
     'always grey', then 'text is invisible' on dark themes, then
-    'hard to differentiate a button from an input box'):
+    'hard to differentiate a button from an input box', then 'two
+    backgrounds, one on the button and one on the text'):
     * 'button' (native TButton) is drawn by the OS visual style and
       stays gray in every theme.
     * 'button_ex' (TATButton) paints bg/border/caption STRICTLY from
@@ -890,7 +897,15 @@ class _DrawnBtn:
     repaint() is the documented-cheap invalidate for a drawn
     listbox: SetItemHeight invalidates but early-exits on equal
     values (atlistbox.pas), so a -1 jitter is always a real
-    repaint of the tiny control."""
+    repaint of the tiny control.
+
+    The caption paints with ONE background under it -- the face.
+    CANVAS_TEXT is Canvas.TextOut, which fills the glyphs' rectangle
+    with the canvas's CURRENT brush before drawing them; the brush
+    at caption time must therefore be the FACE color (it is re-set
+    right before the text call, because the border frame leaves it
+    at pal['border'] -- a second, darker box behind every caption,
+    the 23rd-release report)."""
 
     def __init__(self, owner, name, cap, prop, on_click, mode='btn',
                  checked=False, colors=None, text_w=None):
@@ -1117,6 +1132,23 @@ class _DrawnBtn:
                 tx = gx + g + int(6 * s)
             else:
                 tx = x0 + max(0, (w - tw) // 2)
+            # ONE background, caption included (the 23rd-release
+            # report): CANVAS_TEXT is Canvas.TextOut, and LCL TextOut
+            # paints its glyphs on an OPAQUE rectangle of the canvas's
+            # CURRENT brush -- which the border frame above had just
+            # left at pal['border'], so every caption sat on a second,
+            # darker box (the user's screenshot). Re-set the brush to
+            # the very face color underneath: the caption's text
+            # rectangle then lands in the face color pixel-for-pixel
+            # and disappears. (BRUSH_CLEAR would kill the box too, but
+            # it leaves the canvas's brush TRANSPARENT into the next
+            # paint pass, silently nulling TATListbox's own pre-fill
+            # and border FrameRect -- DoPaintTo assigns Brush.Color
+            # only, never the style, atlistbox.pas 504/586. A solid
+            # face brush is state-neutral: every later fill/frame
+            # re-sets its own brush first.)
+            ct.canvas_proc(canvas, ct.CANVAS_SET_BRUSH,
+                           color=face, style=ct.BRUSH_SOLID)
             if self.cap:
                 ct.canvas_proc(canvas, ct.CANVAS_TEXT,
                                text=self.cap, x=tx, y=ty)
