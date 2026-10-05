@@ -256,6 +256,13 @@ indented under the folder row, in the same window.
   Identical     exists on both sides, same content -- a FOLDER row
                 reads "Identical" when everything inside it is
                 identical (rolled up from its whole subtree)
+  Mixed         a BOTH-sides folder whose subtree holds one-sided
+                content: identical + only-left files, an only-right
+                subfolder, and so on. The folder itself exists on
+                both sides, so "Only left"/"Only right" would be a
+                lie about it (the 25th release gave these folders
+                their own honest status; before, a folder with
+                identical + only-left files read "Only left")
   Folder        a folder with nothing compared inside yet (empty, or
                 while the scan has not reached it). A folder's Status
                 cell and color show the worst status INSIDE it (a
@@ -518,7 +525,11 @@ The window's controls:
   font and the whole list scales up to it, rows included.
 - The status bar shows the scan progress / result line on the left
   and the counts (Different / Only left / Only right / Identical) on
-  the right. Its cells carry no defined width: the status cell
+  the right. The counters follow what the Status column SHOWS: a
+  folder rolled up to "Different" counts as Different, and a Mixed
+  folder counts in no bucket (no single counter is true about
+  one-sided + identical content together). Its cells carry no
+  defined width: the status cell
   auto-fits its text and the counts cell stretches over the rest of
   the bar, so both shrink and grow with the dialog; the bar grows
   taller with a bigger UI font like the list (nothing clips). The
@@ -528,7 +539,12 @@ The window's controls:
   a white system bar on a black theme.
 - The window remembers its size and position across sessions and
   has its own OS taskbar entry (restorable/pinnable like a normal
-  application window).
+  application window). The remembered state -- the window geometry,
+  the drag-resized column widths, the picker's size and the folder
+  histories -- lives in the plugin's own STATE file,
+  settings/cuda_differ2_state.json, NOT in the settings file (the
+  25th release moved it there: it is machine-local UI state, not a
+  user-editable option).
 
 Row colors (the whole line, WinMerge/Beyond-Compare style): every row
 is painted with the SAME colors the diff tabs use for their hunks, so
@@ -543,14 +559,21 @@ will paint:
                  indistinguishable from the empty list area: no
                  grey-on-white tint, and that is what makes the
                  colored rows pop
+  Mixed          no fill BY DESIGN -- a Mixed folder contains
+  (folder)       one-sided AND identical content, so a one-sided
+                 tint would overstate it exactly the way its old
+                 "Only left" caption did; the caption alone carries
+                 the news
 
 A FOLDER row carries the worst status of its subtree (WinMerge's
 rolled-up result): a folder that merely CONTAINS a different file
 is painted with the changed color and its Status cell reads
 "Different" -- you can see a folder matters without expanding it --
-while a folder whose contents are all identical stays plain
-("Folder", no fill). One-sided folders keep their deleted/added
-color and "Only left/right" caption. Folder rows always carry the
+while a folder whose contents are all identical reads "Identical"
+(no fill). One-sided content inside a BOTH-sides folder rolls up to
+"Mixed" (see the status table above); genuinely one-sided folders
+keep their deleted/added color and "Only left/right" caption.
+Folder rows always carry the
 FOLDER icon: the icon tells the kind, the color and caption tell the
 status.
 
@@ -1087,6 +1110,14 @@ them (the parameters are auto-detected):
 
     cudatext -p=cuda_differ2#/path/to/left/folder#/path/to/right/folder
 
+The opened folder-compare window takes the FOCUS: it is brought to
+the front and focused immediately, and once more about half a
+second later. The second pull matters because the -p dispatch runs
+while CudaText itself is still coming up -- the app's own startup
+pass can activate the main window AFTER the compare window opened,
+leaving the compare window behind it (that was the 25th report;
+without the delayed re-focus, the main window ended up on top).
+
 As with filenames, paths with spaces must be passed inside quotes
 around the whole flag:
 
@@ -1102,7 +1133,7 @@ just open the folder picker dialog at startup (CudaText's generic
 Open the options dialog via "Options / Settings-plugins / Differ 2 / Config"
 or "Plugins / Differ 2 / Config...".
 
-All options are stored in settings/cuda_differ2.json. The option names grouped into seven categories: theme, algorithm, ignoreopt, advanced, micromap, toolbar, dirs.
+All options are stored in settings/cuda_differ2.json. The option names grouped into seven categories: theme, algorithm, ignoreopt, advanced, micromap, toolbar, dirs. The folder-compare window's remembered STATE -- the two folder histories, the window and picker geometries, the drag-resized column widths -- is NOT an option and lives in its own file, settings/cuda_differ2_state.json (25th release).
 
 Ignore options section (see the "Ignore options" chapter above for details):
 - differ2.ignoreopt.ignore_case: Ignore case (default: off)

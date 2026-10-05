@@ -271,6 +271,11 @@ theme presets):
                           indistinguishable from the empty list area;
                           the dialog listbox takes its background from
                           TreeBg, NOT from the control's color prop)
+  Mixed (folder)        -> no fill by design -- one-sided AND
+                          identical content in one both-sides folder;
+                          a one-sided tint would overstate it the
+                          same way its pre-25th 'Only left' caption
+                          did, so the caption alone carries the news
 
 So a file painted yellow in the folder list is painted yellow line
 by line when double-clicked into a compare tab; a red "only left"
@@ -503,6 +508,20 @@ _ = get_translation(__file__)  # I18N
 # every other module of cuda_differ2 reads/writes via cudax_lib.
 MODULE_JSON = 'cuda_differ2.json'
 
+# The plugin's STATE file: machine-local runtime state (the dir
+# histories, both window geometries, the drag-resized column widths).
+# Not user-editable options but remembered UI state, so it lives in
+# its own JSON, NOT in the settings file (25th release request:
+# 'move this config you save in cuda_differ2.json to
+# cuda_differ2_state.json'). The same 'differ2.*' option names are
+# used inside it -- only the FILE changes; cudax_lib's get_opt/
+# set_opt take the file name as their user_json argument and create
+# the file on its first write. No backward compatibility is kept
+# (this code was never published): the old keys are DELETED from the
+# settings file once per session (_purge_stale_state_keys), never
+# read from there again.
+STATE_JSON = 'cuda_differ2_state.json'
+
 # Compare-speed constants (see the module docstring's "Speed model"):
 # BYTE_CHUNK is WinMerge's own quick-contents buffer size
 # (Src/CompareEngines/ByteCompare.cpp, WMCMPBUFF = 32 * KILO).
@@ -576,6 +595,12 @@ COL_SEP = chr(31)              # ASCII unit separator
 
 # Row statuses. Files: ST_SAME / ST_DIFF / ST_LONLY / ST_RONLY / ST_ERR.
 # Folders: ST_DIR (on both sides) / ST_DIR_LONLY / ST_DIR_RONLY.
+# ST_MIXED is never a row's own status -- it is the ROLLED-UP status
+# (_es, see _build_view) of a both-sides folder whose subtree holds
+# one-sided content: the folder itself sits on BOTH sides, so saying
+# 'Only left'/'Only right' about it would be a lie (the 25th report:
+# 'when a folder have identical and only left files, the folder status
+# show only left ... it must show a diferent status').
 ST_SAME = 'same'
 ST_DIFF = 'diff'
 ST_LONLY = 'lonly'
@@ -584,6 +609,7 @@ ST_ERR = 'err'
 ST_DIR = 'dir'
 ST_DIR_LONLY = 'dir_lonly'
 ST_DIR_RONLY = 'dir_ronly'
+ST_MIXED = 'mixed'
 
 STATUS_CAPTION = {
     ST_SAME:      _('Identical'),
@@ -594,27 +620,35 @@ STATUS_CAPTION = {
     ST_DIR:       _('Folder'),
     ST_DIR_LONLY: _('Only left'),
     ST_DIR_RONLY: _('Only right'),
+    ST_MIXED:     _('Mixed'),
 }
 
 # Sort order of the Status column: the interesting rows (differences,
 # one-sided files) first, the noise (identical files, plain folders)
-# last. dir_* rows sit right after their file counterparts.
+# last. dir_* rows sit right after their file counterparts; a MIXED
+# folder (one-sided content inside a both-sides folder) sits right
+# after the one-sided folders -- more interesting than an error, less
+# than a difference. Only the ORDER matters, never the values.
 STATUS_SEVERITY = {
     ST_DIFF:      0,
     ST_LONLY:     1,
     ST_RONLY:     2,
     ST_DIR_LONLY: 3,
     ST_DIR_RONLY: 4,
-    ST_ERR:       5,
-    ST_SAME:      6,
-    ST_DIR:       7,
+    ST_MIXED:     5,
+    ST_ERR:       6,
+    ST_SAME:      7,
+    ST_DIR:       8,
 }
 
 # Row statuses painted with a full-line background color in the
 # owner-drawn list, mapped to the Command.cfg key that holds the
 # color (the SAME keys the diff tabs use for their hunk lines --
 # see the module docstring "Row coloring"). Statuses absent from
-# this mapping keep the plain list background.
+# this mapping keep the plain list background: a MIXED folder gets
+# NO tint on purpose -- it contains one-sided AND identical content,
+# so a one-sided tint would overstate exactly the way its old
+# 'Only left' caption did; the caption carries the information.
 ST_COLOR_KEY = {
     ST_DIFF:      'color_changed',
     ST_LONLY:     'color_deleted',
@@ -638,7 +672,8 @@ METHOD_SIZE_TIME = 'size_timestamp'
 # happens at a bigger UI font, which draws 1.x-times-wider glyphs into
 # the old widths). They are also only the DEFAULTS: the fixed columns
 # are drag-resizable (see _on_mouse_down) and persist across sessions
-# as 'dirs.col_widths' (base values).
+# as 'dirs.col_widths' (base values, in the plugin's STATE file --
+# cuda_differ2_state.json, not the settings file).
 _LIST_COLUMNS = (
     (_('Name'), 'L', 230),
     (_('Folder'), 'L', 170),
@@ -695,6 +730,53 @@ def _set_opt(key, val):
     (settings/cuda_differ2.json). Mirrors _get_opt above; cudax_lib's
     set_opt does the comment-preserving line-based update."""
     return ctx.set_opt('differ2.' + key, val, user_json=MODULE_JSON)
+
+
+# Window/UI STATE (histories, geometries, column widths) -- the same
+# get_opt/set_opt machinery pointed at STATE_JSON instead of the
+# settings file. val=None deletes (cudax_lib's convention, same as
+# _set_opt).
+def _get_state(key, def_val):
+    """Read a 'differ2.dirs.*' state key from the plugin's STATE file
+    (settings/cuda_differ2_state.json) -- never from the settings
+    file (see STATE_JSON above)."""
+    return ctx.get_opt('differ2.' + key, def_val, user_json=STATE_JSON)
+
+
+def _set_state(key, val):
+    """Write (or, with val=None, delete) a 'differ2.dirs.*' state key
+    in settings/cuda_differ2_state.json."""
+    return ctx.set_opt('differ2.' + key, val, user_json=STATE_JSON)
+
+
+# The state keys as they lived in cuda_differ2.json before the 25th
+# release -- 'dirs.col_sizes' was never even read by this module (a
+# pre-21st-release leftover sitting in the file); all six are deleted
+# from the SETTINGS file once per session so nothing stale lingers
+# there. set_opt(path, None) is cudax_lib's line-based delete; a
+# missing file or a missing key is a clean no-op (verified against
+# cudax_lib's simple-key branch), so this is safe on any box.
+_STALE_SETTINGS_KEYS = (
+    'dirs.hist_left', 'dirs.hist_right', 'dirs.win_geom',
+    'dirs.picker_geom', 'dirs.col_sizes', 'dirs.col_widths',
+)
+_stale_state_purged = False
+
+
+def _purge_stale_state_keys():
+    """One-time-per-session cleanup: delete the moved state keys from
+    cuda_differ2.json (they now live in cuda_differ2_state.json).
+    Called from compare_dialog and compare_directories -- together
+    they front every entry point (menu/picker, CLI, drill-down)."""
+    global _stale_state_purged
+    if _stale_state_purged:
+        return
+    _stale_state_purged = True
+    for key in _STALE_SETTINGS_KEYS:
+        try:
+            ctx.set_opt('differ2.' + key, None, user_json=MODULE_JSON)
+        except Exception:
+            pass
 
 
 def _theme_ui():
@@ -2674,8 +2756,9 @@ class _PickerDialog:
     def _restore_geom():
         """Saved picker size ("w,h" string) as a prop dict, or None.
         Single-line string for the same reason as the main window's
-        geometry (cudax_lib's flat-key updater)."""
-        g = _get_opt('dirs.picker_geom', '')
+        geometry (cudax_lib's flat-key updater). State file, not the
+        settings file (25th release)."""
+        g = _get_state('dirs.picker_geom', '')
         if isinstance(g, str) and g:
             try:
                 w, h = (int(v) for v in g.split(','))
@@ -2691,7 +2774,7 @@ class _PickerDialog:
             d = ct.dlg_proc(h, ct.DLG_PROP_GET) or {}
             w, hh = int(d.get('w', 0)), int(d.get('h', 0))
             if w >= _PickerDialog.MIN_W and hh >= _PickerDialog.MIN_H:
-                _set_opt('dirs.picker_geom', '%d,%d' % (w, hh))
+                _set_state('dirs.picker_geom', '%d,%d' % (w, hh))
         except Exception:
             pass
 
@@ -2737,13 +2820,15 @@ class _PickerDialog:
     def _remember(pl, pr):
         # History is stored as ONE '\n'-joined string per side (not a
         # list): cudax_lib's flat-key settings updater only handles
-        # single-line values, and '\n' cannot occur in a path.
+        # single-line values, and '\n' cannot occur in a path. In the
+        # STATE file since the 25th release (with the picker geometry
+        # and the window's geometry/widths).
         for key, path in (('dirs.hist_left', pl), ('dirs.hist_right', pr)):
             try:
                 hist = _PickerDialog._load_hist(key)
                 hist = [p for p in hist if p != path]
                 hist.insert(0, path)
-                _set_opt(key, '\n'.join(hist[:HISTORY_MAX]))
+                _set_state(key, '\n'.join(hist[:HISTORY_MAX]))
             except Exception:
                 pass
 
@@ -2751,7 +2836,7 @@ class _PickerDialog:
 
     @staticmethod
     def _load_hist(key):
-        s = _get_opt(key, '')
+        s = _get_state(key, '')
         if not isinstance(s, str):
             return []
         return [p for p in s.split('\n') if p]
@@ -3585,7 +3670,7 @@ class DirCompareForm:
         # is DROPPED (the default size opens instead): a programmatic
         # PROP_SET bypasses the form's constraints, so this guard is
         # the only place the floor is enforced for restored windows.
-        g = _get_opt('dirs.win_geom', '')
+        g = _get_state('dirs.win_geom', '')
         if isinstance(g, str) and g:
             try:
                 x, y, w, h = (int(v) for v in g.split(','))
@@ -3599,6 +3684,39 @@ class DirCompareForm:
 
     def show(self):
         ct.dlg_proc(self.h, ct.DLG_SHOW_NONMODAL)
+
+    def focus(self):
+        """Bring this window to the z-front AND give it keyboard focus
+        (the 25th report: a compare window opened from the CLI
+        'cudatext -p=cuda_differ2#dir1#dir2' ended up BEHIND the main
+        window, which kept the focus). Source-verified pair:
+        DLG_TO_FRONT runs Form.BringToFront (z-order), DLG_FOCUS runs
+        Form.SetFocus -- the app guards the latter with Visible and
+        Enabled (formmain_py_api.inc), so this only works AFTER
+        show(); both are no-ops on a torn window's dead handle."""
+        if self._torn or not self.h:
+            return
+        try:
+            ct.dlg_proc(self.h, ct.DLG_TO_FRONT)
+            ct.dlg_proc(self.h, ct.DLG_FOCUS)
+        except Exception:
+            pass
+
+    def focus_later(self, ms=500):
+        """One-shot DELAYED re-focus for the CLI path (armed by
+        compare_directories(..., from_cli=True)): the -p dispatch
+        happens while CudaText itself is still coming up, and the
+        app's own startup pass can (re)activate the main window AFTER
+        on_cli already opened and focused this one -- one immediate
+        focus then loses the race. The delayed shot re-pulls the
+        window once the startup storm has settled; it runs at most
+        once and never fights the user twice."""
+        def do_focus(tag='', info=''):
+            self.focus()
+        try:
+            ct.timer_proc(ct.TIMER_START_ONE, do_focus, ms)
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # List filling / drawing / sorting
@@ -3635,7 +3753,7 @@ class DirCompareForm:
         by _px_scale() here, ONCE: _col_spec/_col_layout and the
         drag hit tests all share the same pixel values."""
         base = [w for _c, _a, w in _LIST_COLUMNS[1:]]
-        g = _get_opt('dirs.col_widths', '')
+        g = _get_state('dirs.col_widths', '')
         if isinstance(g, str) and g:
             try:
                 v = [int(x) for x in g.split(',')]
@@ -3816,7 +3934,16 @@ class DirCompareForm:
         )
 
     def _filter_ok(self, r):
-        st = r['status']
+        # Folders filter by their ROLLED-UP status (_es -- the very
+        # thing the Status cell shows, set by _build_view before this
+        # runs): a 'Different' folder follows the Different checkbox,
+        # not Identical. A MIXED folder is one-sided + identical
+        # content by construction (no diffs reached it, else the
+        # rollup would say Different) -- it shows when ANY of the
+        # statuses it can contain is checked. One-sided folders roll
+        # up to one-sided _es (or have no _es), so their checkbox is
+        # unchanged; files never carry _es.
+        st = r.get('_es', r['status'])
         if st == ST_ERR:
             return True  # always visible: rare and important
         if st in (ST_LONLY, ST_DIR_LONLY):
@@ -3825,6 +3952,9 @@ class DirCompareForm:
             return self._show[ST_RONLY]
         if st == ST_DIFF:
             return self._show[ST_DIFF]
+        if st == ST_MIXED:
+            return (self._show[ST_LONLY] or self._show[ST_RONLY]
+                    or self._show[ST_SAME])
         return self._show[ST_SAME]  # ST_SAME and plain ST_DIR rows
 
     def _fill_list(self, rows=None):
@@ -3984,6 +4114,19 @@ class DirCompareForm:
                 # above it in the severity table), so the delta of the
                 # widened bar is EXACTLY the all-identical subtree.
                 if w is not None and sev.get(w, 99) < sev[ST_DIR]:
+                    # 25th release: a BOTH-sides folder never carries a
+                    # ONE-SIDED caption. Its subtree rolled up to
+                    # one-sided content, but the folder itself exists
+                    # on both sides -- the user's report was exactly
+                    # this: a folder with identical + only-left files
+                    # showing 'Only left'. Such a folder now reads
+                    # MIXED (ST_MIXED); genuinely one-sided folders
+                    # (r['status'] is dir_lonly/dir_ronly) keep their
+                    # own captions.
+                    if r['status'] == ST_DIR and w in (
+                            ST_LONLY, ST_RONLY,
+                            ST_DIR_LONLY, ST_DIR_RONLY):
+                        w = ST_MIXED
                     r['_es'] = w
                 else:
                     r.pop('_es', None)   # stale value from an old fill
@@ -4281,14 +4424,25 @@ class DirCompareForm:
             pass
 
     def _update_counts(self):
+        # Counters follow the EFFECTIVE status (_es) -- the very text
+        # the Status cell shows. Before the 25th release every
+        # both-sides folder counted as 'Identical' no matter what its
+        # cell said (a 'Different'/'Mixed' folder inflated the
+        # Identical number). MIXED folders count in no bucket: they
+        # are containers of one-sided + identical content and no
+        # single counter is true about them.
         rows = self._rows
-        n_diff = sum(1 for r in rows if r['status'] == ST_DIFF)
-        n_l = sum(1 for r in rows
-                  if r['status'] in (ST_LONLY, ST_DIR_LONLY))
-        n_r = sum(1 for r in rows
-                  if r['status'] in (ST_RONLY, ST_DIR_RONLY))
-        n_same = sum(1 for r in rows
-                     if r['status'] in (ST_SAME, ST_DIR))
+        n_diff = n_l = n_r = n_same = 0
+        for r in rows:
+            st = r.get('_es', r['status'])
+            if st == ST_DIFF:
+                n_diff += 1
+            elif st in (ST_LONLY, ST_DIR_LONLY):
+                n_l += 1
+            elif st in (ST_RONLY, ST_DIR_RONLY):
+                n_r += 1
+            elif st in (ST_SAME, ST_DIR):
+                n_same += 1
         self._sb_text(2, _('Different: {}   Only left: {}   '
                            'Only right: {}   Identical: {}').format(
                                n_diff, n_l, n_r, n_same))
@@ -5229,20 +5383,21 @@ class DirCompareForm:
         # string (lists would corrupt the settings file on the second
         # write, see _restore_geom). The drag-resized column widths
         # go the same way, as base 96-DPI/9pt values (the scale AND
-        # the UI font of a future session may differ).
+        # the UI font of a future session may differ). Both live in
+        # the STATE file since the 25th release.
         if not self._app_exit and self.h:
             try:
                 d = ct.dlg_proc(self.h, ct.DLG_PROP_GET)
-                _set_opt('dirs.win_geom',
-                         ','.join(str(d.get(k, 0))
-                                  for k in ('x', 'y', 'w', 'h')))
+                _set_state('dirs.win_geom',
+                           ','.join(str(d.get(k, 0))
+                                    for k in ('x', 'y', 'w', 'h')))
             except Exception:
                 pass
             try:
                 s = _px_scale()
-                _set_opt('dirs.col_widths',
-                         ','.join(str(int(round(w / s)))
-                                  for w in self._col_w))
+                _set_state('dirs.col_widths',
+                           ','.join(str(int(round(w / s)))
+                                    for w in self._col_w))
             except Exception:
                 pass
         _unregister_form(self)
@@ -5360,6 +5515,7 @@ def compare_dialog(cmd, dir_l='', dir_r=''):
     then open a compare window. The picker is a profiler section of
     its own ('dirs:picker') -- a slow-to-open folder chooser would
     otherwise hide inside the operation's wall time."""
+    _purge_stale_state_keys()
     Profiler.start('dirs:picker')
     try:
         res = _PickerDialog().show(dir_l, dir_r)
@@ -5369,11 +5525,16 @@ def compare_dialog(cmd, dir_l='', dir_r=''):
         compare_directories(cmd, res[0], res[1])
 
 
-def compare_directories(cmd, dir_l, dir_r):
+def compare_directories(cmd, dir_l, dir_r, from_cli=False):
     """Open a NEW compare window for the two folders (any number of
     windows can be open at once). Called by the picker, by the CLI
     handler (Command.on_cli with two folders) and by drill-downs from
-    an existing window's folder rows."""
+    an existing window's folder rows. Every fresh window is brought
+    to the front and focused (focus()); from_cli=True additionally
+    arms focus_later() -- the CLI dispatch races the app's own
+    startup activation of the main window, and the delayed re-pull
+    is what actually lands the focus on the compare window."""
+    _purge_stale_state_keys()
     dir_l = os.path.normpath(dir_l)
     dir_r = os.path.normpath(dir_r)
     if not os.path.isdir(dir_l) or not os.path.isdir(dir_r):
@@ -5399,6 +5560,9 @@ def compare_directories(cmd, dir_l, dir_r):
                      ).format(ex), ct.MB_OK + ct.MB_ICONERROR)
         return
     _register_form(form)
+    form.focus()
+    if from_cli:
+        form.focus_later()
 
 
 def close_all():

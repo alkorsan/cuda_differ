@@ -2015,8 +2015,11 @@ class Command:
         -p=cuda_differ2#param1#param2. The two params are auto-detected:
 
         - both are existing FOLDERS -> a folder-compare window opens
-          (compare_dir.compare_directories; the WinMerge-style tree
-          compare, see that module's docstring);
+          (compare_dir.compare_directories with from_cli=True, so the
+          window is focused IMMEDIATELY and once more after ~0.5 s --
+          the -p dispatch races the app's own startup activation of
+          the main window, and without the delayed re-pull the main
+          window ends up on top, which was the 25th report);
         - both are existing FILES  -> opened and compared in a diff
           tab, exactly as before (open both, then set_files);
         - one folder + one file (or a missing path) -> warning in the
@@ -2026,7 +2029,7 @@ class Command:
         is_dir2 = os.path.isdir(fn2)
         if is_dir1 or is_dir2:
             if is_dir1 and is_dir2:
-                dfd.compare_directories(self, fn1, fn2)
+                dfd.compare_directories(self, fn1, fn2, from_cli=True)
             else:
                 msg(_('on_cli: both parameters must be folders, or both '
                       'files; got: {} / {}').format(fn1, fn2), 1)

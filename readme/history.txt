@@ -1,3 +1,57 @@
+2026.10.05 (25th release, by @alkorsan)
+* fix: a folder that contains BOTH identical and one-sided files
+  showed a one-sided status (report: "when a folder have identical
+  and only left files, the folder status show only left, it s wrong,
+  it s not only left it have identical too, soo it must show a
+  diferent status" -- VLM on the screenshot showed the mirror case:
+  an 'app' folder with only-right AND identical files reading "Only
+  right", green-tinted). The folder itself exists on BOTH sides, so
+  "Only left"/"Only right" is a lie about it. Such folders now carry
+  their own honest status MIXED: identical + only-left files, an
+  only-right subfolder, one-sided content at any depth inside a
+  both-sides folder -- all read "Mixed". Genuinely one-sided folders
+  (the folder itself missing on the other side) keep "Only
+  left"/"Only right". A Mixed row gets NO full-line tint on purpose:
+  one-sided AND identical content share the folder, so a one-sided
+  color would overstate it exactly the way the old caption did --
+  the caption alone carries the news. The status counters follow
+  the same truth now: they count what the Status column SHOWS (a
+  folder rolled up to "Different" counts as Different; before,
+  EVERY both-sides folder silently counted as "Identical" no matter
+  what its cell said), and a Mixed folder counts in no bucket. The
+  filters follow it too: a Mixed folder shows while any of
+  Only-left / Only-right / Identical is checked and hides when all
+  three are off; a rolled-up "Different" folder now follows the
+  Different checkbox instead of the Identical one.
+* fix: a folder-compare window opened from the command line
+  (cudatext -p=cuda_differ2#folder1#folder2) lost the focus to
+  CudaText's main window (report: "the compare window lose focus,
+  cudatext get focused instead of this opened dir compare window, i
+  want to focus the dir compare window"). Every freshly opened
+  compare window is now brought to the front and focused right
+  after the show (DLG_TO_FRONT = BringToFront + DLG_FOCUS =
+  SetFocus, both source-verified in formmain_py_api.inc), and the
+  CLI path arms one extra delayed re-focus ~0.5 s later: the -p
+  dispatch runs while CudaText itself is still coming up, and the
+  app's own startup pass can activate the main window AFTER the
+  compare window opened -- the delayed re-pull is what wins that
+  race. A normal (picker / drill-down) window never arms the delayed
+  shot, so the plugin never fights the user for the focus.
+* change: the folder-compare window's remembered state moved from
+  settings/cuda_differ2.json into its own state file,
+  settings/cuda_differ2_state.json (request: "move this config you
+  save in cuda_differ2.json to cuda_differ2_state.json"): the two
+  folder histories (differ2.dirs.hist_left / hist_right), the window
+  geometry (differ2.dirs.win_geom), the picker geometry
+  (differ2.dirs.picker_geom) and the drag-resized column widths
+  (differ2.dirs.col_widths). It is machine-local UI state, not a
+  user-editable option, so it no longer pollutes the settings file.
+  No backward compatibility is kept (the code was never published):
+  the six old keys -- including differ2.dirs.col_sizes, a leftover
+  no released code ever read -- are DELETED from cuda_differ2.json
+  once per session, the first time a window opens, and nothing ever
+  reads them from there again.
+
 2026.10.05 (24th release, by @alkorsan)
 * fix: two column-resize problems (report: "columns resizing is
   strangte, not like usual apps, not all columns allow to resize to
