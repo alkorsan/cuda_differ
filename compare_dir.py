@@ -306,12 +306,14 @@ the same numbers are written twice, on builds without it the fix is
 the values themselves. The row height keeps the control's own
 auto-fit wherever that band fits the drawn text -- and the painter
 GUARDS it where it does not: it measures the glyphs it just drew and
-raises ItemHeight to measured+2px when the auto-fit band is tighter
+raises ItemHeight to measured+6px when the auto-fit band is tighter
 (the reported build's auto-fit rides the same broken theme chain
 that swallowed the preset, so the band stayed 9pt-sized under the
-grown font and ate the text; LISTBOX_SET_ITEM_H freezes the
-auto-fit, never shrinks, never fires on a healthy build -- see
-_fit_item_h). What IS the plugin's business is every
+grown font and ate the text; the +6px padding is the user's request
+-- at small fonts the built-in auto-fit can sit within a pixel of
+glyph+6, so the guard may bump such a band a pixel or two, by
+design; LISTBOX_SET_ITEM_H freezes the auto-fit and never shrinks
+-- see _fit_item_h). What IS the plugin's business is every
 pixel metric that must fit that text -- column widths, the tree
 gutter, the expand-marker zone -- all scaled by _px_scale() =
 DPI factor x UI-font factor (_font_scale, from ui_font_size and the
@@ -321,6 +323,38 @@ The statusbar cells carry no width at all anymore: the status cell
 AUTOSIZEs to its text and the counts cell AUTOSTRETCHes over the rest
 of the bar, so they shrink and grow with the dialog (TATStatus
 re-fits an autosized cell on every paint).
+
+== Theming (the clNone trap) ========================================
+
+Every theme color comes from PROC_THEME_UI_DICT_GET through
+_theme_color, which reads the LCL clNone sentinel ($1FFFFFFF) as 'not
+themed': the dict carries EVERY TAppThemeColor key and the optional
+ones (StatusBg/StatusFont, ...) sit at clNone when the theme leaves
+them out -- passing that sentinel into a color API is how the
+statusbar once painted white on black themes. The chains mirror the
+app's own wiring (formmain_themes.inc):
+
+  form / statusbar bg   StatusBg -> TabBg (the app's exact pair for
+                       its main statusbar)
+  statusbar font       StatusFont -> ButtonFont (= ATFlatTheme's
+                       ColorFont, TATStatus's own default)
+  statusbar borders    ButtonBorderPassive (as the app assigns)
+  folder inputs        ListBg / ListFont -> TabBg / TabFont -- NOT
+                       EdTextBg/EdTextFont: those are the UI theme's
+                       OPINION of the editor colors and their built-in
+                       defaults are LIGHT, so themes that skip them
+                       left the boxes white on a black UI
+
+The status FILTER CHECKS are not native TCheckBox controls but flat
+button_ex buttons with chk_on/chk_off imagelist glyphs -- cuda_prefs'
+own pattern: under Windows visual styles the OS theme draws a native
+checkbox's caption and ignores Font.Color, so the captions stayed
+black on black themes (the 5th-round report). TATButton paints its
+caption in the themed UI font color and flat paints no background at
+all, so the form's themed color shows through; the check STATE lives
+in the plugin (self._show / self._recursive) because the dialog API's
+'val' does not handle TATButton -- _on_check flips the state and
+swaps the glyph.
 
 == Windows / instances =============================================
 
@@ -572,11 +606,29 @@ def _theme_ui():
         return {}
 
 
+# LCL clNone = TColor($1FFFFFFF): the UI-theme dict's 'not defined'
+# sentinel -- PyHelper_GetThemeDict_UI dumps EVERY TAppThemeColor key
+# and the optional ones (StatusBg/StatusFont, ...) sit at clNone when
+# the theme leaves them out (see _theme_color).
+_CLNONE = 0x1FFFFFFF
+
+
 def _theme_color(key, fallback=None):
-    """int color of a UI-theme key, or fallback when unavailable."""
+    """int color of a UI-theme key, or fallback when unavailable.
+
+    The clNone GUARD is the point (5th dark-theme round): the dict
+    from PROC_THEME_UI_DICT_GET carries EVERY TAppThemeColor key --
+    including the ones the theme does not define, which sit at
+    clNone ($1FFFFFFF; SetColor's default for the optional keys like
+    StatusBg/StatusFont). Passing that sentinel on to a color API is
+    a bug: STATUSBAR_SET_COLOR_BACK would set TATStatus.Color to
+    clNone and the bar paints WHITE on a black theme -- exactly the
+    reported look. So clNone reads as 'not themed' and the caller's
+    fallback chain decides (the app itself resolves StatusBg->TabBg
+    in formmain_themes.inc; the same chains live at our call sites)."""
     try:
         c = _theme_ui().get(key, {}).get('color')
-        if c is not None:
+        if c is not None and int(c) != _CLNONE:
             return int(c)
     except Exception:
         pass
@@ -814,6 +866,22 @@ _ICONS_PNG = {
         'usroAFHLJiXBgjQEEcqCBJeHBkNgAJNeIoS6cmqAAAAABJRU5ErkJggg=='
     ),
     # 199 bytes
+    # Checkbox glyphs for the themed checks (button_ex + imagelist,
+    # cuda_prefs' own pattern -- see _add_check): semi-transparent
+    # gray, so the SAME glyph reads on light and dark themes.
+    'chk_on': (
+        'iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAeUlEQVR42mNgGDQgMTFRE4'
+        'iDicG4DAju7OzcumbNmiP4MFDdMpwGgBQ8JgDINiA7O/suCJNlAEijk5PTHaIM2L1798PJ'
+        'kyffh2kG8WGaifICSDNIA4iGaQZhEJvoMIBpQtdMtAHINiN7h6RYQA8LogwASRKDGYYXAA'
+        'DbMC4B9VuU7gAAAABJRU5ErkJggg=='
+    ),
+    # 178 bytes
+    'chk_off': (
+        'iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAOUlEQVR42mNgGDQgMTFRE4'
+        'iDicG4DAju7OzcumbNmiP4MFDdMpwGgBQ8JgBGDRj+BoAkicEMwwsAABiEUk9D2QrZAAAA'
+        'AElFTkSuQmCC'
+    ),
+    # 114 bytes
 }
 
 
@@ -1916,6 +1984,15 @@ class _PickerDialog:
             prop['color'] = bg
         ct.dlg_proc(self.h, ct.DLG_PROP_SET, prop=prop)
 
+        # Folder-input colors (5th dark-theme round: 'and also folder
+        # selector boxes'): the combos are native TComboBox controls
+        # and rendered system-white unless the plugin colors them.
+        # Same chain as the main window's edits -- ListBg first, NOT
+        # EdTextBg (that key's built-in default is light, and themes
+        # that skip it left the boxes white on a black UI).
+        ed_bg = _theme_color('ListBg', _theme_color('TabBg'))
+        ed_fg = _theme_color('ListFont', _theme_color('TabFont'))
+
         for i, (side, label, hist, init) in enumerate((
                 ('left',  _('Left folder (old):'),  hist_l, dir_l),
                 ('right', _('Right folder (new):'), hist_r, dir_r))):
@@ -1946,7 +2023,7 @@ class _PickerDialog:
             # the only control meant to stretch: BOTH a_l (label's
             # right) and a_r (Browse's left) -- the two fixed controls
             # it sits between.
-            self._add('combo', side, {
+            p = {
                 'w': 330, 'h': 26,
                 'a_l': ('lab_' + side, ']'), 'sp_l': 4,
                 'a_r': ('brw_' + side, '['), 'sp_r': 6,
@@ -1954,7 +2031,12 @@ class _PickerDialog:
                 'items': '\t'.join(hist),
                 'val': init,
                 'texthint': _('Type or pick a folder'),
-            })
+            }
+            if ed_bg is not None:
+                p['color'] = ed_bg
+            if ed_fg is not None:
+                p['font_color'] = ed_fg
+            self._add('combo', side, p)
 
         # Cancel FIRST: Compare's a_r targets it. Both clear the born-
         # with a_l/a_t ('a_l': None, 'a_t': None) -- right+bottom
@@ -2206,6 +2288,21 @@ class DirCompareForm:
     The path edits are editable on purpose: type two paths and press
     Refresh (or Enter) to compare them without reopening any dialog.
 
+    THEMING: every color comes from the UI theme through
+    _theme_color, whose clNone guard is the difference between
+    'not themed' and a literal $1FFFFFFF passed to a color API (the
+    5th-round white statusbar). The five status-filter checks are
+    flat button_ex buttons with chk_on/chk_off imagelist glyphs, not
+    native TCheckBox controls: Windows visual styles draw a native
+    checkbox caption through the OS theme and ignore Font.Color, so
+    the captions stayed black on black themes, while TATButton paints
+    its caption in the themed UI font color over the form's themed
+    background. The check state lives in the plugin (self._show /
+    self._recursive; the dialog API's 'val' does not handle
+    TATButton) -- _on_check flips it and _set_check_icon swaps the
+    glyph. See the module docstring's 'Theming' chapter for the
+    color chains.
+
     The results list is an owner-drawn listbox_ex (LISTBOX_SET_DRAWN):
     the control never paints items itself, it calls on_draw_item for
     every visible row and the form paints background + marker + icon +
@@ -2323,6 +2420,13 @@ class DirCompareForm:
         self._show = {                  # status filter checkboxes
             ST_DIFF: True, ST_LONLY: True, ST_RONLY: True, ST_SAME: True,
         }
+        # The Subfolders toggle + the check handles. The checks are
+        # button_ex controls now (themed -- see _add_check): a native
+        # TCheckBox has no usable state channel in the dialog API
+        # ('val' does not handle TATButton), so the LIVE state lives
+        # here and the button just renders it (icon swap).
+        self._recursive = True
+        self._chk_handles = {}          # check name -> button handle
         # Profiling state of the CURRENT scan (all None/False when the
         # config gate is off): the async-pair token + whether the
         # scanner thread started its own cProfile layer.
@@ -2362,7 +2466,63 @@ class DirCompareForm:
         return n
 
     def _text_color(self):
-        return _theme_color('TabFont', _theme_color('EdTextFont', 0x000000))
+        return _theme_color('TabFont', _theme_color('ListFont', 0x000000))
+
+    def _add_check(self, name, prop, checked):
+        """One THEMED checkbox: a flat button_ex with a checkbox glyph
+        from the window imagelist -- the app's own pattern (cuda_prefs
+        renders its options-dialog bools this way).
+
+        Why not a native 'check' control: under Windows visual styles
+        the OS theme draws the TCheckBox caption and ignores
+        Font.Color (the dialog API's font_color prop is a plain
+        Font.Color assignment) -- the captions stayed black on black
+        themes while every themed control around them went light
+        (5th-round report: 'checkboxes text ... does not use theme
+        colors'). TATButton instead paints its caption in
+        ATFlatTheme.ColorFont (the themed UI font color, wired from
+        ButtonFont) and the flat style paints no background at all,
+        so the form's themed color shows through.
+
+        The state is OURS (self._show / self._recursive): the dialog
+        API's 'val' does not handle TATButton, and there is no
+        BTN_SET_CHECKABLE to let TATButton own it either -- so
+        _on_check flips the Python state and _set_check_icon renders
+        it. The icon order in _build's imagelist load fixes the
+        indices (_icon_idx['chk_on'/'chk_off']).
+
+        autosize comes LAST, through a second PROP_SET: TATButton's
+        SetAutoSize measures the caption in the themed font plus the
+        just-attached icon (BTNKIND_TEXT_ICON_HORZ: text+gap+icon),
+        so the button must already know its kind and imagelist."""
+        n = self._add('button_ex', name, prop)
+        try:
+            h = ct.dlg_proc(self.h, ct.DLG_CTL_HANDLE, name=name)
+            self._chk_handles[name] = h
+            ct.button_proc(h, ct.BTN_SET_FLAT, True)
+            ct.button_proc(h, ct.BTN_SET_KIND, ct.BTNKIND_TEXT_ICON_HORZ)
+            if self.h_imglist:
+                ct.button_proc(h, ct.BTN_SET_IMAGELIST, self.h_imglist)
+            self._set_check_icon(name, checked)
+            ct.dlg_proc(self.h, ct.DLG_CTL_PROP_SET, index=n,
+                        prop={'autosize': True})
+        except Exception:
+            # Pre-button_proc builds: the button still shows its
+            # caption and still fires on_change -- only the glyph and
+            # the fitted width are lost.
+            pass
+        return n
+
+    def _set_check_icon(self, name, on):
+        """Render a check's state as the chk_on/chk_off imagelist
+        glyph (no-op when the imagelist or the icon is missing)."""
+        h = self._chk_handles.get(name, 0)
+        idx = self._icon_idx.get('chk_on' if on else 'chk_off', -1)
+        if h and idx is not None and idx >= 0:
+            try:
+                ct.button_proc(h, ct.BTN_SET_IMAGEINDEX, idx)
+            except Exception:
+                pass
 
     def _build(self):
         self.h = ct.dlg_proc(0, ct.DLG_CREATE)
@@ -2385,9 +2545,31 @@ class DirCompareForm:
             prop['color'] = bg
         ct.dlg_proc(h, ct.DLG_PROP_SET, prop=prop)
 
+        # Per-window imagelist (owned by the form -> freed with it).
+        # Built FIRST: both the row icons (the list's painter) and the
+        # checkbox glyphs (the button_ex checks below) come from it.
+        try:
+            paths = _icon_paths()
+            self.h_imglist = ct.imagelist_proc(0, ct.IMAGELIST_CREATE,
+                                               value=self.h)
+            for name in ('same', 'diff', 'lonly', 'ronly', 'folder', 'err',
+                         'chk_on', 'chk_off'):
+                idx = ct.imagelist_proc(self.h_imglist, ct.IMAGELIST_ADD,
+                                        value=paths[name])
+                self._icon_idx[name] = idx if idx is not None else -1
+        except Exception:
+            pass  # icons are decoration; the Status column carries the info
+
         tcol = self._text_color()
-        ed_bg = _theme_color('EdTextBg')
-        ed_fg = _theme_color('EdTextFont')
+        # Input-box colors. NOT EdTextBg: that key is the UI theme's
+        # OPINION of the editor background and its built-in default
+        # is LIGHT ($e4e4e4) -- themes that don't spell it out left
+        # the folder boxes WHITE on a black UI (5th-round report:
+        # 'and also folder selector boxes'). ListBg is a core key every
+        # real theme defines (dark in dark themes, light in light
+        # ones), TabBg the form's own color as the last resort.
+        ed_bg = _theme_color('ListBg', _theme_color('TabBg'))
+        ed_fg = _theme_color('ListFont', _theme_color('TabFont'))
 
         # -- Row A: toolbar buttons ------------------------------------
         prev = None
@@ -2447,31 +2629,36 @@ class DirCompareForm:
         # left AND right anchors on the same control mean STRETCH, and
         # a half-cleared control becomes a bar across the whole form
         # (the 12th-release giant-button bug).
+        #
+        # The checks themselves are THEMED button_ex buttons with
+        # checkbox glyphs, not native TCheckBox controls (5th
+        # dark-theme round: 'checkboxes text ... does not use theme
+        # colors'): under Windows visual styles a native checkbox
+        # draws its caption through the OS theme and ignores
+        # Font.Color, so the text stayed black-on-dark. The app's own
+        # options dialog (cuda_prefs) solves it exactly this way --
+        # TATButton paints the caption in the themed UI font color
+        # (ATFlatTheme.ColorFont) and the flat style leaves the form
+        # background visible. See _add_check.
         prev = None
         for name, cap, checked in self.FILTER_CHECKS:
             p = {
-                'cap': cap, 'val': '1' if checked else '0',
-                'h': 20, 'autosize': True, 'w': 100,
+                'cap': cap, 'act': True, 'h': 24,
                 'a_t': ('ed_left', ']'), 'sp_t': 10,
-                'font_color': tcol,
-                'act': True,  # fire on_change on every (un)check
                 'on_change': self._on_check,
             }
             if prev is None:
                 p.update({'a_l': ('', '['), 'sp_l': 10})
             else:
                 p.update({'a_l': (prev, ']'), 'sp_l': 12})
-            self._add('check', name, p)
+            self._add_check(name, p, checked)
             prev = name
-        self._add('check', 'chk_sub', {
-            'cap': _('Subfolders'), 'val': '1',
-            'h': 20, 'autosize': True, 'w': 100,
+        self._add_check('chk_sub', {
+            'cap': _('Subfolders'), 'act': True, 'h': 24,
             'a_l': ('chk_same', ']'), 'sp_l': 24,
             'a_t': ('ed_left', ']'), 'sp_t': 10,
-            'font_color': tcol,
-            'act': True,      # without it the toggle would do nothing
             'on_change': self._on_check,
-        })
+        }, True)
         # Right group (right-anchored chain: Apply at the edge, the
         # mask edit and its label to its left; every a_l cleared).
         self._add('button', 'btn_apply', {
@@ -2533,14 +2720,44 @@ class DirCompareForm:
             ct.statusbar_proc(self.h_sb,
                               ct.STATUSBAR_SET_CELL_AUTOSTRETCH,
                               tag=2, value='1')
-            sb_bg = _theme_color('StatusBg', _theme_color('ListBg'))
-            sb_fg = _theme_color('StatusFont', _theme_color('ListFont'))
+            # Theming, 5th dark-theme round ('status bar background
+            # and font colors does not use theme colors'): TATStatus
+            # does NOT take its colors from ATFlatTheme -- its Color
+            # property defaults to clBtnFace (light!) and the whole
+            # bar rendered a white strip on black themes. The chains
+            # below mirror what the app itself wires up for its own
+            # main statusbar (formmain_themes.inc):
+            #   StatusbarMain.Color := GetAppColor(StatusBg, TabBg)
+            #     -- bg: StatusBg, TabBg when the theme leaves it at
+            #     clNone (the _theme_color guard reads that sentinel
+            #     as 'not themed');
+            #   the font: per CELL (STATUSBAR_SET_COLOR_FONT does not
+            #     exist as an action -- the old call raised and the
+            #     broad except ate it silently), StatusFont falling
+            #     back to ButtonFont = ATFlatTheme.ColorFont, exactly
+            #     what TATStatus's UpdateCanvasFont uses when a cell
+            #     carries no ColorFont;
+            #   borders: ButtonBorderPassive, like the app's own
+            #     StatusbarMain.ColorBorderTop/R assignments.
+            sb_bg = _theme_color('StatusBg', bg)
             if sb_bg is not None:
                 ct.statusbar_proc(self.h_sb, ct.STATUSBAR_SET_COLOR_BACK,
                                   value=sb_bg)
+            sb_fg = _theme_color('StatusFont',
+                                 _theme_color('ButtonFont'))
             if sb_fg is not None:
-                ct.statusbar_proc(self.h_sb, ct.STATUSBAR_SET_COLOR_FONT,
-                                  value=sb_fg)
+                for tag in (1, 2):
+                    ct.statusbar_proc(
+                        self.h_sb, ct.STATUSBAR_SET_CELL_COLOR_FONT,
+                        tag=tag, value=sb_fg)
+            sb_line = _theme_color('ButtonBorderPassive')
+            if sb_line is not None:
+                ct.statusbar_proc(self.h_sb,
+                                  ct.STATUSBAR_SET_COLOR_BORDER_TOP,
+                                  value=sb_line)
+                ct.statusbar_proc(self.h_sb,
+                                  ct.STATUSBAR_SET_COLOR_BORDER_R,
+                                  value=sb_line)
         except Exception:
             pass
 
@@ -2555,7 +2772,7 @@ class DirCompareForm:
         p = {
             'a_l': ('', '['), 'sp_l': 10,
             'a_r': ('', ']'), 'sp_r': 10,
-            'a_t': ('ed_left', ']'), 'sp_t': 40,   # clears Row C (10+20)
+            'a_t': ('ed_left', ']'), 'sp_t': 44,   # clears Row C (10+24)
             'a_b': ('sbar', '['), 'sp_b': 4,
             'on_click': self._on_list_click,
             'on_click_dbl': self._on_list_dbl,
@@ -2580,7 +2797,7 @@ class DirCompareForm:
             # NOTE: no LISTBOX_SET_ITEM_H here -- the row height starts
             # as the control's own AUTO-FIT and the painter GUARDS it
             # from the first drawn row on (_fit_item_h: measured glyph
-            # box + 2px, only when the auto-fit band is tighter -- the
+            # box + 6px, only when the auto-fit band is tighter -- the
             # 15th release's fixed height froze every box at OUR
             # estimate; the guard keeps the control's value wherever
             # it already fits).
@@ -2600,18 +2817,6 @@ class DirCompareForm:
             # plain (undrawn, single-column) listbox -- ugly but the
             # window still compares, filters and sorts.
             pass
-
-        # Per-window imagelist (owned by the form -> freed with it).
-        try:
-            paths = _icon_paths()
-            self.h_imglist = ct.imagelist_proc(0, ct.IMAGELIST_CREATE,
-                                               value=self.h)
-            for name in ('same', 'diff', 'lonly', 'ronly', 'folder', 'err'):
-                idx = ct.imagelist_proc(self.h_imglist, ct.IMAGELIST_ADD,
-                                        value=paths[name])
-                self._icon_idx[name] = idx if idx is not None else -1
-        except Exception:
-            pass  # icons are decoration; the Status column carries the info
 
         # Scale the built layout to the OS DPI, then re-apply the saved
         # window geometry (saved values were captured post-scale, so
@@ -3175,24 +3380,25 @@ class DirCompareForm:
         Self-correcting and MEASURED, not guessed: the painter passes
         the very glyph box it just drew (CANVAS_GET_TEXT_SIZE under
         the font it just SET -- real font, real DPI, real point size),
-        and only when the band is tighter than that box + 2px does it
+        and only when the band is tighter than that box + 6px does it
         raise ItemHeight (LISTBOX_SET_ITEM_H; SetItemHeight sets
         FItemHeightIsFixed, the auto-fit freezes and the value rules
         from then on -- the control repaints once and every later
         pass finds the height already fitting, so this fires at most
-        once per window). Never shrinks, and never fires on a healthy
-        build: the app's own auto-fit is CanvasFontSizeToPixels(pt) *
-        Max(96, PPI) div 96 = (1.8*pt + 2)*k px against a real glyph
-        box of ~1.35*pt*k px -- the +2*k padding covers the +2 guard
-        for every k >= 1 and every normal font, so a build whose
-        auto-fit already fits is never touched. The hit tests need no
-        change: _row_at_y and the painter's calibration read
+        once per window). The +6 padding is the 6th-round request
+        ('instead of 2px use 6px'): with it a small-font build can
+        gain a pixel or two over the control's own auto-fit (the
+        built-in formula is (1.8*pt + 2)*k against a real glyph box
+        of ~1.35*pt*k -- at 9pt/96dpi the margin over glyph+6 is
+        under a pixel), which is the point: the band should never sit
+        tight on the glyphs. Never shrinks either way. The hit tests
+        need no change: _row_at_y and the painter's calibration read
         GET_ITEM_H live, and the header height they derive from the
         first row is independent of the item height. _item_h_fix
         remembers the applied height (None = never needed) for the
         functional tests."""
         try:
-            need = int(text_h) + 2
+            need = int(text_h) + 6
             cur = ct.listbox_proc(self.h_list, ct.LISTBOX_GET_ITEM_H)
             if cur is not None and need > int(cur):
                 ct.listbox_proc(self.h_list, ct.LISTBOX_SET_ITEM_H,
@@ -3286,7 +3492,7 @@ class DirCompareForm:
             self._worker.cancel()
             _prof_abandon_scan(self._cmd, self._prof_token, self._worker)
             self._prof_token = None
-        recursive = self._ctl_val('chk_sub') == '1'
+        recursive = self._recursive   # button_ex check state (no 'val')
         mask = _split_mask(self._ctl_val('ed_mask'))
 
         # Profiling gate + colors: _prof_begin_scan reloads the Command
@@ -3504,9 +3710,15 @@ class DirCompareForm:
             'chk_ronly': ST_RONLY, 'chk_same': ST_SAME,
         }
         if name in mapping:
-            self._show[mapping[name]] = self._ctl_val(name) == '1'
+            # button_ex checks carry no 'val' (see _add_check): the
+            # click ITSELF is the toggle -- flip the Python state and
+            # re-render the glyph.
+            self._show[mapping[name]] = not self._show[mapping[name]]
+            self._set_check_icon(name, self._show[mapping[name]])
             self._fill_list()
         elif name == 'chk_sub':
+            self._recursive = not self._recursive
+            self._set_check_icon('chk_sub', self._recursive)
             self.start_scan()
 
     def _on_key(self, id_dlg, id_ctl, data='', info=''):

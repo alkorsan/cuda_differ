@@ -1,3 +1,53 @@
+2026.10.05 (19th release, by @alkorsan)
+* fix: every dialog control now follows the UI theme in BLACK themes
+  too (reported: "checkboxes text and status bar background and font
+  colors does not use theme colors, so in black themes they look
+  bad, see pic / and also folder selector boxes see pic"). Three
+  separate root causes, all fixed at the source:
+  (1) STATUSBAR: the theme dict from PROC_THEME_UI_DICT_GET carries
+  EVERY color key, and the ones a theme does not define sit at the
+  LCL clNone sentinel ($1FFFFFFF) -- the old code passed that
+  sentinel to STATUSBAR_SET_COLOR_BACK, painting the whole bar
+  white on black themes. Worse, the font half called
+  STATUSBAR_SET_COLOR_FONT, an action that does not exist in the
+  API at all -- the AttributeError was swallowed by a broad
+  except, so the bar kept the light default font. _theme_color now
+  reads clNone as "not themed" and the chains mirror the app's own
+  wiring for its main statusbar (formmain_themes.inc): background
+  StatusBg -> TabBg, cell fonts (per CELL -- the only font action
+  that exists) StatusFont -> ButtonFont = ATFlatTheme.ColorFont,
+  borders ButtonBorderPassive. The bar now renders dark on dark
+  themes, light on light ones.
+  (2) CHECKBOXES: under Windows visual styles the OS theme draws a
+  native TCheckBox caption and ignores Font.Color -- the five
+  filter checks (Different / Only left / Only right / Identical /
+  Subfolders) stayed black-on-black while every control around
+  them went light. They are now THEMED button_ex buttons with
+  chk_on/chk_off imagelist glyphs -- exactly the pattern the app's
+  own options dialog (cuda_prefs) uses for its bools: TATButton
+  paints the caption in the themed UI font color, the flat style
+  paints no background (the form's themed color shows through),
+  and the glyph is a semi-transparent gray that reads on light and
+  dark alike. The check state lives in the plugin (the dialog
+  API's 'val' does not handle TATButton): a click flips the Python
+  state and swaps the glyph.
+  (3) FOLDER SELECTOR BOXES (both the picker's combos and the main
+  window's path edits): they were themed from EdTextBg/EdTextFont
+  -- the UI theme's OPINION of the editor colors, whose built-in
+  defaults are LIGHT and which many dark themes never define --
+  so the boxes rendered white on a black UI. Both dialogs now use
+  ListBg/ListFont with TabBg/TabFont as the last resort: core keys
+  every real theme defines, dark in dark themes, light in light
+  ones.
+* change: the row-height guard's padding is now 6px (requested:
+  "instead of 2px use 6px in: need = int(text_h) + 6") -- the
+  painter raises the row band to measured-glyphs + 6px where the
+  control's own auto-fit is tighter, so the band never sits tight
+  on the drawn text; at small fonts this can bump a fitting band
+  by a pixel (13px glyphs + 6 = 19px against an 18px band), which
+  is the point of the request. Still once per window, still never
+  shrinks.
+
 2026.10.05 (18th release, by @alkorsan)
 * fix: the row height now grows with the drawn font (reported: "the
   list items height does not grow when font grow so text become eaten

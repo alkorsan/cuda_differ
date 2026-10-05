@@ -378,10 +378,16 @@ The window's controls:
   high-DPI screens too. The two folder boxes always have the SAME
   width: the row labels are pinned to the wider caption's live
   width after the build, so both combos start at the same x and end
-  at the same right-anchored Browse button.
+  at the same right-anchored Browse button. The boxes follow the UI
+  theme in dark themes too (the theme's list colors -- never the
+  light editor-color default that left them white on black themes).
 - The status filters (Different / Only left / Only right / Identical)
   hide or show rows instantly, without rescanning. Uncheck
-  "Identical" for the usual "show me what matters" view.
+  "Identical" for the usual "show me what matters" view. The check
+  marks are themed buttons with a checkbox glyph (flat, the UI font
+  color), so their captions stay readable in black themes too -- a
+  native checkbox caption ignores the font color on Windows and
+  would render black-on-black.
 - The Subfolders checkbox switches between the full recursive tree
   (default) and the two top folders only; changing it rescans. With
   subfolders ON, every folder row is folded by default; with
@@ -420,16 +426,21 @@ The window's controls:
   HEIGHT follows it too -- the control's own auto-fit where that
   fits, and where it does not (builds whose list theme ignores the
   UI font size) the painter measures the glyphs it just drew and
-  raises the row height to fit them, so the text is never eaten.
-  Every metric that must fit the glyphs (column widths, the tree
-  gutter with its +/- markers) grows with it. Set a 14 pt UI font
-  and the whole list scales up to it, rows included.
+  raises the row height to fit them plus 6px of breathing room, so
+  the text is never eaten and the band never sits tight on the
+  glyphs. Every metric that must fit the glyphs (column widths, the
+  tree gutter with its +/- markers) grows with it. Set a 14 pt UI
+  font and the whole list scales up to it, rows included.
 - The status bar shows the scan progress / result line on the left
   and the counts (Different / Only left / Only right / Identical) on
   the right. Its cells carry no defined width: the status cell
   auto-fits its text and the counts cell stretches over the rest of
   the bar, so both shrink and grow with the dialog; the bar grows
-  taller with a bigger UI font like the list (nothing clips).
+  taller with a bigger UI font like the list (nothing clips). The
+  bar is themed like the rest of the window: its background and
+  font colors come from the UI theme (the statusbar keys when the
+  theme defines them, the window's own colors otherwise) -- never
+  a white system bar on a black theme.
 - The window remembers its size and position across sessions and
   has its own OS taskbar entry (restorable/pinnable like a normal
   application window).
