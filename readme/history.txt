@@ -1,3 +1,48 @@
+2026.10.05 (13th release, by @alkorsan)
+* fix: the 12th release broke both folder-compare dialogs on real
+  CudaText builds (reported: the picker showed ONE BIG CANCEL BUTTON
+  only -- an empty dialog shell). Root cause, TWO properties of the
+  dialog API's anchors that the test simulator did not model:
+  1) every control is BORN with its left and top sides anchored to
+     the form (the LCL default). The 12th release's Browse / Compare
+     / Cancel / Apply / mask controls set a_r/a_b WITHOUT clearing
+     the born-with a_l/a_t -- left AND right anchors on the same
+     control mean STRETCH, so those controls stretched to fill the
+     whole form; the picker's Cancel was also created LAST, i.e. on
+     top: one giant button covering everything else. Fix: every
+     right/bottom-anchored control now clears the opposite side
+     explicitly ('a_l': None / 'a_t': None -- the documented way);
+  2) an anchor target is resolved EAGERLY, by control NAME, at
+     prop-set time; a target that does not exist yet is silently
+     anchored to the FORM instead. The picker combos anchored a_r to
+     their Browse buttons and Compare anchored a_r to Cancel --
+     all created AFTER the anchoring control, so all resolved to the
+     form (more stretching). Fix: creation order now respects the
+     anchor graph (per row: label -> Browse -> combo; Cancel before
+     Compare);
+  3) the sort pair moved from the filter row to its OWN row below
+     it: filters + sort combo + mask group needed ~1000px of the
+     940px default window and overlapped even with the anchors
+     correct. Mask + Apply stay right-anchored on the filter row
+     (as requested); the list's top spacing grew to clear the new
+     row;
+  4) picker labels are now 'autosize': the caption can never clip
+     at any DPI/theme font (the combo follows the label's real
+     right edge via its anchor), on top of the 12th release's
+     DLG_SCALE + 150px label fix.
+  Tests: the GUI simulator now MODELS the anchor semantics (born
+  a_l/a_t, None clears, eager name resolution with a violations
+  log, stretch layout computation, bottom-aligned statusbars), and
+  the suite gained a geometric regression battery -- anchor
+  violations must be empty; Cancel must be exactly 90x28 at the
+  bottom-right; Browse 90x26 at the right edge; the combos stretch
+  and take the extra width on resize while the buttons keep their
+  sizes; Apply/mask fixed-size at the right edge; Row C groups and
+  Row D do not overlap; the list stretches between the margins.
+  Verified the battery reproduces the shipped bug on the 12th
+  release code (Cancel = the whole form, 3 forward references,
+  Apply = a 930px bar) before accepting the fix.
+
 2026.10.05 (12th release, by @alkorsan)
 * fix: folder-compare GUI round, from the user's screenshots:
   - the picker dialog ("Differ 2: compare folders") is now RESIZABLE

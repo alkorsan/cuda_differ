@@ -382,13 +382,13 @@ The window's controls:
 - Sorting works two ways, always in sync: click a column header
   (Name, Folder, Status, left/right size or date) where headers
   render, or use the always-visible "Sort by" combo + direction
-  button in the filter row -- some CudaText builds do not render
-  the listbox header at all, and the combo/button are the only sort
-  UI there. The direction marker is plain ASCII (^ / v): the
-  Unicode triangles used before rendered as hollow boxes on real
-  UI fonts. Column widths are DPI-scaled (Name stretches with the
-  window) so the header and the drawn rows stay aligned and dates
-  never clip at 125% scaling.
+  button on the row below the filters -- some CudaText builds do
+  not render the listbox header at all, and the combo/button are
+  the only sort UI there. The direction marker is plain ASCII
+  (^ / v): the Unicode triangles used before rendered as hollow
+  boxes on real UI fonts. Column widths are DPI-scaled (Name
+  stretches with the window) so the header and the drawn rows stay
+  aligned and dates never clip at 125% scaling.
 - The status bar shows the scan progress / result line on the left
   and the counts (Different / Only left / Only right / Identical) on
   the right.

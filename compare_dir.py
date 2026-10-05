@@ -1662,7 +1662,21 @@ class _PickerDialog:
     (dirs.picker_geom, "w,h") and re-applied after DLG_SCALE. The
     layout is DLG_SCALEd like the main window -- without it a 125%-DPI
     box keeps 96-DPI label widths under a bigger font and clips the
-    captions (the reported "Left folder (ol" bug)."""
+    captions (the reported "Left folder (ol" bug).
+
+    Anchor discipline (the API's anchor semantics are EAGER and
+    ADDITIVE -- both mattered here, see history.txt 13th release):
+    * a control is born with a_l/a_t ALREADY anchored to the form
+      (LCL default). Setting only a_r/a_b therefore gives the control
+      left AND right (top AND bottom) anchors -> it STRETCHES to fill
+      the form. Every right/bottom-anchored control below clears the
+      opposite side with 'a_l': None / 'a_t': None first.
+    * an anchor target is resolved by NAME at prop-set time; a target
+      that does not exist YET silently anchors to the form instead.
+      So every target is created before the control that anchors to
+      it: per row label -> Browse -> combo (the combo's a_r targets
+      the Browse button), and Cancel before Compare (Compare's a_r
+      targets Cancel)."""
 
     W = 640
     H = 150
@@ -1718,13 +1732,31 @@ class _PickerDialog:
                 ('right', _('Right folder (new):'), hist_r, dir_r))):
             top = ('', '[') if i == 0 else ('left', ']')
             sp_t = self.ROW_Y0 if i == 0 else self.ROW_DY - 26
+            # autosize: the caption never clips at any DPI/font -- the
+            # combo follows the label's real right edge via its a_l
             self._add('label', 'lab_' + side, {
                 'cap': label,
                 'w': self.LABEL_W, 'h': 20,
+                'autosize': True,
                 'a_l': ('', '['), 'sp_l': 12,
                 'a_t': top, 'sp_t': sp_t + 5,
                 'font_color': _theme_color('TabFont'),
             })
+            # Browse BEFORE the combo: the combo's a_r targets it, and
+            # an anchor target must exist (and carry its name) when the
+            # anchor is set. 'a_l': None clears the form-left anchor a
+            # new control is born with -- without it the button keeps
+            # left AND right anchors and stretches across the form.
+            self._add('button', 'brw_' + side, {
+                'cap': _('Browse...'),
+                'w': self.BRW_W, 'h': 26,
+                'a_l': None, 'a_r': ('', ']'), 'sp_r': 12,
+                'a_t': top, 'sp_t': sp_t,
+                'on_change': self._on_button,
+            })
+            # the only control meant to stretch: BOTH a_l (label's
+            # right) and a_r (Browse's left) -- the two fixed controls
+            # it sits between.
             self._add('combo', side, {
                 'w': 330, 'h': 26,
                 'a_l': ('lab_' + side, ']'), 'sp_l': 4,
@@ -1734,25 +1766,24 @@ class _PickerDialog:
                 'val': init,
                 'texthint': _('Type or pick a folder'),
             })
-            self._add('button', 'brw_' + side, {
-                'cap': _('Browse...'),
-                'w': self.BRW_W, 'h': 26,
-                'a_r': ('', ']'), 'sp_r': 12,
-                'a_t': top, 'sp_t': sp_t,
-                'on_change': self._on_button,
-            })
 
-        self._add('button', 'ok', {
-            'cap': _('Compare'),
-            'w': 100, 'h': 28,
-            'a_r': ('cancel', '['), 'sp_r': 8,
-            'a_b': ('', ']'), 'sp_b': 12,
-            'on_change': self._on_button,
-        })
+        # Cancel FIRST: Compare's a_r targets it. Both clear the born-
+        # with a_l/a_t ('a_l': None, 'a_t': None) -- right+bottom
+        # anchored, fixed size; a half-cleared pair stretches into a
+        # button covering the whole dialog (the 12th-release bug).
         self._add('button', 'cancel', {
             'cap': _('Cancel'),
             'w': 90, 'h': 28,
+            'a_l': None, 'a_t': None,
             'a_r': ('', ']'), 'sp_r': 12,
+            'a_b': ('', ']'), 'sp_b': 12,
+            'on_change': self._on_button,
+        })
+        self._add('button', 'ok', {
+            'cap': _('Compare'),
+            'w': 100, 'h': 28,
+            'a_l': None, 'a_t': None,
+            'a_r': ('cancel', '['), 'sp_r': 8,
             'a_b': ('', ']'), 'sp_b': 12,
             'on_change': self._on_button,
         })
@@ -1916,7 +1947,8 @@ class DirCompareForm:
       [ New compare... ][ Swap sides ][ Refresh ]            [ Close ]
       [ left path edit          ][Browse...]  [ right path edit   ][Br...]
       [x]Different [x]Only left [x]Only right [x]Identical [x]Subfolders
-         Sort by:[ combo ][^]                 Mask:[ edit ][ Apply ]
+                                    Mask:[ edit ][ Apply ]
+      Sort by:[ combo ][^]
       +--------------------------------------------------------------+
       | Name | Folder | Status | Left size | Left date | R.size | R.date |
       | (owner-drawn listbox_ex, stretches with the form; every row  |
@@ -2107,15 +2139,14 @@ class DirCompareForm:
                   'val': self._dir_r, 'texthint': _('right folder')})
         self._add('edit', 'ed_right', p)
 
-        # -- Row C: filters | sort controls | mask (right) --------------
-        # Left group: the four status filters + Subfolders. Middle:
-        # the always-visible sort pair (column combo + direction
-        # button) -- the listbox header that used to be the only sort
-        # UI does not render on every CudaText build (on the reporting
-        # box the header never appears, so header clicks cannot sort
-        # there); the combo/button work everywhere and mirror the
-        # header state on builds where the header does render. Right,
-        # anchored to the form's right edge: Mask + Apply.
+        # -- Row C: filters (left) | Mask + Apply (right) --------------
+        # Left group: the four status filters + Subfolders, chained
+        # left to right. Right group, anchored to the form's right
+        # edge: Mask + Apply (the requested placement). Each right-
+        # group control clears the a_l a new control is born with --
+        # left AND right anchors on the same control mean STRETCH, and
+        # a half-cleared control becomes a bar across the whole form
+        # (the 12th-release giant-button bug).
         prev = None
         for name, cap, checked in self.FILTER_CHECKS:
             p = {
@@ -2141,35 +2172,16 @@ class DirCompareForm:
             'act': True,      # without it the toggle would do nothing
             'on_change': self._on_check,
         })
-        self._add('label', 'lab_sort', {
-            'cap': _('Sort by:'), 'h': 20, 'autosize': True, 'w': 56,
-            'a_l': ('chk_sub', ']'), 'sp_l': 24,
-            'a_t': ('ed_left', ']'), 'sp_t': 12,
-            'font_color': tcol,
-        })
-        self._add('combo', 'sort_col', {
-            'w': 150, 'h': 24,
-            'a_l': ('lab_sort', ']'), 'sp_l': 6,
-            'a_t': ('ed_left', ']'), 'sp_t': 8,
-            'items': '\t'.join(cap for cap, _a, _w in _LIST_COLUMNS),
-            'val': _LIST_COLUMNS[self._sort_col][0],
-            'on_change': self._on_sort_col,
-        })
-        self._add('button', 'btn_sort_dir', {
-            'cap': _SORT_DIR_CAP[self._sort_desc], 'w': 34, 'h': 24,
-            'a_l': ('sort_col', ']'), 'sp_l': 6,
-            'a_t': ('ed_left', ']'), 'sp_t': 8,
-            'on_change': self._on_button,
-        })
         # Right group (right-anchored chain: Apply at the edge, the
-        # mask edit and its label to its left).
+        # mask edit and its label to its left; every a_l cleared).
         self._add('button', 'btn_apply', {
             'cap': _('Apply'), 'w': 70, 'h': 24,
-            'a_r': ('', ']'), 'sp_r': 10,
+            'a_l': None, 'a_r': ('', ']'), 'sp_r': 10,
             'a_t': ('ed_left', ']'), 'sp_t': 8,
             'on_change': self._on_button,
         })
         p = {'w': 170, 'h': 22,
+             'a_l': None,
              'a_r': ('btn_apply', '['), 'sp_r': 6,
              'a_t': ('ed_left', ']'), 'sp_t': 9,
              'texthint': _('*.py; *.txt')}
@@ -2180,9 +2192,41 @@ class DirCompareForm:
         self._add('edit', 'ed_mask', p)
         self._add('label', 'lab_mask', {
             'cap': _('Mask:'), 'h': 20, 'autosize': True, 'w': 44,
+            'a_l': None,
             'a_r': ('ed_mask', '['), 'sp_r': 6,
             'a_t': ('ed_left', ']'), 'sp_t': 12,
             'font_color': tcol,
+        })
+
+        # -- Row D: the always-visible sort pair ------------------------
+        # Column combo + direction button on their own row below the
+        # filters: the listbox header that used to be the only sort UI
+        # does not render on every CudaText build (on the reporting box
+        # the header never appears, so header clicks cannot sort there)
+        # -- the combo/button work everywhere and mirror the header
+        # state where it does render. A row of their own because the
+        # filters + sort pair + mask group do NOT fit side by side at
+        # the default width (they need ~1000px of a 940px window and
+        # overlapped even with the anchors right).
+        self._add('label', 'lab_sort', {
+            'cap': _('Sort by:'), 'h': 20, 'autosize': True, 'w': 56,
+            'a_l': ('', '['), 'sp_l': 10,
+            'a_t': ('ed_left', ']'), 'sp_t': 38,
+            'font_color': tcol,
+        })
+        self._add('combo', 'sort_col', {
+            'w': 150, 'h': 24,
+            'a_l': ('lab_sort', ']'), 'sp_l': 6,
+            'a_t': ('ed_left', ']'), 'sp_t': 36,
+            'items': '\t'.join(cap for cap, _a, _w in _LIST_COLUMNS),
+            'val': _LIST_COLUMNS[self._sort_col][0],
+            'on_change': self._on_sort_col,
+        })
+        self._add('button', 'btn_sort_dir', {
+            'cap': _SORT_DIR_CAP[self._sort_desc], 'w': 34, 'h': 24,
+            'a_l': ('sort_col', ']'), 'sp_l': 6,
+            'a_t': ('ed_left', ']'), 'sp_t': 36,
+            'on_change': self._on_button,
         })
 
         # -- Statusbar (created before the list: the list anchors to it) --
@@ -2223,7 +2267,7 @@ class DirCompareForm:
         p = {
             'a_l': ('', '['), 'sp_l': 10,
             'a_r': ('', ']'), 'sp_r': 10,
-            'a_t': ('ed_left', ']'), 'sp_t': 40,
+            'a_t': ('ed_left', ']'), 'sp_t': 68,   # clears Row D (36+24)
             'a_b': ('sbar', '['), 'sp_b': 4,
             'on_click_dbl': self._on_list_dbl,
             'on_click_header': self._on_header,
