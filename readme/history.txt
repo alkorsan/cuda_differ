@@ -1,3 +1,56 @@
+2026.10.05 (17th release, by @alkorsan)
+* fix: the rows STILL rendered small on the reporter's build (reported:
+  "list items still use small font not ui font see pic") -- the 16th
+  release kept an EMPTY CANVAS_SET_FONT name, trusting TATListbox's
+  DoPaintTo to preset the themed UI font on the canvas. That preset is
+  real in current upstream atlistbox.pas (verified), but the reported
+  box demonstrably does not apply it: with nothing set, the canvas
+  falls back to the LCL default GUI font at ~75-80% of the UI size.
+  The painter now SETS the font: name from the ui_font_name option,
+  size from the NEW _ui_font_pt() = DoScaleFont(ui_font_size) =
+  ui_font_size * ui_scale_font // 100 (PROC_CONFIG_SCALE_GET's 2nd
+  item; integer division like Pascal's div, so 9*150//100 = 13 on
+  both sides of the API; min 1pt so canvas_proc's >0 skip can never
+  drop it). Build-proof: on builds WITH the preset the same numbers
+  are written twice, on builds without it the values themselves are
+  the fix. The row height stays the control's auto-fit (no
+  LISTBOX_SET_ITEM_H), which follows the same theme chain.
+* fix: the column-resize cursor is CURSOR_H_SPLIT, not CURSOR_V_SPLIT
+  (reported: "use CURSOR_H_SPLIT instead of CURSOR_V_SPLIT"): the
+  boundary being dragged is a VERTICAL line, so the glyph must be the
+  left-right arrow; V_SPLIT is the up-down arrow and reads as a
+  row-height resize. Hover and drag both use it now.
+* fix: the picker's two folder boxes have the SAME width (reported:
+  "folder selector boxes must have same width see pic"): the combos
+  stretch between their row label's right edge and the identical
+  right-anchored Browse buttons, so their widths differed by exactly
+  the label captions' width difference ("Right folder (new):" is
+  wider than "Left folder (old):" -- the right combo came out
+  narrower). _equalize_labels(), run once after the build (after
+  DLG_SCALE and the saved-geometry restore), reads the labels' LIVE
+  widths (DLG_CTL_PROP_GET returns C.Left/Top/Width/Height, not the
+  build-time props) and pins BOTH labels to the wider one (autosize
+  off + that width): captions still fit, both combos start at the
+  same x, and the modal picker's font/DPI cannot change under it.
+* fix: the statusbar cells carry no defined width anymore (reported:
+  "status bar elements must not use a defined width so it can shrink
+  and grow with ui dialog see pic"): the 15th release pinned them
+  with STATUSBAR_SET_CELL_SIZE, and a resized dialog clipped the bar
+  or left it half empty. TATStatus's two flex modes replace the pins
+  (atstatusbar.pas DoPanelAutoWidth / DoPanelStretch): the status
+  cell (progress/result messages) AUTOSIZEs -- re-fitted to its text
+  on every paint -- and the counts cell AUTOSTRETCHes over whatever
+  width the bar has left, so both shrink and grow with the dialog.
+Tests: GUI suite 260 checks (was 246) -- the UI-font battery now
+asserts the painter SETS name+pt size (14pt 'Segoe UI', and
+'default'+13pt at ui_scale_font=150), the no-SET_CELL_SIZE +
+AUTOSIZE/AUTOSTRETCH flags plus a flex model that shrinks the counts
+cell 340px between a 940px and a 600px bar while the status cell
+keeps its text width, the H-split cursor on hover/off, and the
+picker's equal label pinning (137px = the wider caption) with BOTH
+combos at the same x/width before and after a resize. Scanner/span/
+import unchanged and green; pyflakes/vermin 3.6/static_check clean.
+
 2026.10.05 (16th release, by @alkorsan)
 * fix: the compare list's rows render in the CudaText UI font, the
   very font the list's own header, the tabs and the command palette

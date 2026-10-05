@@ -375,7 +375,10 @@ The window's controls:
   resizable (the combos stretch with it) and its size is remembered
   across sessions; the layout is DPI-scaled, so the labels keep
   their full text ("Left folder (old):" / "Right folder (new):") on
-  high-DPI screens too.
+  high-DPI screens too. The two folder boxes always have the SAME
+  width: the row labels are pinned to the wider caption's live
+  width after the build, so both combos start at the same x and end
+  at the same right-anchored Browse button.
 - The status filters (Different / Only left / Only right / Identical)
   hide or show rows instantly, without rescanning. Uncheck
   "Identical" for the usual "show me what matters" view.
@@ -400,8 +403,9 @@ The window's controls:
   sort by their ROLLED-UP status (see the row-colors note below), so
   the Status column's order always matches what the rows show.
 - The columns are RESIZABLE with the mouse: press near a boundary
-  line between two columns (the cursor turns into a vertical split)
-  and drag -- the column left of the boundary follows the mouse,
+  line between two columns (the cursor turns into a left-right
+  split arrow) and drag -- the column left of the boundary follows
+  the mouse,
   live; Name always takes whatever space the other columns leave.
   Widths are clamped (a column cannot shrink under its caption or
   grow past half the list), remembered across sessions like the
@@ -411,15 +415,18 @@ The window's controls:
 - The rows render in the CudaText UI font -- the very font the
   list's own header, the command palette and every themed control
   use (the "ui_font_name" / "ui_font_size" options), NOT some
-  smaller default: the row height auto-fits that font exactly like
-  every built-in CudaText list, and every metric that must fit the
-  glyphs (column widths, the tree gutter with its +/- markers,
-  status-cell sizes) grows with it. Set a 14 pt UI font and the
+  smaller default: the painter SETS that font on the canvas (name
+  and point size, the app's own DoScaleFont chain), the row height
+  auto-fits it exactly like every built-in CudaText list, and every
+  metric that must fit the glyphs (column widths, the tree gutter
+  with its +/- markers) grows with it. Set a 14 pt UI font and the
   whole list scales up to it, rows included.
 - The status bar shows the scan progress / result line on the left
   and the counts (Different / Only left / Only right / Identical) on
-  the right; its cells follow the DPI and the UI font size like the
-  list (the bar grows taller with a bigger UI font, nothing clips).
+  the right. Its cells carry no defined width: the status cell
+  auto-fits its text and the counts cell stretches over the rest of
+  the bar, so both shrink and grow with the dialog; the bar grows
+  taller with a bigger UI font like the list (nothing clips).
 - The window remembers its size and position across sessions and
   has its own OS taskbar entry (restorable/pinnable like a normal
   application window).

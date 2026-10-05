@@ -292,21 +292,30 @@ sidedness by color and caption, not by swapping the icon.
 == Row font =========================================================
 
 The rows render in the CudaText UI font -- the very font the listbox's
-own header, the command palette and every themed control use. Nothing
-is configured to reach that: the list control is never given font
-props (so its ThemedFont stays on and it picks ATFlatTheme's font =
-the ui_font_name/ui_font_size options), TATListbox presets that font
-on the canvas before every on_draw_item call, and the painter only
-sets the COLOR (CANVAS_SET_FONT with an empty name keeps the preset).
-The row height is equally not the plugin's business: with no
-LISTBOX_SET_ITEM_H the control auto-fits it to that font on every
-paint (UpdateItemHeight -> GetItemHeightDefault), exactly like every
-built-in CudaText list. What IS the plugin's business is every pixel
-metric that must fit that text -- column widths, the tree gutter, the
-expand-marker zone, statusbar cells -- all scaled by _px_scale() =
+own header, the command palette and every themed control use. The
+painter SETS it explicitly on every pass: CANVAS_SET_FONT with the
+name from ui_font_name and the size _ui_font_pt() (ui_font_size as
+the app draws it, DoScaleFont = size * ui_scale_font // 100). Relying
+on TATListbox's canvas preset was tried and did NOT survive the
+field: current upstream atlistbox.pas presets the themed font in
+DoPaintTo, but the reported box rendered small anyway -- older
+builds evidently skip the preset, so an empty-name CANVAS_SET_FONT
+left the canvas at the LCL default GUI font (~75-80% of the UI
+size). Passing the values is build-proof: on builds WITH the preset
+the same numbers are written twice, on builds without it the fix is
+the values themselves. The row height stays the control's own: with
+no LISTBOX_SET_ITEM_H it auto-fits to the themed font on every paint
+(UpdateItemHeight -> GetItemHeightDefault), which is the same chain
+the explicit size replicates. What IS the plugin's business is every
+pixel metric that must fit that text -- column widths, the tree
+gutter, the expand-marker zone -- all scaled by _px_scale() =
 DPI factor x UI-font factor (_font_scale, from ui_font_size and the
 ui_scale_font option read via PROC_CONFIG_SCALE_GET; a 14pt UI font
 draws ~1.5x-wider glyphs than the 9pt default the base widths assume).
+The statusbar cells carry no width at all anymore: the status cell
+AUTOSIZEs to its text and the counts cell AUTOSTRETCHes over the rest
+of the bar, so they shrink and grow with the dialog (TATStatus
+re-fits an autosized cell on every paint).
 
 == Windows / instances =============================================
 
@@ -320,7 +329,7 @@ those remain only for folders without scanned children, i.e. with
 Subfolders off or truly empty folders). Sorting is the column
 header's own click-sort (the marker is the U+2191/U+2193 arrow); the
 column WIDTHS are drag-resizable -- press near a boundary line in
-the list (the cursor turns into a V-split) and drag; the widths are
+the list (the cursor turns into an H-split) and drag; the widths are
 remembered across sessions and resettable from the context menu.
 Forms register themselves in the module-level _forms list (which keeps
 their Python objects -- and thus their timer callbacks -- alive);
@@ -661,6 +670,39 @@ def _font_scale():
             pass
         _FONT_SCALE = max(0.8, min(3.0, px / 18.2))
     return _FONT_SCALE
+
+
+_UI_FONT_PT = None
+
+
+def _ui_font_pt():
+    """The UI font size in POINTS, exactly as the app's themed controls
+    draw it: DoScaleFont(ui_font_size) = ui_font_size *
+    ui_scale_font // 100 -- the same ScaleFontPercents PROC_CONFIG_
+    SCALE_GET's 2nd item carries (integer division, like Pascal's
+    div, so 9 * 150 // 100 = 13 on both sides of the API). This is
+    the value the painter hands to CANVAS_SET_FONT: the row text was
+    reported small twice -- once with text='default' (v5: overwrote
+    the name only, the size fell back to the canvas default ~8pt) and
+    once with an empty name kept for TATListbox's DoPaintTo preset
+    (v6: the preset is real in current upstream but demonstrably
+    absent on the reported build -- the rows stayed small), so the
+    size is no longer inferred from anything: it is SET, from the
+    same options the app loads into ATFlatTheme. Guarded like its
+    siblings (never raises, min 1pt so the >0 skip in canvas_proc
+    can never drop it); cached per process."""
+    global _UI_FONT_PT
+    if _UI_FONT_PT is None:
+        size = _ui_font()[1]
+        pct = 100
+        try:
+            sc = ct.app_proc(ct.PROC_CONFIG_SCALE_GET, '')
+            if isinstance(sc, (tuple, list)) and len(sc) == 2:
+                pct = int(sc[1] or 100)
+        except Exception:
+            pass
+        _UI_FONT_PT = max(1, size * max(10, min(500, pct)) // 100)
+    return _UI_FONT_PT
 
 
 def _px_scale():
@@ -1803,7 +1845,16 @@ class _PickerDialog:
       So every target is created before the control that anchors to
       it: per row label -> Browse -> combo (the combo's a_r targets
       the Browse button), and Cancel before Compare (Compare's a_r
-      targets Cancel)."""
+      targets Cancel).
+
+    The two combos end up equally wide by construction, not by
+    coincidence: they stretch between their row label's right edge
+    and the identical right-anchored Browse buttons, so their widths
+    differ by exactly the label-caption difference -- _equalize_
+    labels() pins both labels to the wider caption's live width
+    after the build (prop_get returns the LIVE control geometry),
+    giving both combos the same left edge. See history.txt 17th
+    release."""
 
     W = 640
     H = 150
@@ -1927,6 +1978,45 @@ class _PickerDialog:
                 ct.dlg_proc(self.h, ct.DLG_PROP_SET, prop=geom)
             except Exception:
                 pass
+        # LAST, with the layout final (DLG_SCALE applied, saved size
+        # restored): pin both row labels to one width so the two
+        # combos render equally wide.
+        self._equalize_labels()
+
+    def _equalize_labels(self):
+        """Both folder combos must have the SAME width (reported:
+        'folder selector boxes must have same width'). A combo's left
+        edge follows its row label's right edge and its right edge
+        the Browse button (all four buttons right-anchored at the
+        same offset), so the two combos differ by exactly the
+        difference of the two autosized captions ('Left folder
+        (old):' is narrower than 'Right folder (new):') -- the right
+        combo came out a few px narrower. The fix measures the two
+        labels AFTER the layout is final -- DLG_CTL_PROP_GET returns
+        the LIVE control geometry (proc_customdialog.pas fills
+        x/y/w/h from C.Left/Top/Width/Height), so the autosized,
+        DLG_SCALEd widths are in -- takes the wider one and pins
+        BOTH labels to it ('autosize': False + that 'w'): each
+        caption still fits (every label is at least as wide as its
+        own caption needed), and with identical label widths the
+        anchored combos come out exactly equal. Run once after the
+        build: the picker is modal, the font and DPI cannot change
+        under it; guarded like every dlg helper (a failure just
+        leaves the labels as built)."""
+        try:
+            ws = []
+            for side in ('left', 'right'):
+                d = ct.dlg_proc(self.h, ct.DLG_CTL_PROP_GET,
+                                name='lab_' + side) or {}
+                ws.append(int(d.get('w', 0) or 0))
+            w = max(ws)
+            if w > 0:
+                for side in ('left', 'right'):
+                    ct.dlg_proc(self.h, ct.DLG_CTL_PROP_SET,
+                                name='lab_' + side,
+                                prop={'autosize': False, 'w': w})
+        except Exception:
+            pass
 
     # -- geometry persistence ------------------------------------------
 
@@ -2135,7 +2225,7 @@ class DirCompareForm:
     but the control DOES deliver on_mouse_down/up/move (data =
     {'btn','state','x','y'} client coords) over its rows area. The
     six internal column boundaries run through the rows; a left
-    press within ~6px of one (the hover shows the V-split cursor)
+    press within ~6px of one (the hover shows the H-split cursor)
     starts a drag that adjusts the column to its left -- boundary 1
     (Name|Folder) inversely narrows Folder, since Name is the stretch
     column. Widths are clamped to MIN/MAX_COL_W, pushed live via
@@ -2406,14 +2496,26 @@ class DirCompareForm:
         try:
             ct.statusbar_proc(self.h_sb, ct.STATUSBAR_ADD_CELL, tag=1)
             ct.statusbar_proc(self.h_sb, ct.STATUSBAR_ADD_CELL, tag=2)
-            sb_s = _px_scale()     # cell sizes are raw pixels like the
-                                   # list columns -- scale them by DPI
-                                   # AND the UI-font factor (the cell
-                                   # text is the themed font too)
-            ct.statusbar_proc(self.h_sb, ct.STATUSBAR_SET_CELL_SIZE,
-                              tag=1, value=int(430 * sb_s))
-            ct.statusbar_proc(self.h_sb, ct.STATUSBAR_SET_CELL_SIZE,
-                              tag=2, value=int(560 * sb_s))
+            # NO defined cell widths (reported: 'status bar elements
+            # must not use a defined width so it can shrink and grow
+            # with ui dialog'): the 15th release pinned them with
+            # SET_CELL_SIZE, and a resized dialog either clipped the
+            # bar or left it half empty. TATStatus has the two flex
+            # modes for exactly this (atstatusbar.pas
+            # DoPanelAutoWidth / DoPanelStretch):
+            # * cell 1 (scan status / progress messages, short and
+            #   variable) AUTOSIZEs -- TATStatus re-fits it to its
+            #   text on every paint, so the cell is never wider than
+            #   its message needs;
+            # * cell 2 (the counts line, the long one) AUTOSTRETCHes
+            #   -- it takes whatever width the bar has left, so it
+            #   grows and shrinks with the dialog (the bar itself is
+            #   full-width anchored to the form's sides).
+            ct.statusbar_proc(self.h_sb, ct.STATUSBAR_SET_CELL_AUTOSIZE,
+                              tag=1, value='1')
+            ct.statusbar_proc(self.h_sb,
+                              ct.STATUSBAR_SET_CELL_AUTOSTRETCH,
+                              tag=2, value='1')
             sb_bg = _theme_color('StatusBg', _theme_color('ListBg'))
             sb_fg = _theme_color('StatusFont', _theme_color('ListFont'))
             if sb_bg is not None:
@@ -2949,17 +3051,23 @@ class DirCompareForm:
         cells = self._row_cells(row)
         layout = self._col_layout(w)
         try:
-            # THE font fix: an EMPTY font name (and no size) leaves the
-            # canvas font exactly as TATListbox preset it -- the themed
-            # UI font (ATFlatTheme.FontName / DoScaleFont(FontSize),
-            # what the header and every CudaText list draws with);
-            # canvas_proc skips the assignment for '' / 0 / -1. Only
-            # the color (and style reset) are ours. The 15th release
-            # passed text='default' here, which OVERWROTE the preset
-            # UI font with the OS default GUI font -- the reported
-            # 'items are small, must use the font size of cudatext ui'.
-            ct.canvas_proc(canvas, ct.CANVAS_SET_FONT, text='',
-                           color=fg, style=0)
+            # THE font fix, 3rd round: the row text is drawn in the
+            # CudaText UI font by SETTING it -- name from ui_font_name,
+            # size _ui_font_pt() (DoScaleFont(ui_font_size)). v5 set
+            # only the name ('default') and left the size to the
+            # canvas; v6 set neither and trusted TATListbox's DoPaintTo
+            # preset; both left the rows SMALL on the reported build
+            # (the preset is real in current upstream atlistbox.pas but
+            # evidently missing there -- an unset canvas falls back to
+            # the LCL default GUI font at ~75-80% of the UI size).
+            # Explicit values are build-proof: preset or no preset,
+            # every glyph after this line is the themed UI font.
+            # canvas_proc skips the assignment for ''/-1, so only the
+            # color and the style reset are extra; style=0 clears any
+            # bold/italic a previous row may have left on the canvas.
+            ct.canvas_proc(canvas, ct.CANVAS_SET_FONT,
+                           text=_ui_font()[0],
+                           color=fg, size=_ui_font_pt(), style=0)
             # one measure for the vertical centering baseline
             sz = ct.canvas_proc(canvas, ct.CANVAS_GET_TEXT_SIZE,
                                 text='Ag')
@@ -3465,14 +3573,18 @@ class DirCompareForm:
                 return i + 1
         return None
 
-    def _set_cursor(self, v_split):
-        """Show/restore the V-split resize cursor on the list
+    def _set_cursor(self, h_split):
+        """Show/restore the H-split resize cursor on the list
         (edge-triggered from _on_mouse_move -- cheap on hover, and
-        skipped entirely on builds without the cursor prop)."""
-        self._zone = v_split
+        skipped entirely on builds without the cursor prop).
+        H_SPLIT, not V_SPLIT (reported: 'use CURSOR_H_SPLIT instead
+        of CURSOR_V_SPLIT'): the glyph is a left-right arrow, the
+        right shape for dragging a VERTICAL boundary line; V_SPLIT
+        is the up-down arrow and reads as a row-height resize."""
+        self._zone = h_split
         try:
             ct.dlg_proc(self.h, ct.DLG_CTL_PROP_SET, name='list',
-                        prop={'cursor': ct.CURSOR_V_SPLIT if v_split
+                        prop={'cursor': ct.CURSOR_H_SPLIT if h_split
                               else ct.CURSOR_DEFAULT})
         except Exception:
             pass
@@ -3508,7 +3620,7 @@ class DirCompareForm:
             self._set_cursor(True)   # a fast press may skip the hover
 
     def _on_mouse_move(self, id_dlg, id_ctl, data='', info=''):
-        """Hover: show the V-split cursor over a boundary
+        """Hover: show the H-split cursor over a boundary
         (edge-triggered: the prop is touched only when the zone is
         entered/left; steady hovering costs one comparison). Drag:
         move the boundary with the mouse, clamped to
