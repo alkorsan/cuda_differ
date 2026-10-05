@@ -391,9 +391,10 @@ The window's controls:
 - Sorting is the column header's own click-sort (Name, Folder,
   Status, left/right size or date): click a column to sort by it,
   click again to reverse. The direction marker is the Unicode arrow
-  pair (U+2191 / U+2193). Column widths are DPI-scaled (Name
-  stretches with the window) so the header and the drawn rows stay
-  aligned and dates never clip at 125% scaling. In the tree view the
+  pair (U+2191 / U+2193). Column widths are scaled by BOTH the
+  DPI and the UI font size (Name stretches with the window) so the
+  header and the drawn rows stay aligned and dates never clip at
+  125% scaling or a bigger "UI font size" option. In the tree view the
   sort orders every level (a folder's children among themselves),
   exactly like the old flat list ordered the whole table. Folders
   sort by their ROLLED-UP status (see the row-colors note below), so
@@ -407,9 +408,18 @@ The window's controls:
   window size, and the context menu's "Reset column widths" puts
   the defaults back. (The dialog API's listbox header itself is not
   draggable -- that is why the grab zones run through the rows.)
+- The rows render in the CudaText UI font -- the very font the
+  list's own header, the command palette and every themed control
+  use (the "ui_font_name" / "ui_font_size" options), NOT some
+  smaller default: the row height auto-fits that font exactly like
+  every built-in CudaText list, and every metric that must fit the
+  glyphs (column widths, the tree gutter with its +/- markers,
+  status-cell sizes) grows with it. Set a 14 pt UI font and the
+  whole list scales up to it, rows included.
 - The status bar shows the scan progress / result line on the left
   and the counts (Different / Only left / Only right / Identical) on
-  the right.
+  the right; its cells follow the DPI and the UI font size like the
+  list (the bar grows taller with a bigger UI font, nothing clips).
 - The window remembers its size and position across sessions and
   has its own OS taskbar entry (restorable/pinnable like a normal
   application window).

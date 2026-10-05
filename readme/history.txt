@@ -1,3 +1,47 @@
+2026.10.05 (16th release, by @alkorsan)
+* fix: the compare list's rows render in the CudaText UI font, the
+  very font the list's own header, the tabs and the command palette
+  use (reported: "text used in items is small it must use the font
+  size of cudatext ui see pic"). The 15th release called
+  canvas_proc(CANVAS_SET_FONT) with text='default' in its row
+  painter, which OVERWROTE the font TATListbox presets on the canvas
+  -- the themed UI font (ATFlatTheme.FontName + DoScaleFont(
+  ATFlatTheme.FontSize)) -- with the OS default GUI font at ~75-80%
+  of the size: big-UI-font boxes drew small rows under a big header.
+  The painter now passes an EMPTY name (canvas_proc skips the
+  assignment for '' / 0 / -1 -- verified in formmain_py_api.inc),
+  so the preset survives and only the color (and a style reset) are
+  the plugin's. The row height is the control's business now too:
+  with no LISTBOX_SET_ITEM_H, TATListbox auto-fits it to that same
+  font on every paint (UpdateItemHeight -> GetItemHeightDefault =
+  CanvasFontSizeToPixels(DoScaleFont(theme font)) * Max(96, PPI)
+  div 96 -- verified against upstream ATFlatControls), exactly the
+  height every built-in CudaText list uses; a fixed height was the
+  other half of the bug (rows stayed ~9pt-sized while the text
+  outgrew them). What IS the plugin's business is every metric that
+  must fit those glyphs: _px_scale() = the DPI factor times a NEW
+  UI-font factor (_font_scale), so column widths, the tree gutter
+  (+/- marker zone, icon offset), the status cells -- and the
+  statusbar's own height -- all grow with the font; the drag-boundary
+  grab tolerance stays hand-tracked (DPI only). The factor is
+  measured, not guessed: ui_font_name/ui_font_size (with the OS
+  suffix PROC_GET_OS_SUFFIX returns) are read from the global
+  settings -- the same options the app loads into UiOps.VarFont*
+  and from there into ATFlatTheme (formmain.pas) -- and DoScaleFont's
+  percents come from PROC_CONFIG_SCALE_GET's second tuple item; the
+  conversion replicates the app's own CanvasFontSizeToPixels chain
+  (point size -> pixels -> ratio vs the 9 pt default), clamped to a
+  sane 0.8..3.0 so a corrupt option cannot lay the window out
+  absurdly. A 14 pt UI font now scales the whole list ~1.49x --
+  wider columns, taller rows, taller status bar -- and a default box
+  renders exactly as before (factor 1.0). Tests: the GUI suite gains
+  a UI-font battery (option read, factor math at 14 pt and at
+  ui_scale_font=150, auto-fitted row heights 18/27/25 px, scaled
+  columns/cells/gutter/hit-zone, the painter's empty-name
+  CANVAS_SET_FONT, auto item height never fixed) and the drag
+  battery re-checks its clamps under the new factor; 246 checks
+  green, scanner/span/import unchanged and green, py_compile/
+  static_check clean.
 2026.10.05 (15th release, by @alkorsan)
 * add: the compare list's columns are RESIZABLE with the mouse
   (requested: "i cannot resize the columns, i want to be able to

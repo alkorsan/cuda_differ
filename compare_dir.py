@@ -289,6 +289,25 @@ while a folder whose contents are all identical stays plain. Folders
 always carry the folder icon -- one-sided folders communicate their
 sidedness by color and caption, not by swapping the icon.
 
+== Row font =========================================================
+
+The rows render in the CudaText UI font -- the very font the listbox's
+own header, the command palette and every themed control use. Nothing
+is configured to reach that: the list control is never given font
+props (so its ThemedFont stays on and it picks ATFlatTheme's font =
+the ui_font_name/ui_font_size options), TATListbox presets that font
+on the canvas before every on_draw_item call, and the painter only
+sets the COLOR (CANVAS_SET_FONT with an empty name keeps the preset).
+The row height is equally not the plugin's business: with no
+LISTBOX_SET_ITEM_H the control auto-fits it to that font on every
+paint (UpdateItemHeight -> GetItemHeightDefault), exactly like every
+built-in CudaText list. What IS the plugin's business is every pixel
+metric that must fit that text -- column widths, the tree gutter, the
+expand-marker zone, statusbar cells -- all scaled by _px_scale() =
+DPI factor x UI-font factor (_font_scale, from ui_font_size and the
+ui_scale_font option read via PROC_CONFIG_SCALE_GET; a 14pt UI font
+draws ~1.5x-wider glyphs than the 9pt default the base widths assume).
+
 == Windows / instances =============================================
 
 Every compare is a separate NON-MODAL dlg_proc form: run as many
@@ -394,10 +413,18 @@ POLL_MS = 200                  # worker -> UI poll period while scanning
 ICON_CACHE_VER = '1'           # bump to force-renew the icon cache dir
 
 # Owner-drawn list metrics (the results list is a listbox_ex in
-# LISTBOX_SET_DRAWN mode -- see the module docstring "Row coloring"):
-# one row's height (in 96-DPI base pixels; _ui_scale multiplies it at
-# build time, like every other raw-pixel metric below).
-LIST_ITEM_H = 26
+# LISTBOX_SET_DRAWN mode -- see the module docstring "Row coloring").
+# The ROW HEIGHT is NOT set by the plugin at all: TATListbox auto-fits
+# it to the UI font on every paint (ATFlatControls atlistbox.pas,
+# Paint -> UpdateItemHeight -> GetItemHeightDefault =
+# CanvasFontSizeToPixels(DoScaleFont(theme font)) * Max(96, PPI) div
+# 96) -- the exact height every CudaText list (command palette,
+# tab list) uses. A fixed LISTBOX_SET_ITEM_H would freeze the rows at
+# OUR estimate and clip the text on every box whose UI font is bigger
+# than the 9pt default -- the 15th release did exactly that, and the
+# reported box drew 9pt-ish rows under a much larger UI font.
+# LISTBOX_GET_ITEM_H (used by the painter's hit-test calibration and
+# _row_at_y) always returns the live auto-fitted value.
 
 # Column separator for the listbox items/header. A control character
 # is used (not '|'): item captions are built from real file names,
@@ -463,12 +490,14 @@ METHOD_SIZE_TIME = 'size_timestamp'
 # The two sides' size/date columns mirror WinMerge's "Left/Right
 # size/date" layout; the Folder column keeps the Name column clean
 # ("Name" is the base name, "Folder" the path below the compared roots).
-# Widths are 96-DPI BASE pixels -- _col_spec/_col_layout multiply them
-# by _ui_scale() so the cells keep fitting the (DPI-scaled) control
-# font on high-DPI boxes (the reporting box ellipsized every date at
-# 125% DPI with the raw 96-DPI widths). They are also only the
-# DEFAULTS: the fixed columns are drag-resizable (see _on_mouse_down)
-# and persist across sessions as 'dirs.col_widths' (base values).
+# Widths are 96-DPI, 9pt-font BASE pixels -- _col_spec/_col_layout
+# multiply them by _px_scale() (DPI x UI-font factor) so the cells keep
+# fitting the text the control actually draws (the reporting box
+# ellipsized every date at 125% DPI with the raw widths; the same
+# happens at a bigger UI font, which draws 1.x-times-wider glyphs into
+# the old widths). They are also only the DEFAULTS: the fixed columns
+# are drag-resizable (see _on_mouse_down) and persist across sessions
+# as 'dirs.col_widths' (base values).
 _LIST_COLUMNS = (
     (_('Name'), 'L', 230),
     (_('Folder'), 'L', 170),
@@ -544,8 +573,8 @@ def _ui_scale():
     by that factor. Everything the plugin passes through dlg_proc
     (anchors, autosize labels, w/h of controls) is scaled by the
     form's own DLG_SCALE -- but the raw pixel values handed to
-    listbox_proc / statusbar_proc (column widths, item height, status
-    cell sizes) BYPASS it, while the text drawn into them does not.
+    listbox_proc / statusbar_proc (column widths, status cell sizes)
+    BYPASS it, while the text drawn into them does not.
     Unscaled, a 125%-DPI box draws 1.25x-wide text into 96-DPI
     columns: the date cells were the first casualty ('2026-10-04 …'
     ellipsized on the reporting box).
@@ -570,6 +599,79 @@ def _ui_scale():
         except Exception:
             _UI_SCALE = 1.0
     return _UI_SCALE
+
+
+_FONT_SCALE = None
+
+
+def _ui_font():
+    """(name, size_pt) of the CudaText UI font -- the font every themed
+    control renders with: menus, tabs, side panels, and the AT
+    listboxes/statusbars/buttons of plugin dialogs (ATFlatTheme), our
+    results list included. Source: the global options 'ui_font_name' /
+    'ui_font_size' (+ the OS suffix PROC_GET_OS_SUFFIX returns -- ''
+    on Windows, '__linux', '__mac', ...; both app_procs predate the
+    plugin's api 1.0.483 requirement by ~100 releases). The app loads
+    the very same options into UiOps.VarFontName/VarFontSize and from
+    there into ATFlatTheme, which TATListbox's canvas starts every
+    owner-draw pass from -- so this is the plugin's view of what the
+    list is about to draw. Defaults 'default'/9 = the app's own
+    fallbacks; never raises (any failure keeps them)."""
+    name = 'default'
+    size = 9
+    try:
+        suffix = ct.app_proc(ct.PROC_GET_OS_SUFFIX, '') or ''
+        n = ctx.get_opt('ui_font_name' + suffix, '',
+                        user_json='user.json')
+        if isinstance(n, str) and n:
+            name = n
+        s = ctx.get_opt('ui_font_size' + suffix, 0,
+                        user_json='user.json')
+        if s:
+            size = max(4, min(72, int(s)))
+    except Exception:
+        pass
+    return name, size
+
+
+def _font_scale():
+    """How much wider/taller the UI font renders vs the 9pt default
+    (1.0 on a default-config box). Replicates the app's own chain:
+    ATFlatTheme.FontSize = ui_font_size, TATListbox draws it at
+    DoScaleFont(size) = size * ScaleFontPercents div 100, where
+    ScaleFontPercents is the 'ui_scale_font' option (read via
+    PROC_CONFIG_SCALE_GET's 2nd tuple item), and converts points to
+    pixels with CanvasFontSizeToPixels(s) = s*18 div 10 + 2. The DPI
+    factor is deliberately dropped: it multiplies the current and the
+    default font alike, so it cancels in the ratio -- and the metrics
+    this feeds are already _ui_scale()d. Feeds _px_scale(); cached per
+    process like _ui_scale; clamped to a sane 0.8..3.0 so a corrupt
+    option cannot lay the window out absurdly."""
+    global _FONT_SCALE
+    if _FONT_SCALE is None:
+        px = 18.2       # CanvasFontSizeToPixels(9) -- the default font
+        try:
+            size = _ui_font()[1]
+            pct = 100
+            sc = ct.app_proc(ct.PROC_CONFIG_SCALE_GET, '')
+            if isinstance(sc, (tuple, list)) and len(sc) == 2:
+                pct = int(sc[1] or 100)
+            px = (size * max(10, min(500, pct)) / 100.0) * 1.8 + 2
+        except Exception:
+            pass
+        _FONT_SCALE = max(0.8, min(3.0, px / 18.2))
+    return _FONT_SCALE
+
+
+def _px_scale():
+    """The factor for every raw-pixel metric that must follow the LIST
+    TEXT: DPI (_ui_scale) times the UI-font factor (_font_scale) --
+    column widths, tree-gutter offsets, expand-marker zone, statusbar
+    cell sizes. Values passed through dlg_proc (control w/h, sp_*)
+    need only the font part: the form's own DLG_SCALE handles their
+    DPI. Mouse-precision constants (the boundary grab tolerance) stay
+    at _ui_scale() -- they track the hand, not the glyphs."""
+    return _ui_scale() * _font_scale()
 
 
 def _fmt_size(n):
@@ -1978,9 +2080,11 @@ class DirCompareForm:
     them at once -- see the module docstring).
 
     Layout (all sizes are base pixels; DLG_SCALE adjusts them to the
-    OS DPI before the saved geometry is re-applied, and _ui_scale()
-    does the same for the raw-pixel metrics that bypass DLG_SCALE --
-    list columns, item height, status cells):
+    OS DPI before the saved geometry is re-applied, and _px_scale()
+    -- DPI x UI-font factor -- does the same for the raw-pixel metrics
+    that bypass DLG_SCALE: list columns, tree gutter, status cells.
+    The row height is not ours at all: TATListbox auto-fits it to the
+    UI font, and the painter draws with the font the control preset):
 
       [ New compare... ][ Swap sides ][ Refresh ]            [ Close ]
       [ left path edit          ][Browse...]  [ right path edit   ][Br...]
@@ -2288,8 +2392,13 @@ class DirCompareForm:
         })
 
         # -- Statusbar (created before the list: the list anchors to it) --
+        # TATStatus renders its cells in the themed UI font (like the
+        # list), so the bar's height follows the font too -- the 'h'
+        # prop is a dlg coordinate (the form's DLG_SCALE covers DPI),
+        # it needs only the FONT factor or a big UI font clips the
+        # cell text vertically.
         self._add('statusbar', 'sbar', {
-            'h': 26,
+            'h': max(26, int(26 * _font_scale())),
             'a_l': ('', '['), 'a_r': ('', ']'), 'a_b': ('', ']'),
             'sp_l': 0, 'sp_r': 0, 'sp_b': 0,
         })
@@ -2297,8 +2406,10 @@ class DirCompareForm:
         try:
             ct.statusbar_proc(self.h_sb, ct.STATUSBAR_ADD_CELL, tag=1)
             ct.statusbar_proc(self.h_sb, ct.STATUSBAR_ADD_CELL, tag=2)
-            sb_s = _ui_scale()   # cell sizes are raw pixels like the
-                                 # list columns -- scale them too
+            sb_s = _px_scale()     # cell sizes are raw pixels like the
+                                   # list columns -- scale them by DPI
+                                   # AND the UI-font factor (the cell
+                                   # text is the themed font too)
             ct.statusbar_proc(self.h_sb, ct.STATUSBAR_SET_CELL_SIZE,
                               tag=1, value=int(430 * sb_s))
             ct.statusbar_proc(self.h_sb, ct.STATUSBAR_SET_CELL_SIZE,
@@ -2347,8 +2458,11 @@ class DirCompareForm:
         self._add('listbox_ex', 'list', p)
         self.h_list = ct.dlg_proc(h, ct.DLG_CTL_HANDLE, name='list')
         try:
-            ct.listbox_proc(self.h_list, ct.LISTBOX_SET_ITEM_H,
-                            index=int(LIST_ITEM_H * _ui_scale()))
+            # NOTE: no LISTBOX_SET_ITEM_H -- the row height stays
+            # AUTO-FIT to the UI font (TATListbox.UpdateItemHeight on
+            # every paint; see the metrics comment at the top). A fixed
+            # height was the 15th-release bug: rows stayed ~9pt-sized
+            # while the themed text outgrew them (the reported box).
             ct.listbox_proc(self.h_list, ct.LISTBOX_SET_COLUMN_SEP,
                             text=COL_SEP)
             ct.listbox_proc(self.h_list, ct.LISTBOX_SET_COLUMNS,
@@ -2436,10 +2550,10 @@ class DirCompareForm:
     def _load_col_w(self):
         """Pixel widths of the six FIXED columns (Name stretches: 0
         in _col_spec). Defaults come from _LIST_COLUMNS; a saved
-        'dirs.col_widths' (base 96-DPI values, written at window
+        'dirs.col_widths' (base 96-DPI/9pt values, written at window
         close -- see _teardown) overrides them, sanitized per column
         (a hand-edited junk value must not break the layout). Scaled
-        by _ui_scale() here, ONCE: _col_spec/_col_layout and the
+        by _px_scale() here, ONCE: _col_spec/_col_layout and the
         drag hit tests all share the same pixel values."""
         base = [w for _c, _a, w in _LIST_COLUMNS[1:]]
         g = _get_opt('dirs.col_widths', '')
@@ -2450,7 +2564,7 @@ class DirCompareForm:
                 v = None
             if v is not None and len(v) == len(base):
                 base = [min(MAX_COL_W, max(MIN_COL_W, x)) for x in v]
-        s = _ui_scale()
+        s = _px_scale()
         return [int(w * s) for w in base]
 
     def _col_spec(self):
@@ -2824,15 +2938,27 @@ class DirCompareForm:
         # marker only on folders with scanned children). Icon and
         # text have separate offsets -- the pre-tree code painted the
         # icon at x0+3 with the Name text at x0+4, i.e. ON TOP of it.
+        # The offsets carry _px_scale() (DPI x UI-font factor): the
+        # glyphs the canvas draws are the UI font, so the gutter must
+        # grow with it or the +/- marker collides with the icon.
         depth = row.get('_d', 0)
-        ind = int(TREE_INDENT * _ui_scale()) * depth
+        ind = int(TREE_INDENT * _px_scale()) * depth
         ax = x0 + 2 + ind
-        ix = x0 + int(GUTTER_ICON * _ui_scale()) + ind
+        ix = x0 + int(GUTTER_ICON * _px_scale()) + ind
 
         cells = self._row_cells(row)
         layout = self._col_layout(w)
         try:
-            ct.canvas_proc(canvas, ct.CANVAS_SET_FONT, text='default',
+            # THE font fix: an EMPTY font name (and no size) leaves the
+            # canvas font exactly as TATListbox preset it -- the themed
+            # UI font (ATFlatTheme.FontName / DoScaleFont(FontSize),
+            # what the header and every CudaText list draws with);
+            # canvas_proc skips the assignment for '' / 0 / -1. Only
+            # the color (and style reset) are ours. The 15th release
+            # passed text='default' here, which OVERWROTE the preset
+            # UI font with the OS default GUI font -- the reported
+            # 'items are small, must use the font size of cudatext ui'.
+            ct.canvas_proc(canvas, ct.CANVAS_SET_FONT, text='',
                            color=fg, style=0)
             # one measure for the vertical centering baseline
             sz = ct.canvas_proc(canvas, ct.CANVAS_GET_TEXT_SIZE,
@@ -2861,14 +2987,18 @@ class DirCompareForm:
             idx = self._icon_idx.get(icon, -1)
             if idx is not None and idx >= 0 and self.h_imglist:
                 try:
+                    # 16px icons in an auto-fitted row: guard the
+                    # centering against rows TIGHTER than the icon
+                    # (a small UI font can auto-fit below 16px)
+                    iy = y0 + max(0, (h - 16) // 2)
                     ct.imagelist_proc(
                         self.h_imglist, ct.IMAGELIST_PAINT,
-                        value=(canvas, ix, y0 + (h - 16) // 2, idx))
+                        value=(canvas, ix, iy, idx))
                 except Exception:
                     pass
 
         # the Name cell loses the gutter + indent to the ellipsis too
-        gut = int(GUTTER_TEXT * _ui_scale()) + ind
+        gut = int(GUTTER_TEXT * _px_scale()) + ind
         for i, (text, (cx, cw, align)) in enumerate(zip(cells, layout)):
             if i == 0:
                 cx, cw = cx + gut, cw - gut
@@ -3283,10 +3413,11 @@ class DirCompareForm:
     def _in_arrow(self, row, x):
         """Is client-x inside the row's expand-marker zone? (The zone
         the painter draws the +/- glyph into, widened to ARROW_W for
-        an easy hit.)"""
+        an easy hit. Same _px_scale() math as the painter -- the zone
+        must sit exactly under the drawn glyph at any DPI/font.)"""
         ax = self._row_x0 + 2 + \
-            int(TREE_INDENT * _ui_scale()) * row.get('_d', 0)
-        return ax <= x <= ax + int(ARROW_W * _ui_scale())
+            int(TREE_INDENT * _px_scale()) * row.get('_d', 0)
+        return ax <= x <= ax + int(ARROW_W * _px_scale())
 
     def _row_at_y(self, idx, y):
         """Is client-y inside row idx's band? Separates row clicks
@@ -3405,8 +3536,8 @@ class DirCompareForm:
             self._drag = None          # released outside the control
             return
         k, sign, x0, w0 = self._drag
-        s = _ui_scale()
-        new_w = int(min(MAX_COL_W * s,
+        s = _px_scale()      # the clamps live in the same scaled
+        new_w = int(min(MAX_COL_W * s,   # pixel space as _col_w
                         max(MIN_COL_W * s, w0 + sign * (x - x0))))
         if new_w != self._col_w[k]:
             self._col_w[k] = new_w
@@ -3425,7 +3556,7 @@ class DirCompareForm:
         via the close-time save, the session)."""
         if self._torn:
             return
-        s = _ui_scale()
+        s = _px_scale()
         self._col_w = [int(w * s) for _c, _a, w in _LIST_COLUMNS[1:]]
         self._apply_cols()
 
@@ -3768,8 +3899,8 @@ class DirCompareForm:
         # Remember the window geometry -- a single-line "x,y,w,h"
         # string (lists would corrupt the settings file on the second
         # write, see _restore_geom). The drag-resized column widths
-        # go the same way, as base 96-DPI values (the scale of a
-        # future session may differ).
+        # go the same way, as base 96-DPI/9pt values (the scale AND
+        # the UI font of a future session may differ).
         if not self._app_exit and self.h:
             try:
                 d = ct.dlg_proc(self.h, ct.DLG_PROP_GET)
@@ -3779,7 +3910,7 @@ class DirCompareForm:
             except Exception:
                 pass
             try:
-                s = _ui_scale()
+                s = _px_scale()
                 _set_opt('dirs.col_widths',
                          ','.join(str(int(round(w / s)))
                                   for w in self._col_w))
