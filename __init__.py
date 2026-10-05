@@ -1,9 +1,8 @@
+import copy
 import functools
 import gc
 import os
 import json
-import re
-import tempfile
 import threading
 import time
 import typing as tp
@@ -1387,14 +1386,17 @@ DIFF_TAB_COUNT = 1
 # Persistent state file: stores compare-tab state grouped by session.
 # session_key is the session file path, relative to the settings folder if
 # the session is inside it (at any depth), or the full path if outside.
-# SHARED FILE CONTRACT (28th release): the dir-compare side keeps its own
-# remembered state (differ2.dirs.* -- histories, geometries, column
-# widths) in this SAME file, written through cudax_lib's line-based
-# set_opt. This module owns ONLY the 'sessions' key here: it must parse
-# the file tolerantly (_state_json_loads) and must never let a save drop
-# the other writers' keys (_save_state's merge guard) -- a compare-tab
-# event deleting the dir-compare state is the 28th-release bug.
-STATE_FILE = os.path.join(ct.app_path(ct.APP_DIR_SETTINGS), 'cuda_differ2_state.json')
+# SHARED FILE CONTRACT (29th release): the compare-tab tracking keeps its
+# 'differ2.sessions' key in this SAME file where the dir-compare side
+# keeps its differ2.dirs.* state -- and EVERY writer on this file goes
+# through cudax_lib's key-level set_opt now (the 28th-release fix still
+# carried a whole-file json.dump writer, which is what had made a
+# compare-tab event able to delete the dir-compare state in the first
+# place). A line-based write updates only its own key's line: it can
+# never drop another writer's keys, and it never eats the user's
+# hand-made // comments. Nothing in the plugin rewrites the state file
+# wholesale, and nothing ever deletes a key it does not own.
+STATE_JSON = 'cuda_differ2_state.json'
 # Path to plugins.ini -- used to persistently subscribe to on_start2 so the
 # plugin auto-loads on next CudaText startup when compare tabs are active.
 PLUGINS_INI = os.path.join(ct.app_path(ct.APP_DIR_SETTINGS), 'plugins.ini')
@@ -1409,52 +1411,6 @@ MODULE_NAME = __name__.split('.')[-1]  # e.g. 'cuda_differ2'
 # _FAIL, on_close keeps the closing compare tabs' persisted registrations
 # (the tabs still exist in the session file being left and come back when
 # the user returns to that session).
-
-
-def _state_json_loads(text):
-    """Parse the state file's JSON the way CudaText parses EVERY settings
-    JSON (the same normalization cudax_lib._json_loads applies): strip
-    '//'-to-end-of-line comments (a '//' inside a string literal is NOT a
-    comment) and dangling commas around braces/brackets, then strict
-    json.loads. Raises ValueError on text no amount of normalizing saves.
-
-    The state file is written by TWO independent writers plus the user:
-      - this module rewrites it wholesale with json.dump (_save_state);
-      - compare_dir writes single keys through cudax_lib's set_opt, whose
-        line-based append/update LEGITIMATELY leaves a trailing comma on
-        the last pair (every CudaText settings reader accepts that);
-      - hand edits follow the house style of every CudaText JSON, which
-        carries '//'-comments.
-    A strict json.load here rejects both (28th release: it choked on the
-    trailing comma, _load_state silently returned {'sessions': {}}, and
-    the next _save_state -- a compare-tab register/unregister/dirty-flip
-    -- OVERWROTE the file without the differ2.dirs.* keys, deleting the
-    dir-compare histories and geometries: 'when i compare two files and
-    the plugin do cleaning, the history and all config of dir compare
-    get deleted'). This parser reads exactly what the app reads, so keys
-    written by any of the three hands survive."""
-    def strip_comment(match):
-        line = match.group(0)
-        pos = 0
-        in_str = False
-        while pos < len(line):
-            ch = line[pos]
-            if ch == '\\':
-                pos += 2
-            else:
-                if ch == '"':
-                    in_str = not in_str
-                elif not in_str and line[pos:pos + 2] == '//':
-                    return line[:pos]
-                pos += 1
-        return line
-
-    s = re.sub(r'^.*//.*$', strip_comment, text, flags=re.MULTILINE)
-    s = re.sub(r'{\s*,', '{', s)
-    s = re.sub(r',\s*}', '}', s)
-    s = re.sub(r'\[\s*,', '[', s)
-    s = re.sub(r',\s*\]', ']', s)
-    return json.loads(s)
 
 
 _homedir = os.path.expanduser('~')
@@ -1478,6 +1434,49 @@ def set_opt(key, val):
     set_opt does the comment-preserving line-based update, so hand-made
     comments in the JSON survive."""
     return ctx.set_opt('differ2.' + key, val, user_json=JSONFILE)
+
+
+# Compare-tab STATE -- the same machinery pointed at STATE_JSON instead
+# of the settings file (compare_dir keeps its differ2.dirs.* state there
+# through the very same wrappers). One writer regime for the whole
+# shared file: every write is a key-level line update.
+def _get_state(key, def_val):
+    """Read a 'differ2.*' state key from the plugin's STATE file
+    (settings/cuda_differ2_state.json) -- never from the settings file.
+    Mirrors get_opt above; the file is parsed by the app's own tolerant
+    reader, so // comments and the trailing comma set_opt's line-based
+    update/append legitimately leaves are always legal there.
+
+    NB: the returned value may be the very dict parsed into cudax_lib's
+    per-file option cache -- callers that keep and mutate it must
+    deep-copy first (Command._load_sessions does)."""
+    return ctx.get_opt('differ2.' + key, def_val, user_json=STATE_JSON)
+
+
+def _set_state(key, val):
+    """Write a 'differ2.*' state key to the plugin's STATE file
+    (settings/cuda_differ2_state.json). Mirrors _get_state above; the
+    line-based set_opt touches only this key's own line, so every other
+    key in the shared state file -- and the user's hand-made //
+    comments -- survives every write.
+
+    Empty-file heal: a crash between any writer's open('w') and its
+    write can leave the state file 0 bytes / whitespace-only, and
+    cudax_lib's set_opt append branch then dies on body.rstrip()[:-1]
+    (IndexError on an empty string) -- every later state write would
+    fail. Such a file carries nothing to lose, so it is healed to '{}'
+    before set_opt runs (28th release, kept in the 29th's single-writer
+    regime)."""
+    try:
+        path = os.path.join(ct.app_path(ct.APP_DIR_SETTINGS), STATE_JSON)
+        with open(path, 'r', encoding='utf8') as f:
+            if f.read().strip():
+                raise ValueError('not empty')
+        with open(path, 'w', encoding='utf8') as f:
+            f.write('{}')
+    except (OSError, UnicodeDecodeError, ValueError):
+        pass
+    return ctx.set_opt('differ2.' + key, val, user_json=STATE_JSON)
 
 
 # Ignore options exposed as checkable items of the compare-tab
@@ -1760,6 +1759,10 @@ class Command:
         # saved/dirty caches all live on the session object, never on the
         # Command. _is_compare_tab is now exactly "has a session".
         self._sessions = {}
+        # The persisted sessions dict (the 'differ2.sessions' state key),
+        # kept in memory once loaded (lazily) -- see _load_sessions.
+        # None = not read from disk yet.
+        self._state_sessions = None
         # Cached key for the current session (relative path if inside
         # settings folder, full path otherwise). Set in on_start2 and
         # set_files; individual sessions remember their OWN key.
@@ -1788,72 +1791,49 @@ class Command:
                 pass
         return session_path
 
-    def _load_state(self):
-        """Load the persisted state from disk. Parses the file with
-        _state_json_loads (comments + trailing commas tolerated) so keys
-        written by cudax_lib's set_opt or by hand never make this side
-        see an empty state. Only a file that is unreadable, non-dict or
-        unparseable even after normalization falls back to the fresh
-        {'sessions': {}} -- and even then _save_state's merge guard
-        keeps whatever it can still read from the disk copy."""
-        try:
-            with open(STATE_FILE, 'r', encoding='utf8') as f:
-                text = f.read()
-        except OSError:
-            return {'sessions': {}}
-        try:
-            data = _state_json_loads(text)
-        except ValueError:
-            return {'sessions': {}}
-        if not isinstance(data, dict):
-            return {'sessions': {}}
-        if not isinstance(data.get('sessions'), dict):
-            data['sessions'] = {}
-        return data
+    def _load_sessions(self):
+        """The persisted compare-tab registrations -- the sessions dict
+        of the STATE file's 'differ2.sessions' key -- as a dict this
+        Command owns.
 
-    def _save_state(self, state):
-        """Save the state to disk -- without ever dropping keys this
-        side does not own. The compare-tab tracking owns ONLY the
-        'sessions' key; every OTHER top-level key (all the differ2.dirs.*
-        state compare_dir remembers, and anything the user keeps there
-        by hand) belongs to the other writers, so before writing, the
-        CURRENT disk copy is re-read and those keys are carried over --
-        both when the outgoing dict lost them (a parse hiccup in
-        _load_state) and when it carries a stale copy (a dir compare
-        wrote a history between our load and this save: disk wins).
-        This makes it structurally impossible for a compare-tab event
-        -- registering a tab, flipping a dirty flag, closing a tab,
-        pruning dead records at startup -- to delete the dir-compare
-        state again (the 28th-release report).
-        The write itself is atomic (temp file in the same folder +
-        os.replace): a crash mid-save can never leave a truncated
-        state file, which would both lose everything and crash
-        cudax_lib's append branch on the next set_opt."""
-        try:
-            with open(STATE_FILE, 'r', encoding='utf8') as f:
-                disk = _state_json_loads(f.read())
-        except (OSError, ValueError):
-            disk = None
-        if isinstance(disk, dict):
-            for key, val in disk.items():
-                if key != 'sessions':
-                    state[key] = val
-        tmp = None
-        try:
-            fd, tmp = tempfile.mkstemp(
-                prefix=os.path.basename(STATE_FILE) + '.',
-                dir=os.path.dirname(STATE_FILE) or '.')
-            with os.fdopen(fd, 'w', encoding='utf8') as f:
-                json.dump(state, f, indent=2)
-            os.replace(tmp, STATE_FILE)
-            tmp = None
-        except OSError as ex:
-            msg('failed to save state file: {}'.format(ex), level=2)
-            if tmp is not None:
-                try:
-                    os.remove(tmp)
-                except OSError:
-                    pass
+        Read from disk ONCE per Command lifetime (lazily, at the first
+        state event) and kept authoritative in memory afterwards: every
+        change goes through _save_sessions, which writes the dict back
+        through cudax_lib's key-level set_opt -- the same line-based
+        writer the dir-compare side uses -- so a write updates only the
+        'differ2.sessions' line and can never touch another key.
+
+        Why a memory copy instead of a get_opt on every event (29th
+        release): cudax_lib caches each settings file (LAST_FILE_OPTS)
+        and set_opt never refreshes that cache, which reloads only on a
+        strictly-greater mtime -- a same-tick read-after-write can be
+        served the STALE pre-write copy. This side is the only writer
+        of its key, so the memory copy is always at least as fresh as
+        the disk, and back-to-back events (a register, then an
+        unregister in the same tick) see their own writes.
+
+        The disk value is deep-copied before use: get_opt hands out the
+        dict parsed into the app's option cache, and the
+        read-modify-write cycles of the state events would otherwise
+        mutate that cached object.
+
+        A value that is not a dict (a hand-mangled file) reads as {};
+        per-entry shape is validated at the use sites, as before."""
+        if self._state_sessions is None:
+            val = _get_state('sessions', {})
+            if not isinstance(val, dict):
+                val = {}
+            self._state_sessions = copy.deepcopy(val)
+        return self._state_sessions
+
+    def _save_sessions(self, data):
+        """Persist the sessions dict to the STATE file (the
+        'differ2.sessions' key) through cudax_lib's line-based set_opt
+        and keep it as this Command's authoritative memory copy (see
+        _load_sessions). Never deletes the key -- an all-tabs-closed
+        state persists as {}."""
+        self._state_sessions = data
+        _set_state('sessions', data)
 
     def _new_session(self, tab_id, state_key=''):
         """Create and register the standalone session for a compare tab
@@ -1916,17 +1896,15 @@ class Command:
         back to their originals. Also fills the session's saved/dirty
         caches (the runtime 'saved' flag is derived: no half dirty)."""
         dirty = {h for h in dirty if h in ('a', 'b')}
-        state = self._load_state()
-        if session.state_key not in state['sessions']:
-            state['sessions'][session.state_key] = {}
-        state['sessions'][session.state_key][session.tab_id_str] = {
+        data = self._load_sessions()
+        data.setdefault(session.state_key, {})[session.tab_id_str] = {
             'primary_orig_tab_id': primary_orig_id,
             'primary_orig_name': primary_orig_name or '',
             'secondary_orig_tab_id': secondary_orig_id,
             'secondary_orig_name': secondary_orig_name or '',
             'dirty': sorted(dirty),
         }
-        self._save_state(state)
+        self._save_sessions(data)
         session.dirty = set(dirty)
         session.saved = not dirty
 
@@ -1958,12 +1936,11 @@ class Command:
         if session.dirty == dirty_halves:
             return
         session.dirty = set(dirty_halves)
-        state = self._load_state()
-        group = state['sessions'].get(session.state_key, {})
-        entry = group.get(session.tab_id_str)
+        data = self._load_sessions()
+        entry = data.get(session.state_key, {}).get(session.tab_id_str)
         if isinstance(entry, dict):
             entry['dirty'] = sorted(dirty_halves)
-            self._save_state(state)
+            self._save_sessions(data)
         session.saved = not dirty_halves
 
     def _unregister_compare_tab(self, session):
@@ -1971,14 +1948,14 @@ class Command:
         tab's OWN state_key, so closing a tab created in another
         CudaText session never touches that session's group). Returns
         the removed entry dict or None if not found."""
-        state = self._load_state()
-        group = state['sessions'].get(session.state_key, {})
+        data = self._load_sessions()
+        group = data.get(session.state_key, {})
         entry = group.pop(session.tab_id_str, None)
         if entry is not None:
             # Clean up empty session group.
             if not group:
-                del state['sessions'][session.state_key]
-            self._save_state(state)
+                del data[session.state_key]
+            self._save_sessions(data)
         return entry
 
     def _get_orig_tab_ids(self, tab_id):
@@ -1987,10 +1964,8 @@ class Command:
         session group."""
         session = self._session_for(tab_id)
         state_key = session.state_key if session is not None else self._current_session_key
-        state = self._load_state()
-        group = state['sessions'].get(state_key, {})
-        key = str(tab_id)
-        entry = group.get(key)
+        data = self._load_sessions()
+        entry = data.get(state_key, {}).get(str(tab_id))
         if not isinstance(entry, dict):
             return (None, None)
         return (entry.get('primary_orig_tab_id'), entry.get('secondary_orig_tab_id'))
@@ -3415,7 +3390,7 @@ class Command:
             session_path = ''
         self._current_session_key = self._session_key(session_path)
 
-        state = self._load_state()
+        data = self._load_sessions()
 
         # --- Cleanup dead records ---
         # Get all open tab IDs so we can check which compare tabs still exist.
@@ -3427,20 +3402,20 @@ class Command:
         # Check the current session's compare tabs. If a compare tab ID is
         # not in open_tab_ids, it's a dead record (CudaText didn't restore it
         # -- e.g. it was an empty untitled tab that CudaText discards).
-        session = state['sessions'].get(self._current_session_key, {})
-        dead_keys = [k for k in session if k not in open_tab_ids]
+        group = data.get(self._current_session_key, {})
+        dead_keys = [k for k in group if k not in open_tab_ids]
         for k in dead_keys:
-            del session[k]
-        if not session and self._current_session_key in state['sessions']:
-            # Clean up empty session.
-            del state['sessions'][self._current_session_key]
+            del group[k]
+        if not group and self._current_session_key in data:
+            # Clean up empty session group.
+            del data[self._current_session_key]
         if dead_keys:
-            self._save_state(state)
+            self._save_sessions(data)
 
         # --- Rebuild the sessions for the surviving compare tabs ---
         self.scroll.tab_id = set()
         self._sessions = {}
-        for tab_id_str, entry in session.items():
+        for tab_id_str, entry in group.items():
             if not isinstance(entry, dict):
                 continue
             try:
@@ -4034,9 +4009,8 @@ class Command:
         # to follows the content after the swap. Dirty labels swap
         # with them -- a dirty left half becomes a dirty right half
         # (both-dirty and both-clean are swap-invariant).
-        state = self._load_state()
-        group = state['sessions'].get(session.state_key, {})
-        entry = group.get(session.tab_id_str)
+        data = self._load_sessions()
+        entry = data.get(session.state_key, {}).get(session.tab_id_str)
         entry = entry if isinstance(entry, dict) else {}
         orig_a_id = entry.get('primary_orig_tab_id')
         orig_b_id = entry.get('secondary_orig_tab_id')
@@ -6371,9 +6345,8 @@ class Command:
             tab_session = self._session_for(tab_id)
             state_key = (tab_session.state_key if tab_session is not None
                          else self._current_session_key)
-            state = self._load_state()
-            group = state['sessions'].get(state_key, {})
-            entry = group.get(str(tab_id))
+            data = self._load_sessions()
+            entry = data.get(state_key, {}).get(str(tab_id))
         if not isinstance(entry, dict):
             entry = {}
         names = []
@@ -7894,6 +7867,5 @@ class Command:
         # If no more compare tabs are open in this tab's persisted
         # session group, disable autostart so the plugin does not load
         # on next startup.
-        state = self._load_state()
-        if not state['sessions'].get(session.state_key, {}):
+        if not self._load_sessions().get(session.state_key, {}):
             self._disable_autostart()

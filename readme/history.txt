@@ -1,3 +1,34 @@
+2026.10.05 (29th release, by @alkorsan)
+* change: the compare-tab state ("sessions") now goes through the SAME
+  app option writer as everything else -- cudax_lib's key-level
+  set_opt/get_opt -- instead of the plugin's own whole-file
+  json.dump/json.load reader/writer pair (review: 'why you created
+  _state_json_loads? why not use directly set_opt? i think it s better
+  to use set_opt get_opt instead of _load_state _save_state'). The
+  key is the namespaced differ2.sessions in
+  settings/cuda_differ2_state.json now, sitting next to the
+  differ2.dirs.* keys, and ONE writer regime covers the whole shared
+  file: a write updates only its own key's line, so no compare-tab
+  event (opening/closing a compare tab, editing, the startup prune)
+  can ever drop another key -- the 28th-release bug class is dead at
+  the root, not patched around -- and your hand-made // comments in
+  the state file survive every write (the old whole-file rewrite ate
+  them). The sessions dict is kept in memory by the plugin (single
+  writer = always fresh), because the app's option cache is not
+  refreshed by set_opt and a same-tick read-after-write could
+  otherwise serve a stale copy; the write itself always reads the
+  real file. The 28th-release machinery is DELETED as dead code, per
+  the no-backward-compatibility rule (never published):
+  _state_json_loads (the tolerant-parser shim the whole-file reader
+  needed), _load_state/_save_state with their merge guard, and the
+  atomic tempfile writes. The 0-byte-file heal (a crashed write's
+  leftover would crash the app writer's append branch) now covers the
+  sessions side's writes too. Note for your live install: the old bare
+  "sessions" key in cuda_differ2_state.json is dead weight now -- your
+  open compare tabs' registrations do not survive THIS one update
+  (close and re-open them); the key itself is yours to clean by hand,
+  nothing in the plugin ever deletes it.
+
 2026.10.05 (28th release, by @alkorsan)
 * fix: comparing two FILES deleted the dir-compare state (report: 'when
   i compare two files and the plugin do cleaning, the history and all

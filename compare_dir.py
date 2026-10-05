@@ -540,10 +540,14 @@ MODULE_JSON = 'cuda_differ2.json'
 # user's to clean by hand (26th release request: 'i can clean the
 # json file manually no need to delete it from the plugin').
 # The file is SHARED with __init__.py's compare-tab tracking (its
-# 'sessions' key): this side's line-based set_opt writes never touch
-# the other keys, __init__._save_state's merge guard never touches
-# ours, and _set_state heals an empty file before set_opt (whose
-# append branch IndexErrors on one) -- see _set_state (28th release).
+# 'differ2.sessions' key): EVERY writer on this file goes through
+# cudax_lib's line-based set_opt now (29th release -- before it,
+# __init__ rewrote the file wholesale with json.dump, which is what
+# could delete this side's keys), a write touches only its own key's
+# line and never drops another writer's keys or the user's hand-made
+# // comments, and _set_state heals an empty file before set_opt
+# (whose append branch IndexErrors on one) -- see _set_state
+# (28th release).
 STATE_JSON = 'cuda_differ2_state.json'
 
 # Compare-speed constants (see the module docstring's "Speed model"):
@@ -847,10 +851,11 @@ def _set_state(key, val):
     '{}' before set_opt runs (28th release).
 
     The file itself is SHARED with __init__.py's compare-tab tracking
-    (its 'sessions' key): set_opt's line-based append/update touches
-    only this key's own line and never drops the other writer's keys
-    (see __init__._save_state for the other direction of the
-    contract)."""
+    (its 'differ2.sessions' key), and since the 29th release EVERY
+    writer on it uses this very line-based set_opt: a write touches
+    only this key's own line and never drops another writer's keys
+    (or the user's hand-made // comments) -- the whole-file json.dump
+    writer whose rewrites could delete this side's keys is gone."""
     try:
         path = os.path.join(ct.app_path(ct.APP_DIR_SETTINGS), STATE_JSON)
         with open(path, 'r', encoding='utf8') as f:
