@@ -2917,9 +2917,20 @@ class DirCompareForm:
     {'btn','state','x','y'} client coords) over its rows area. The
     six internal column boundaries run through the rows; a left
     press within ~6px of one (the hover shows the H-split cursor)
-    starts a drag that adjusts the column to its left -- boundary 1
-    (Name|Folder) inversely narrows Folder, since Name is the stretch
-    column. Widths are clamped to MIN/MAX_COL_W, pushed live via
+    starts a drag that moves that boundary the way usual apps do
+    (the 24th report: 'not like usual apps'): the column LEFT of
+    the boundary takes what the drag gives it, the column RIGHT of
+    it gives that width back -- every other column (Name included)
+    keeps its width, so only the two cells flanking the dragged
+    line change. Boundary 1 (Name|Folder) is the one exception:
+    Name is the stretch column and simply absorbs, so the drag
+    adjusts Folder INVERSELY (dragging right grows Name), with
+    Folder's growth capped so Name never drops below its floor
+    (NAME_MIN_W). Every column is now resizable from BOTH its
+    edges -- including the LAST one (Right date, via the boundary
+    on its left; the 24th report: 'last column cannot be
+    resized' -- before, that boundary only adjusted Right size).
+    Widths are clamped to MIN/MAX_COL_W, pushed live via
     LISTBOX_SET_COLUMNS (+ the header re-split over them), persisted
     as 'dirs.col_widths' at window close and resettable from the
     context menu. A move without the button held ends the drag (the
@@ -2928,8 +2939,27 @@ class DirCompareForm:
     window too narrow for the fixed sum plus NAME_MIN_W the fixed
     columns are scaled down proportionally, so the Name column is
     always visible (the 21st report: it went to ZERO -- TATListbox
-    gives an auto column Max(0, ClientWidth - fixed sum)); the
-    form's on_resize re-derives the split for the header.
+    gives an auto column Max(0, ClientWidth - fixed sum)).
+
+    HEADER/ROW ALIGNMENT: the pushed column widths are the ONLY
+    thing that keeps the header and the drawn rows together --
+    TATListbox.UpdateColumnWidths (atlistbox.pas) passes explicit
+    sizes through RAW on every paint and never re-derives them from
+    the live width, while the plugin's owner-drawn rows DO re-derive
+    their cell layout from the painted row width on every paint.
+    So any width change that does not run through _apply_cols
+    leaves the header on the stale split while the rows spread over
+    the live width (the 24th report's screenshot: every cell far
+    right of its caption). The form's on_resize re-pushes, but a
+    programmatic size change can MISS that event (the saved-geometry
+    PROP_SET runs before the form is shown, when a formless LCL
+    bounds change fires no OnResize), so _apply_cols also runs once
+    more AFTER the geometry restore at build, and the painter
+    GUARDS the alignment on every painted row: when the painted row
+    width no longer matches the width the spec was pushed for
+    (_cols_pushed_w), a one-shot timer re-pushes the spec outside
+    the paint cycle (never re-entrant) -- the header can never stay
+    misaligned, whatever event was missed.
     """
 
     DEF_W = 940
@@ -3004,12 +3034,18 @@ class DirCompareForm:
         # Column-resize state (see the class docstring "COLUMN
         # RESIZE"): the live pixel widths of the six fixed columns
         # (Name stretches -- _col_spec), None while no drag runs;
-        # _drag = (col index, sign, press x, width at press), _zone =
+        # _drag = (boundary 1..6, press x, left width at press,
+        # right width at press or None on boundary 1), _zone =
         # the cursor is currently over a boundary (edge-triggered
-        # cursor updates).
+        # cursor updates). _cols_pushed_w = the row width the
+        # current column spec was pushed for (the painter's
+        # alignment guard -- see "HEADER/ROW ALIGNMENT"),
+        # _cols_heal_armed = a re-push one-shot is pending.
         self._col_w = self._load_col_w()
         self._drag = None
         self._zone = False
+        self._cols_pushed_w = 0
+        self._cols_heal_armed = False
         self._quick_only = bool(_get_opt('dirs.quick_only', False))
         self._method = _get_method()
         self._show = {                  # status filter checkboxes
@@ -3486,10 +3522,9 @@ class DirCompareForm:
             # it already fits).
             ct.listbox_proc(self.h_list, ct.LISTBOX_SET_COLUMN_SEP,
                             text=COL_SEP)
-            ct.listbox_proc(self.h_list, ct.LISTBOX_SET_COLUMNS,
-                            text=self._col_spec())
-            ct.listbox_proc(self.h_list, ct.LISTBOX_SET_HEADER,
-                            text=self._header_text())
+            # columns + header through the ONE pusher (tracks
+            # _cols_pushed_w for the painter's alignment guard)
+            self._apply_cols()
             # Owner-drawn ON after the header/columns exist: from here
             # the control paints nothing itself -- every visible row
             # arrives in _on_draw_item (the header keeps its built-in
@@ -3523,6 +3558,15 @@ class DirCompareForm:
         # are live pixels, like the saved geometry itself).
         for b in self._drawn.values():
             b.sync()
+        # ...and re-push the column spec for the FINAL geometry: the
+        # restore's PROP_SET can change the form's size without ever
+        # firing on_resize (a bounds change on a not-yet-shown LCL
+        # form fires no event -- see "HEADER/ROW ALIGNMENT"), which
+        # is exactly how a reopened compare window ended up with its
+        # header on the default-width split while the rows painted
+        # the restored width (the 24th report's misaligned
+        # screenshot).
+        self._apply_cols()
 
     def _restore_geom(self):
         # Stored as a single-line "x,y,w,h" STRING, not a list:
@@ -3604,15 +3648,27 @@ class DirCompareForm:
 
     def _col_spec(self):
         """Column widths for LISTBOX_SET_COLUMNS, in _LIST_COLUMNS
-        order -- all SEVEN as explicit pixel widths, from
-        _effective_cols over the list's LIVE width (the header splits
-        its captions over exactly these numbers, and the drawn cells
-        use the very same list via _col_layout, so header and rows
-        cannot drift apart). The drag-resizable widths behind them
-        live in self._col_w (persisted across sessions as
-        'dirs.col_widths'); _on_resize re-pushes this spec whenever
-        the window's width change makes the effective set move."""
-        return self._effective_cols(self._list_px_w())
+        order -- all SEVEN as explicit pixel widths, over the same
+        width _apply_cols pushes (the live row width once a row has
+        been painted, else the list control's width), so this always
+        mirrors what is on screen (the header splits its captions
+        over exactly these numbers, and the drawn cells use the very
+        same list via _col_layout, so header and rows cannot drift
+        apart). The drag-resizable widths behind them live in
+        self._col_w (persisted across sessions as 'dirs.col_widths');
+        _on_resize re-pushes this spec whenever the window's width
+        change makes the effective set move."""
+        return self._effective_cols(self._cols_source_w())
+
+    def _cols_source_w(self):
+        """The width the column spec is derived from: the last PAINTED
+        row's width once the painter has calibrated one (ground truth
+        -- it is the very ClientWidth the header and the cells share),
+        else the list control's live width. _apply_cols pushes from
+        the same source, so the pushed spec and the painted layout
+        are one and the same split."""
+        return self._row_w if getattr(self, '_row_w', 0) > 0 \
+            else self._list_px_w()
 
     def _effective_cols(self, width):
         """The seven on-screen column widths for a row 'width' pixels
@@ -3671,19 +3727,45 @@ class DirCompareForm:
     def _apply_cols(self):
         """Push the current column widths to the control: the header
         re-splits its captions over the very same widths. Called at
-        build, after every drag step, by _reset_cols and by
-        _on_resize (a width change moves the effective split -- see
-        _effective_cols: a shrunken window scales the fixed columns
-        down so Name keeps its floor)."""
+        build (twice -- before owner-draw, and again after the saved
+        geometry restore, whose PROP_SET can change the form size
+        without firing on_resize), after every drag step, by
+        _reset_cols, by _on_resize (a width change moves the effective
+        split -- see _effective_cols: a shrunken window scales the
+        fixed columns down so Name keeps its floor) and by the
+        painter's alignment heal (see "HEADER/ROW ALIGNMENT"). The
+        width the spec was derived for is remembered in
+        _cols_pushed_w -- the painter compares it against every
+        painted row width and re-arms this pusher when they drift
+        apart (a missed resize event would otherwise leave the header
+        on a stale split: TATListbox never re-derives explicit
+        widths, atlistbox.pas UpdateColumnWidths)."""
         if self._torn or not self.h_list:
             return
+        w = self._cols_source_w()
         try:
             ct.listbox_proc(self.h_list, ct.LISTBOX_SET_COLUMNS,
-                            text=self._col_spec())
+                            text=self._effective_cols(w))
             ct.listbox_proc(self.h_list, ct.LISTBOX_SET_HEADER,
                             text=self._header_text())
+            self._cols_pushed_w = w
         except Exception:
             pass
+
+    def _on_cols_heal(self, tag='', info=''):
+        """One-shot timer body for the painter's alignment guard: the
+        last painted row was WIDER or NARROWER than the width the
+        column spec was pushed for, so the header sat on a stale
+        split (the 24th report: 'the column headers does not align
+        correctly with their corresponding rows'). Re-push OUTSIDE
+        the paint cycle -- listbox_proc during a paint could trigger
+        the control's own repaint; the deferred one-shot cannot. The
+        push converges: it is derived from the very row width the
+        guard measured, so the next paint finds them equal and arms
+        nothing."""
+        self._cols_heal_armed = False
+        if not self._torn:
+            self._apply_cols()
 
     def _on_resize(self, id_dlg, id_ctl, data='', info=''):
         """Form resize (the dialog API's form-level on_resize event):
@@ -3998,6 +4080,19 @@ class DirCompareForm:
         # on every painted row, not just the first).
         self._row_x0 = x0
         self._row_w = w
+        # the alignment guard (see "HEADER/ROW ALIGNMENT"): a painted
+        # row width that no longer matches the pushed spec's source
+        # width means a resize event was missed and the header sits
+        # on a stale split -- arm the deferred re-push (once; the
+        # heal itself re-arms if anything drifts again). Cheap: one
+        # comparison per painted row.
+        if self._cols_pushed_w and abs(w - self._cols_pushed_w) > 1 \
+                and not self._cols_heal_armed:
+            self._cols_heal_armed = True
+            try:
+                ct.timer_proc(ct.TIMER_START_ONE, self._on_cols_heal, 30)
+            except Exception:
+                self._cols_heal_armed = False
         if self._hdr_h is None:
             try:
                 ih = ct.listbox_proc(self.h_list, ct.LISTBOX_GET_ITEM_H)
@@ -4682,9 +4777,20 @@ class DirCompareForm:
         dragged; the control does deliver mouse events over its rows,
         where the boundary lines run). data =
         {'btn': 0/1/2, 'state': 's/c/a/L/...', 'x': int, 'y': int}.
-        Boundary 1 (Name|Folder) adjusts Folder INVERSELY -- Name is
-        the stretch column and grows with the freed space; boundary
-        j>=2 adjusts the column to its left."""
+        The drag moves the pressed boundary the way usual apps move
+        it (the 24th report: 'not like usual apps'): the column LEFT
+        of the boundary takes the drag's delta, the column RIGHT of
+        it gives that width back -- every OTHER column (Name
+        included) keeps its width, so exactly the two flanking cells
+        change and the boundary follows the mouse. Boundary 1
+        (Name|Folder) is the exception: Name is the stretch column
+        and absorbs, so the drag adjusts Folder INVERSELY (dragging
+        right grows Name) with Folder's growth capped at Name's
+        floor (NAME_MIN_W). Boundary 6 finally makes the LAST column
+        resizable too (its left boundary now grows/shrinks Right
+        date -- the 24th report: 'last column cannot be resized').
+        _drag = (boundary, press x, left width at press, right
+        width at press -- None on boundary 1)."""
         if self._torn or not self.h_list:
             return
         if not isinstance(data, dict):
@@ -4699,10 +4805,9 @@ class DirCompareForm:
         if j is None:
             return
         if j == 1:
-            k, sign = 0, -1
+            self._drag = (1, x, self._col_w[0], None)
         else:
-            k, sign = j - 2, 1
-        self._drag = (k, sign, x, self._col_w[k])
+            self._drag = (j, x, self._col_w[j - 2], self._col_w[j - 1])
         if not self._zone:
             self._set_cursor(True)   # a fast press may skip the hover
 
@@ -4734,12 +4839,37 @@ class DirCompareForm:
         if not held:
             self._drag = None          # released outside the control
             return
-        k, sign, x0, w0 = self._drag
+        # the new boundary math (the 24th report: 'not like usual
+        # apps'): the column LEFT of the pressed boundary takes the
+        # drag's delta, the one RIGHT of it gives that width back --
+        # every other column keeps its width. Both flanking columns
+        # are clamped at MIN_COL_W (the boundary stops where either
+        # one bottoms out -- the standard grid behavior) and MAX.
+        j, x0, w0l, w0r = self._drag
         s = _px_scale()      # the clamps live in the same scaled
-        new_w = int(min(MAX_COL_W * s,   # pixel space as _col_w
-                        max(MIN_COL_W * s, w0 + sign * (x - x0))))
-        if new_w != self._col_w[k]:
-            self._col_w[k] = new_w
+        lo = int(MIN_COL_W * s)         # pixel space as _col_w
+        hi = int(MAX_COL_W * s)
+        dx = x - x0
+        if w0r is None:
+            # boundary 1 (Name|Folder): Name absorbs, so Folder
+            # adjusts INVERSELY; its growth is capped where Name
+            # would drop below the guaranteed floor (NAME_MIN_W)
+            avail = (self._cols_source_w() or 0) - 4
+            others = sum(self._col_w) - self._col_w[0]
+            cap = min(hi, avail - int(NAME_MIN_W * s) - others)
+            new_w = int(max(lo, min(w0l - dx, cap)))
+            if new_w != self._col_w[0]:
+                self._col_w[0] = new_w
+                self._apply_cols()
+            return
+        new_l = int(max(lo, min(w0l + dx, hi)))
+        take = new_l - w0l
+        if w0r - take < lo:
+            take = w0r - lo            # the right column bottoms out:
+            new_l = w0l + take        # the boundary stops here
+        if new_l != self._col_w[j - 2]:
+            self._col_w[j - 2] = new_l
+            self._col_w[j - 1] = w0r - take
             self._apply_cols()
 
     def _on_mouse_up(self, id_dlg, id_ctl, data='', info=''):

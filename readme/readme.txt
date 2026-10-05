@@ -471,21 +471,38 @@ The window's controls:
   exactly like the old flat list ordered the whole table. Folders
   sort by their ROLLED-UP status (see the row-colors note below), so
   the Status column's order always matches what the rows show.
-- The columns are RESIZABLE with the mouse: press near a boundary
-  line between two columns (the cursor turns into a left-right
-  split arrow) and drag -- the column left of the boundary follows
-  the mouse,
-  live; Name always takes whatever space the other columns leave,
-  and never less than its guaranteed minimum: on a window too
-  narrow for all six fixed columns plus that minimum, the FIXED
-  columns are scaled down proportionally instead, so the file name
-  is always visible (the stock listbox would give the Name column
-  zero pixels there) and every column stays on screen.
-  Widths are clamped (a column cannot shrink under its caption or
-  grow past half the list), remembered across sessions like the
-  window size, and the context menu's "Reset column widths" puts
-  the defaults back. (The dialog API's listbox header itself is not
-  draggable -- that is why the grab zones run through the rows.)
+- The columns are RESIZABLE with the mouse, and the drag works like
+  in usual applications: press near a boundary line between two
+  columns (the cursor turns into a left-right split arrow) and drag
+  -- the boundary follows the mouse, the column on its LEFT takes
+  the width, the column on its RIGHT gives it back, and every other
+  column keeps its width, so exactly the two flanking cells change.
+  EVERY column is resizable from both its edges, including the LAST
+  one (Right date -- its left boundary grows / shrinks it; before,
+  that boundary only adjusted Right size and the last column could
+  not be resized at all). The Name|Folder boundary is the one
+  exception: Name is the stretch column and absorbs what Folder
+  releases (dragging right grows Name), and Folder's growth is
+  capped so Name never drops below its guaranteed minimum: on a
+  window too narrow for all six fixed columns plus that minimum,
+  the FIXED columns are scaled down proportionally instead, so the
+  file name is always visible (the stock listbox would give the
+  Name column zero pixels there) and every column stays on screen.
+  Widths are clamped (a column cannot shrink under its caption, and
+  the boundary stops where the column on either side of it reaches
+  that limit), remembered across sessions like the window size, and
+  the context menu's "Reset column widths" puts the defaults back.
+  (The dialog API's listbox header itself is not draggable -- that
+  is why the grab zones run through the rows.)
+- The header and the rows can never sit on different column splits:
+  the widths the header shows are pushed by the plugin and are the
+  very numbers the rows paint by, and the row painter GUARDS the
+  alignment on every painted row -- should any resize slip past the
+  normal events (a reopened window whose stored size was applied
+  before the window was shown, where no resize event fires), the
+  next paint detects the drift and re-pushes the header split
+  through a deferred one-shot, so the captions land back under
+  their columns within one paint.
 - The rows render in the CudaText UI font -- the very font the
   list's own header, the command palette and every themed control
   use (the "ui_font_name" / "ui_font_size" options), NOT some

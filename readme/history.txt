@@ -1,3 +1,49 @@
+2026.10.05 (24th release, by @alkorsan)
+* fix: two column-resize problems (report: "columns resizing is
+  strangte, not like usual apps, not all columns allow to resize to
+  left and right, and last column cannot be resized"). (1) THE DRAG
+  now moves the pressed boundary the way usual applications move
+  it: the column LEFT of the boundary takes the drag's width, the
+  column RIGHT of it gives that width back, and every other column
+  (Name included) keeps its width -- exactly the two flanking cells
+  change. Before, only the left column changed and Name (the
+  stretch column) silently absorbed every drag, which is what made
+  the resize feel strange. Boundary 1 (Name|Folder) keeps its
+  special role -- Name absorbs what Folder releases -- but Folder's
+  growth is now capped so Name never drops below its guaranteed
+  minimum (before, dragging that boundary left ran Folder all the
+  way to MAX with no regard for Name). (2) THE LAST COLUMN
+  (Right date) is resizable at last: its left boundary (Right
+  size|Right date) now adjusts both flanking columns, so every
+  column in the table is resizable from both its edges; before,
+  that boundary only adjusted Right size and no drag could ever
+  touch Right date.
+* fix: after resizing the window and opening a new compare window,
+  the column headers did not align with their rows (report: "the
+  column headers does not align correctly with their corresponding
+  rows, see pic" -- VLM on the screenshot: every cell sat far right
+  of its caption, only Name roughly aligned). Root cause,
+  source-verified: TATListbox.UpdateColumnWidths (atlistbox.pas)
+  passes explicit column sizes through RAW on every paint and never
+  re-derives them from the live width -- only the plugin's re-push
+  can move the header split, while the owner-drawn rows re-derive
+  their cell layout from the painted row width on every paint. A
+  programmatic size change that does not run through the plugin's
+  on_resize therefore leaves the header on the stale split while
+  the rows spread over the live width -- and the saved-geometry
+  restore at build is exactly such a change (its PROP_SET runs
+  before the form is shown, where a bounds change on a handleless
+  LCL form fires no OnResize), which is why reopening a window
+  after a resize showed the misalignment "sometimes". Fixed on
+  three levels: _apply_cols runs once more AFTER the geometry
+  restore at build; the row painter GUARDS the alignment on every
+  painted row (a row width that no longer matches the pushed
+  spec's source width arms a deferred one-shot re-push outside the
+  paint cycle -- converging, never re-entrant, so the header can
+  never STAY misaligned whatever event was missed); and the pushed
+  spec is derived from the same width the rows paint by (the
+  painted row width once calibrated, else the live control width).
+
 2026.10.05 (23rd release, by @alkorsan)
 * fix: the drawn buttons' captions sat on a SECOND, darker
   rectangle -- "one background on the button and one on the text"
