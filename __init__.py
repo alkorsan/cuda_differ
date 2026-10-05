@@ -2019,7 +2019,10 @@ class Command:
           window is focused IMMEDIATELY and once more after ~0.5 s --
           the -p dispatch races the app's own startup activation of
           the main window, and without the delayed re-pull the main
-          window ends up on top, which was the 25th report);
+          window ends up on top, which was the 25th report -- and the
+          pair is remembered in the picker's folder histories, like
+          every pair picked in the dialog: differ2.dirs.hist_left /
+          hist_right in the state file, 26th release);
         - both are existing FILES  -> opened and compared in a diff
           tab, exactly as before (open both, then set_files);
         - one folder + one file (or a missing path) -> warning in the

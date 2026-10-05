@@ -1,3 +1,65 @@
+2026.10.05 (26th release, by @alkorsan)
+* fix: a folder with mixed content showed "Mixed" -- the user's rule
+  is stricter and simpler (report: "when a folder have identical and
+  only left or right files, the folder status show now 'mixed', it
+  must show diferent and colorize the row with the different color,
+  identical must be shown only when all inside is identical, 'only
+  left' must be shown only when all inside is 'only left', 'only
+  right' must be shown only when all inside is 'only right' ... etc
+  use common sense and fix all cases, revise all"). The "Mixed"
+  status is GONE. A folder's Status cell now describes its CONTENT
+  under one uniform rule: a PURE caption only when the whole subtree
+  is that one kind -- all identical reads "Identical" (no fill), all
+  only-left reads "Only left" (the deleted color), all only-right
+  reads "Only right" (the added color) -- and ANY mix of kinds reads
+  "Different" and carries the changed color, exactly as the report
+  demands: identical + one-sided files (the reported case), left-only
+  next to right-only, a one-sided subfolder next to an identical
+  file, a difference next to anything. The both-sides-folder-with-
+  one-sided-content debate of the 25th release is settled the user's
+  way: the caption is about the content, not the folder's own
+  existence -- a folder that exists on both sides but whose ENTIRE
+  content is only-left legitimately reads "Only left". The rollup is
+  a content-kind bitmask now (same/diff/lonly/ronly/err bits OR-ed up
+  the tree, one-sided folders contributing their own side's bit --
+  an empty one-sided folder is still one-sided), resolved by one
+  rule table (_rollup_status) instead of a severity min. The err
+  carve-outs, by common sense: a folder whose only comparable content
+  is unreadable reads "Cannot read", and so does identical + nothing
+  KNOWN to differ + something unreadable (cannot claim "Identical",
+  must not invent a difference); with one-sided or differing content
+  KNOWN, err does not soften the verdict -- the known mismatch is
+  real and the folder reads "Different". Sorting, filtering and the
+  status-bar counters all follow the same effective status as before
+  -- a mixed-content folder sorts with the differences, rides the
+  Different checkbox, and counts as Different, so the counters never
+  disagree with the cells. Tested exhaustively: every one of the 32
+  possible content masks is table-checked against rules re-derived
+  from the user's own words, plus a real-tree battery (the reported
+  case, the mirror, the one-sided subfolder, uniform one-sided
+  content on both-sides folders, left-only + right-only, all-diff)
+  with caption, _es, row-color, counter and filter assertions, and
+  the err paths through the same _build_view the scanner feeds.
+* fix: a folder compare started from the command line did not enter
+  the picker's histories (report: "when a dir compare is triggered
+  from cli the folders are not added to differ2.dirs.hist_left /
+  differ2.dirs.hist_right"). The CLI dispatch
+  (cudatext -p=cuda_differ2#dir1#dir2) now remembers the pair
+  exactly like the picker's Compare button -- after the same
+  validation (a pair that never opened a window is not one the user
+  compared), into the same state-file keys, with the same
+  move-to-front de-duplication. Drill-down windows (double-clicking
+  a folder row in an existing compare) deliberately still do not
+  remember: navigating an existing compare is not a new pick.
+* change: the plugin no longer deletes the six stale keys the 25th
+  release purged from cuda_differ2.json (request: "i told you no
+  backward compatibility, i can clean the json file manually no need
+  to delete it from the plugin, so remove that cleaning code"). The
+  one-time purge (_purge_stale_state_keys and its two call sites) is
+  removed; the old keys are simply never READ, and anything left in
+  the settings file stays there -- the file is the user's to clean
+  by hand.
+
 2026.10.05 (25th release, by @alkorsan)
 * fix: a folder that contains BOTH identical and one-sided files
   showed a one-sided status (report: "when a folder have identical

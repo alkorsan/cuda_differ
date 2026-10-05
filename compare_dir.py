@@ -271,11 +271,6 @@ theme presets):
                           indistinguishable from the empty list area;
                           the dialog listbox takes its background from
                           TreeBg, NOT from the control's color prop)
-  Mixed (folder)        -> no fill by design -- one-sided AND
-                          identical content in one both-sides folder;
-                          a one-sided tint would overstate it the
-                          same way its pre-25th 'Only left' caption
-                          did, so the caption alone carries the news
 
 So a file painted yellow in the folder list is painted yellow line
 by line when double-clicked into a compare tab; a red "only left"
@@ -287,12 +282,20 @@ the dialog API's listview has no per-row colors at all --
 owner-drawing was the only way to give the folder list
 WinMerge/Beyond-Compare-style row colors.
 
-A FOLDER row carries the worst status of its subtree (WinMerge's
-rolled-up result): a folder that only CONTAINS a different file is
-painted with color_changed and its Status cell reads "Different",
-while a folder whose contents are all identical stays plain. Folders
-always carry the folder icon -- one-sided folders communicate their
-sidedness by color and caption, not by swapping the icon.
+A FOLDER row paints by its ROLLED-UP status -- the content of its
+whole subtree, under the 26th-release rules ('identical must be
+shown only when all inside is identical ... use common sense and fix
+all cases'): a folder whose contents are all identical reads
+"Identical" (no fill); a folder whose contents are ALL only-left (or
+all only-right) reads "Only left" ("Only right") in the deleted
+(added) color; any MIX of kinds -- an identical file next to a
+one-sided one, left-only next to right-only, a difference next to
+anything -- reads "Different" and carries the changed color: the
+folders do not match, and the color says exactly that (26th report:
+'it must show diferent and colorize the row with the different
+color'). Folders always carry the folder icon -- one-sided folders
+communicate their sidedness by color and caption, not by swapping
+the icon.
 
 == Row font =========================================================
 
@@ -517,9 +520,10 @@ MODULE_JSON = 'cuda_differ2.json'
 # used inside it -- only the FILE changes; cudax_lib's get_opt/
 # set_opt take the file name as their user_json argument and create
 # the file on its first write. No backward compatibility is kept
-# (this code was never published): the old keys are DELETED from the
-# settings file once per session (_purge_stale_state_keys), never
-# read from there again.
+# (this code was never published): the old keys are simply never
+# READ from the settings file again -- anything left there is the
+# user's to clean by hand (26th release request: 'i can clean the
+# json file manually no need to delete it from the plugin').
 STATE_JSON = 'cuda_differ2_state.json'
 
 # Compare-speed constants (see the module docstring's "Speed model"):
@@ -595,12 +599,13 @@ COL_SEP = chr(31)              # ASCII unit separator
 
 # Row statuses. Files: ST_SAME / ST_DIFF / ST_LONLY / ST_RONLY / ST_ERR.
 # Folders: ST_DIR (on both sides) / ST_DIR_LONLY / ST_DIR_RONLY.
-# ST_MIXED is never a row's own status -- it is the ROLLED-UP status
-# (_es, see _build_view) of a both-sides folder whose subtree holds
-# one-sided content: the folder itself sits on BOTH sides, so saying
-# 'Only left'/'Only right' about it would be a lie (the 25th report:
-# 'when a folder have identical and only left files, the folder status
-# show only left ... it must show a diferent status').
+# A folder's Status CELL never shows these raw statuses directly: it
+# shows the rolled-up status of the folder's CONTENT (_es, see
+# _build_view / _rollup_status), which for a both-sides folder is
+# one of ST_SAME / ST_DIFF / ST_LONLY / ST_RONLY / ST_ERR -- or the
+# plain 'Folder' look when nothing was scanned below (26th release:
+# 'identical must be shown only when all inside is identical ...
+# use common sense and fix all cases').
 ST_SAME = 'same'
 ST_DIFF = 'diff'
 ST_LONLY = 'lonly'
@@ -609,7 +614,6 @@ ST_ERR = 'err'
 ST_DIR = 'dir'
 ST_DIR_LONLY = 'dir_lonly'
 ST_DIR_RONLY = 'dir_ronly'
-ST_MIXED = 'mixed'
 
 STATUS_CAPTION = {
     ST_SAME:      _('Identical'),
@@ -620,35 +624,95 @@ STATUS_CAPTION = {
     ST_DIR:       _('Folder'),
     ST_DIR_LONLY: _('Only left'),
     ST_DIR_RONLY: _('Only right'),
-    ST_MIXED:     _('Mixed'),
 }
+
+# Content bits for the folder rollup: WHAT KINDS of comparison
+# results live in a folder's subtree. The rolled-up caption follows
+# the SET of kinds (_rollup_status), not a severity order -- a
+# one-word caption like 'Only left' is honest only when NOTHING else
+# is in there (26th release: identical + only-left files in one
+# folder read 'Different', not 'Only left' and not 'Mixed').
+M_SAME = 1
+M_DIFF = 2
+M_LONLY = 4
+M_RONLY = 8
+M_ERR = 16
+
+_FILE_MASK_BIT = {
+    ST_SAME:  M_SAME,
+    ST_DIFF:  M_DIFF,
+    ST_LONLY: M_LONLY,
+    ST_RONLY: M_RONLY,
+    ST_ERR:   M_ERR,
+}
+
+
+def _rollup_status(mask):
+    """A folder's rolled-up status from its subtree's content mask
+    (None = nothing scanned below: keep the plain 'Folder' look).
+
+    The Status cell describes the folder's CONTENT, and a pure
+    caption is allowed only when the whole subtree is that ONE kind
+    ('identical must be shown only when all inside is identical,
+    "only left" must be shown only when all inside is "only left",
+    "only right" must be shown only when all inside is "only right"
+    ... use common sense and fix all cases'):
+
+      all identical      -> Identical
+      all only-left      -> Only left
+      all only-right     -> Only right
+      any MIX of kinds   -> Different (an identical file next to a
+                            one-sided one, left-only next to
+                            right-only, a difference next to
+                            anything -- the folders do not match,
+                            and the changed color says so)
+      only unreadable    -> Cannot read
+
+    'Cannot read' also wins when the only KNOWN content is identical
+    but something below could not be read: 'Identical' would
+    overstate (the unreadable part is unverified) while 'Different'
+    would invent a difference nothing established. With one-sided or
+    differing content KNOWN, err does not soften the verdict -- a
+    known mismatch is real either way, and 'all inside is only left'
+    is no longer true, so the folder reads Different."""
+    if not mask:
+        return None
+    known = mask & ~M_ERR
+    if not known or known == M_SAME:
+        return ST_SAME if not (mask & M_ERR) else ST_ERR
+    if known == M_LONLY and not (mask & M_ERR):
+        return ST_LONLY
+    if known == M_RONLY and not (mask & M_ERR):
+        return ST_RONLY
+    return ST_DIFF
 
 # Sort order of the Status column: the interesting rows (differences,
 # one-sided files) first, the noise (identical files, plain folders)
-# last. dir_* rows sit right after their file counterparts; a MIXED
-# folder (one-sided content inside a both-sides folder) sits right
-# after the one-sided folders -- more interesting than an error, less
-# than a difference. Only the ORDER matters, never the values.
+# last. dir_* rows sit right after their file counterparts; a folder
+# sorts by its ROLLED-UP status (see _sort_key), so a uniform
+# one-sided folder sorts with the one-sided files and a mixed-content
+# folder sorts with the differences. Only the ORDER matters, never
+# the values.
 STATUS_SEVERITY = {
     ST_DIFF:      0,
     ST_LONLY:     1,
     ST_RONLY:     2,
     ST_DIR_LONLY: 3,
     ST_DIR_RONLY: 4,
-    ST_MIXED:     5,
-    ST_ERR:       6,
-    ST_SAME:      7,
-    ST_DIR:       8,
+    ST_ERR:       5,
+    ST_SAME:      6,
+    ST_DIR:       7,
 }
 
 # Row statuses painted with a full-line background color in the
 # owner-drawn list, mapped to the Command.cfg key that holds the
 # color (the SAME keys the diff tabs use for their hunk lines --
 # see the module docstring "Row coloring"). Statuses absent from
-# this mapping keep the plain list background: a MIXED folder gets
-# NO tint on purpose -- it contains one-sided AND identical content,
-# so a one-sided tint would overstate exactly the way its old
-# 'Only left' caption did; the caption carries the information.
+# this mapping keep the plain list background. A folder paints by
+# its ROLLED-UP status (the painter reads _es first), so a
+# mixed-content folder gets the changed color -- exactly what its
+# 'Different' caption claims (26th release: 'it must show diferent
+# and colorize the row with the different color').
 ST_COLOR_KEY = {
     ST_DIFF:      'color_changed',
     ST_LONLY:     'color_deleted',
@@ -747,36 +811,6 @@ def _set_state(key, val):
     """Write (or, with val=None, delete) a 'differ2.dirs.*' state key
     in settings/cuda_differ2_state.json."""
     return ctx.set_opt('differ2.' + key, val, user_json=STATE_JSON)
-
-
-# The state keys as they lived in cuda_differ2.json before the 25th
-# release -- 'dirs.col_sizes' was never even read by this module (a
-# pre-21st-release leftover sitting in the file); all six are deleted
-# from the SETTINGS file once per session so nothing stale lingers
-# there. set_opt(path, None) is cudax_lib's line-based delete; a
-# missing file or a missing key is a clean no-op (verified against
-# cudax_lib's simple-key branch), so this is safe on any box.
-_STALE_SETTINGS_KEYS = (
-    'dirs.hist_left', 'dirs.hist_right', 'dirs.win_geom',
-    'dirs.picker_geom', 'dirs.col_sizes', 'dirs.col_widths',
-)
-_stale_state_purged = False
-
-
-def _purge_stale_state_keys():
-    """One-time-per-session cleanup: delete the moved state keys from
-    cuda_differ2.json (they now live in cuda_differ2_state.json).
-    Called from compare_dialog and compare_directories -- together
-    they front every entry point (menu/picker, CLI, drill-down)."""
-    global _stale_state_purged
-    if _stale_state_purged:
-        return
-    _stale_state_purged = True
-    for key in _STALE_SETTINGS_KEYS:
-        try:
-            ctx.set_opt('differ2.' + key, None, user_json=MODULE_JSON)
-        except Exception:
-            pass
 
 
 def _theme_ui():
@@ -3937,11 +3971,11 @@ class DirCompareForm:
         # Folders filter by their ROLLED-UP status (_es -- the very
         # thing the Status cell shows, set by _build_view before this
         # runs): a 'Different' folder follows the Different checkbox,
-        # not Identical. A MIXED folder is one-sided + identical
-        # content by construction (no diffs reached it, else the
-        # rollup would say Different) -- it shows when ANY of the
-        # statuses it can contain is checked. One-sided folders roll
-        # up to one-sided _es (or have no _es), so their checkbox is
+        # not Identical -- and a mixed-content folder IS a Different
+        # folder under the 26th-release rules (identical + one-sided
+        # content, left-only + right-only, ...), so it rides the
+        # Different checkbox like any other. One-sided folders roll up
+        # to one-sided _es (or have no _es), so their checkbox is
         # unchanged; files never carry _es.
         st = r.get('_es', r['status'])
         if st == ST_ERR:
@@ -3952,9 +3986,6 @@ class DirCompareForm:
             return self._show[ST_RONLY]
         if st == ST_DIFF:
             return self._show[ST_DIFF]
-        if st == ST_MIXED:
-            return (self._show[ST_LONLY] or self._show[ST_RONLY]
-                    or self._show[ST_SAME])
         return self._show[ST_SAME]  # ST_SAME and plain ST_DIR rows
 
     def _fill_list(self, rows=None):
@@ -4052,15 +4083,25 @@ class DirCompareForm:
           '_d'   depth (0 = directly under the compared roots)
           '_hk'  folder HAS scanned children (the +/- marker is drawn)
           '_ex'  folder is expanded (the marker is '-')
-          '_es'  folder's ROLLED-UP status: the worst status found in
-                 its subtree (the row color + Status caption + the
-                 Status-column sort key -- WinMerge's 'a folder that
-                 contains a difference is Different', and the 21st
-                 release's converse: a folder whose whole subtree is
-                 'Identical' shows 'Identical' too, not 'Folder');
-                 set whenever the rollup beats a plain 'Folder', i.e.
-                 only a folder with NOTHING scanned below (or an
-                 empty one) keeps the plain 'Folder' look
+          '_es'  folder's ROLLED-UP status: what its CONTENT amounts
+                 to (the row color + Status caption + the
+                 Status-column sort key). The 26th-release rules --
+                 the caption describes the content, and a pure caption
+                 only when the whole subtree is that ONE kind
+                 ('identical must be shown only when all inside is
+                 identical, "only left" only when all inside is
+                 "only left", "only right" only when all inside is
+                 "only right"'): an all-identical subtree reads
+                 'Identical' (the 21st release), an entirely
+                 one-sided subtree reads 'Only left'/'Only right',
+                 and any MIX of kinds reads 'Different' -- an
+                 identical file next to a one-sided one (the 25th and
+                 26th reports), left-only next to right-only, a
+                 difference next to anything. See _rollup_status for
+                 the err carve-outs. Only a folder with NOTHING
+                 scanned below (or an empty one) keeps the plain
+                 'Folder' look -- the rollup cannot claim anything
+                 about it
 
         The rollup is computed over the WHOLE subtree (visible rows
         or not) BEFORE the walk: hidden-but-present differences must
@@ -4077,57 +4118,35 @@ class DirCompareForm:
         for r in rows:
             kids.setdefault(r['dir'], []).append(r)
 
-        # Rolled-up folder status (the '_es' field above): worst
-        # status of the folder's own row and everything under it,
+        # Rolled-up folder status (the '_es' field above): the SET of
+        # content kinds in the folder's whole subtree, as a bitmask,
         # memoized per rel path (each rel is unique -- the kids graph
-        # is a well-founded tree by construction). Severity order =
-        # STATUS_SEVERITY, i.e. the display's order of interesting.
-        sev = STATUS_SEVERITY
+        # is a well-founded tree by construction). A one-sided folder
+        # contributes its own side's bit (everything below it is that
+        # side by construction, and an EMPTY one-sided folder is still
+        # one-sided); a both-sides folder contributes nothing of its
+        # own -- what its children are decides its caption.
         memo = {}
 
         def rollup(rel, own):
-            w, ws = own, sev.get(own, 99)
+            m = M_LONLY if own == ST_DIR_LONLY else \
+                M_RONLY if own == ST_DIR_RONLY else 0
             for r in kids.get(rel, ()):
-                cw = rollup(r['rel'], r['status']) \
-                    if r['isdir'] else r['status']
-                cs = sev.get(cw, 99)
-                if cs < ws:
-                    w, ws = cw, cs
-            memo[rel] = w
-            return w
+                if r['isdir']:
+                    m |= rollup(r['rel'], r['status'])
+                else:
+                    m |= _FILE_MASK_BIT.get(r['status'], 0)
+            memo[rel] = m
+            return m
 
         for r in rows:
             if r['isdir'] and r['rel'] not in memo:
                 rollup(r['rel'], r['status'])
         for r in rows:
             if r['isdir']:
-                w = memo.get(r['rel'])
-                # The bar is ST_DIR, not ST_SAME (21st release: 'when
-                # folders are identical, the status column shows
-                # "folder" instead of "identical"'): a both-sides
-                # folder whose whole subtree rolled up to ST_SAME now
-                # carries _es=ST_SAME -> the Status cell says
-                # 'Identical', the row sorts with the identical files
-                # and the filter's 'Identical' checkbox governs it.
-                # One-sided folders are unaffected (their rollup can
-                # never reach ST_SAME -- their own status already sits
-                # above it in the severity table), so the delta of the
-                # widened bar is EXACTLY the all-identical subtree.
-                if w is not None and sev.get(w, 99) < sev[ST_DIR]:
-                    # 25th release: a BOTH-sides folder never carries a
-                    # ONE-SIDED caption. Its subtree rolled up to
-                    # one-sided content, but the folder itself exists
-                    # on both sides -- the user's report was exactly
-                    # this: a folder with identical + only-left files
-                    # showing 'Only left'. Such a folder now reads
-                    # MIXED (ST_MIXED); genuinely one-sided folders
-                    # (r['status'] is dir_lonly/dir_ronly) keep their
-                    # own captions.
-                    if r['status'] == ST_DIR and w in (
-                            ST_LONLY, ST_RONLY,
-                            ST_DIR_LONLY, ST_DIR_RONLY):
-                        w = ST_MIXED
-                    r['_es'] = w
+                es = _rollup_status(memo.get(r['rel'], 0))
+                if es is not None:
+                    r['_es'] = es
                 else:
                     r.pop('_es', None)   # stale value from an old fill
 
@@ -4427,10 +4446,10 @@ class DirCompareForm:
         # Counters follow the EFFECTIVE status (_es) -- the very text
         # the Status cell shows. Before the 25th release every
         # both-sides folder counted as 'Identical' no matter what its
-        # cell said (a 'Different'/'Mixed' folder inflated the
-        # Identical number). MIXED folders count in no bucket: they
-        # are containers of one-sided + identical content and no
-        # single counter is true about them.
+        # cell said (a 'Different' folder inflated the Identical
+        # number). A mixed-content folder counts as Different now --
+        # its cell says Different, and that is the whole rule: the
+        # counters never disagree with the Status column.
         rows = self._rows
         n_diff = n_l = n_r = n_same = 0
         for r in rows:
@@ -5515,7 +5534,6 @@ def compare_dialog(cmd, dir_l='', dir_r=''):
     then open a compare window. The picker is a profiler section of
     its own ('dirs:picker') -- a slow-to-open folder chooser would
     otherwise hide inside the operation's wall time."""
-    _purge_stale_state_keys()
     Profiler.start('dirs:picker')
     try:
         res = _PickerDialog().show(dir_l, dir_r)
@@ -5533,8 +5551,14 @@ def compare_directories(cmd, dir_l, dir_r, from_cli=False):
     to the front and focused (focus()); from_cli=True additionally
     arms focus_later() -- the CLI dispatch races the app's own
     startup activation of the main window, and the delayed re-pull
-    is what actually lands the focus on the compare window."""
-    _purge_stale_state_keys()
+    is what actually lands the focus on the compare window -- and
+    remembers the pair in the picker's histories (26th release:
+    'when a dir compare is triggered from cli the folders are not
+    added to differ2.dirs.hist_left / hist_right'): the CLI dispatch
+    is just another way of PICKING the pair, so it feeds the same
+    history the picker's OK button feeds. Drill-downs deliberately
+    do not remember -- navigating an existing compare is not a new
+    pick -- and the picker path remembers in its own _try_ok."""
     dir_l = os.path.normpath(dir_l)
     dir_r = os.path.normpath(dir_r)
     if not os.path.isdir(dir_l) or not os.path.isdir(dir_r):
@@ -5549,6 +5573,10 @@ def compare_directories(cmd, dir_l, dir_r, from_cli=False):
         ct.msg_box(_('The two folders are the same folder.'),
                    ct.MB_OK + ct.MB_ICONWARNING)
         return
+    if from_cli:
+        # after the validation, like the picker's own _try_ok: a pair
+        # that never opened a window is not one the user compared
+        _PickerDialog._remember(dir_l, dir_r)
     try:
         Profiler.start('dirs:form_build')
         try:

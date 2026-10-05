@@ -254,21 +254,37 @@ indented under the folder row, in the same window.
   Only left     exists only in the left folder
   Only right    exists only in the right folder
   Identical     exists on both sides, same content -- a FOLDER row
-                reads "Identical" when everything inside it is
+                reads "Identical" only when ALL inside it is
                 identical (rolled up from its whole subtree)
-  Mixed         a BOTH-sides folder whose subtree holds one-sided
-                content: identical + only-left files, an only-right
-                subfolder, and so on. The folder itself exists on
-                both sides, so "Only left"/"Only right" would be a
-                lie about it (the 25th release gave these folders
-                their own honest status; before, a folder with
-                identical + only-left files read "Only left")
+  Only left /   a FOLDER reads "Only left" only when ALL inside it
+  Only right    is only-left (mirror for "Only right") -- a folder
+                that exists on both sides but whose entire content
+                sits on one side still reads one-sided: the caption
+                describes the CONTENT
+  Mixed         a folder with a MIX of kinds inside -- identical +
+                only-left files, left-only next to right-only, a
+                difference next to anything. Such a folder does not
+                match, so it reads "Different" and carries the
+                different color (26th release: the user's rule --
+                'identical must be shown only when all inside is
+                identical, "only left" only when all inside is
+                "only left" ... use common sense and fix all cases';
+                before, these folders read "Mixed" with no color,
+                and before that "Only left")
   Folder        a folder with nothing compared inside yet (empty, or
-                while the scan has not reached it). A folder's Status
-                cell and color show the worst status INSIDE it (a
-                folder containing a different file reads "Different")
+                while the scan has not reached it)
   Cannot read   stat/open failed (permissions, broken link...) --
-                always shown, whatever the filters say
+                always shown, whatever the filters say. A folder
+                reads "Cannot read" when its only comparable content
+                is unreadable, or when everything KNOWN inside is
+                identical but something could not be read (cannot
+                claim "Identical", nothing known to differ)
+
+A folder's Status cell and row color always describe its CONTENT:
+pure captions only on uniform content, any mix reads "Different"
+in the changed color. A folder with nothing scanned inside keeps
+the plain "Folder" look (the rollup cannot claim anything about
+it).
 
 The FIRST pass is deliberately cheap so even huge trees fill the list
 fast: nothing is ever loaded into an editor and no diff algorithm
@@ -526,9 +542,9 @@ The window's controls:
 - The status bar shows the scan progress / result line on the left
   and the counts (Different / Only left / Only right / Identical) on
   the right. The counters follow what the Status column SHOWS: a
-  folder rolled up to "Different" counts as Different, and a Mixed
-  folder counts in no bucket (no single counter is true about
-  one-sided + identical content together). Its cells carry no
+  folder rolled up to "Different" counts as Different, a uniform
+  only-left folder counts as Only left -- the counters never
+  disagree with the cells. Its cells carry no
   defined width: the status cell
   auto-fits its text and the counts cell stretches over the rest of
   the bar, so both shrink and grow with the dialog; the bar grows
@@ -544,7 +560,13 @@ The window's controls:
   histories -- lives in the plugin's own STATE file,
   settings/cuda_differ2_state.json, NOT in the settings file (the
   25th release moved it there: it is machine-local UI state, not a
-  user-editable option).
+  user-editable option). Both histories are fed by every pair you
+  PICK -- the picker's Compare button and the command line
+  (cudatext -p=cuda_differ2#dir1#dir2) alike; drill-downs from an
+  existing window are navigation and do not pollute them. Any stale
+  keys the pre-25th releases left in cuda_differ2.json are simply
+  never read -- the file is yours to clean by hand, the plugin does
+  not touch it (26th release).
 
 Row colors (the whole line, WinMerge/Beyond-Compare style): every row
 is painted with the SAME colors the diff tabs use for their hunks, so
@@ -559,23 +581,18 @@ will paint:
                  indistinguishable from the empty list area: no
                  grey-on-white tint, and that is what makes the
                  colored rows pop
-  Mixed          no fill BY DESIGN -- a Mixed folder contains
-  (folder)       one-sided AND identical content, so a one-sided
-                 tint would overstate it exactly the way its old
-                 "Only left" caption did; the caption alone carries
-                 the news
 
-A FOLDER row carries the worst status of its subtree (WinMerge's
-rolled-up result): a folder that merely CONTAINS a different file
-is painted with the changed color and its Status cell reads
-"Different" -- you can see a folder matters without expanding it --
-while a folder whose contents are all identical reads "Identical"
-(no fill). One-sided content inside a BOTH-sides folder rolls up to
-"Mixed" (see the status table above); genuinely one-sided folders
-keep their deleted/added color and "Only left/right" caption.
-Folder rows always carry the
-FOLDER icon: the icon tells the kind, the color and caption tell the
-status.
+A FOLDER row is painted by its ROLLED-UP status -- what its content
+amounts to -- so the color always agrees with the Status cell: a
+folder that merely CONTAINS a different file, or whose content is a
+MIX of kinds (identical + one-sided, left-only + right-only), is
+painted with the changed color and reads "Different" -- you can see
+a folder matters without expanding it; a folder whose contents are
+all identical reads "Identical" (no fill); a folder whose content is
+ALL one-sided reads "Only left"/"Only right" in the deleted/added
+color (see the status table above for the full rules). Folder rows
+always carry the FOLDER icon: the icon tells the kind, the color and
+caption tell the status.
 
 The selected row shows the theme's list-selection colors instead
 (selection wins, like in an editor). The colors follow the
@@ -1118,6 +1135,13 @@ pass can activate the main window AFTER the compare window opened,
 leaving the compare window behind it (that was the 25th report;
 without the delayed re-focus, the main window ended up on top).
 
+The compared pair also enters the picker's folder histories
+(differ2.dirs.hist_left / hist_right in settings/
+cuda_differ2_state.json) exactly as if you had picked it in the
+dialog -- the command line is just another way of picking the pair
+(26th release: before, only the dialog's Compare button fed the
+histories).
+
 As with filenames, paths with spaces must be passed inside quotes
 around the whole flag:
 
@@ -1133,7 +1157,7 @@ just open the folder picker dialog at startup (CudaText's generic
 Open the options dialog via "Options / Settings-plugins / Differ 2 / Config"
 or "Plugins / Differ 2 / Config...".
 
-All options are stored in settings/cuda_differ2.json. The option names grouped into seven categories: theme, algorithm, ignoreopt, advanced, micromap, toolbar, dirs. The folder-compare window's remembered STATE -- the two folder histories, the window and picker geometries, the drag-resized column widths -- is NOT an option and lives in its own file, settings/cuda_differ2_state.json (25th release).
+All options are stored in settings/cuda_differ2.json. The option names grouped into seven categories: theme, algorithm, ignoreopt, advanced, micromap, toolbar, dirs. The folder-compare window's remembered STATE -- the two folder histories, the window and picker geometries, the drag-resized column widths -- is NOT an option and lives in its own file, settings/cuda_differ2_state.json (25th release). State keys the older releases left in cuda_differ2.json are never read; the plugin never deletes anything from your settings file (26th release).
 
 Ignore options section (see the "Ignore options" chapter above for details):
 - differ2.ignoreopt.ignore_case: Ignore case (default: off)
