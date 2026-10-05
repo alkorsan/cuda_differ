@@ -539,6 +539,11 @@ MODULE_JSON = 'cuda_differ2.json'
 # READ from the settings file again -- anything left there is the
 # user's to clean by hand (26th release request: 'i can clean the
 # json file manually no need to delete it from the plugin').
+# The file is SHARED with __init__.py's compare-tab tracking (its
+# 'sessions' key): this side's line-based set_opt writes never touch
+# the other keys, __init__._save_state's merge guard never touches
+# ours, and _set_state heals an empty file before set_opt (whose
+# append branch IndexErrors on one) -- see _set_state (28th release).
 STATE_JSON = 'cuda_differ2_state.json'
 
 # Compare-speed constants (see the module docstring's "Speed model"):
@@ -832,7 +837,29 @@ def _get_state(key, def_val):
 
 def _set_state(key, val):
     """Write (or, with val=None, delete) a 'differ2.dirs.*' state key
-    in settings/cuda_differ2_state.json."""
+    in settings/cuda_differ2_state.json.
+
+    Empty-file heal: a crash between any writer's open('w') and its
+    write can leave the state file 0 bytes / whitespace-only, and
+    cudax_lib's set_opt append branch then dies on body.rstrip()[:-1]
+    (IndexError on an empty string) -- every later state write would
+    fail. Such a file carries nothing to lose, so it is healed to
+    '{}' before set_opt runs (28th release).
+
+    The file itself is SHARED with __init__.py's compare-tab tracking
+    (its 'sessions' key): set_opt's line-based append/update touches
+    only this key's own line and never drops the other writer's keys
+    (see __init__._save_state for the other direction of the
+    contract)."""
+    try:
+        path = os.path.join(ct.app_path(ct.APP_DIR_SETTINGS), STATE_JSON)
+        with open(path, 'r', encoding='utf8') as f:
+            if f.read().strip():
+                raise ValueError('not empty')
+        with open(path, 'w', encoding='utf8') as f:
+            f.write('{}')
+    except (OSError, UnicodeDecodeError, ValueError):
+        pass
     return ctx.set_opt('differ2.' + key, val, user_json=STATE_JSON)
 
 

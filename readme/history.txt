@@ -1,3 +1,39 @@
+2026.10.05 (28th release, by @alkorsan)
+* fix: comparing two FILES deleted the dir-compare state (report: 'when
+  i compare two files and the plugin do cleaning, the history and all
+  config of dir compare get deleted' -- differ2.dirs.hist_left,
+  hist_right, win_geom, picker_geom, col_sizes and col_widths vanished
+  from settings/cuda_differ2_state.json, "sometimes automatically").
+  Root cause, proven against the real cudax_lib: the dir-compare side
+  writes its state keys through cudax_lib's set_opt, whose line-based
+  append/update legitimately leaves a TRAILING COMMA on the last pair
+  (every CudaText settings reader tolerates it), and hand edits may
+  carry //-comments -- but the file-compare side's _load_state used a
+  STRICT json.load, which rejects both. Every parse failure silently
+  became an empty state, and the next state write on that side --
+  registering a compare tab (opening a compare!), flipping a dirty
+  flag while you edit, closing the tab, pruning dead records at
+  startup -- REWROTE the file with only its own "sessions" key,
+  physically deleting the six dir-compare keys. Fixed in depth:
+  (1) the file-compare side now parses the state file exactly like
+  the app parses every settings JSON (_state_json_loads: // comments
+  and trailing commas tolerated, a // inside a string value -- a URL
+  -- is not a comment); (2) its saves carry a MERGE GUARD -- that
+  side owns ONLY the "sessions" key; every other top-level key is
+  re-read from disk at save time and carried over, the disk value
+  winning over a stale in-memory copy (a dir compare that wrote a
+  history between the load and the save is never reverted) -- so a
+  compare-tab event can no more delete the dir-compare state than
+  delete a file; (3) saves are ATOMIC (temp file in the settings
+  folder + os.replace), so a crash mid-save can never leave a
+  truncated state file; (4) the dir-compare side heals an empty /
+  whitespace-only state file (a crashed write's leftover) before
+  calling set_opt, whose append branch would otherwise crash with
+  IndexError and brick every later state write. The state file keeps
+  the CudaText settings style -- comments and trailing commas are
+  legal -- and after any file-compare-side save it is strict-JSON
+  clean again.
+
 2026.10.05 (27th release, by @alkorsan)
 * fix: files and folders with the status "Cannot read" had no row
   color and no count in the status bar (report: 'files or folders with

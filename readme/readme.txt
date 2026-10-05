@@ -571,6 +571,19 @@ The window's controls:
   keys the pre-25th releases left in cuda_differ2.json are simply
   never read -- the file is yours to clean by hand, the plugin does
   not touch it (26th release).
+- The STATE file is SHARED with the plugin's compare-tab tracking
+  (its own "sessions" key there, which survives a restart to restore
+  compare tabs). The two writers never delete each other's keys: a
+  file-compare tab event (opening/closing a compare tab, editing in
+  one) cannot remove the dir-compare histories, geometries or column
+  widths -- and the dir-compare side writes its keys line-by-line,
+  never touching the sessions data (28th release; the 27th-release
+  builds could lose the six differ2.dirs.* keys when you compared two
+  files, because the file-compare side misread the dir-compare's
+  written file and rewrote it without those keys). The file follows
+  the CudaText settings style -- "//"-comments and a trailing comma
+  are legal in it, exactly like in cuda_differ2.json -- and it is
+  saved atomically, so a crash can never leave it truncated.
 
 Row colors (the whole line, WinMerge/Beyond-Compare style): every row
 is painted with the SAME colors the diff tabs use for their hunks, so
@@ -1174,7 +1187,7 @@ just open the folder picker dialog at startup (CudaText's generic
 Open the options dialog via "Options / Settings-plugins / Differ 2 / Config"
 or "Plugins / Differ 2 / Config...".
 
-All options are stored in settings/cuda_differ2.json. The option names grouped into seven categories: theme, algorithm, ignoreopt, advanced, micromap, toolbar, dirs. The folder-compare window's remembered STATE -- the two folder histories, the window and picker geometries, the drag-resized column widths -- is NOT an option and lives in its own file, settings/cuda_differ2_state.json (25th release). State keys the older releases left in cuda_differ2.json are never read; the plugin never deletes anything from your settings file (26th release).
+All options are stored in settings/cuda_differ2.json. The option names grouped into seven categories: theme, algorithm, ignoreopt, advanced, micromap, toolbar, dirs. The folder-compare window's remembered STATE -- the two folder histories, the window and picker geometries, the drag-resized column widths -- is NOT an option and lives in its own file, settings/cuda_differ2_state.json (25th release). State keys the older releases left in cuda_differ2.json are never read; the plugin never deletes anything from your settings file (26th release). The state file is shared with the compare-tab tracking (its "sessions" key); the two writers never delete each other's keys, the file accepts CudaText-style comments and trailing commas, and it is saved atomically (28th release).
 
 Ignore options section (see the "Ignore options" chapter above for details):
 - differ2.ignoreopt.ignore_case: Ignore case (default: off)

@@ -2,6 +2,8 @@ import functools
 import gc
 import os
 import json
+import re
+import tempfile
 import threading
 import time
 import typing as tp
@@ -1385,6 +1387,13 @@ DIFF_TAB_COUNT = 1
 # Persistent state file: stores compare-tab state grouped by session.
 # session_key is the session file path, relative to the settings folder if
 # the session is inside it (at any depth), or the full path if outside.
+# SHARED FILE CONTRACT (28th release): the dir-compare side keeps its own
+# remembered state (differ2.dirs.* -- histories, geometries, column
+# widths) in this SAME file, written through cudax_lib's line-based
+# set_opt. This module owns ONLY the 'sessions' key here: it must parse
+# the file tolerantly (_state_json_loads) and must never let a save drop
+# the other writers' keys (_save_state's merge guard) -- a compare-tab
+# event deleting the dir-compare state is the 28th-release bug.
 STATE_FILE = os.path.join(ct.app_path(ct.APP_DIR_SETTINGS), 'cuda_differ2_state.json')
 # Path to plugins.ini -- used to persistently subscribe to on_start2 so the
 # plugin auto-loads on next CudaText startup when compare tabs are active.
@@ -1400,6 +1409,52 @@ MODULE_NAME = __name__.split('.')[-1]  # e.g. 'cuda_differ2'
 # _FAIL, on_close keeps the closing compare tabs' persisted registrations
 # (the tabs still exist in the session file being left and come back when
 # the user returns to that session).
+
+
+def _state_json_loads(text):
+    """Parse the state file's JSON the way CudaText parses EVERY settings
+    JSON (the same normalization cudax_lib._json_loads applies): strip
+    '//'-to-end-of-line comments (a '//' inside a string literal is NOT a
+    comment) and dangling commas around braces/brackets, then strict
+    json.loads. Raises ValueError on text no amount of normalizing saves.
+
+    The state file is written by TWO independent writers plus the user:
+      - this module rewrites it wholesale with json.dump (_save_state);
+      - compare_dir writes single keys through cudax_lib's set_opt, whose
+        line-based append/update LEGITIMATELY leaves a trailing comma on
+        the last pair (every CudaText settings reader accepts that);
+      - hand edits follow the house style of every CudaText JSON, which
+        carries '//'-comments.
+    A strict json.load here rejects both (28th release: it choked on the
+    trailing comma, _load_state silently returned {'sessions': {}}, and
+    the next _save_state -- a compare-tab register/unregister/dirty-flip
+    -- OVERWROTE the file without the differ2.dirs.* keys, deleting the
+    dir-compare histories and geometries: 'when i compare two files and
+    the plugin do cleaning, the history and all config of dir compare
+    get deleted'). This parser reads exactly what the app reads, so keys
+    written by any of the three hands survive."""
+    def strip_comment(match):
+        line = match.group(0)
+        pos = 0
+        in_str = False
+        while pos < len(line):
+            ch = line[pos]
+            if ch == '\\':
+                pos += 2
+            else:
+                if ch == '"':
+                    in_str = not in_str
+                elif not in_str and line[pos:pos + 2] == '//':
+                    return line[:pos]
+                pos += 1
+        return line
+
+    s = re.sub(r'^.*//.*$', strip_comment, text, flags=re.MULTILINE)
+    s = re.sub(r'{\s*,', '{', s)
+    s = re.sub(r',\s*}', '}', s)
+    s = re.sub(r'\[\s*,', '[', s)
+    s = re.sub(r',\s*\]', ']', s)
+    return json.loads(s)
 
 
 _homedir = os.path.expanduser('~')
@@ -1734,11 +1789,21 @@ class Command:
         return session_path
 
     def _load_state(self):
-        """Load the persisted state from disk."""
+        """Load the persisted state from disk. Parses the file with
+        _state_json_loads (comments + trailing commas tolerated) so keys
+        written by cudax_lib's set_opt or by hand never make this side
+        see an empty state. Only a file that is unreadable, non-dict or
+        unparseable even after normalization falls back to the fresh
+        {'sessions': {}} -- and even then _save_state's merge guard
+        keeps whatever it can still read from the disk copy."""
         try:
             with open(STATE_FILE, 'r', encoding='utf8') as f:
-                data = json.load(f)
-        except (OSError, ValueError):
+                text = f.read()
+        except OSError:
+            return {'sessions': {}}
+        try:
+            data = _state_json_loads(text)
+        except ValueError:
             return {'sessions': {}}
         if not isinstance(data, dict):
             return {'sessions': {}}
@@ -1747,12 +1812,48 @@ class Command:
         return data
 
     def _save_state(self, state):
-        """Save the state to disk."""
+        """Save the state to disk -- without ever dropping keys this
+        side does not own. The compare-tab tracking owns ONLY the
+        'sessions' key; every OTHER top-level key (all the differ2.dirs.*
+        state compare_dir remembers, and anything the user keeps there
+        by hand) belongs to the other writers, so before writing, the
+        CURRENT disk copy is re-read and those keys are carried over --
+        both when the outgoing dict lost them (a parse hiccup in
+        _load_state) and when it carries a stale copy (a dir compare
+        wrote a history between our load and this save: disk wins).
+        This makes it structurally impossible for a compare-tab event
+        -- registering a tab, flipping a dirty flag, closing a tab,
+        pruning dead records at startup -- to delete the dir-compare
+        state again (the 28th-release report).
+        The write itself is atomic (temp file in the same folder +
+        os.replace): a crash mid-save can never leave a truncated
+        state file, which would both lose everything and crash
+        cudax_lib's append branch on the next set_opt."""
         try:
-            with open(STATE_FILE, 'w', encoding='utf8') as f:
+            with open(STATE_FILE, 'r', encoding='utf8') as f:
+                disk = _state_json_loads(f.read())
+        except (OSError, ValueError):
+            disk = None
+        if isinstance(disk, dict):
+            for key, val in disk.items():
+                if key != 'sessions':
+                    state[key] = val
+        tmp = None
+        try:
+            fd, tmp = tempfile.mkstemp(
+                prefix=os.path.basename(STATE_FILE) + '.',
+                dir=os.path.dirname(STATE_FILE) or '.')
+            with os.fdopen(fd, 'w', encoding='utf8') as f:
                 json.dump(state, f, indent=2)
+            os.replace(tmp, STATE_FILE)
+            tmp = None
         except OSError as ex:
             msg('failed to save state file: {}'.format(ex), level=2)
+            if tmp is not None:
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
 
     def _new_session(self, tab_id, state_key=''):
         """Create and register the standalone session for a compare tab
