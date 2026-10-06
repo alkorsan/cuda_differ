@@ -1,3 +1,85 @@
+2026.10.06 (30th release, by @alkorsan)
+* add: "Method 1: Fast (Pascal engine, joined-block mapping)" -- the new
+  fast implementation of differ2.algorithm.beautify.align_by_similarity.
+  The old implementation re-paired the lines of every unequal-count
+  REPLACE block with a pure-Python recursive search (anchor on the
+  longest unique exact match or the best prefix/suffix-similar pair,
+  char-diff it, recurse on both sides) -- an O(N*M)-per-block search
+  that made the option unusable on big files (the profiled case: a
+  37.5s compare of which ~37s was that search grinding on ONE
+  3366x9397-line block). The new method asks the DIFF ENGINE ITSELF
+  to pair the two sides of each unequal block: one engine call maps
+  side A against side B, the EQUAL ranges it returns become the
+  aligned line pairs (rendered with char-level details like a
+  changed line), unmatched residuals recurse with progressively
+  looser line keys (raw -> stripped -> 12-char prefix, at most 3
+  depths), and only small leftovers (da*db <= 256) fall back to the
+  original similarity search -- which is kept verbatim inside the
+  new align_joined.py for that small-block role. The engine calls
+  use the CONFIGURED algorithm and the same ignore flags as the main
+  compare, so the pairing always agrees with the compare's notion of
+  "equal" (native_histogram -> every sub-block diff runs Histogram,
+  native_myers -> Myers, a Python algorithm -> that Python matcher).
+  On the native path the mapping plan is computed once in the
+  collect pass and CACHED (budget 65536 ops, desync-safe fallback to
+  fresh computation); the replay pass pops it. Speed on the offline
+  harness (stub engine; the real native engine is 10-50x faster
+  still): test_4a/b 30655x33880 lines -- the align pass went
+  972ms -> 170ms and finds MORE anchor pairs (11217 -> 11488);
+  test_10a/b (the one giant block) -- 37,559ms -> 36.9ms (1017x).
+  Tuning knobs: align_joined.SMALL_PRODUCT (256),
+  PREFIX_KEY_LEN (12), MAX_DEPTH (3), Differ._PLAN_CACHE_BUDGET
+  (65536). The profiling report's Beautify-passes block gains the
+  align_by_similarity:joined_block_sub_diff row (the engine calls
+  of the fast mapper), so the two methods' costs are separable in
+  one report.
+* change: differ2.algorithm.beautify.align_by_similarity is a DROPDOWN
+  now, not a checkbox: "Off / disabled (algo-faithful rendering)" /
+  "Method 1: Fast (Pascal engine, joined-block mapping)" /
+  "Method 2: Slow (original pure-Python recursive search)". The
+  ORIGINAL slow implementation is preserved verbatim as Method 2, so
+  the two pairing methods can be A/B-compared on the same inputs
+  three clicks apart -- its output is event-for-event identical to
+  the 29th release's code (verified on every test pair and all 5
+  Python algorithms), including its big-file pathology (that is the
+  point of keeping it: the old output stays reproducible). ONE
+  stored string means the "both methods on" state is structurally
+  impossible -- the exclusivity bookkeeping and the slow-wins rule
+  of the two-checkbox design are deleted outright. Per the
+  no-backward-compatibility rule (nothing of this was ever
+  published) there is NO settings migration of any kind: a stored
+  value that is not 'fast' / 'slow' (an old bool, a typo, a junk
+  hand-edit) simply reads as 'off'.
+* change: the toolbar Presets dropdown is redesigned around the single
+  dropdown. New layout: the two presets, a separator, the three
+  algorithms, a separator, the two align methods, a separator, the
+  Absorb toggle. "Algorithm 3: Hybrid Python (slow)" is now exposed
+  -- the pure-Python Patience + Myers O(NP) combination that was
+  already the fallback on CudaText builds without diff_proc; the
+  "(slow)" word in its caption marks it as the non-native one. The
+  two presets are QUICK TOGGLES of the two beautify features now,
+  not fixed algorithm combinations: "Preset 1: Align by similarity -
+  Method 1 (fast)" toggles the fast align method, "Preset 2: Absorb
+  trivial equal blocks" toggles the Absorb pass -- each writes ONLY
+  its own setting (the algorithm and the other beautify option stay
+  exactly as they are), so both can be checked at once and they are
+  plain checkable items, not a radio pair. The align methods are a
+  radio pair with NO "off" item: clicking the checked method again
+  turns it off (when neither method shows a dot, the stored value IS
+  'off'), which is why the off state needs no third item. The
+  button tooltip and the click status line show the align state as
+  fast / slow / off.
+* change: readme/readme.txt documents the dropdown, both methods, and
+  a "Which one should you use?" guide with each choice's use case
+  (off = algo-faithful rendering / matching what other diff tools
+  show / the absolute fastest compare; Method 1 = the recommended
+  everyday alignment at engine speed, safe on any file size;
+  Method 2 = A/B comparison against the old output, or the rare
+  block where its anchoring is preferred); the toolbar Presets
+  chapter is rewritten for the new menu; the profiling rows list
+  gains the joined_block_sub_diff row and notes which rows belong
+  to which method.
+
 2026.10.05 (29th release, by @alkorsan)
 * change: the compare-tab state ("sessions") now goes through the SAME
   app option writer as everything else -- cudax_lib's key-level

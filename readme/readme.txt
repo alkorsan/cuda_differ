@@ -871,30 +871,36 @@ into the compare view):
   While a pure-Python algorithm is the effective one, the items
   disable themselves and an explanatory item heads the menu (same
   guard as the tab context menu).
-- ★ Preset ▾ -- dropdown with quick "preset" combinations: "Preset 1:
-  Fastest comparison - Myers, Align Off, Absorb Off" and "Preset 2:
-  Better readability (slower) - Histogram, Align On, Absorb Off"; the
-  two presets are
-  RADIO items (a dot mark instead of a checkmark; clicking one
-  unchecks the other), so at most one is ever marked. After a
-  separator, "Algorithm 1: Native Histogram" and "Algorithm 2:
-  Native Myers" (also radio items, also mutually exclusive) and the
-  two independent checkable toggles "Align by similarity" and
-  "Absorb trivial equal blocks" (each works with either algorithm).
-  The preset marks are DERIVED from the current settings on every
-  menu open -- a preset is an EXACT combination of three settings:
-  Native Myers + Align off + Absorb off checks Preset 1, Native
-  Histogram + Align on + Absorb off checks Preset 2, any other
-  combination (Absorb on included) checks NEITHER -- so a custom
-  selection is visible at a glance. Picking a preset writes ALL
-  THREE settings (differ2.algorithm.diff_algorithm /
+- ★ Preset ▾ -- dropdown with the quick beautify presets, the
+  algorithms and the beautify toggles. In order: the two PRESETS
+  ("Preset 1: Align by similarity - Method 1 (fast)" turns the fast
+  similarity-alignment method on / off; "Preset 2: Absorb trivial
+  equal blocks" toggles the Absorb pass; each preset changes ONLY
+  its own setting -- the algorithm and the other beautify option
+  stay as they are -- so both can be checked at once and they are
+  plain CHECKABLE items, not a radio pair); a separator; the three
+  algorithms as RADIO items ("Algorithm 1: Native Histogram",
+  "Algorithm 2: Native Myers", "Algorithm 3: Hybrid Python (slow)"
+  -- mutually exclusive; the "slow" word marks the pure-Python
+  one); a separator; the two Align-by-similarity methods as RADIO
+  items ("Method 1 - fast (Pascal)" / "Method 2 - slow (Python)" --
+  the two non-off values of the single align_by_similarity
+  dropdown; there is deliberately NO "off" item: clicking the
+  checked method again turns it off, so off is always one click
+  away); a separator; and the independent checkable "Absorb
+  trivial equal blocks" toggle. All checkmarks are DERIVED from
+  the current settings on every menu open -- a preset is checked
+  exactly when its feature is on (Preset 1 when the fast align
+  method is on, Preset 2 when Absorb is on), so the live state is
+  visible at a glance. Clicks persist the settings
+  (differ2.algorithm.diff_algorithm /
   differ2.algorithm.beautify.align_by_similarity /
-  differ2.algorithm.beautify.absorb_trivial_equal_blocks -- the same
-  settings the config dialog edits; both presets write Absorb off)
-  and re-runs this tab's
+  differ2.algorithm.beautify.absorb_trivial_equal_blocks -- the
+  same settings the config dialog edits) and re-run this tab's
   compare immediately. The button is disabled while a compare runs
   (like the Ignore dropdown); its tooltip shows the current
-  algorithm + both beautify flags.
+  algorithm + both beautify states (align fast / slow / off,
+  absorb on / off).
 - ⇋ Swap -- swap the two sides of this compare tab (same as the
   "Swap compared editors" command): the texts trade places together
   with their syntax highlighting and per-side settings, and the
@@ -1061,8 +1067,7 @@ files are.
   the native engine's background form for the native algorithms.)
 - Slow-compare offer: when a background compare has been running for
   over a minute and is not already using the fastest combination
-  (Native Myers with both beautify options off -- the Preset 1
-  combination), the plugin asks once:
+  (Native Myers with both beautify options off), the plugin asks once:
   keep waiting, or switch to that faster combination for this compare?
   "Switch" cancels the running compare and re-runs it in the fast mode;
   it is temporary -- it applies to that compare tab until the tab is
@@ -1427,27 +1432,70 @@ Algorithm section:
   (the dash is not). (All expected results verified against the
   engine.)
 - differ2.algorithm.beautify.align_by_similarity: Align by similarity
-  Beautify line alignment inside REPLACE blocks where the two sides have
-  DIFFERENT line counts.
-  - When OFF (algo-faithful): lines are paired top-down by position for
-    the first min(da, db) lines, and leftover lines on the longer side
-    are shown as plain added/deleted lines against a gap at the bottom
-    of the shorter side. Nothing is re-paired or re-ordered.
-    This renders exactly the way the algorithm dictates; for example if
-    native_myers is used it renders the way WinMerge / GNU diffutils
-    side-by-side (sdiff) output does.
-  - When ON (VS Code-like): the engine's hunks are re-paired by
-    similarity -- finds best pairs anchored on the longest unique exact
-    match or the best prefix/suffix-similar pair, char-diffs them, and
-    recurses on both sides. Lines with < 3 chars of similarity are shown
-    as separate delete+add. This re-arranges the engine's output for a
-    more "aligned" look but is no longer a faithful rendering of the
-    diff.
-  This results in a more human-readable diff in some cases, but the
-  compare becomes slower with very big files.
-  Applies to both native and Python algorithms.
-  Equal-count REPLACE blocks (da == db) are positional in BOTH modes, so
-  this option only affects unequal-count REPLACE blocks.
+  A DROPDOWN with three choices that controls how lines inside
+  REPLACE blocks with DIFFERENT line counts on the two sides are
+  paired for display (equal-count REPLACE blocks are positional in
+  every mode, so only unequal-count blocks are affected):
+  - "Off / disabled (algo-faithful rendering)" (the default): lines
+    are paired top-down by position for the first min(da, db) lines,
+    and leftover lines on the longer side are shown as plain
+    added/deleted lines against a gap at the bottom of the shorter
+    side. Nothing is re-paired or re-ordered. This renders exactly
+    the way the algorithm dictates; for example if native_myers is
+    used it renders the way WinMerge / GNU diffutils side-by-side
+    (sdiff) output does.
+  - "Method 1: Fast (Pascal engine, joined-block mapping)": ONE diff
+    engine call per unequal block maps the two sides against each
+    other -- the EQUAL ranges it finds become the aligned line
+    pairs (shown with char-level details like a changed line), the
+    unmatched residuals recurse with progressively looser line
+    keys (stripped text, line prefixes), and only small leftovers
+    (up to 16x16 lines) fall back to the original similarity
+    search. A more "aligned", VS Code-like look at engine speed:
+    the mapping runs inside the same engine call machinery as the
+    main compare (native Pascal for the two native algorithms, the
+    configured pure-Python matcher for the Python ones), so it
+    stays fast even on very big files -- but the view is no longer
+    a faithful rendering of the raw diff.
+  - "Method 2: Slow (original pure-Python recursive search)": the
+    ORIGINAL implementation of this option, kept verbatim: anchor
+    on the longest unique exact match or the best prefix/suffix-
+    similar pair, char-diff the anchor pair, and recurse on both
+    sides. Lines with < 3 chars of similarity show as separate
+    delete+add. The search is O(N*M) per block and recursive -- on
+    files with big unequal blocks the compare becomes MUCH slower
+    than Method 1 (the same inputs that Method 1 aligns in a few
+    dozen milliseconds can take MINUTES with Method 2).
+  Which one should you use?
+  - "off" when you want to see exactly what the engine computed --
+    for verifying an algorithm's behavior, for matching what other
+    diff tools (WinMerge, GNU diff, git diff --side-by-side) show,
+    and for the absolute fastest compare.
+  - "Method 1" when the raw positional rendering of unequal blocks
+    bothers you -- moved/rewritten lines that read as a mess of
+    separate adds and deletes become paired, aligned changes. In
+    practice it finds the same or better anchor pairs as Method 2
+    at a small fraction of the cost, so it is the recommended
+    everyday choice, and it is safe on any file size.
+  - "Method 2" when you want to A/B-compare the two pairing methods
+    on the same inputs (it is kept exactly as it was, so the old
+    output stays reproducible), or for the rare block where you
+    prefer its anchoring: it does not use the engine for the
+    pairing, so it can occasionally pair a very messy block
+    differently (slightly more or fewer anchors). On small files
+    the speed difference is invisible; on big files it is the
+    difference between moments and minutes -- hence the "slow"
+    label.
+  Both methods work with BOTH the native and the pure-Python
+  algorithms. Method 1's sub-diffs always use the CONFIGURED
+  algorithm and the same ignore options (the same engine call as
+  the main compare), so the pairing agrees with the compare's
+  notion of "equal"; Method 2 always runs its own pure-Python
+  search.
+  In the toolbar's Presets dropdown the two methods are the radio
+  pair "Align by similarity: Method 1 - fast (Pascal)" /
+  "Method 2 - slow (Python)"; clicking the checked method again
+  turns it off (no separate off item is needed).
   Default: off.
 - differ2.algorithm.beautify.absorb_trivial_equal_blocks: Absorb
   trivial equal blocks
@@ -1530,13 +1578,19 @@ Advanced section:
     algo-faithful default and the beautify fast path):
     'calls' is the number of produced chunks.
   - compare:align_by_similarity -- the same event production in the
-    beautify mode's anchor / prefix-suffix pairing (present only
-    when align_by_similarity produced unequal-count blocks):
+    slow method's anchor / prefix-suffix pairing (present only
+    when the slow method produced unequal-count blocks):
     'calls' is the number of such blocks. One row per producer, so
     the report always shows WHICH pairing mode the time went to.
+  - align_by_similarity:joined_block_sub_diff -- the ENGINE calls
+    of the FAST method's joined-block mapper (one per unequal
+    block plus the recursion depths), booked as batched marks; on
+    the native path this is the Pascal diff_proc time, so a few
+    dozen milliseconds even on huge files.
   - align_by_similarity:step1_exact_match_search /
     align_by_similarity:step2_prefix_suffix_search -- the two STEPS
-    of the Align-by-similarity beautify, timed per invocation with
+    of the SLOW method's search (and of the fast method's small-
+    leftover fallback), timed per invocation with
     perf_counter and booked as batched marks: step1 builds the
     unique-line index and scans for the longest unique exact match
     (the anchor), step2 (only when no anchor was found) does the
@@ -1586,7 +1640,8 @@ Advanced section:
   file's path, or the tab title for untitled tabs). After the main
   table a 'Beautify passes' block prints each option-gated pass with
   its steps IN RUN ORDER (align_by_similarity: the
-  compare:align_by_similarity umbrella + step1 + step2;
+  compare:align_by_similarity umbrella + the joined_block engine
+  calls of the fast method + step1 + step2 of the slow search;
   absorb_trivial_equal_blocks: the umbrella + step1 + step2), so the
   step costs read as the sequence they run in instead of being
   scattered by the self-time sort; a pass whose rows are all absent
@@ -1697,8 +1752,10 @@ Toolbar section (see the "Toolbar" chapter above for details):
   A toolbar docked to the top of every compare tab: Recompare (Cancel
   while a compare runs), Prev, Next, Copy to left, Copy to right, the
   Ignore-options dropdown (multiple checkable options plus
-  "Uncheck all"), the Presets dropdown (algorithm / beautify-alignment
-  preset combinations), Swap, Resize, the View dropdown (bars / gutters /
+  "Uncheck all"), the Presets dropdown (the two quick beautify
+  presets, the three algorithms, the two Align-by-similarity
+  methods and the Absorb toggle), Swap, Resize, the View dropdown
+  (bars / gutters /
   overview visibility), Config, and a status label on the right
   (compare state + difference count). Every button has a tooltip; the
   toolbar follows UI theme switches and is restored at startup for
@@ -1784,7 +1841,7 @@ also the default configuration except for the two detail options:
 - Set differ2.algorithm.diff_algorithm to "native_myers" (the default).
 - Disable differ2.algorithm.compare_with_details (no
   character-by-character comparison inside changed lines).
-- Disable differ2.algorithm.beautify.align_by_similarity (off by
+- Keep differ2.algorithm.beautify.align_by_similarity at "off" (the
   default: no similarity-based re-pairing of changed blocks).
 - Disable differ2.algorithm.beautify.absorb_trivial_equal_blocks (off
   by default: the engine's raw opcodes are rendered as produced).
@@ -1797,9 +1854,10 @@ Best human-readable compare:
 - Set differ2.algorithm.diff_algorithm to "native_histogram".
 - Enable differ2.algorithm.compare_with_details (highlights the exact
   changed characters inside each modified line).
-- Enable differ2.algorithm.beautify.align_by_similarity (re-pairs
-  similar lines inside changed blocks so they appear aligned, like VS
-  Code does).
+- Set differ2.algorithm.beautify.align_by_similarity to "fast"
+  (re-pairs similar lines inside changed blocks so they appear
+  aligned, like VS Code does, at engine speed -- see the option's
+  "Which one should you use?" notes).
 - Enable differ2.algorithm.beautify.absorb_trivial_equal_blocks
   (merges hunks that the engine split on a matched blank/brace line,
   so one change reads as one change).

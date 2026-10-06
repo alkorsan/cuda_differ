@@ -944,10 +944,6 @@ OPTS_META = [
               'show as separate delete+add. The search is O(N*M) per '
               'block and recursive -- on big files the compare becomes '
               'MUCH slower than Method 1.\n'
-              'Settings from older releases migrate automatically at '
-              'startup: align_by_similarity2=true (or both old flags '
-              'true) -> Method 2 (slow); align_by_similarity=true -> '
-              'Method 1 (fast); anything else -> off.\n'
               'Applies to both native and Python algorithms.\n'
               'Equal-count REPLACE blocks (da == db) are positional in '
               'ALL modes, so this option only affects unequal-count '
@@ -1630,10 +1626,10 @@ class _CompareJob:
 
 def _is_fast_mode(diff):
     """True when the Differ is configured exactly as the slow-compare
-    dialog's 'faster mode' -- the toolbar's Preset 1 combination: the
-    NATIVE engine running Native Myers with ALL beautify options off
-    (every Align-by-similarity mode and the absorb pass). A job started
-    this way never arms the slow-compare watchdog."""
+    dialog's 'faster mode' -- the NATIVE engine running Native Myers
+    with ALL beautify options off (every Align-by-similarity mode and
+    the absorb pass). A job started this way never arms the
+    slow-compare watchdog."""
     return (isinstance(diff, dfn.Differ)
             and getattr(diff, 'diff_algorithm', '') == 'native_myers'
             and not getattr(diff, 'align_by_similarity', False)
@@ -3376,34 +3372,7 @@ class Command:
         We use on_start2 (not on_start) because on_start fires too early --
         before session restore completes. By on_start2, all editors exist
         and CudaText has finished restoring the modified flag/tab colors."""
-        # Migrate the settings of older releases to the SINGLE
-        # align_by_similarity dropdown FIRST (idempotent): writes the
-        # resolved mode as the dropdown's string value and clears the
-        # legacy align_by_similarity2 bool, so the config dialog's
-        # dropdown and the toolbar both start from a clean value.
-        self._normalize_align_opts()
         self._restore_session_tabs()
-
-    def _normalize_align_opts(self):
-        """One-time (idempotent) settings migration to the SINGLE
-        align_by_similarity dropdown config: resolve the current value
-        (legacy bools and the previous build's align_by_similarity2 key
-        included -- see toolbar.resolve_align_mode), then write it back
-        as the dropdown's plain string value and clear the legacy key.
-        After this the stored state is exactly what the dropdown
-        shows: one of 'off' / 'fast' / 'slow'. Safe to call at any
-        time; every read path works with or without it."""
-        try:
-            raw = get_opt('algorithm.beautify.align_by_similarity', 'off')
-            legacy2 = get_opt('algorithm.beautify.align_by_similarity2',
-                              False)
-            if raw in difftb.ALIGN_MODES and not legacy2:
-                return  # already a clean dropdown value
-            mode = difftb.get_align_mode()
-            set_opt('algorithm.beautify.align_by_similarity', mode)
-            set_opt('algorithm.beautify.align_by_similarity2', False)
-        except Exception:
-            pass
 
     def _restore_session_tabs(self):
         """Re-attach the plugin's runtime world to the compare tabs of the
@@ -4572,9 +4541,9 @@ class Command:
                         _algo, self.cfg.get('diff_algorithm', 'native_myers')))
             if getattr(session, 'fast_temp', False):
                 # Temporary fast mode (the slow-compare dialog's
-                # 'faster mode' -- the exact Preset 1 combination):
-                # ALL beautify options off for this compare tab,
-                # regardless of the configured options.
+                # 'faster mode': Native Myers with EVERY beautify
+                # option off) for this compare tab, regardless of
+                # the configured options.
                 diff.align_by_similarity = False
                 diff.align_by_similarity2 = False
                 diff.absorb_trivial_equal_blocks = False
@@ -6966,8 +6935,7 @@ class Command:
         # The resolved Align-by-similarity mode of the SINGLE dropdown
         # config ('differ2.algorithm.beautify.align_by_similarity' = one
         # of 'off' / 'fast' / 'slow'), read through the shared resolver
-        # so the toolbar, this config dict and the startup
-        # normalization all agree (legacy values included).
+        # so the toolbar and this config dict always agree.
         _align_mode = difftb.get_align_mode()
         config = {
             'opt_time':
