@@ -57,17 +57,22 @@
   -- the pure-Python Patience + Myers O(NP) combination that was
   already the fallback on CudaText builds without diff_proc; the
   "(slow)" word in its caption marks it as the non-native one. The
-  two presets are QUICK TOGGLES of the two beautify features now,
-  not fixed algorithm combinations: "Preset 1: Align by similarity -
-  Method 1 (fast)" toggles the fast align method, "Preset 2: Absorb
-  trivial equal blocks" toggles the Absorb pass -- each writes ONLY
-  its own setting (the algorithm and the other beautify option stay
-  exactly as they are), so both can be checked at once and they are
-  plain checkable items, not a radio pair. The align methods are a
-  radio pair with NO "off" item: clicking the checked method again
-  turns it off (when neither method shows a dot, the stored value IS
-  'off'), which is why the off state needs no third item. The
-  button tooltip and the click status line show the align state as
+  two presets keep their ORIGINAL form -- each stays one exact
+  radio-checked combination of the three settings (algorithm +
+  align method + absorb), a click writes all three -- with only the
+  align / absorb values updated for the new dropdown world:
+  "Preset 1: Fastest comparison - Myers, Align Method 1 (fast),
+  Absorb Off" (align off -> the FAST method; algorithm and absorb
+  unchanged) and "Preset 2: Better readability (slower) - Histogram,
+  Align Method 2 (slow), Absorb On" (the preset's "Align On" WAS
+  the slow method all along, so it stays Method 2; absorb off ->
+  on). A preset mark still means the settings match its combination
+  EXACTLY; anything else (align off, the Hybrid algorithm, a custom
+  pick) checks neither preset. The align methods are a radio pair
+  with NO "off" item: clicking the checked method again turns it
+  off (when neither method shows a dot, the stored value IS 'off'),
+  which is why the off state needs no third item. The button
+  tooltip and the click status line show the align state as
   fast / slow / off.
 * change: readme/readme.txt documents the dropdown, both methods, and
   a "Which one should you use?" guide with each choice's use case

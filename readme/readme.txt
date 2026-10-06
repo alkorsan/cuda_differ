@@ -871,36 +871,40 @@ into the compare view):
   While a pure-Python algorithm is the effective one, the items
   disable themselves and an explanatory item heads the menu (same
   guard as the tab context menu).
-- ★ Preset ▾ -- dropdown with the quick beautify presets, the
-  algorithms and the beautify toggles. In order: the two PRESETS
-  ("Preset 1: Align by similarity - Method 1 (fast)" turns the fast
-  similarity-alignment method on / off; "Preset 2: Absorb trivial
-  equal blocks" toggles the Absorb pass; each preset changes ONLY
-  its own setting -- the algorithm and the other beautify option
-  stay as they are -- so both can be checked at once and they are
-  plain CHECKABLE items, not a radio pair); a separator; the three
-  algorithms as RADIO items ("Algorithm 1: Native Histogram",
-  "Algorithm 2: Native Myers", "Algorithm 3: Hybrid Python (slow)"
-  -- mutually exclusive; the "slow" word marks the pure-Python
-  one); a separator; the two Align-by-similarity methods as RADIO
-  items ("Method 1 - fast (Pascal)" / "Method 2 - slow (Python)" --
-  the two non-off values of the single align_by_similarity
-  dropdown; there is deliberately NO "off" item: clicking the
-  checked method again turns it off, so off is always one click
-  away); a separator; and the independent checkable "Absorb
-  trivial equal blocks" toggle. All checkmarks are DERIVED from
-  the current settings on every menu open -- a preset is checked
-  exactly when its feature is on (Preset 1 when the fast align
-  method is on, Preset 2 when Absorb is on), so the live state is
-  visible at a glance. Clicks persist the settings
+- ★ Preset ▾ -- dropdown with quick "preset" combinations: "Preset 1:
+  Fastest comparison - Myers, Align Method 1 (fast), Absorb Off" and
+  "Preset 2: Better readability (slower) - Histogram, Align Method 2
+  (slow), Absorb On" -- the original preset combinations with only
+  their align / absorb values updated for the two align methods
+  (Preset 1 turned align on, with the FAST method; Preset 2 turned
+  absorb on -- its "Align On" stays the slow readability method it
+  always was). The two presets are RADIO items (a dot mark instead
+  of a checkmark; clicking one unchecks the other), so at most one
+  is ever marked. After a separator, "Algorithm 1: Native
+  Histogram", "Algorithm 2: Native Myers" and "Algorithm 3: Hybrid
+  Python (slow)" (also radio items, also mutually exclusive; the
+  "slow" word marks the pure-Python one), a separator, the two
+  Align-by-similarity methods as RADIO items ("Method 1 - fast
+  (Pascal)" / "Method 2 - slow (Python)" -- the two non-off values
+  of the single align_by_similarity dropdown; there is deliberately
+  NO "off" item: clicking the checked method again turns it off, so
+  off is always one click away), a separator, and the independent
+  checkable "Absorb trivial equal blocks" toggle. The preset marks
+  are DERIVED from the current settings on every menu open -- a
+  preset is an EXACT combination of three settings: Native Myers +
+  Align Method 1 (fast) + Absorb off checks Preset 1, Native
+  Histogram + Align Method 2 (slow) + Absorb on checks Preset 2,
+  any other combination (Align off, the Hybrid algorithm, included)
+  checks NEITHER -- so a custom selection is visible at a glance.
+  Picking a preset writes ALL THREE settings
   (differ2.algorithm.diff_algorithm /
   differ2.algorithm.beautify.align_by_similarity /
-  differ2.algorithm.beautify.absorb_trivial_equal_blocks -- the
-  same settings the config dialog edits) and re-run this tab's
-  compare immediately. The button is disabled while a compare runs
-  (like the Ignore dropdown); its tooltip shows the current
-  algorithm + both beautify states (align fast / slow / off,
-  absorb on / off).
+  differ2.algorithm.beautify.absorb_trivial_equal_blocks -- the same
+  settings the config dialog edits; Preset 1 writes Absorb off,
+  Preset 2 writes Absorb on) and re-runs this tab's compare
+  immediately. The button is disabled while a compare runs (like
+  the Ignore dropdown); its tooltip shows the current algorithm +
+  both beautify states (align fast / slow / off, absorb on / off).
 - ⇋ Swap -- swap the two sides of this compare tab (same as the
   "Swap compared editors" command): the texts trade places together
   with their syntax highlighting and per-side settings, and the
@@ -1752,10 +1756,10 @@ Toolbar section (see the "Toolbar" chapter above for details):
   A toolbar docked to the top of every compare tab: Recompare (Cancel
   while a compare runs), Prev, Next, Copy to left, Copy to right, the
   Ignore-options dropdown (multiple checkable options plus
-  "Uncheck all"), the Presets dropdown (the two quick beautify
-  presets, the three algorithms, the two Align-by-similarity
-  methods and the Absorb toggle), Swap, Resize, the View dropdown
-  (bars / gutters /
+  "Uncheck all"), the Presets dropdown (algorithm / beautify-alignment
+  preset combinations, the three algorithms, the two
+  Align-by-similarity methods and the Absorb toggle), Swap, Resize,
+  the View dropdown (bars / gutters /
   overview visibility), Config, and a status label on the right
   (compare state + difference count). Every button has a tooltip; the
   toolbar follows UI theme switches and is restored at startup for
