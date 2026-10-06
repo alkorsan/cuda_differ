@@ -52,8 +52,9 @@ TWO-PHASE ASYNCHRONOUS DESIGN (both engine jobs run off the UI thread):
   joined-block search (align_joined.py) runs in the collect pass, its
   per-block plans are cached on the Differ (see _take_align_plan) and
   the replay pass reuses them verbatim, so the whole search runs once
-  per compare, not twice. The legacy slow beautify (align_by_similarity2
-  -> _find_best_pairs_events) takes no plan cache: its recursive search
+  per compare, not twice. The legacy slow beautify (Method 2 'slow'
+  of the align_by_similarity dropdown -> _find_best_pairs_events)
+  takes no plan cache: its recursive search
   runs in both passes, but the walk stays deterministic, so the
   collect pass's _char_diff RECORDS and the replay pass's pops keep
   their order-matching guarantee exactly the same way.
@@ -595,8 +596,9 @@ class Differ:
         compare() by the caller (Command.refresh_compare), used as locals
         inside compare() to drive the engine + painting, and dropped
         when compare() returns. Between compares, the Differ holds
-        only config (withdetail / diff_algorithm / align_by_similarity /
-        align_by_similarity2 / absorb_trivial_equal_blocks /
+        only config (withdetail / diff_algorithm / the two flags of
+        the align_by_similarity dropdown /
+        absorb_trivial_equal_blocks /
         ignore_flags / break_chars) and the diffmap (line-index
         tuples, small). The text itself stays in the editor tabs'
         Pascal-side buffers (a_ed / b_ed), which are the source of
@@ -606,16 +608,17 @@ class Differ:
         self.withdetail = True
         self.diff_algorithm = 'native_myers'
         self.align_by_similarity = False
-        # 'differ2.algorithm.beautify.align_by_similarity2' -- the OLD
-        # slow pure-Python beautify: the original recursive best-pair
+        # The slow-method bit of the SINGLE 'align_by_similarity'
+        # dropdown ('differ2.algorithm.beautify.align_by_similarity' =
+        # 'fast' / 'slow' / 'off'): True = Method 2, the OLD slow
+        # pure-Python beautify -- the original recursive best-pair
         # search (_find_best_pairs_events: longest unique exact-match
         # anchor, else O(N*M) prefix/suffix scoring per block). Kept
         # side by side with the fast joined-block mapper above so the
-        # two methods can be A/B-switched from the toolbar. MUTUALLY
-        # EXCLUSIVE with align_by_similarity: the plugin resolves the
-        # pair before every compare (align_by_similarity2 wins when a
-        # hand-edited JSON sets both) and _replace_block_chunks applies
-        # the same priority, so at most one of the two ever runs.
+        # two methods can be A/B-switched from the toolbar. Exactly
+        # one of the two flags is on by construction (get_config feeds
+        # them from the one dropdown value); defensively, this one
+        # wins if a directly constructed Differ sets both.
         self.align_by_similarity2 = False
         # 'differ2.algorithm.beautify.absorb_trivial_equal_blocks' --
         # when True, the engine's finished opcodes go through
@@ -1576,9 +1579,10 @@ class Differ:
         entirely different 1M-line files come as ONE replace opcode)
         do not materialize their whole event stream at once.
 
-        Three rendering modes, selected by the two MUTUALLY EXCLUSIVE
-        beautify flags (align_by_similarity / align_by_similarity2 --
-        see __init__; when both are somehow set on a directly
+        Three rendering modes, selected by the two flags of the SINGLE
+        align_by_similarity dropdown (Method 1 'fast' / Method 2
+        'slow' / 'off' -- see __init__; exactly one bit is on by
+        construction, and when both are somehow set on a directly
         constructed Differ, align_by_similarity2 wins in the branch
         below):
 
@@ -1651,7 +1655,8 @@ class Differ:
         if (self.align_by_similarity or self.align_by_similarity2) \
                 and da != db:
             if self.align_by_similarity2:
-                # SLOW legacy beautify (align_by_similarity2): the
+                # SLOW legacy beautify (Method 2 'slow' of the single
+                # align_by_similarity dropdown): the
                 # original pure-Python recursive search, restored
                 # verbatim. anchor + prefix/suffix scoring + threshold
                 # and staggering. Produced into ONE list (the recursive
@@ -1674,7 +1679,8 @@ class Differ:
                 yield evs
                 return
 
-            # FAST beautify (align_by_similarity): joined-block mapping
+            # FAST beautify (Method 1 'fast' of the dropdown):
+            # joined-block mapping
             # (align_joined.py): the engine maps the block's sides,
             # Python only translates. The plan is computed ONCE
             # (COLLECT pass) and cached -- the REPLAY pass pops it and
@@ -1766,7 +1772,8 @@ class Differ:
                 y = y2
 
     def _find_best_pairs_events(self, out, a, alo, ahi, b, blo, bhi):
-        """(LEGACY beautify mode -- align_by_similarity2) The OLD slow
+        """(LEGACY beautify mode -- Method 2 'slow' of the single
+        align_by_similarity dropdown) The OLD slow
         pure-Python line alignment within a sub-REPLACE block,
         APPENDING events to `out`. Kept verbatim from the original
         implementation (the code this module ran under the

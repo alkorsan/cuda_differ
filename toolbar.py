@@ -95,27 +95,28 @@ Implementation notes:
   the beautify flags: two mutually exclusive RADIO presets
   ("Preset 1: Fastest comparison - Myers, Align Off, Absorb Off",
   "Preset 2: Better readability (slower) - Histogram, Align On,
-  Absorb Off"), a separator,
-  two mutually exclusive RADIO algorithms ("Algorithm 1: Native
-  Histogram", "Algorithm 2: Native Myers"), then the mutually
-  exclusive RADIO pair of the two align methods ("Align by
-  similarity" -- the FAST engine-driven joined-block mapper -- and
-  "Align by similarity 2 (slow)" -- the original pure-Python
-  recursive search) and the independent checkable toggle "Absorb
+  Absorb Off"), a separator, the mutually exclusive RADIO
+  algorithms ("Algorithm 1: Native Histogram", "Algorithm 2: Native
+  Myers", "Algorithm 3: Hybrid Python (slow)"), a separator, the
+  three mutually exclusive RADIO choices of the SINGLE
+  align_by_similarity dropdown config ("Align by similarity:
+  Method 1 - fast (Pascal)" -- the engine-driven joined-block
+  mapper; "Align by similarity: Method 2 - slow (Python)" -- the
+  original pure-Python recursive search; "Align by similarity:
+  off"), a separator, and the independent checkable toggle "Absorb
   trivial equal blocks". It is REBUILT on every
   open, so the checkmarks always mirror settings/cuda_differ2.json,
   and the preset checkmarks are DERIVED from it -- a preset is an
-  EXACT combination of four settings: Preset 1 = native Myers +
-  both aligns off + absorb off, Preset 2 = native Histogram + the
-  FAST align on + the slow align off + absorb off; any other
-  combination (absorb on, or the slow align on, included) checks
-  NEITHER (a custom selection is visible at a glance). Clicks persist
+  EXACT combination: Preset 1 = native Myers + align off + absorb
+  off; Preset 2 = native Histogram + align Method 1 (fast) +
+  absorb off; any other combination (absorb on, the slow method
+  on, the Hybrid Python algorithm, included) checks NEITHER (a
+  custom selection is visible at a glance). Clicks persist
   'differ2.algorithm.*' (the config dialog's store) and re-compare
-  this tab on the 100ms timer, like the ignore items. Clicking the
-  checked align method turns it back OFF (both off = the
-  algo-faithful rendering); clicking one while the other is checked
-  switches methods (each click writes BOTH flags, so the pair can
-  never be on together).
+  this tab on the 100ms timer, like the ignore items. The three
+  align items write the single dropdown VALUE (one key -- nothing
+  to get out of sync); clicking the checked Method 1/2 item turns
+  it back off (off = the algo-faithful rendering).
 
 * The VIEW dropdown toggles the surrounding UI from the compare tab:
   "Hide all" flips every item at once; "Show all" everything EXCEPT
@@ -260,12 +261,14 @@ def _set_ignore_opt(key, val):
 
 
 # The Presets dropdown's items: two mutually exclusive preset
-# combinations, a separator, the two native algorithms (also mutually
-# exclusive), the two beautify ALIGN methods (ALSO mutually exclusive
-# -- 'differ2.algorithm.beautify.align_by_similarity' is the FAST
-# engine-driven joined-block mapper, 'align_by_similarity2' is the
-# OLD slow pure-Python recursive search; the "slow" word in the
-# caption marks it) and the independent absorb toggle
+# combinations, a separator, the three algorithms (also mutually
+# exclusive: the two native ones + the pure-Python Hybrid), a
+# separator, the THREE choices of the SINGLE beautify dropdown
+# ('differ2.algorithm.beautify.align_by_similarity' holds one of
+# 'fast' / 'slow' / 'off' -- Method 1 is the FAST engine-driven
+# joined-block mapper, Method 2 the OLD slow pure-Python recursive
+# search, and the "slow" word in the caption marks it), a
+# separator, and the independent absorb toggle
 # ('differ2.algorithm.beautify.absorb_trivial_equal_blocks').
 # Each entry: (menu key, menu caption); None = the separator.
 # Toolbar-only -- the config dialog / tab context menu keep their own
@@ -278,8 +281,12 @@ _PRESET_ITEMS = (
     (None, None),
     ('algo1',    _('Algorithm 1: Native Histogram')),
     ('algo2',    _('Algorithm 2: Native Myers')),
-    ('beautify', _('Align by similarity')),
-    ('beautify2', _('Align by similarity 2 (slow)')),
+    ('algo3',    _('Algorithm 3: Hybrid Python (slow)')),
+    (None, None),
+    ('beautify_fast',  _('Align by similarity: Method 1 - fast (Pascal)')),
+    ('beautify_slow',  _('Align by similarity: Method 2 - slow (Python)')),
+    ('beautify_off',   _('Align by similarity: off')),
+    (None, None),
     ('absorb',   _('Absorb trivial equal blocks')),
 )
 
@@ -288,27 +295,33 @@ _PRESET_ITEMS = (
 # mechanism: items marked RadioItem that share a GroupIndex form one
 # group; clicking one checks it and auto-unchecks the others, and the
 # mark renders as a radio dot instead of a checkmark). The two
-# presets form one group, the two algorithms another, and the two
-# align methods a third; the absorb toggle stays a plain checkable
-# item (it is independent). Purely visual polish -- the checkmarks
-# are still re-derived from the settings on every menu open, and the
-# click handlers write the same exclusive values, so behavior is
-# unchanged without it.
+# presets form one group, the three algorithms another, and the
+# three align-mode choices a third; the absorb toggle stays a plain
+# checkable item (it is independent). Purely visual polish -- the
+# checkmarks are still re-derived from the settings on every menu
+# open, and the click handlers write the same exclusive values, so
+# behavior is unchanged without it.
 _PRESET_RADIO = {
     'preset1': 1,
     'preset2': 1,
     'algo1': 2,
     'algo2': 2,
-    'beautify': 3,
-    'beautify2': 3,
+    'algo3': 2,
+    'beautify_fast': 3,
+    'beautify_slow': 3,
+    'beautify_off': 3,
 }
 
 # Values written to 'differ2.algorithm.diff_algorithm' by the preset /
 # algorithm items (the same values the config dialog writes; on older
-# CudaText builds without diff_proc the plugin falls back to the closest
-# pure-Python algorithm).
+# CudaText builds without diff_proc the plugin falls back to the
+# closest pure-Python algorithm -- native_histogram -> hybrid,
+# native_myers -> myers. 'hybrid' IS a pure-Python algorithm, so it
+# runs everywhere; it is the "third algorithm" of the menu, and the
+# "(slow)" word in its caption marks that it is not a native one).
 _ALGO_MYERS = 'native_myers'
 _ALGO_HIST = 'native_histogram'
+_ALGO_HYBRID = 'hybrid'
 
 
 def _get_diff_algo():
@@ -326,52 +339,93 @@ def _set_diff_algo(val):
                        user_json=_JSON_FILE)
 
 
-def _get_beautify():
-    """The Align-by-similarity flag
-    ('differ2.algorithm.beautify.align_by_similarity'), read live from
-    the settings."""
-    return bool(ctx.get_opt(
-        'differ2.algorithm.beautify.align_by_similarity', False,
-        user_json=_JSON_FILE))
+# --- The SINGLE Align-by-similarity dropdown config ------------------
+# 'differ2.algorithm.beautify.align_by_similarity' is ONE option with
+# three values ('fast' / 'slow' / 'off'), rendered as a dropdown in
+# the config dialog and as the radio trio of the Presets menu. It
+# replaces the former bool pair (align_by_similarity +
+# align_by_similarity2): ONE stored value -- the "both methods on"
+# state of the old pair is structurally impossible now. The resolver
+# below still understands the LEGACY values, so a settings file from
+# an older release migrates automatically (see resolve_align_mode).
+
+ALIGN_FAST = 'fast'
+ALIGN_SLOW = 'slow'
+ALIGN_OFF = 'off'
+# All valid values of the dropdown (the OPTS_META 'dct' keys of
+# __init__ -- listed there in the display order off / fast / slow).
+ALIGN_MODES = (ALIGN_OFF, ALIGN_FAST, ALIGN_SLOW)
+
+_ALIGN_OPT = 'differ2.algorithm.beautify.align_by_similarity'
+# The PREVIOUS build's legacy option (bool): true meant the OLD slow
+# pure-Python method. Read ONLY for migration; every write of the
+# new dropdown clears it, and on_start2's normalization retires it
+# for good (Command._normalize_align_opts).
+_ALIGN_OPT_LEGACY2 = 'differ2.algorithm.beautify.align_by_similarity2'
 
 
-def _set_beautify(val):
-    """Write 'differ2.algorithm.beautify.align_by_similarity' to the
-    plugin's settings (same store the config dialog uses)."""
-    return ctx.set_opt(
-        'differ2.algorithm.beautify.align_by_similarity', bool(val),
-        user_json=_JSON_FILE)
+def resolve_align_mode(legacy_slow, raw_val):
+    """PURE value resolver of the single align_by_similarity dropdown:
+    returns ALIGN_FAST / ALIGN_SLOW / ALIGN_OFF from the raw stored
+    value plus the legacy key. Shared by the toolbar,
+    Command.get_config and the startup normalization -- ONE rule
+    everywhere.
+
+    Migration of an older release's settings (the only place any
+    'priority' is still needed -- with the dropdown itself the state
+    is one string, so two methods can never be on at once):
+    - legacy_slow (align_by_similarity2=true) wins over everything:
+      it was the explicit "I want the old method" opt-in, so a
+      hand-set slow flag keeps meaning slow (and both old bools on
+      resolve to slow -- the same slow-wins rule the former pair
+      applied);
+    - raw_val True (the previous build's align_by_similarity=true)
+      means the FAST joined-block method;
+    - raw_val False / 'off' / anything unexpected -> off."""
+    if legacy_slow:
+        return ALIGN_SLOW
+    if raw_val is True:
+        return ALIGN_FAST
+    if raw_val in (ALIGN_FAST, ALIGN_SLOW):
+        return raw_val
+    return ALIGN_OFF
 
 
-def _get_beautify2():
-    """The legacy SLOW Align-by-similarity-2 flag
-    ('differ2.algorithm.beautify.align_by_similarity2' -- the OLD
-    pure-Python recursive search), read live from the settings."""
-    return bool(ctx.get_opt(
-        'differ2.algorithm.beautify.align_by_similarity2', False,
-        user_json=_JSON_FILE))
+def get_align_mode():
+    """The RESOLVED Align-by-similarity mode (one of ALIGN_MODES),
+    read live from the plugin's settings (mtime-cached by cudax_lib,
+    so config-dialog / toolbar / hand-edited changes are picked up at
+    once). Legacy bool values and the previous build's
+    align_by_similarity2 key resolve through resolve_align_mode."""
+    return resolve_align_mode(
+        bool(ctx.get_opt(_ALIGN_OPT_LEGACY2, False, user_json=_JSON_FILE)),
+        ctx.get_opt(_ALIGN_OPT, ALIGN_OFF, user_json=_JSON_FILE))
 
 
-def _set_beautify2(val):
-    """Write 'differ2.algorithm.beautify.align_by_similarity2' to the
-    plugin's settings (same store the config dialog uses)."""
-    return ctx.set_opt(
-        'differ2.algorithm.beautify.align_by_similarity2', bool(val),
-        user_json=_JSON_FILE)
+def set_align_mode(mode):
+    """Write the single 'differ2.algorithm.beautify.align_by_similarity'
+    dropdown value to the plugin's settings (the config dialog's
+    store) and CLEAR the legacy align_by_similarity2 key, so a
+    leftover true from an older release can never override the
+    dropdown again."""
+    if mode not in (ALIGN_FAST, ALIGN_SLOW):
+        mode = ALIGN_OFF
+    ctx.set_opt(_ALIGN_OPT, mode, user_json=_JSON_FILE)
+    ctx.set_opt(_ALIGN_OPT_LEGACY2, False, user_json=_JSON_FILE)
+    return mode
 
 
 def _align_state_text():
     """The live Align-by-similarity state as one word for the status
-    line and the Presets tooltip: 'slow' (align_by_similarity2, the
-    old pure-Python recursive search), 'fast' (align_by_similarity,
-    the engine-driven joined-block mapper) or 'off'. The two flags
-    are mutually exclusive; when a hand-edited JSON somehow sets
-    both, the slow one wins -- the same resolution Command.get_config
-    applies."""
-    if _get_beautify2():
-        return _('slow')
-    if _get_beautify():
+    line and the Presets tooltip: 'fast' (Method 1: the engine-driven
+    joined-block mapper), 'slow' (Method 2: the original pure-Python
+    recursive search) or 'off' -- the resolved value of the single
+    dropdown config (see get_align_mode)."""
+    mode = get_align_mode()
+    if mode == ALIGN_FAST:
         return _('fast')
+    if mode == ALIGN_SLOW:
+        return _('slow')
     return _('off')
 
 
@@ -899,8 +953,8 @@ class CompareToolbar:
         (read from the settings file, so it is always current -- the
         same 'know the current state without opening it' feedback the
         Ignore tooltip's enabled-list gives). The align state shows as
-        fast / slow / off: the two methods are mutually exclusive
-        (see _align_state_text)."""
+        fast / slow / off: the resolved value of the single
+        align_by_similarity dropdown (see _align_state_text)."""
         return '\r'.join((
             _('Comparison presets: algorithm and beautify options'),
             '{}: {} / {} {} / {} {}'.format(
@@ -1269,24 +1323,25 @@ class CompareToolbar:
 
     def rebuild_preset_menu(self):
         """(Re)build the Presets dropdown: the two mutually exclusive
-        presets, a separator, the two native algorithms (also mutually
-        exclusive), the two beautify ALIGN methods (ALSO mutually
-        exclusive -- "Align by similarity" fast / "Align by
-        similarity 2 (slow)" legacy) and the independent "Absorb
-        trivial equal blocks" toggle.
+        presets, a separator, the three algorithms (also mutually
+        exclusive: Native Histogram / Native Myers / Hybrid Python),
+        a separator, the THREE radio choices of the SINGLE
+        align_by_similarity dropdown config ("Method 1 - fast
+        (Pascal)" / "Method 2 - slow (Python)" / "off"), a separator,
+        and the independent "Absorb trivial equal blocks" toggle.
 
-        The presets, the algorithms and the align methods are RADIO
-        items (a dot, not a checkmark -- see _PRESET_RADIO); the
-        absorb toggle is a plain checkable item.
+        The presets, the algorithms and the align-mode choices are
+        RADIO items (a dot, not a checkmark -- see _PRESET_RADIO);
+        the absorb toggle is a plain checkable item.
 
         The checkmarks are DERIVED from the settings file -- a preset
-        is an EXACT combination of four settings: native
-        Myers + both aligns off + absorb off -> Preset 1 checked;
-        native Histogram + fast align on + slow align off + absorb
-        off -> Preset 2 checked; any other combination -> NEITHER
-        preset checked, so a custom selection is visible at a glance.
-        Called on every open (popup_preset_menu); the whole body is
-        guarded like the ignore twin's."""
+        is an EXACT combination: native Myers + align off + absorb
+        off -> Preset 1 checked; native Histogram + align Method 1
+        (fast) + absorb off -> Preset 2 checked; any other combination
+        (absorb on, the slow method on, the Hybrid Python algorithm)
+        -> NEITHER preset checked, so a custom selection is visible at
+        a glance. Called on every open (popup_preset_menu); the whole
+        body is guarded like the ignore twin's."""
         if self.h_dlg is None:
             return
         try:
@@ -1300,26 +1355,29 @@ class CompareToolbar:
         ct.menu_proc(self.h_pmenu, ct.MENU_CLEAR)
 
         algo = _get_diff_algo()
-        beautify2 = _get_beautify2()
-        # Mutual exclusivity of the two align methods, resolved the
-        # same way Command.get_config resolves the pair: the SLOW one
-        # wins when a hand-edited JSON sets both (a hand-set slow flag
-        # is the deliberate "I want the old method" choice).
-        beautify = _get_beautify() and not beautify2
+        # The RESOLVED value of the single align_by_similarity
+        # dropdown (legacy bool values and the previous build's
+        # align_by_similarity2 key included -- see get_align_mode):
+        # exactly ONE of the three radio items is checked, always.
+        align_mode = get_align_mode()
         absorb = _get_absorb()
         marks = {
-            # a preset is an EXACT combination of four settings --
-            # absorb on unchecks BOTH (it is not part of either
-            # preset's combination), and so does the slow align
-            # (Preset 2's "Align On" means the FAST method)
-            'preset1': algo == _ALGO_MYERS and not beautify
-                       and not beautify2 and not absorb,
-            'preset2': algo == _ALGO_HIST and beautify
-                       and not beautify2 and not absorb,
+            # a preset is an EXACT combination of settings -- absorb on
+            # unchecks BOTH (it is not part of either preset's
+            # combination), and so do the slow method (Preset 2's
+            # "Align On" means Method 1, the fast one) and the Hybrid
+            # Python algorithm (the presets' algorithms are the native
+            # pair)
+            'preset1': algo == _ALGO_MYERS
+                       and align_mode == ALIGN_OFF and not absorb,
+            'preset2': algo == _ALGO_HIST
+                       and align_mode == ALIGN_FAST and not absorb,
             'algo1': algo == _ALGO_HIST,
             'algo2': algo == _ALGO_MYERS,
-            'beautify': beautify,
-            'beautify2': beautify2,
+            'algo3': algo == _ALGO_HYBRID,
+            'beautify_fast': align_mode == ALIGN_FAST,
+            'beautify_slow': align_mode == ALIGN_SLOW,
+            'beautify_off': align_mode == ALIGN_OFF,
             'absorb': absorb,
         }
         for key, caption in _PRESET_ITEMS:
@@ -1377,53 +1435,52 @@ class CompareToolbar:
         re-compare this tab on the 100ms timer (the menu-close-first
         convention) -- refresh_compare re-reads the settings file (its
         mtime cache), so this very refresh already uses the new
-        algorithm / beautify flags. A preset click writes ALL FOUR
-        settings of its exact combination (the algorithm, both Align
-        by similarity flags, Absorb trivial equal blocks -- both
-        presets have align on the FAST method and absorb off). The
-        two align items are mutually exclusive: each click writes
-        BOTH align flags, so switching one on always switches the
-        other off, and clicking the currently-checked method turns it
-        back off (both off = algo-faithful). The menu is rebuilt on
-        every open, so the new checkmarks show up the next time it
-        pops."""
+        algorithm / align mode. A preset click writes ALL settings of
+        its exact combination (the algorithm, the align mode, absorb
+        -- both presets use a native algorithm, align off / Method 1
+        and absorb off).
+        The three align items write the SINGLE dropdown value through
+        set_align_mode -- one key, so the methods are exclusive by
+        construction (nothing to keep in step) -- and clicking the
+        currently-checked Method 1/2 item turns it back off (off =
+        algo-faithful). The menu is rebuilt on every open, so the new
+        checkmarks show up the next time it pops."""
         algo = None          # None = leave the option unchanged
-        beautify = None
-        beautify2 = None
+        align_mode = None
         absorb = None
         if action == 'preset1':
             algo = _ALGO_MYERS
-            beautify, beautify2, absorb = False, False, False
+            align_mode, absorb = ALIGN_OFF, False
         elif action == 'preset2':
             algo = _ALGO_HIST
-            beautify, beautify2, absorb = True, False, False
+            align_mode, absorb = ALIGN_FAST, False
         elif action == 'algo1':
             algo = _ALGO_HIST
         elif action == 'algo2':
             algo = _ALGO_MYERS
-        elif action == 'beautify':
-            # Toggle the FAST method; the pair is exclusive, so the
-            # write always clears the slow flag. The toggle reads the
-            # RESOLVED state (slow wins when both raw flags are on),
-            # so clicking 'beautify' in that mixed state simply turns
-            # the fast method cleanly on.
-            beautify = not (_get_beautify() and not _get_beautify2())
-            beautify2 = False
-        elif action == 'beautify2':
-            # Toggle the SLOW legacy method; the pair is exclusive, so
-            # the write always clears the fast flag.
-            beautify2 = not _get_beautify2()
-            beautify = False
+        elif action == 'algo3':
+            algo = _ALGO_HYBRID
+        elif action == 'beautify_fast':
+            # Toggle Method 1 (fast): off when it is already the
+            # current mode (the old toggle-off workflow), on when
+            # anything else (off / the slow method) is current.
+            align_mode = ALIGN_OFF if get_align_mode() == ALIGN_FAST \
+                else ALIGN_FAST
+        elif action == 'beautify_slow':
+            # Toggle Method 2 (slow): off when it is already the
+            # current mode, on when anything else is current.
+            align_mode = ALIGN_OFF if get_align_mode() == ALIGN_SLOW \
+                else ALIGN_SLOW
+        elif action == 'beautify_off':
+            align_mode = ALIGN_OFF
         elif action == 'absorb':
             absorb = not _get_absorb()
         else:
             return
         if algo is not None:
             _set_diff_algo(algo)
-        if beautify is not None:
-            _set_beautify(beautify)
-        if beautify2 is not None:
-            _set_beautify2(beautify2)
+        if align_mode is not None:
+            set_align_mode(align_mode)
         if absorb is not None:
             _set_absorb(absorb)
         try:
