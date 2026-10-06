@@ -16,13 +16,15 @@ must not consome more than 30s
 must not consome more than 10s
 
 - test_2 files
-this lines must align exactly like that (using naive histogram algo or hybrid python algo + beautify):
+this lines must align exactly like that (using naive histogram algo or hybrid python algo + align_by_similarity):
 273 """Register a compare tab       259 """Register a compare tab     like vscode 
 291 entry = state  now align with   297 entry = session               like vscode
 
-538 def on_change_slow(self, ed_self):   663 def on_change_slow(self, ed_self):
+hybrid python algo not histogram + align_by_similarity
+538 def on_change_slow(self, ed_self):   663 def on_change_slow(self, ed_self):     
 542 def on_save(self, ed_self):          670 def on_save_pre(self, ed_self):
-    
+
+
 this empty lines must align and not be absorbed by the blocks over or bellow them
 258-242
 271-255
@@ -33,7 +35,8 @@ this empty lines must align and not be absorbed by the blocks over or bellow the
 not yet fixed, but winmerge, vscode, beyound compare, meld, notepad++ also fails to align it
 591    def _sync_editor_to_original(self, ed):   720    def _sync_to_original_by_id(self, orig_tab_id, new_text):
    
-    
+   
+hybrid python algo + align_by_similarity + _absorb_trivial_equal_blocks
 623  740 is bad it considers space as a similarity
 
 ________________________________________

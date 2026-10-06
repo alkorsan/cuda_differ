@@ -634,6 +634,8 @@ class Profiler:
                 ('align_by_similarity',
                  're-pairs lines inside unequal REPLACE blocks',
                  (('total (blocks walked)', 'compare:align_by_similarity'),
+                  ('joined_block engine calls',
+                   'align_by_similarity:joined_block_sub_diff'),
                   ('step1 exact_match_search',
                    'align_by_similarity:step1_exact_match_search'),
                   ('step2 prefix_suffix_search',
@@ -660,7 +662,11 @@ class Profiler:
         print('  Notes: an umbrella SELF = the pass minus its steps (list')
         print('  copy, guards, fixpoint bookkeeping); the align searches')
         print('  also run in the COLLECT pass, so step calls can exceed')
-        print('  the umbrella block count; the python engine books its')
+        print('  the umbrella block count; the joined_block row is the')
+        print('  ENGINE time of the joined-block mapper (one call per')
+        print('  cascade level per block, native diff_proc on the native')
+        print('  path -- the old pass did this work as step1/step2 Python')
+        print('  scans; small blocks still do); the python engine books its')
         print('  absorb steps from the background thread WITHOUT an')
         print('  umbrella row (thread-safe standalone marks -- see')
         print('  differ_python.engine_opcodes), so there the steps sum')
