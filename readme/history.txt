@@ -61,12 +61,13 @@
   radio-checked combination of the three settings (algorithm +
   align method + absorb), a click writes all three -- with only the
   align / absorb values updated for the new dropdown world:
-  "Preset 1: Fastest comparison - Myers, Align Method 1 (fast),
-  Absorb Off" (align off -> the FAST method; algorithm and absorb
+  "Preset 1: Fastest comparison - Myers, Fast Align On, Absorb
+  Off" (align off -> the FAST method; algorithm and absorb
   unchanged) and "Preset 2: Better readability (slower) - Histogram,
-  Align Method 2 (slow), Absorb On" (the preset's "Align On" WAS
-  the slow method all along, so it stays Method 2; absorb off ->
-  on). A preset mark still means the settings match its combination
+  Fast Align On, Absorb On" (the slow method the preset always had
+  is replaced by the FAST one; absorb off ->
+  on). The captions say "Fast Align On" -- no "Method" wording. A
+  preset mark still means the settings match its combination
   EXACTLY; anything else (align off, the Hybrid algorithm, a custom
   pick) checks neither preset. The align methods are a radio pair
   with NO "off" item: clicking the checked method again turns it

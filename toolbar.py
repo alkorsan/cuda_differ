@@ -93,20 +93,22 @@ Implementation notes:
 
 * The PRESETS dropdown is the quick way to set the algorithm +
   the beautify flags: two mutually exclusive RADIO presets
-  ("Preset 1: Fastest comparison - Myers, Align Method 1 (fast),
-  Absorb Off" and "Preset 2: Better readability (slower) -
-  Histogram, Align Method 2 (slow), Absorb On" -- the original
-  preset combinations with only their align / absorb values updated:
-  Preset 1 turned align on with the FAST method, Preset 2 turned
-  absorb on; the algorithms and the slow "readability" align method
-  are exactly what they always were), a separator, the mutually
+  ("Preset 1: Fastest comparison - Myers, Fast Align On, Absorb
+  Off" and "Preset 2: Better readability (slower) - Histogram,
+  Fast Align On, Absorb On" -- the original preset combinations
+  with only their align / absorb values updated: BOTH presets turn
+  align on with the FAST method (the captions say "Fast Align
+  On" -- no "Method" wording), and Preset 2 additionally turns
+  absorb on; the algorithms are exactly what they always were), a
+  separator, the mutually
   exclusive RADIO algorithms ("Algorithm 1: Native Histogram",
   "Algorithm 2: Native Myers", "Algorithm 3: Hybrid Python
   (slow)"), a separator, the TWO mutually exclusive RADIO choices
   of the SINGLE align_by_similarity dropdown config ("Align by
-  similarity: Method 1 - fast (Pascal)" -- the engine-driven
-  joined-block mapper; "Align by similarity: Method 2 - slow
-  (Python)" -- the original pure-Python recursive search; there is
+  similarity: Method 1 - fast" -- the engine-driven joined-block
+  mapper; "Align by similarity: Method 2 - slow" -- the original
+  pure-Python recursive search (no engine words in the captions);
+  there is
   deliberately NO "off" item: re-clicking the checked method turns
   it off, so the off state is reachable without a third item), a
   separator, and the independent checkable toggle "Absorb trivial
@@ -114,9 +116,9 @@ Implementation notes:
   always mirror settings/cuda_differ2.json, and the preset
   checkmarks are DERIVED from it -- a preset is an EXACT
   combination of three settings: Preset 1 = native Myers + align
-  Method 1 (fast) + absorb off; Preset 2 = native Histogram +
-  align Method 2 (slow) + absorb on; any other combination (align
-  off, the Hybrid Python algorithm, included) checks NEITHER (a
+  fast + absorb off; Preset 2 = native Histogram + align fast +
+  absorb on; any other combination (align off or slow, the Hybrid
+  Python algorithm, included) checks NEITHER (a
   custom selection is visible at a glance). Clicks persist
   'differ2.algorithm.*' (the config dialog's store) and re-compare
   this tab on the 100ms timer, like the ignore items. The two align
@@ -280,28 +282,31 @@ def _set_ignore_opt(key, val):
 # The two presets keep their ORIGINAL form -- each is an EXACT
 # combination of the three settings (algorithm + align method +
 # absorb), picked with one click; only the align / absorb values
-# were updated for the new dropdown world:
-#   Preset 1 = native Myers + align Method 1 (fast) + absorb off
-#     (was Myers + align off + absorb off -- align on now, but the
+# were updated for the new dropdown world (the captions say
+# "Fast Align On" -- no "Method" wording -- because BOTH presets
+# now align with the fast method):
+#   Preset 1 = native Myers + align fast + absorb off
+#     (was Myers + align off + absorb off -- align on now, the
 #     FAST method, so the preset stays the quick everyday compare);
-#   Preset 2 = native Histogram + align Method 2 (slow) + absorb on
-#     (was Histogram + align on + absorb off -- the original "Align
-#     On" WAS the slow method, so it stays; only absorb turns on).
+#   Preset 2 = native Histogram + align fast + absorb on
+#     (was Histogram + align on + absorb off -- the slow method
+#     the preset always had is replaced by the FAST one, and
+#     absorb turns on).
 # Each entry: (menu key, menu caption); None = the separator.
 # Toolbar-only -- the config dialog / tab context menu keep their own
 # algorithm UIs.
 _PRESET_ITEMS = (
     ('preset1',  _('Preset 1: Fastest comparison - Myers, '
-                   'Align Method 1 (fast), Absorb Off')),
+                   'Fast Align On, Absorb Off')),
     ('preset2',  _('Preset 2: Better readability (slower) - Histogram, '
-                   'Align Method 2 (slow), Absorb On')),
+                   'Fast Align On, Absorb On')),
     (None, None),
     ('algo1',    _('Algorithm 1: Native Histogram')),
     ('algo2',    _('Algorithm 2: Native Myers')),
     ('algo3',    _('Algorithm 3: Hybrid Python (slow)')),
     (None, None),
-    ('beautify_fast',  _('Align by similarity: Method 1 - fast (Pascal)')),
-    ('beautify_slow',  _('Align by similarity: Method 2 - slow (Python)')),
+    ('beautify_fast',  _('Align by similarity: Method 1 - fast')),
+    ('beautify_slow',  _('Align by similarity: Method 2 - slow')),
     (None, None),
     ('absorb',   _('Absorb trivial equal blocks')),
 )
@@ -1313,19 +1318,18 @@ class CompareToolbar:
     def rebuild_preset_menu(self):
         """(Re)build the Presets dropdown: the two mutually exclusive
         preset COMBINATIONS ("Preset 1: Fastest comparison - Myers,
-        Align Method 1 (fast), Absorb Off" / "Preset 2: Better
-        readability (slower) - Histogram, Align Method 2 (slow),
-        Absorb On" -- the original preset form, each an exact
-        combination of the three settings, with only the align /
-        absorb values updated for the new dropdown world), a
-        separator, the three algorithms (also mutually exclusive:
-        Native Histogram / Native Myers / Hybrid Python), a
-        separator, the TWO radio choices of the SINGLE
-        align_by_similarity dropdown config ("Method 1 - fast
-        (Pascal)" / "Method 2 - slow (Python)" -- there is no "off"
-        item: re-clicking the checked method turns it off), a
-        separator, and the independent "Absorb trivial equal blocks"
-        toggle.
+        Fast Align On, Absorb Off" / "Preset 2: Better readability
+        (slower) - Histogram, Fast Align On, Absorb On" -- the
+        original preset form, each an exact combination of the
+        three settings, with only the align / absorb values updated
+        for the new dropdown world: BOTH presets align with the
+        FAST method), a separator, the three algorithms (also
+        mutually exclusive: Native Histogram / Native Myers /
+        Hybrid Python), a separator, the TWO radio choices of the
+        SINGLE align_by_similarity dropdown config ("Method 1 -
+        fast" / "Method 2 - slow" -- there is no "off" item:
+        re-clicking the checked method turns it off), a separator,
+        and the independent "Absorb trivial equal blocks" toggle.
 
         The presets, the algorithms and the align-method choices are
         RADIO items (a dot, not a checkmark -- see _PRESET_RADIO);
@@ -1334,11 +1338,11 @@ class CompareToolbar:
 
         The checkmarks are DERIVED from the settings file -- a preset
         is an EXACT combination of three settings: Myers + align
-        fast + absorb off checks Preset 1, Histogram + align slow +
-        absorb on checks Preset 2, any other combination (align off,
-        the Hybrid algorithm, included) checks NEITHER. Called on
-        every open (popup_preset_menu); the whole body is guarded
-        like the ignore twin's."""
+        fast + absorb off checks Preset 1, Histogram + align fast +
+        absorb on checks Preset 2, any other combination (align off
+        or slow, the Hybrid algorithm, included) checks NEITHER.
+        Called on every open (popup_preset_menu); the whole body is
+        guarded like the ignore twin's."""
         if self.h_dlg is None:
             return
         try:
@@ -1366,7 +1370,7 @@ class CompareToolbar:
             # glance
             'preset1': algo == _ALGO_MYERS and align_mode == ALIGN_FAST
                        and not absorb,
-            'preset2': algo == _ALGO_HIST and align_mode == ALIGN_SLOW
+            'preset2': algo == _ALGO_HIST and align_mode == ALIGN_FAST
                        and absorb,
             'algo1': algo == _ALGO_HIST,
             'algo2': algo == _ALGO_MYERS,
@@ -1434,8 +1438,8 @@ class CompareToolbar:
         settings of its exact combination (the algorithm, Align by
         similarity, Absorb trivial equal blocks -- the original
         preset behavior, with the updated align / absorb values):
-        Preset 1 = Myers + align Method 1 (fast) + absorb off,
-        Preset 2 = Histogram + align Method 2 (slow) + absorb on.
+        Preset 1 = Myers + align fast + absorb off,
+        Preset 2 = Histogram + align fast + absorb on.
         The align items write the SINGLE dropdown value through
         set_align_mode -- one key, so the methods are exclusive by
         construction (nothing to keep in step) -- and clicking the
@@ -1452,9 +1456,9 @@ class CompareToolbar:
             algo, align_mode, absorb = _ALGO_MYERS, ALIGN_FAST, False
         elif action == 'preset2':
             # The exact Preset 2 combination (the original "Better
-            # readability (slower)" preset -- the slow align method
-            # it always had -- with absorb on).
-            algo, align_mode, absorb = _ALGO_HIST, ALIGN_SLOW, True
+            # readability (slower)" preset with the FAST align
+            # method and absorb on).
+            algo, align_mode, absorb = _ALGO_HIST, ALIGN_FAST, True
         elif action == 'algo1':
             algo = _ALGO_HIST
         elif action == 'algo2':

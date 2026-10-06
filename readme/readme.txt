@@ -872,30 +872,30 @@ into the compare view):
   disable themselves and an explanatory item heads the menu (same
   guard as the tab context menu).
 - ★ Preset ▾ -- dropdown with quick "preset" combinations: "Preset 1:
-  Fastest comparison - Myers, Align Method 1 (fast), Absorb Off" and
-  "Preset 2: Better readability (slower) - Histogram, Align Method 2
-  (slow), Absorb On" -- the original preset combinations with only
-  their align / absorb values updated for the two align methods
-  (Preset 1 turned align on, with the FAST method; Preset 2 turned
-  absorb on -- its "Align On" stays the slow readability method it
-  always was). The two presets are RADIO items (a dot mark instead
+  Fastest comparison - Myers, Fast Align On, Absorb Off" and
+  "Preset 2: Better readability (slower) - Histogram, Fast Align
+  On, Absorb On" -- the original preset combinations with only
+  their align / absorb values updated (both presets turn align on
+  with the FAST method; Preset 2 additionally turns absorb on).
+  The two presets are RADIO items (a dot mark instead
   of a checkmark; clicking one unchecks the other), so at most one
   is ever marked. After a separator, "Algorithm 1: Native
   Histogram", "Algorithm 2: Native Myers" and "Algorithm 3: Hybrid
   Python (slow)" (also radio items, also mutually exclusive; the
   "slow" word marks the pure-Python one), a separator, the two
-  Align-by-similarity methods as RADIO items ("Method 1 - fast
-  (Pascal)" / "Method 2 - slow (Python)" -- the two non-off values
+  Align-by-similarity methods as RADIO items ("Method 1 - fast" /
+  "Method 2 - slow" -- the two non-off values
   of the single align_by_similarity dropdown; there is deliberately
   NO "off" item: clicking the checked method again turns it off, so
   off is always one click away), a separator, and the independent
   checkable "Absorb trivial equal blocks" toggle. The preset marks
   are DERIVED from the current settings on every menu open -- a
   preset is an EXACT combination of three settings: Native Myers +
-  Align Method 1 (fast) + Absorb off checks Preset 1, Native
-  Histogram + Align Method 2 (slow) + Absorb on checks Preset 2,
-  any other combination (Align off, the Hybrid algorithm, included)
-  checks NEITHER -- so a custom selection is visible at a glance.
+  Fast Align On + Absorb off checks Preset 1, Native
+  Histogram + Fast Align On + Absorb on checks Preset 2,
+  any other combination (Align off or slow, the Hybrid algorithm,
+  included) checks NEITHER -- so a custom selection is visible at a
+  glance.
   Picking a preset writes ALL THREE settings
   (differ2.algorithm.diff_algorithm /
   differ2.algorithm.beautify.align_by_similarity /
@@ -1497,8 +1497,8 @@ Algorithm section:
   notion of "equal"; Method 2 always runs its own pure-Python
   search.
   In the toolbar's Presets dropdown the two methods are the radio
-  pair "Align by similarity: Method 1 - fast (Pascal)" /
-  "Method 2 - slow (Python)"; clicking the checked method again
+  pair "Align by similarity: Method 1 - fast" /
+  "Method 2 - slow"; clicking the checked method again
   turns it off (no separate off item is needed).
   Default: off.
 - differ2.algorithm.beautify.absorb_trivial_equal_blocks: Absorb
