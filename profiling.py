@@ -632,7 +632,8 @@ class Profiler:
         print('Beautify passes (option-gated; steps in run order):')
         for _title, _desc, _rows in (
                 ('align_by_similarity',
-                 're-pairs lines inside unequal REPLACE blocks',
+                 're-pairs lines inside unequal REPLACE blocks (BOTH the'
+                 ' fast and the slow method book here)',
                  (('total (blocks walked)', 'compare:align_by_similarity'),
                   ('joined_block engine calls',
                    'align_by_similarity:joined_block_sub_diff'),
@@ -660,13 +661,18 @@ class Profiler:
             if not _any:
                 print('    (no rows: the option is off, or nothing matched)')
         print('  Notes: an umbrella SELF = the pass minus its steps (list')
-        print('  copy, guards, fixpoint bookkeeping); the align searches')
-        print('  also run in the COLLECT pass, so step calls can exceed')
-        print('  the umbrella block count; the joined_block row is the')
-        print('  ENGINE time of the joined-block mapper (one call per')
-        print('  cascade level per block, native diff_proc on the native')
-        print('  path -- the old pass did this work as step1/step2 Python')
-        print('  scans; small blocks still do); the python engine books its')
+        print('  copy, guards, fixpoint bookkeeping); the two align')
+        print('  methods are mutually exclusive (align_by_similarity =')
+        print('  the fast joined-block mapper, align_by_similarity2 =')
+        print('  the old slow pure-Python search) and both book here:')
+        print('  the joined_block row is the ENGINE time of the fast')
+        print('  mapper (one call per cascade level per block, native')
+        print('  diff_proc on the native path); the step1/step2 rows are')
+        print('  the OLD searches -- the slow mode books them for EVERY')
+        print('  block, the fast mode only for small residual blocks')
+        print('  (da*db <= align_joined.SMALL_PRODUCT, the ported scorer);')
+        print('  both also run in the COLLECT pass, so step calls can')
+        print('  exceed the umbrella block count; the python engine books its')
         print('  absorb steps from the background thread WITHOUT an')
         print('  umbrella row (thread-safe standalone marks -- see')
         print('  differ_python.engine_opcodes), so there the steps sum')
@@ -695,9 +701,12 @@ class Profiler:
         print('              line_diff:native_engine (wall time incl. the')
         print('              background wait)')
         print('  align_by_similarity:*')
-        print('              steps of the Align-by-similarity beautify:')
-        print('              step1 exact-match anchor search, step2 prefix/')
-        print('              suffix similarity scoring; compare:align_by_')
+        print('              steps of the Align-by-similarity beautify (BOTH')
+        print('              methods book here): the joined_block engine')
+        print('              calls of the fast mapper, and the step1')
+        print('              exact-match / step2 prefix-suffix searches of')
+        print('              the slow legacy mode (and of the fast mode\'s')
+        print('              small residual blocks); compare:align_by_')
         print('              similarity is the umbrella section per unequal')
         print('              block (see the Beautify passes block above)')
         print('  absorb_trivial_equal_blocks*')

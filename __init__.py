@@ -915,7 +915,7 @@ OPTS_META = [
      'native_only': True,
      },
     {'opt': 'differ2.algorithm.beautify.align_by_similarity',
-     'cmt': _('Align by similarity\n'
+     'cmt': _('Align by similarity (fast, engine-driven)\n'
               'Beautify line alignment inside REPLACE blocks where the two '
               'sides have DIFFERENT line counts.\n'
               '- When OFF (algo-faithful): lines are paired top-down by '
@@ -926,19 +926,48 @@ OPTS_META = [
               'This renders exactly the way the algorithm dictates; for '
               'example if native_myers is used it renders the way WinMerge / '
               'GNU diffutils side-by-side (sdiff) output does.\n'
-              '- When ON (VS Code-like): the engine\'s hunks are re-paired '
-              'by similarity -- finds best pairs anchored on the longest '
-              'unique exact match or the best prefix/suffix-similar pair, '
-              'char-diffs them, and recurses on both sides. Lines with < 3 '
-              'chars of similarity are shown as separate delete+add. This '
-              're-arranges the engine\'s output for a more "aligned" look '
-              'but is no longer a faithful rendering of the diff.\n'
-              'This results in a more human-readable diff in some cases, '
-              'but the compare becomes slower with very big files.\n'
+              '- When ON (VS Code-like, FAST): the block\'s two sides are '
+              'mapped against each other by the diff ENGINE itself '
+              '(joined-block mapping: one engine call per block, EQUAL '
+              'ranges become the line pairs; unmatched residuals fall '
+              'back to progressively looser line keys and, for small '
+              'leftovers, to the old similarity search). This '
+              're-arranges the engine\'s output for a more "aligned" '
+              'look but is no longer a faithful rendering of the diff, '
+              'and it runs at engine speed even on very big files.\n'
+              'Mutually exclusive with "Align by similarity 2 (slow)" -- '
+              'turning either one on turns the other off (when both are '
+              'somehow set, the slow one wins).\n'
               'Applies to both native and Python algorithms.\n'
-              'Equal-count REPLACE blocks (da == db) are positional in BOTH '
-              'modes, so this option only affects unequal-count REPLACE '
-              'blocks.\n'
+              'Equal-count REPLACE blocks (da == db) are positional in '
+              'ALL modes, so this option only affects unequal-count '
+              'REPLACE blocks.\n'
+              'Default: off.'),
+     'def': False,
+     'frm': 'bool',
+     'chp': 'algorithm',
+     },
+    {'opt': 'differ2.algorithm.beautify.align_by_similarity2',
+     'cmt': _('Align by similarity 2 (slow, pure Python)\n'
+              'The ORIGINAL implementation of "Align by similarity", kept '
+              'for A/B comparison with the fast method.\n'
+              'When ON, unequal-count REPLACE blocks are aligned by the '
+              'old pure-Python recursive search: anchor on the longest '
+              'unique exact match or the best prefix/suffix-similar pair, '
+              'char-diff it, and recurse on both sides. Lines with < 3 '
+              'chars of similarity are shown as separate delete+add.\n'
+              'The search is O(N*M) per block and recursive, so on big '
+              'files the compare becomes MUCH slower than the fast '
+              'method -- that is exactly why it is kept: switch between '
+              'both methods from the toolbar\'s preset menu and compare '
+              'their pairing quality.\n'
+              'Mutually exclusive with "Align by similarity" -- turning '
+              'either one on turns the other off (when both are somehow '
+              'set, this slow one wins).\n'
+              'Applies to both native and Python algorithms.\n'
+              'Equal-count REPLACE blocks (da == db) are positional in '
+              'ALL modes, so this option only affects unequal-count '
+              'REPLACE blocks.\n'
               'Default: off.'),
      'def': False,
      'frm': 'bool',
@@ -1615,12 +1644,14 @@ class _CompareJob:
 def _is_fast_mode(diff):
     """True when the Differ is configured exactly as the slow-compare
     dialog's 'faster mode' -- the toolbar's Preset 1 combination: the
-    NATIVE engine running Native Myers with BOTH beautify options
-    off (Align-by-similarity and the absorb pass). A job started
-    this way never arms the slow-compare watchdog."""
+    NATIVE engine running Native Myers with ALL beautify options off
+    (Align-by-similarity, the legacy Align-by-similarity-2 and the
+    absorb pass). A job started this way never arms the slow-compare
+    watchdog."""
     return (isinstance(diff, dfn.Differ)
             and getattr(diff, 'diff_algorithm', '') == 'native_myers'
             and not getattr(diff, 'align_by_similarity', False)
+            and not getattr(diff, 'align_by_similarity2', False)
             and not getattr(diff, 'absorb_trivial_equal_blocks', False))
 
 
@@ -4135,7 +4166,8 @@ class Command:
         switch never disturbs another tab's records) so the Differ is
         always the right type before a compare runs. Preserves the
         options (withdetail, align_by_similarity,
-        absorb_trivial_equal_blocks) but NOT the sequences:
+        align_by_similarity2, absorb_trivial_equal_blocks) but NOT the
+        sequences:
         neither Differ holds sequences between compares — both
         the native Differ (compare(a_text, b_text)) and the Python
         Differ (compare(lines_a, lines_b)) take their inputs as
@@ -4168,10 +4200,13 @@ class Command:
         # both consistent states.
         old_withdetail = getattr(diff, 'withdetail', True)
         old_align_by_similarity = getattr(diff, 'align_by_similarity', False)
+        old_align_by_similarity2 = getattr(diff, 'align_by_similarity2',
+                                            False)
         old_absorb = getattr(diff, 'absorb_trivial_equal_blocks', False)
         diff = dfn.Differ() if want_native else dfp.Differ()
         diff.withdetail = old_withdetail
         diff.align_by_similarity = old_align_by_similarity
+        diff.align_by_similarity2 = old_align_by_similarity2
         diff.absorb_trivial_equal_blocks = old_absorb
         diff.diff_algorithm = algo
         session.diff = diff
@@ -4525,13 +4560,19 @@ class Command:
             if getattr(session, 'fast_temp', False):
                 # Temporary fast mode (the slow-compare dialog's
                 # 'faster mode' -- the exact Preset 1 combination):
-                # BOTH beautify options off for this compare tab,
+                # ALL beautify options off for this compare tab,
                 # regardless of the configured options.
                 diff.align_by_similarity = False
+                diff.align_by_similarity2 = False
                 diff.absorb_trivial_equal_blocks = False
             else:
                 diff.align_by_similarity = self.cfg.get(
                     'align_by_similarity')
+                # The OLD slow pure-Python beautify, exclusive with the
+                # one above (cfg already resolved the pair -- the fast
+                # flag reads False whenever this one is on).
+                diff.align_by_similarity2 = self.cfg.get(
+                    'align_by_similarity2')
                 diff.absorb_trivial_equal_blocks = self.cfg.get(
                     'absorb_trivial_equal_blocks')
             # Ignore options -> diff_proc DIFF_IGN_* bitmask for the
@@ -6949,8 +6990,17 @@ class Command:
             'break_chars':
                 dfn.normalize_break_chars(
                     get_opt('algorithm.break_chars', dfn.DEFAULT_BREAK_CHARS)),
+            'align_by_similarity2':
+                get_opt('algorithm.beautify.align_by_similarity2', False),
+            # The two beautify alignment methods are MUTUALLY EXCLUSIVE
+            # (the toolbar writes them as an exclusive pair; the slow
+            # one wins when a hand-edited JSON sets both -- the same
+            # priority _replace_block_chunks applies), so the fast
+            # flag is resolved OFF whenever the legacy slow flag is on.
             'align_by_similarity':
-                get_opt('algorithm.beautify.align_by_similarity', False),
+                get_opt('algorithm.beautify.align_by_similarity', False)
+                and not get_opt('algorithm.beautify.align_by_similarity2',
+                                False),
             'absorb_trivial_equal_blocks':
                 get_opt('algorithm.beautify.absorb_trivial_equal_blocks',
                         False),
@@ -7246,7 +7296,8 @@ class Command:
         the current caret line, not the whole hunk: the caret must be ON a
         changed line of the hunk (a gap has no line to copy -- jumping to
         a one-sided difference puts the caret on the changed line). With
-        align_by_similarity the intra-hunk pairing can be anchored instead
+        align_by_similarity (or the legacy align_by_similarity2) the
+        intra-hunk pairing can be anchored instead
         of positional; the diffmap-based formula below is then the closest
         line-index approximation."""
         fc, eds = self.focused

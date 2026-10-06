@@ -52,7 +52,11 @@ TWO-PHASE ASYNCHRONOUS DESIGN (both engine jobs run off the UI thread):
   joined-block search (align_joined.py) runs in the collect pass, its
   per-block plans are cached on the Differ (see _take_align_plan) and
   the replay pass reuses them verbatim, so the whole search runs once
-  per compare, not twice.
+  per compare, not twice. The legacy slow beautify (align_by_similarity2
+  -> _find_best_pairs_events) takes no plan cache: its recursive search
+  runs in both passes, but the walk stays deterministic, so the
+  collect pass's _char_diff RECORDS and the replay pass's pops keep
+  their order-matching guarantee exactly the same way.
 
 Ignore options: the plugin's 'ignoreopt.*' settings are collected into
 a DIFF_IGN_* bitmask (see build_ignore_flags) and applied to BOTH the
@@ -91,6 +95,7 @@ from .py_algo.char_diff import char_diff
 from .profiling import Profiler
 from .utils import split_lines_safe
 from .align_joined import AlignEngine, align_block_plan
+from collections import Counter
 import cudatext as _ct
 from cudax_lib import get_translation
 _ = get_translation(__file__)  # I18N
@@ -506,11 +511,14 @@ class Differ:
     differ_python.Differ instead.
 
     This class is self-contained: it does not import from differ_python.
-    The line-level alignment of the beautify mode lives in
-    align_joined.py (engine-agnostic, shared with differ_python);
-    everything else that overlapped with differ_python.Differ (event
-    constants, _replace_block_chunks, _char_diff_pair_events, etc.)
-    is duplicated intentionally to allow independent evolution.
+    The line-level alignment of the FAST beautify mode lives in
+    align_joined.py (engine-agnostic, shared with differ_python); the
+    legacy SLOW beautify (align_by_similarity2 ->
+    _find_best_pairs_events, the original pure-Python recursive search)
+    is kept here verbatim; everything else that overlapped with
+    differ_python.Differ (event constants, _replace_block_chunks,
+    _char_diff_pair_events, etc.) is duplicated intentionally to allow
+    independent evolution.
 
     compare() function return tuples for paint text:
     id can be:
@@ -588,8 +596,8 @@ class Differ:
         inside compare() to drive the engine + painting, and dropped
         when compare() returns. Between compares, the Differ holds
         only config (withdetail / diff_algorithm / align_by_similarity /
-        absorb_trivial_equal_blocks / ignore_flags / break_chars) and
-        the diffmap (line-index
+        align_by_similarity2 / absorb_trivial_equal_blocks /
+        ignore_flags / break_chars) and the diffmap (line-index
         tuples, small). The text itself stays in the editor tabs'
         Pascal-side buffers (a_ed / b_ed), which are the source of
         truth; the Python-side copy is built fresh on each compare via
@@ -598,6 +606,17 @@ class Differ:
         self.withdetail = True
         self.diff_algorithm = 'native_myers'
         self.align_by_similarity = False
+        # 'differ2.algorithm.beautify.align_by_similarity2' -- the OLD
+        # slow pure-Python beautify: the original recursive best-pair
+        # search (_find_best_pairs_events: longest unique exact-match
+        # anchor, else O(N*M) prefix/suffix scoring per block). Kept
+        # side by side with the fast joined-block mapper above so the
+        # two methods can be A/B-switched from the toolbar. MUTUALLY
+        # EXCLUSIVE with align_by_similarity: the plugin resolves the
+        # pair before every compare (align_by_similarity2 wins when a
+        # hand-edited JSON sets both) and _replace_block_chunks applies
+        # the same priority, so at most one of the two ever runs.
+        self.align_by_similarity2 = False
         # 'differ2.algorithm.beautify.absorb_trivial_equal_blocks' --
         # when True, the engine's finished opcodes go through
         # _absorb_trivial_equal_blocks (the module-level function at
@@ -956,7 +975,8 @@ class Differ:
         lists. Pure translation of the engine's opcodes into paint
         events — nothing is added, removed or re-paired here.
 
-        The alignment mode (align_by_similarity) only affects how
+        The alignment mode (align_by_similarity / the legacy
+        align_by_similarity2) only affects how
         unequal-count REPLACE blocks are laid out — see
         _replace_block_chunks.
 
@@ -1040,8 +1060,9 @@ class Differ:
         off, the raw engine output is rendered exactly as the engine
         produced it (GNU diffutils / WinMerge faithful). The option
         lives in the same 'differ2.algorithm.beautify.*' group as
-        align_by_similarity, but the two are independent layers:
-        align_by_similarity re-pairs lines INSIDE one replace block
+        align_by_similarity (or the legacy align_by_similarity2),
+        but the two are independent layers:
+        the beautify flags re-pair lines INSIDE one replace block
         (rendering), the absorb pass changes WHICH lines belong to
         which hunk (structure).
 
@@ -1555,9 +1576,13 @@ class Differ:
         entirely different 1M-line files come as ONE replace opcode)
         do not materialize their whole event stream at once.
 
-        Two rendering modes, selected by self.align_by_similarity:
+        Three rendering modes, selected by the two MUTUALLY EXCLUSIVE
+        beautify flags (align_by_similarity / align_by_similarity2 --
+        see __init__; when both are somehow set on a directly
+        constructed Differ, align_by_similarity2 wins in the branch
+        below):
 
-        align_by_similarity = True ('beautified' alignment)
+        align_by_similarity = True (fast 'beautified' alignment)
             Unequal line counts go to the JOINED-BLOCK MAPPER
             (align_joined.py): ONE native engine call maps the block's
             two sides against each other (EQUAL ranges = the pairing,
@@ -1575,7 +1600,25 @@ class Differ:
             Slow path (da != db): the joined-block cascade — see
             align_joined's module docstring.
 
-        align_by_similarity = False (algo-faithful, default)
+        align_by_similarity2 = True (slow legacy 'beautified' alignment)
+            Unequal line counts use the ORIGINAL pure-Python search,
+            _find_best_pairs_events(): anchor on the longest unique
+            exact match or the best prefix/suffix-similar pair,
+            char-diff it, recurse on both sides. Lines with < 3 chars
+            of similarity are shown as separate delete+add. VS Code-
+            like; re-arranges the engine's output. Kept side by side
+            with the fast mapper for A/B comparison -- the search is
+            O(N*M) per block and runs in BOTH the collect and replay
+            passes (no plan cache; only the collect pass's _char_diff
+            RECORDS survive it).
+
+            Fast path (da == db): positional pairing (same as the
+            algo-faithful mode).
+
+            Slow path (da != db): _find_best_pairs_events — see its
+            docstring.
+
+        both flags False (algo-faithful, default)
             Render exactly the way the algorithm dictates: pair the
             first min(da, db) lines top-down by position (char-diff each
             pair via the engine), and show leftover lines on the longer
@@ -1604,19 +1647,45 @@ class Differ:
                   [(A_LINE_DEL, y) for y in range(alo, ahi)]
             return
 
-        # ---- da != db: the two modes diverge here ----
-        if self.align_by_similarity and da != db:
-            # Joined-block mapping (align_joined.py): the engine maps
-            # the block's sides, Python only translates. The plan is
-            # computed ONCE (COLLECT pass) and cached -- the REPLAY
-            # pass pops it and never searches again (see
-            # _take_align_plan). Emission is chunked by _REPLACE_CHUNK
-            # plan ops so a huge block's event list stays bounded (the
-            # old recursive scorer had to build ONE unbounded list per
-            # block). Producing sections are suppressed during the
-            # COLLECT pass: the collect pass's whole cost lands in the
-            # caller's 'compare:collect_pairs' section (the per-call
-            # engine marks still run in every mode -- see
+        # ---- da != db: the beautify modes diverge here ----
+        if (self.align_by_similarity or self.align_by_similarity2) \
+                and da != db:
+            if self.align_by_similarity2:
+                # SLOW legacy beautify (align_by_similarity2): the
+                # original pure-Python recursive search, restored
+                # verbatim. anchor + prefix/suffix scoring + threshold
+                # and staggering. Produced into ONE list (the recursive
+                # scorer makes chunking invasive). Char diffs inside
+                # are perf_counter-timed and booked as batched marks
+                # (legacy synchronous mode only). The producing
+                # section is suppressed during the COLLECT pass: the
+                # collect pass's whole cost lands in the caller's
+                # 'compare:collect_pairs' section, so these rows keep
+                # reporting ONLY the paint-pass walk. No plan cache:
+                # the search runs identically in both passes (only the
+                # collect pass's _char_diff RECORDS are consumed).
+                _collecting = self._char_pairs_pending is not None
+                if not _collecting:
+                    Profiler.start('compare:align_by_similarity')
+                evs = []
+                self._find_best_pairs_events(evs, a, alo, ahi, b, blo, bhi)
+                if not _collecting:
+                    Profiler.stop('compare:align_by_similarity')
+                yield evs
+                return
+
+            # FAST beautify (align_by_similarity): joined-block mapping
+            # (align_joined.py): the engine maps the block's sides,
+            # Python only translates. The plan is computed ONCE
+            # (COLLECT pass) and cached -- the REPLAY pass pops it and
+            # never searches again (see _take_align_plan). Emission is
+            # chunked by _REPLACE_CHUNK plan ops so a huge block's
+            # event list stays bounded (the old recursive scorer had
+            # to build ONE unbounded list per block). Producing
+            # sections are suppressed during the COLLECT pass: the
+            # collect pass's whole cost lands in the caller's
+            # 'compare:collect_pairs' section (the per-call engine
+            # marks still run in every mode -- see
             # align_joined.AlignEngine.call).
             _collecting = self._char_pairs_pending is not None
             if not _collecting:
@@ -1695,6 +1764,208 @@ class Differ:
                     evs.append((B_LINE_ADD, yy))
                 yield evs
                 y = y2
+
+    def _find_best_pairs_events(self, out, a, alo, ahi, b, blo, bhi):
+        """(LEGACY beautify mode -- align_by_similarity2) The OLD slow
+        pure-Python line alignment within a sub-REPLACE block,
+        APPENDING events to `out`. Kept verbatim from the original
+        implementation (the code this module ran under the
+        'align_by_similarity' option before the joined-block mapper
+        took that name) so the two methods stay A/B-comparable; the
+        only changes here are docstring notes.
+
+        Strategies (same as the old generator version):
+        1. Exact unique match: build a dict of unique lines in
+           a[alo:ahi], scan b[blo:bhi] for matches, pick the LONGEST
+           match as anchor. O(N+M) via Counter-based uniqueness check.
+        2. If no exact match: prefix/suffix length scoring, O(N*M) per
+           block (each comparison O(line_length)).
+
+        After finding the best pair, char-diff it, then recurse on the
+        parts before and after. A minimum prefix threshold (>= 3 chars)
+        prevents pairing completely unrelated lines.
+
+        Profiling: both searches and the char diffs are perf_counter-
+        timed and booked as batched marks (calls = 1 per invocation) —
+        no sections, so recursion depth adds zero instrumentation cost.
+        The two searches are the pass's STEPS and book their own rows
+        ('align_by_similarity:step1_exact_match_search' /
+        'align_by_similarity:step2_prefix_suffix_search' — the report's
+        'Beautify passes' block prints them under the pass). The
+        SEARCH marks run in every mode (the search itself runs in
+        every pass); the CHAR-DIFF timing runs only in the legacy
+        synchronous mode (in the two-phase flow the engine time is
+        booked by the async pair around the batched DIF_CHARS job).
+        """
+        da, db = ahi - alo, bhi - blo
+        if da == 0:
+            if db > 0:
+                out.append((A_GAP, alo, blo, bhi))
+                for y in range(blo, bhi):
+                    out.append((B_LINE_ADD, y))
+            return
+        if db == 0:
+            if da > 0:
+                out.append((B_GAP, blo, alo, ahi))
+                for y in range(alo, ahi):
+                    out.append((A_LINE_DEL, y))
+            return
+
+        # Find the best-matching pair by char-level similarity.
+        # First pass: find all unique exact matches and pick the longest.
+        # Use a dict-based approach for O(N+M) instead of O(N*M):
+        # build a map of unique lines in a[alo:ahi], then scan b[blo:bhi].
+        prof_on = Profiler.enabled
+        # char-diff timing: legacy synchronous mode only (see docstring)
+        _time_engine = (prof_on and
+                        self._char_pairs_pending is None and
+                        self._char_ops is None)
+        if prof_on:
+            _t0 = time.perf_counter()
+        sub_a_counts = Counter(a[alo:ahi])
+        sub_b_counts = Counter(b[blo:bhi])
+        best_exact_len = 0
+        best_exact_i, best_exact_j = -1, -1
+        # Build index of unique lines in sub_a
+        sub_a_unique = {}
+        for i in range(alo, ahi):
+            line = a[i]
+            if sub_a_counts.get(line, 0) == 1 and line not in sub_a_unique:
+                non_ws = line.replace(' ', '').replace('\t', '')
+                non_ws = non_ws.replace('\n', '').replace('\r', '')
+                if len(non_ws) >= 3:
+                    sub_a_unique[line] = i
+        # Scan sub_b for matches
+        for j in range(blo, bhi):
+            line = b[j]
+            if sub_b_counts.get(line, 0) == 1 and line in sub_a_unique:
+                if len(line) > best_exact_len:
+                    best_exact_len = len(line)
+                    best_exact_i = sub_a_unique[line]
+                    best_exact_j = j
+        if prof_on:
+            Profiler.mark('align_by_similarity:step1_exact_match_search',
+                          time.perf_counter() - _t0)
+
+        best_score = -1
+        best_prefix = 0
+        best_i, best_j = alo, blo
+        max_prefix_any = 0
+
+        if best_exact_i >= 0:
+            # Use the longest unique exact match as anchor
+            best_i, best_j = best_exact_i, best_exact_j
+            best_score = 1000000
+            best_prefix = 1000000
+            max_prefix_any = 1000000
+        else:
+            # No unique exact match — prefix/suffix length scoring.
+            # NOTE: O(N*M) and RECURSIVE (see the old generator's
+            # docstring) — the reason align_by_similarity2 is the SLOW
+            # option on large files.
+            if prof_on:
+                _t0 = time.perf_counter()
+            for j in range(blo, bhi):
+                bj_line = b[j]
+                for i in range(alo, ahi):
+                    ai_line = a[i]
+                    if ai_line == bj_line:
+                        continue  # skip exact matches (already checked)
+                    # Common prefix length
+                    min_len = min(len(ai_line), len(bj_line))
+                    prefix = 0
+                    while prefix < min_len and ai_line[prefix] == bj_line[prefix]:
+                        prefix += 1
+                    if prefix > max_prefix_any:
+                        max_prefix_any = prefix
+                    # Common suffix length (only if there's a mismatch)
+                    if prefix < min_len:
+                        suffix = 0
+                        while (suffix < min_len - prefix and
+                               ai_line[len(ai_line)-1-suffix] == bj_line[len(bj_line)-1-suffix]):
+                            suffix += 1
+                    else:
+                        suffix = min(len(ai_line), len(bj_line)) - prefix
+                    # Score: prefix is most important (lines starting the same
+                    # are likely the "same" line), then suffix, then total.
+                    # Scale prefix heavily to prefer long-prefix matches.
+                    score = prefix * 100 + suffix
+                    if score > best_score:
+                        best_score, best_i, best_j = score, i, j
+                        best_prefix = prefix
+            if prof_on:
+                Profiler.mark('align_by_similarity:step2_prefix_suffix_search',
+                              time.perf_counter() - _t0)
+
+        # Minimum similarity threshold: only pair lines if the BEST pair
+        # shares a meaningful common prefix (>= 3 chars) — VS Code's
+        # behavior; unrelated lines show as separate delete + add.
+        # Exception: 1xN/Nx1 blocks pair positionally when the opposing
+        # first line is non-trivial (>= 3 non-whitespace chars).
+        if best_prefix < 3 and best_prefix != 1000000:
+            if da == 1 or db == 1:
+                # Single-line block: check if the opposing first line
+                # is non-trivial (>= 3 non-ws chars)
+                if da == 1 and db >= 1:
+                    opp_line = b[blo]
+                elif db == 1 and da >= 1:
+                    opp_line = a[alo]
+                else:
+                    opp_line = ''
+                opp_non_ws = opp_line.replace(' ', '').replace('\t', '')
+                opp_non_ws = opp_non_ws.replace('\n', '').replace('\r', '')
+                if len(opp_non_ws) >= 3:
+                    # Non-trivial opposing line: pair positionally
+                    pass
+                else:
+                    # Trivial opposing line: show as delete + add
+                    for i in range(alo, ahi):
+                        out.append((B_GAP, blo, i, i + 1))
+                        out.append((A_LINE_DEL, i))
+                    for j in range(blo, bhi):
+                        out.append((A_GAP, ahi, j, j + 1))
+                        out.append((B_LINE_ADD, j))
+                    return
+            else:
+                # Multi-line block with no good match: show all as
+                # separate delete + add
+                for i in range(alo, ahi):
+                    out.append((B_GAP, blo, i, i + 1))
+                    out.append((A_LINE_DEL, i))
+                for j in range(blo, bhi):
+                    out.append((A_GAP, ahi, j, j + 1))
+                    out.append((B_LINE_ADD, j))
+                return
+
+        # Recurse on the part before the best pair
+        self._find_best_pairs_events(out, a, alo, best_i, b, blo, best_j)
+
+        # Process the best pair itself
+        a_line, b_line = a[best_i], b[best_j]
+        if a_line == b_line:
+            if self._char_pairs_pending is None and not self._skip_align:
+                out.append((ALIGN, best_i, best_j))
+        else:
+            if _time_engine:
+                _t0 = time.perf_counter()
+                ops = self._char_diff(a_line, b_line)
+                dt = time.perf_counter() - _t0
+                Profiler.mark(self._CHAR_ROW, dt, 1, dt)
+            else:
+                ops = self._char_diff(a_line, b_line)
+            # COLLECT pass: the pair events are drained and discarded by
+            # collect_char_pairs (same dead-write skip as
+            # _positional_pairs_events) -- the record call above already
+            # did the work that matters.
+            if self._char_pairs_pending is None:
+                # composite PAIR_CHANGED carries the pair's line-level
+                # work incl. its wrap-compensation (the old trailing
+                # ALIGN's job)
+                self._char_diff_pair_events(out, best_i, best_j, ops)
+
+        # Recurse on the part after the best pair
+        self._find_best_pairs_events(out, a, best_i + 1, ahi,
+                                     b, best_j + 1, bhi)
 
     # Plan-op budget of the joined-block aligner's cache: total plan ops
     # cached for one compare's replay pass (see collect_char_pairs).
