@@ -7,7 +7,7 @@ beautifier option is used in native algo and python algorithms, its code is some
 beautifier code is maybe duplicated for python and native algorithms, check if both same code or code diverged between them then gaveme a report and what is the best way to continue, if there is only one way then implement it directly if there is multiple ways then ask me to choose
 
 
-align_by_similarity
+ 
 
 split beautifier to blocks/modules
 
@@ -19,21 +19,28 @@ i want to reduce events overead
 remove all events from install inf except on_tab_menu, and subscribe dynamically to only the events we need when the plugin start comparing , when we close the last diff tab we must unsubscribe from all events except right click menu, when a compare is done again we subscribe to what we need, 
 this is just a suggestion if it s wrong and there is a better plan then do it
 ___________________
+ 
+sometimes when i compare big files of 50mb i see this message:
+ERROR: Exception in CudaText for on_scroll: List index (-1) out of bounds
 
+ 
+when compare is done, scroll to caret of the focused editor
 
-restore the old code which was running under align_by_similarity in python, then create a new config called align_by_similarity2 and put the old python method of align_by_similarity under this new config align_by_similarity2, then put your new method you added in previous turn under align_by_similarity , so i end up with both methods the old one using slow python code and the new fast one using pascal code, so i can switch between both methods easly
-then expose both methods in the toolbar presets, but they must be exclusive, when one is selected the other must be unselected, put the word slow near align_by_similarity2 text in the toolbar 
-
-
-fix high cpu after changing config , it happen when i change algo using the old config gui
-
-when compare is done scroll to caret of the focused editor
-
+fix mem leak when i compare big file 140mb
 
 first compare show non aligned hunks, it get autocorrected when i scroll or move caret, it happens also when sidepanel is opened
 
+fast preset1 triggers dialog to use fast preset after 1Min,it should not
+remove native to python fallback
+
 cleanup doc and changelog
 
+
+===============================
+
+if cuda_hilite_occurrences is enbled, compare gave this error when i compare  140mb
+ERROR: Exception in CudaText for on_scroll: List index (-1) out of bounds
+then 700mb ram is leaked when compare finishhes and tabs are closed
 
 ===============================
  
