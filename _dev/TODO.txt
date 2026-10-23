@@ -1,18 +1,6 @@
 
 
- 
 
-
-beautifier option is used in native algo and python algorithms, its code is some experiments i ported from several compare apps specially and mostly from vscode, so they are experimental , i want to organise them in an easy way so i can continue expanding and fixing them over time, i want the best way to organise it, i have some ideas like move its code to a dedicated file called beautifier.py, but i don t want to make things more complicated, so i don t know what will be the best way to choose
-beautifier code is maybe duplicated for python and native algorithms, check if both same code or code diverged between them then gaveme a report and what is the best way to continue, if there is only one way then implement it directly if there is multiple ways then ask me to choose
-
-
- 
-
-split beautifier to blocks/modules
-
-
- 
  
 __________________
 i want to reduce events overead
@@ -20,18 +8,24 @@ remove all events from install inf except on_tab_menu, and subscribe dynamically
 this is just a suggestion if it s wrong and there is a better plan then do it
 ___________________
  
-sometimes when i compare big files of 50mb i see this message:
-ERROR: Exception in CudaText for on_scroll: List index (-1) out of bounds
+change default of align_by_similarity to fast
 
  
 when compare is done, scroll to caret of the focused editor
 
-fix mem leak when i compare big file 140mb
+when i have a diff tab and i restart cudatxt then recompare, the align is wrong, i have to recompare again to get it right! seen in test2_a.py
+
 
 first compare show non aligned hunks, it get autocorrected when i scroll or move caret, it happens also when sidepanel is opened
 
 fast preset1 triggers dialog to use fast preset after 1Min,it should not
+
 remove native to python fallback
+
+
+when we start a compare for the first time, there is no changes yet in the diff tab, so we must set its change state to false to remove the dot on the tab
+
+
 
 cleanup doc and changelog
 
@@ -41,6 +35,9 @@ cleanup doc and changelog
 if cuda_hilite_occurrences is enbled, compare gave this error when i compare  140mb
 ERROR: Exception in CudaText for on_scroll: List index (-1) out of bounds
 then 700mb ram is leaked when compare finishhes and tabs are closed
+
+sometimes when i compare big files of 50mb i see this message:
+ERROR: Exception in CudaText for on_scroll: List index (-1) out of bounds
 
 ===============================
  
