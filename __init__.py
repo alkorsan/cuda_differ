@@ -284,6 +284,33 @@ PY_ENGINE_POLL_MS = 50
 # faster to switch to).
 SLOW_COMPARE_SECONDS = 60
 
+# --- Word-wrap layout settling (restart / restored-tab alignment) -------
+# The editor's wrap table (ATSynEdit WrapInfo -- which visual rows each
+# wrapped line occupies, the data the alignment gaps are sized from) is
+# rebuilt lazily, INSIDE the editor's paint cycle, and is NOT built at
+# all for an editor that has never been shown (CudaText issue #6398:
+# get_wrapinfo() returns [] for passive restored tabs). On a
+# session-RESTORED compare tab the text is loaded by CudaText's session
+# restore BEFORE the plugin re-creates its geometry (toolbar, micromap
+# gutter, hidden scrollbars, overview panel -- all of them change the
+# editors' width), so the first Recompare can read a wrap table that is
+# EMPTY or built at the pre-overview width, and sizes the alignment gaps
+# from it -- "the align is wrong, I have to recompare again to get it
+# right". Two guards close that window:
+WRAP_WAIT_RETRY_MS = 200
+# Cadence of the defer-retry while the wrap table is missing entirely
+# (editor restored but not yet painted): the compare is postponed until
+# the table exists, so it never sizes gaps from the [1]*n fallback.
+WRAP_WAIT_MAX_RETRIES = 10
+# ~2s of retries; past the cap the compare runs best-effort anyway
+# (exactly the old behavior) with a status hint -- never blocks the user.
+WRAP_VERIFY_DELAY_MS = 250
+# Delay of the post-compare wrap-data verification: by then the compare's
+# own paints + the final EDACTION_UPDATE have rebuilt both halves' wrap
+# tables at the settled geometry, so a re-read that DIFFERS from the
+# snapshot the gaps were sized from proves those gaps stale -- and the
+# compare re-runs itself once, automatically (what the user did by hand).
+
 # Re-entrancy guard: PROC_IDLE dispatches messages synchronously, and a
 # dispatched event handler that itself reaches a pump point must NOT
 # nest a second ProcessMessages pass inside ours (LCL tolerates nested
@@ -1583,6 +1610,7 @@ class _CompareJob:
         'fast_mode',        # started as the fast mode (Native Myers, both beautify off): the slow-compare dialog never asks
         'py_poll_cb',       # Python-engine completion poll timer callback (to TIMER_STOP on cancel), None when off
         'py_engine_thread', # daemon thread running the Python engine (diagnostic ref), None when off
+        'wrap_verify_needed',  # wrap-on compare that may have sized gaps from a stale wrap table (WRAP_VERIFY_DELAY_MS)
     )
 
     def __init__(self):
@@ -1622,6 +1650,7 @@ class _CompareJob:
         self.fast_mode = False
         self.py_poll_cb = None
         self.py_engine_thread = None
+        self.wrap_verify_needed = False
 
 
 def _is_fast_mode(diff):
@@ -1690,6 +1719,10 @@ class _TabSession:
         'marks_micromap_a', 'marks_micromap_b',
         'marks_chars_a', 'marks_chars_b',
         'mark_window_a', 'mark_window_b',
+        'wrap_geometry_settled',
+        'wrap_wait_retries',
+        'wrap_verify_armed',
+        'wrap_verify_snapshot',
     )
 
     def __init__(self, tab_id, state_key=''):
@@ -1731,6 +1764,30 @@ class _TabSession:
         # editor cover, or None when no window is applied.
         self.mark_window_a = None
         self.mark_window_b = None
+        # --- Word-wrap layout settling (restart alignment fix) ---
+        # True once this tab's editor geometry and wrap tables are KNOWN
+        # consistent -- set by the post-compare wrap verification (a
+        # re-read that matched the snapshot the gaps were sized from, or
+        # the one automatic recompare a mismatch triggered). False until
+        # then: a fresh compare tab (set_files) is NOT born settled --
+        # its overview dock / micromap gutter land on LCL's own schedule,
+        # which can slip past the first compare's wrap read ("first
+        # compare shows non-aligned hunks") -- and a session-RESTORED tab
+        # is never settled: CudaText loaded the texts before the plugin's
+        # geometry exists at all. While False, every wrap-on compare arms
+        # the WRAP_VERIFY_DELAY_MS verification; wrap-off compares never
+        # verify (the wrap table is virtual and always exact).
+        self.wrap_geometry_settled = False
+        # Consecutive defer-retries of a compare whose editors have no
+        # wrap table yet (restored tab, not painted at kick-off time).
+        # Reset by the first compare that actually runs.
+        self.wrap_wait_retries = 0
+        # True while the post-compare wrap verification timer is armed
+        # for this tab (loop guard: at most one verification in flight).
+        self.wrap_verify_armed = False
+        # The wrap counts the last compare sized its gaps from -- the
+        # verification timer compares a fresh re-read against this.
+        self.wrap_verify_snapshot = None
 
 
 class Command:
@@ -2642,6 +2699,12 @@ class Command:
         # micromap columns are in place by now, so the editors
         # already have their FINAL width and the text wraps only
         # once.
+        #
+        # NOTE (restart-alignment fix): "final width" here means the
+        # plugin's own setup is done -- but a docked form's LCL align can
+        # still land a message-pass later, so even this flow's first
+        # compare arms the wrap verification (the session is not marked
+        # settled; see _TabSession.wrap_geometry_settled).
         a_ed.set_text_all(orig_texts[0])
         b_ed.set_text_all(orig_texts[1])
 
@@ -3043,6 +3106,172 @@ class Command:
         except Exception:
             pass
 
+    # --- Word-wrap layout settling (restart alignment fix) ---------------
+    # The pieces below close the "restart CudaText -> recompare -> wrong
+    # align -> recompare again to get it right" bug (and its fresh-tab
+    # twin, "first compare shows non-aligned hunks, autocorrected on
+    # scroll"). Root cause: the editor's wrap table (WrapInfo) is built
+    # lazily inside the paint cycle, not at all for a never-shown editor
+    # (CudaText #6398), and the plugin's geometry (overview dock, micromap
+    # gutter, hidden scrollbars) lands on the LCL layout's own schedule --
+    # which can be AFTER the compare's wrap read on a restored tab (texts
+    # loaded by the session restore, geometry re-created only at the first
+    # Recompare) and even on a fresh tab (the docked overview's align).
+    # The gap math then sizes alignment gaps from an empty or old-width
+    # wrap table. See the WRAP_* constants block for the full story.
+
+    def _defer_compare_for_wrap_data(self, session, cprof):
+        """Postpone a compare whose editors have no wrap table yet (the
+        untrusted read of _get_wrap_counts -- restored tab, not painted
+        since the restart). Arms the one-shot WRAP_WAIT_RETRY_MS timer
+        that re-runs refresh_compare on this tab; the retries stop at
+        WRAP_WAIT_MAX_RETRIES (refresh_compare then proceeds best-effort
+        with the estimated wrap counts).
+
+        Called from inside refresh_compare's try block, at the wrap-count
+        read: nothing compare-shaped has happened yet (no job slot, no
+        toolbar 'comparing' state, no editor lock -- all of those come
+        later), so the clean way out is exactly this: cancel the cProfile
+        layer (its data covers only the aborted setup), tell the user,
+        and let the timer start the compare over from the top.
+
+        Returns None (the caller assigns it back to its _cprof local --
+        the layer is cancelled and must not be cancelled twice)."""
+        cancel_profiling(cprof)
+        try:
+            callback = ('module=cuda_differ2;cmd=_wrap_wait_retry_timer;'
+                        'info={};'.format(session.tab_id_str))
+            ct.timer_proc(ct.TIMER_START_ONE, callback, WRAP_WAIT_RETRY_MS)
+        except Exception:
+            pass
+        ct.msg_status(_('Differ 2: waiting for editor layout '
+                        '(word-wrap table)...'))
+        return None
+
+    def _wrap_wait_retry_timer(self, tag='', info=''):
+        """One-shot WRAP_WAIT_RETRY_MS timer callback: re-run the compare
+        of the tab named by info (PROP_TAB_ID) -- the previous attempt
+        found no wrap table and postponed itself. Automatic -- no
+        'identical' dialog. The retry re-reads the wrap data from
+        scratch: either the editor has painted by now and the compare
+        runs, or refresh_compare defers again (up to the retry cap)."""
+        if not info:
+            return
+        ed = self._editor_by_tab_id(info)
+        if ed is not None:
+            self.refresh_compare(ed, show_dialog=False)
+
+    def _arm_wrap_verification(self, job):
+        """Arm the post-compare wrap-data verification for a finished
+        compare (WRAP_VERIFY_DELAY_MS one-shot timer). Called from every
+        paint-finish path (_finish_native_compare for both background
+        modes, the inline legacy path) after the editor lock is released
+        and the job slot freed -- the timer must never fire into a
+        running compare.
+
+        Only wrap-on compares whose gap math may have read a stale wrap
+        table arm it (job.wrap_verify_needed -- restored-tab recompare,
+        overview created/destroyed mid-refresh): by the time the timer
+        fires, the compare's own paints + the finisher's final
+        EDACTION_UPDATE have rebuilt both halves' wrap tables at the
+        settled geometry, so a fresh read that differs from the snapshot
+        the gaps were sized from proves those gaps stale. Loop-safe:
+        session.wrap_verify_armed allows at most one verification in
+        flight per tab."""
+        session = job.session
+        if session is None or not job.wrap_verify_needed:
+            return
+        if (job.stale or self._app_exiting
+                or not self._is_compare_tab(job.tab_id)):
+            return
+        if session.wrap_verify_armed:
+            return
+        session.wrap_verify_armed = True
+        session.wrap_verify_snapshot = (job.wrap_counts_a, job.wrap_counts_b)
+        try:
+            callback = ('module=cuda_differ2;cmd=_wrap_verify_timer;'
+                        'info={};'.format(session.tab_id_str))
+            ct.timer_proc(ct.TIMER_START_ONE, callback, WRAP_VERIFY_DELAY_MS)
+        except Exception:
+            session.wrap_verify_armed = False
+            session.wrap_verify_snapshot = None
+
+    def _wrap_verify_timer(self, tag='', info=''):
+        """One-shot WRAP_VERIFY_DELAY_MS timer callback: verify that the
+        wrap counts the last compare sized its alignment gaps from still
+        match the editors. A mismatch means the gaps were sized from a
+        stale/empty wrap table (restored tab, geometry that settled only
+        after the kick-off) -- so re-run the compare ONCE, automatically,
+        with the now-settled data. A match (or wrap turned off, or the
+        tab edited/closed meanwhile) just settles the session: geometry
+        and wrap data are in sync, later recomparers need no check."""
+        if not info or self._app_exiting:
+            return
+        session = self._sessions.get(str(info))
+        if session is None:
+            return
+        session.wrap_verify_armed = False
+        snapshot = session.wrap_verify_snapshot
+        session.wrap_verify_snapshot = None
+        if snapshot is None:
+            return
+        # A compare running right now owns the tab's editors; it paints
+        # with its own (fresh) wrap read and arms its own verification
+        # when it finishes -- nothing to do here.
+        if session.job is not None:
+            return
+        ed = self._editor_by_tab_id(info)
+        if ed is None:
+            return
+        try:
+            a_ed = ct.Editor(ed.get_prop(ct.PROP_HANDLE_PRIMARY))
+            b_ed = ct.Editor(ed.get_prop(ct.PROP_HANDLE_SECONDARY))
+        except Exception:
+            return
+        try:
+            wrap_a = a_ed.get_prop(ct.PROP_WRAP)
+            wrap_b = b_ed.get_prop(ct.PROP_WRAP)
+            if (wrap_a == ct.WRAP_OFF and wrap_b == ct.WRAP_OFF):
+                # Wrap went off after the compare: the virtual table is
+                # always exact, the painted gaps cannot be stale.
+                session.wrap_geometry_settled = True
+                return
+            counts_a, ok_a = self._get_wrap_counts(a_ed, True)
+            counts_b, ok_b = self._get_wrap_counts(b_ed, True)
+            # Still no table (tab never painted -- user is not looking
+            # at it): do NOT settle and do NOT recompare on a guess;
+            # leave the session risky so the next real recompare arms
+            # the verification again.
+            if not (ok_a and ok_b):
+                return
+            snap_a, snap_b = snapshot
+            # Line-count drift means the user edited (or a copy command
+            # merged a hunk): the arrays are not comparable and a
+            # recompare is already due through the edit path anyway.
+            if (len(counts_a) != len(snap_a or [])
+                    or len(counts_b) != len(snap_b or [])):
+                session.wrap_geometry_settled = True
+                return
+            if counts_a == snap_a and counts_b == snap_b:
+                # Gap sizes were computed from data that is still true:
+                # geometry settled, alignment correct. Settle the
+                # session -- later recomparers of this tab skip the
+                # verification until its geometry changes again.
+                session.wrap_geometry_settled = True
+                return
+        except Exception:
+            return
+        # Mismatch: the wrap tables changed after the gaps were sized
+        # (the restart bug -- first recompare read the pre-overview
+        # table). The geometry is settled NOW, so mark the session
+        # settled FIRST (the re-run below reads fresh data; even if it
+        # somehow read stale data again it must not trigger another
+        # auto-recompare -- one per chain, no loops), then recompare.
+        session.wrap_geometry_settled = True
+        ct.msg_status(_('Differ 2: editor layout settled -- '
+                        'recomparing automatically'))
+        self.refresh_compare(ed, show_dialog=False)
+
     def on_caret(self, ed_self):
         """Mirror caret to opposite editor when sync_caret is enabled."""
         if self.cfg.get('enable_sync_caret', False):
@@ -3442,6 +3671,19 @@ class Command:
             # tab's diff markers are not re-painted on purpose -- see the
             # method docstring).
             tab_session = _TabSession(tab_id_int, self._current_session_key)
+            # Restart-alignment fix: CudaText's session restore loaded
+            # this tab's texts BEFORE the plugin's geometry exists (the
+            # overview/micromap/hidden-scrollbars come back only at the
+            # first Recompare), so the first compare's wrap-table read
+            # is NOT trusted to match the final editor width -- the
+            # session starts UNSETTLED (wrap_geometry_settled=False,
+            # the _TabSession default) and that compare arms the wrap
+            # verification. The other wrap fields are the defaults too
+            # (no pending wait chain, no armed verification).
+            tab_session.wrap_geometry_settled = False
+            tab_session.wrap_wait_retries = 0
+            tab_session.wrap_verify_armed = False
+            tab_session.wrap_verify_snapshot = None
             # Populate the saved/dirty caches from disk (the runtime
             # 'saved' flag is derived: no half dirty).
             tab_session.dirty = self._entry_dirty(entry)
@@ -4367,6 +4609,14 @@ class Command:
             if micromap_on:
                 self._setup_micromap(a_ed, b_ed)
 
+            # Geometry-risk bookkeeping for the wrap-table staleness fix
+            # (see the WRAP_* constants): remember whether the overview
+            # EXISTS before this refresh's setup runs. A transition
+            # (created or destroyed below) changes the editors' WIDTH
+            # mid-refresh -- exactly the situation in which a restored
+            # tab's wrap table can be stale at the gap-math read.
+            _overview_before = session.overview
+
             # Create or reuse the paintbox overview for this compare tab
             # (the tab's OWN session holds it -- two tabs' overviews can
             # never mix). The overview is a custom paintbox added to the
@@ -4584,18 +4834,41 @@ class Command:
             wrap_a = a_ed.get_prop(ct.PROP_WRAP)
             wrap_b = b_ed.get_prop(ct.PROP_WRAP)
             wrap_on = (wrap_a != ct.WRAP_OFF) or (wrap_b != ct.WRAP_OFF)
+            _wrap_data_trusted = True
             if wrap_on:
                 Profiler.start('refresh:wrap_counts')
-                wrap_counts_a = self._get_wrap_counts(a_ed)
-                wrap_counts_b = self._get_wrap_counts(b_ed)
+                wrap_counts_a, _ok_a = self._get_wrap_counts(a_ed, True)
+                wrap_counts_b, _ok_b = self._get_wrap_counts(b_ed, True)
                 __, line_h_a = a_ed.get_prop(ct.PROP_CELL_SIZE)
                 __, line_h_b = b_ed.get_prop(ct.PROP_CELL_SIZE)
                 Profiler.stop('refresh:wrap_counts')
+                _wrap_data_trusted = _ok_a and _ok_b
+                if not _wrap_data_trusted:
+                    # Wrap table missing on at least one half (restored
+                    # tab, editor not painted yet -- CudaText #6398).
+                    # Sizing gaps from the [1]*n guess is exactly the
+                    # "restart -> recompare -> wrong align" bug, so
+                    # POSTPONE the compare until the table exists --
+                    # unless the retry budget is spent, in which case
+                    # run best-effort (the old behavior) with a hint.
+                    session.wrap_wait_retries += 1
+                    if session.wrap_wait_retries <= WRAP_WAIT_MAX_RETRIES:
+                        _cprof = self._defer_compare_for_wrap_data(
+                            session, _cprof)
+                        _epilogue = False
+                        Profiler.stop('refresh')
+                        return
+                    ct.msg_status(_('Differ 2: editor layout still settling '
+                                    '-- comparing with estimated wrap'))
             else:
                 wrap_counts_a = None
                 wrap_counts_b = None
                 line_h_a = 0
                 line_h_b = 0
+            if _wrap_data_trusted:
+                # A compare that actually runs ends any pending wait
+                # chain: the next empty read starts counting from zero.
+                session.wrap_wait_retries = 0
             # ALIGN events drive exactly ONE thing: the compensating
             # gaps for matched pairs that wrap to DIFFERENT visual
             # heights (the dispatch loop's ALIGN branch). When no line
@@ -4653,6 +4926,22 @@ class Command:
             job.fast_mode = _is_fast_mode(diff)
             job.profiling_enabled_here = _profiling_enabled_here
             job.cprofile = _cprof
+            # Wrap-table verification (restart alignment fix -- see the
+            # WRAP_* constants): a wrap-on compare whose editor geometry
+            # is not yet PROVEN settled (fresh tab before its first
+            # verification, session-restored tab, or the overview
+            # created/destroyed by this very refresh -- every case where
+            # the layout can still change after the wrap read) may have
+            # sized its alignment gaps from a wrap table built at the
+            # wrong width, or no table at all. The finisher arms the
+            # WRAP_VERIFY_DELAY_MS timer that re-reads the counts at the
+            # settled geometry and re-runs the compare once if they
+            # changed -- the "recompare again to get it right" the user
+            # had to do by hand, now automatic. Wrap-off compares never
+            # verify (the wrap table is virtual and always exact).
+            job.wrap_verify_needed = wrap_on and (
+                not session.wrap_geometry_settled
+                or ((session.overview is None) != (_overview_before is None)))
             if isinstance(diff, dfn.Differ):
                 job.a_text = a_text_all
                 job.b_text = b_text_all
@@ -4860,6 +5149,18 @@ class Command:
                 # Differ, which has no two-phase state).
                 if isinstance(diff, dfn.Differ):
                     diff.drop_cached_state()
+                # Inline-mode twin of the finisher's closing pair: flush
+                # the final repaint of both halves now that the paint
+                # lock is released, and arm the delayed wrap-data
+                # verification for the risky wrap-on compares (restart
+                # alignment fix -- see _arm_wrap_verification).
+                if not job.stale:
+                    for _e in (job.a_ed, job.b_ed):
+                        try:
+                            _e.action(ct.EDACTION_UPDATE)
+                        except Exception:
+                            pass
+                self._arm_wrap_verification(job)
         finally:
             # Compare-time epilogue: status-bar timing message + profiling
             # report. Runs here for every synchronous completion path
@@ -6265,6 +6566,30 @@ class Command:
                 diff = self._session_diff(job.session)
                 if isinstance(diff, dfn.Differ):
                     diff.drop_cached_state()
+            # Finished compare: force ONE repaint of both halves now that
+            # the paint lock is released. EDACTION_UNLOCK only INVALIDATES
+            # (the repaint is queued), so without this the freshly painted
+            # gaps/markers reach the screen only at the next message-loop
+            # paint -- and with word-wrap on, a viewport still laid out by
+            # the pre-compare wrap table can show the halves misaligned
+            # until some later repaint (scroll / caret move) "fixes" them.
+            # One explicit EDACTION_UPDATE per half flushes the pending
+            # invalidate right here (on Windows it is a synchronous
+            # Repaint). Dead-handle-safe: a tab closed mid-finish skips
+            # its repaint.
+            if not job.stale:
+                for _e in (job.a_ed, job.b_ed):
+                    try:
+                        _e.action(ct.EDACTION_UPDATE)
+                    except Exception:
+                        pass
+            # Restart-alignment fix: on the risky wrap-on compares
+            # (restored tab, overview created/destroyed mid-refresh) arm
+            # the delayed wrap-data verification -- it re-reads the wrap
+            # counts at the now-settled geometry and re-runs the compare
+            # once if the gaps were sized from stale data (see
+            # _arm_wrap_verification / WRAP_VERIFY_DELAY_MS).
+            self._arm_wrap_verification(job)
 
     def _compare_epilogue(self, compare_start, profiling_enabled_here,
                           tab_id=None, cprofile=None):
@@ -6655,19 +6980,33 @@ class Command:
               color=color
               )
 
-    def _get_wrap_counts(self, ed):
-        """Return a list where wrap_counts[i] = number of visual rows that
-        line i occupies on screen. Uses Editor.get_wrapinfo() to query the
-        editor's current word-wrap state. For a non-wrapped editor every
-        line has 1 visual row. The returned list is indexed by logical line
-        index (0-based) and has the same length as the editor's line count.
-        Used to size inter-line gaps correctly when word-wrap is on: a gap
-        that compensates for N missing logical lines must actually be
-        (sum of those lines' visual rows) * line_height pixels tall,
-        otherwise the two compare sides drift apart visually."""
+    def _get_wrap_counts(self, ed, wrap_mode_on=False):
+        """Return (wrap_counts, trusted) for editor ed.
+
+        wrap_counts[i] = number of visual rows that line i occupies on
+        screen. Uses Editor.get_wrapinfo() to query the editor's current
+        word-wrap state. For a non-wrapped editor every line has 1 visual
+        row. The returned list is indexed by logical line index (0-based)
+        and has the same length as the editor's line count. Used to size
+        inter-line gaps correctly when word-wrap is on: a gap that
+        compensates for N missing logical lines must actually be (sum of
+        those lines' visual rows) * line_height pixels tall, otherwise the
+        two compare sides drift apart visually.
+
+        trusted is False ONLY in one case: word-wrap is ON, the editor
+        has lines, and get_wrapinfo() returned NOTHING -- the editor's
+        wrap table was never built (a restored-after-restart tab that has
+        not painted yet; CudaText only builds the table inside the paint
+        cycle -- issue #6398). The [1]*n fallback is then a GUESS, and
+        every wrapped line makes it wronger; the caller (refresh_compare)
+        defers the compare until a real table exists instead of sizing
+        alignment gaps from the guess. With wrap OFF the table is virtual
+        (one row per line, always exact), so every other empty/failed
+        read still returns trusted=True -- the [1]*n list IS the truth
+        there."""
         line_count = ed.get_line_count()
         if line_count <= 0:
-            return []
+            return [], True
         counts = [1] * line_count
         # Force CudaText to refresh its internal WrapInfo structure before
         # we query it. After text changes CudaText usually detects the
@@ -6690,9 +7029,15 @@ class Command:
             with Profiler.section('refresh:wrapinfo_api'):
                 info = ed.get_wrapinfo()
         except Exception:
-            return counts
+            return counts, True
         if not info:
-            return counts
+            # Empty table. With wrap ON that means "not built yet"
+            # (never-painted editor -- CudaText #6398): the [1]*n list
+            # below is a GUESS, not data. With wrap OFF the table is
+            # virtual and get_wrapinfo synthesizes one entry per line, so
+            # an empty read here is a degenerate edge -- [1]*n is exactly
+            # right for it regardless.
+            return counts, not wrap_mode_on
         # FAST path: wrapinfo carries ONE ENTRY PER VISUAL ROW and every
         # line occupies at least one row, so len(info) == line_count
         # means every line has EXACTLY one visual row -- the [1]*n
@@ -6701,7 +7046,7 @@ class Command:
         # precisely the no-wrapping case the ALIGN-suppression check
         # in refresh_compare then detects via max(counts) == 1.
         if len(info) == line_count:
-            return counts
+            return counts, True
         # Counter path: the API contract is a list of {'line': <int>}
         # dicts, one entry per VISUAL row (a line wrapping to 2 rows
         # appears twice). Counter over map(itemgetter) is a single
@@ -6727,7 +7072,7 @@ class Command:
                         counts[line] = n
         Profiler.stop('refresh:wrapinfo_count')
         if rows is not None:
-            return counts
+            return counts, True
         # Tolerant fallback (original loop): non-dict rows skipped,
         # missing 'line' treated as -1 -> skipped by the bounds check.
         temp = [0] * line_count
@@ -6741,7 +7086,7 @@ class Command:
         for i in range(line_count):
             if temp[i] > 0:
                 counts[i] = temp[i]
-        return counts
+        return counts, True
 
     @staticmethod
     def _visual_rows(wrap_counts, line_index):

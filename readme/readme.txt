@@ -36,7 +36,12 @@ synced back to the original files automatically.
   different heights. Toggling wrap mode on one half turns it on in BOTH
   halves at once (same for turning it off), and the compare is
   re-run automatically afterwards so the alignment gaps are re-sized
-  for the new wrap mode.
+  for the new wrap mode. The plugin also self-corrects the alignment
+  when the editor layout settles too late for a compare's gap math
+  (first compare of a tab, first Recompare after a restart): it
+  verifies the editors' wrap data right after the compare finishes and
+  re-runs the compare once by itself if the layout changed under it --
+  see "Compare tabs, restarts and session switches".
 - Optional gap-aware overview panel docked to the right of the compare
   view, showing a miniature of both editors side-by-side with colored
   diff highlights (WinMerge-style), with its own scrollbar-like slider,
@@ -1107,6 +1112,21 @@ Compare tabs survive CudaText restarts:
 - If you close CudaText with a compare tab open, the compare tab is
   restored when you start CudaText again, with the same content but
   without compare, run Recompare command to start the compare.
+- With word-wrap on, the first Recompare after a restart fixes its own
+  alignment automatically: a restored tab's editor geometry (overview
+  panel, micromap gutter, hidden scrollbars) is re-created only at that
+  first Recompare, and the alignment gaps must be sized from the
+  editors' wrap table, which is rebuilt by the editor's paints. The
+  plugin verifies the wrap data 250ms after the compare finishes and,
+  if the layout settled too late for the gap math, re-runs the compare
+  by itself once ("editor layout settled -- recomparing automatically"
+  on the status bar). If the restored tab has not been painted yet, the
+  compare even postpones itself ("waiting for editor layout") instead
+  of comparing with estimated wrap data. (Resizing the window or
+  toggling side panels DURING a running compare is the one case that
+  can still leave the alignment stale -- no event reports foreign
+  width changes mid-compare; one Recompare after big layout changes
+  fixes it.)
 - The plugin loads automatically on startup only when compare tabs are
   active, so there is no performance impact when you are not comparing.
 - When you close the last compare tab, the plugin stops auto-loading on
