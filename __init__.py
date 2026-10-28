@@ -355,6 +355,20 @@ class _PaintAborted(Exception):
 # itself adds only ~2-4k markers (a few ms).
 MARKER_WINDOW_MARGIN = 1500
 
+# Tab-title font color for a compare tab whose halves are all synced
+# ('saved' -- no unsaved edits; the green of the saved/dirty indicator).
+# INVARIANT the plugin keeps: whenever a compare tab's title is GREEN,
+# PROP_MODIFIED is False on BOTH halves -- the green state means "content
+# matches the originals", and the halves get their text from set_text_all
+# (which always sets Modified=True as a side effect of Strs.
+# SetNewCommandMark), so every site that paints the title green also
+# clears the flag (set_files, on_save_pre, _apply_color_to_tab,
+# swap_editors). The dot on the tab (the modified marker) then never
+# contradicts the green 'synced' title; a DIRTY tab keeps the flag (the
+# 'Save changes?' dialog on close is the reminder to sync, see
+# on_close_pre).
+_TAB_GREEN = 0x00A000
+
 # Hotkeys for compare tabs, dispatched by Command.on_key. The plugin
 # subscribes to the lazy on_key~ event AT RUNTIME with a key-code filter
 # (see _sync_on_key_subscription) -- install.inf does NOT list on_key.
@@ -783,9 +797,11 @@ OPTS_META = [
               'Native algorithms run in compiled Pascal code and are 10-30x '
               'faster than the pure-Python implementations on large files. '
               'They require a CudaText build that includes the diff_proc '
-              'API; if it is not available, they silently fall back to the '
-              'closest Python equivalent (native_histogram -> hybrid, '
-              'native_myers -> myers).\n'
+              'API; if it is not available, starting a compare shows a '
+              'dialog explaining the situation (update CudaText, or pick a '
+              'pure-Python algorithm here) with the choice to cancel the '
+              'compare or run it once with the closest Python equivalent '
+              '(native_histogram -> hybrid, native_myers -> myers).\n'
               '- native_histogram -- Native Histogram diff (port of JGit\'s '
               'Histogram Diff, with JGit\'s Myers O(ND) Diff as internal '
               'fallback for sub-regions -- the same algorithm git uses for '
@@ -949,8 +965,8 @@ OPTS_META = [
               'Equal-count REPLACE blocks (da == db) are positional in '
               'ALL modes, so this option only affects unequal-count '
               'REPLACE blocks.\n'
-              'Default: off.'),
-     'def': 'off',
+              'Default: fast.'),
+     'def': 'fast',
      'frm': 'str2s',
      'dct': [('off',   _('Off / disabled (algo-faithful rendering)')),
              ('fast',  _('Method 1: Fast (Pascal engine, joined-block mapping)')),
@@ -1585,7 +1601,9 @@ class _CompareJob:
                             # layout), after the layout settles, not at kick-off
         'stale',            # job dropped (tab closed / app exiting)
         'in_flight',        # background engine call was started
-        'fast_mode',        # started as the fast mode (Native Myers, both beautify off): the slow-compare dialog never asks
+        'fast_mode',        # started as the fast mode (Native Myers with at most the FAST
+                            # Align-by-similarity on, absorb off -- Preset 1 included):
+                            # the slow-compare dialog never asks
         'py_poll_cb',       # Python-engine completion poll timer callback (to TIMER_STOP on cancel), None when off
         'py_engine_thread', # daemon thread running the Python engine (diagnostic ref), None when off
     )
@@ -1631,14 +1649,28 @@ class _CompareJob:
 
 
 def _is_fast_mode(diff):
-    """True when the Differ is configured exactly as the slow-compare
-    dialog's 'faster mode' -- the NATIVE engine running Native Myers
-    with ALL beautify options off (every Align-by-similarity mode and
-    the absorb pass). A job started this way never arms the
-    slow-compare watchdog."""
+    """True when the Differ is configured so the slow-compare dialog
+    would have nothing left to offer -- the NATIVE engine running
+    Native Myers with the slow beautify options off: the legacy
+    Align-by-similarity Method 2 (slow) and the absorb pass.
+
+    The FAST Align-by-similarity (Method 1, align_by_similarity) is
+    deliberately ALLOWED here: it runs entirely in the Pascal engine
+    (one engine call per REPLACE block -- the joined-block mapper), so
+    it is fast by construction, and the toolbar's Preset 1 ('Fastest
+    comparison' = Native Myers + align FAST + absorb off) keeps it ON.
+    Treating Preset 1 as NOT fast made the slow-compare dialog pop up
+    after a minute on exactly that preset, offering to stop the
+    running compare and re-run it in 'the faster mode' -- which for a
+    Preset 1 user differs only by turning the fast alignment off:
+    stop, inform, re-run nearly the same compare, pointless. With
+    this definition Preset 1 (and the plain Myers+all-off combo the
+    dialog switches to) never arms the watchdog; Histogram, Method 2
+    and absorb-on configurations still do.
+
+    A job started this way never arms the slow-compare watchdog."""
     return (isinstance(diff, dfn.Differ)
             and getattr(diff, 'diff_algorithm', '') == 'native_myers'
-            and not getattr(diff, 'align_by_similarity', False)
             and not getattr(diff, 'align_by_similarity2', False)
             and not getattr(diff, 'absorb_trivial_equal_blocks', False))
 
@@ -2657,9 +2689,17 @@ class Command:
         a_ed.set_text_all(orig_texts[0])
         b_ed.set_text_all(orig_texts[1])
 
+        # set_text_all sets Modified=True on each half (Strs.
+        # SetNewCommandMark -- the side effect that puts the dot on a
+        # freshly created compare tab). The FIRST compare starts from
+        # content identical to the originals: nothing is unsaved, so
+        # clear the flag on both halves right away -- the green title
+        # below and the no-dot tab state go together (see _TAB_GREEN).
+        self._clear_modified(a_ed, b_ed)
+
         # Color the tab title green to indicate 'synced' (no unsaved
         # changes yet -- content is identical to the originals).
-        ct.ed.set_prop(ct.PROP_TAB_COLOR_FONT, 0x00A000)  # green
+        ct.ed.set_prop(ct.PROP_TAB_COLOR_FONT, _TAB_GREEN)
 
         # Persistently subscribe to on_start2 so the plugin auto-loads on
         # next startup to restore compare tabs.
@@ -2783,6 +2823,14 @@ class Command:
         compares" -- or exits CudaText -- is stopped through
         unidiff.UnidiffRunner.cancel / cancel_all.
         """
+        # The same native-fallback gate as the side-by-side compare: a
+        # native algorithm configured on a build without diff_proc is
+        # not silently replaced by a Python one -- the user cancels the
+        # command or accepts the one-time mapped Python algorithm.
+        if not self._confirm_native_fallback():
+            ct.msg_status(_('Differ 2: diff command cancelled — configure '
+                            'a Python algorithm or update CudaText'))
+            return
         algo, use_native, _fell_back = self._resolve_algorithm()
         self.unidiff.start(txt0, txt1, fn0, fn1,
                            self.cfg.get('diff_context'), algo, use_native)
@@ -3312,15 +3360,13 @@ class Command:
         dirty half failed to sync, e.g. its original tab was closed, the
         tab correctly stays red). The color is reset to COLOR_NONE (which
         CudaText re-colors red) when the user edits again -- see
-        on_change. PROP_MODIFIED is deliberately left untouched here: it
-        plays no role in session persistence -- CudaText's session saver
-        ALWAYS stores the text of untitled tabs (it forces 'modified' to
-        true for them when writing the session file, for the first AND
-        the second half of a split alike; the flag only gates the text
-        of FILE tabs), and the restore path brings untitled tabs back
-        as modified anyway. The flag's real job is driving the
-        'Save changes?' dialogs, which on_close_pre already handles for
-        clean compare tabs."""
+        on_change. PROP_MODIFIED follows the green-title invariant (see
+        _TAB_GREEN): every synced half gets its flag cleared (its text
+        now matches its original, so the 'Save changes?' prompt on close
+        would be noise), a half whose sync failed keeps the flag -- the
+        dot and the red title then tell the same story. In the no-dirty
+        early return both halves are clean by definition, so both flags
+        are cleared there too."""
         tab_id = ed_self.get_prop(ct.PROP_TAB_ID)
         session = self._session_for(tab_id)
         if session is None:
@@ -3339,6 +3385,11 @@ class Command:
         if job is not None:
             self._cancel_job(job)
 
+        # Get both split editors (needed for the per-half PROP_MODIFIED
+        # clearing in both the early return and the sync path below).
+        a_ed = ct.Editor(ed_self.get_prop(ct.PROP_HANDLE_PRIMARY))
+        b_ed = ct.Editor(ed_self.get_prop(ct.PROP_HANDLE_SECONDARY))
+
         # Which halves carry unsaved edits? Only those get synced.
         dirty = self._get_dirty_halves(session)
         if not dirty:
@@ -3346,19 +3397,17 @@ class Command:
             # re-synced and re-saved BOTH files on every Ctrl+S (and on
             # the "Save changes?" prompt of a closing tab) -- pure waste.
             # Clear any pending suppress counter so a later real edit is
-            # not swallowed by it, keep the title green, and tell the
-            # user why nothing was saved.
+            # not swallowed by it, keep the title green, clear both
+            # halves' modified flags (green-title invariant), and tell
+            # the user why nothing was saved.
             session.suppress_change = 0
             self._update_dirty_state(session, set())  # repair stale state
-            ed_self.set_prop(ct.PROP_TAB_COLOR_FONT, 0x00A000)  # green
+            ed_self.set_prop(ct.PROP_TAB_COLOR_FONT, _TAB_GREEN)  # green
+            self._clear_modified(a_ed, b_ed)
             ct.msg_status(_('Differ 2: no unsaved changes'))
             # Block the default save (which would show a Save dialog for
             # the untitled compare tab).
             return False
-
-        # Get both split editors.
-        a_ed = ct.Editor(ed_self.get_prop(ct.PROP_HANDLE_PRIMARY))
-        b_ed = ct.Editor(ed_self.get_prop(ct.PROP_HANDLE_SECONDARY))
 
         # Look up the original tab IDs from the persisted state.
         orig_a_id, orig_b_id = self._get_orig_tab_ids(tab_id)
@@ -3391,7 +3440,21 @@ class Command:
             if remaining:
                 ed_self.set_prop(ct.PROP_TAB_COLOR_FONT, ct.COLOR_NONE)
             else:
-                ed_self.set_prop(ct.PROP_TAB_COLOR_FONT, 0x00A000)  # green
+                ed_self.set_prop(ct.PROP_TAB_COLOR_FONT, _TAB_GREEN)  # green
+            # Green-title invariant (see _TAB_GREEN): a half that just
+            # synced now matches its original -- its 'modified' dot must
+            # go. When the tab turns GREEN, BOTH flags are cleared: the
+            # other half is clean too, but its flag can still be stale-
+            # True (e.g. the session restore of a dirty tab brings BOTH
+            # halves back modified, and only one of them just synced).
+            # A half whose sync FAILED keeps the flag (still dirty,
+            # still needs the close-time 'Save changes?' reminder).
+            if synced_a:
+                self._clear_modified(a_ed)
+            if synced_b:
+                self._clear_modified(b_ed)
+            if not remaining:
+                self._clear_modified(a_ed, b_ed)
             # Persist the state (per-half dirty flags) so
             # on_start2 can restore the correct color after restart.
             self._update_dirty_state(session, remaining)
@@ -3541,8 +3604,11 @@ class Command:
             self._sessions[tab_id_str] = tab_session
 
             # Re-apply the title color: green only when no half is dirty.
+            # (_apply_color_to_tab also clears PROP_MODIFIED on both
+            # halves for the green case -- the restored-untitled-tab dot
+            # must not contradict the green title; see _TAB_GREEN.)
             if tab_session.saved:
-                self._apply_color_to_tab(tab_id_str, 0x00A000)  # green
+                self._apply_color_to_tab(tab_id_str, _TAB_GREEN)  # green
 
         # Restore the compare TOOLBARS of the session-restored compare
         # tabs (the toolbar is docked into the editor parent, which is
@@ -3567,15 +3633,48 @@ class Command:
         if self.cfg.get('sync_scroll') and self.scroll.tab_id:
             ct.app_proc(ct.PROC_EVENTS_SUB, self.scroll.name+';on_scroll;;')
 
+    @staticmethod
+    def _clear_modified(*eds):
+        """Set PROP_MODIFIED False on each given editor, exception-safe
+        per editor. The clearing side of the green-title invariant (see
+        _TAB_GREEN): a synced compare tab never shows the modified dot,
+        so the user never sees 'Save changes?' for content that already
+        matches the originals (on_close_pre's own clearing covers the
+        close path; these calls keep the flag correct WHILE the tab
+        lives). Clearing cannot drop a compare tab from a saved session
+        -- CudaText's session saver always stores untitled tabs' text
+        (see on_close_pre for the full analysis)."""
+        for e in eds:
+            if e is None:
+                continue
+            try:
+                e.set_prop(ct.PROP_MODIFIED, False)
+            except Exception:
+                pass  # dead handle / exotic host: keep the current flag
+
     def _apply_color_to_tab(self, tab_id_str, color):
         """Apply a title font color to a compare tab by its PROP_TAB_ID.
         Used by _restore_session_tabs (startup restore and mid-run
-        session switches) to re-apply the green/default color."""
+        session switches) to re-apply the green/default color.
+
+        The GREEN color also clears PROP_MODIFIED on both halves of the
+        tab (the green-title invariant, see _TAB_GREEN): session
+        restore brings untitled compare tabs back as modified whatever
+        their real state, so a clean restored tab would show the
+        modified dot next to its green title until the next edit --
+        cleared here instead, the moment the green is re-applied. A
+        non-green color (the red of a dirty tab) keeps the flags as
+        they are: the dirty halves' 'Save changes?' protection on
+        close must survive the restart."""
         target = str(tab_id_str)
         for h in ct.ed_handles():
             e = ct.Editor(h)
             if str(e.get_prop(ct.PROP_TAB_ID)) == target:
                 e.set_prop(ct.PROP_TAB_COLOR_FONT, color)
+                if color == _TAB_GREEN:
+                    self._clear_modified(
+                        ct.Editor(e.get_prop(ct.PROP_HANDLE_PRIMARY)),
+                        ct.Editor(e.get_prop(ct.PROP_HANDLE_SECONDARY)))
                 return
 
     def on_exit_pre(self, ed_self):
@@ -3925,11 +4024,12 @@ class Command:
         """Arm the one-shot SLOW_COMPARE_SECONDS timer for a
         just-started BACKGROUND compare (both background forms: the
         native engine job and the Python engine thread). Skipped when
-        the compare already runs the fast mode (Native Myers + both
-        beautify
-        off -- the mode the dialog would switch to; asking would be
-        pointless) or when the native engine is unavailable (the
-        switch would be impossible). The timer callback
+        the compare already runs the fast mode (Native Myers with at
+        most the FAST Align-by-similarity on and absorb off -- the
+        Preset 1 combination included; the dialog's switch would
+        change nothing meaningful, asking would be pointless) or when
+        the native engine is unavailable (the switch would be
+        impossible). The timer callback
         (_slow_compare_timer) re-checks everything at fire time, so a
         compare that finishes early, a tab that closes, or a newer
         kick-off on the same tab all resolve to silent no-ops."""
@@ -3946,9 +4046,10 @@ class Command:
     def _slow_compare_timer(self, tag='', info=''):
         """One-shot SLOW_COMPARE_SECONDS timer callback: a background
         compare has been running for over a minute and was NOT started
-        in the fast mode -- ask the user whether to keep waiting or to
-        re-run this compare in the fast mode (Native Myers, both
-        beautify options off).
+        in the fast mode (Native Myers with at most the fast alignment
+        on, absorb off) -- ask the user whether to keep waiting or to
+        re-run this compare in the dialog's faster mode (Native Myers,
+        every beautify option off).
 
         Guards (each resolves to a silent no-op): the tab closed with
         the timer in flight, the compare finished or was cancelled,
@@ -4172,6 +4273,14 @@ class Command:
             except Exception:
                 pass
 
+        # The swapped-in texts set Modified=True on both halves
+        # (set_text_all), but the tab's PAIR of texts is unchanged by
+        # the swap: a clean (green) tab stays clean and must not grow
+        # the modified dot -- clear the flags (green-title invariant,
+        # see _TAB_GREEN; a dirty tab keeps them, its halves still
+        # carry the same unsynced edits, only the sides swapped).
+        self._clear_modified(a_ed, b_ed)
+
         # Re-compare with the swapped sides (markers, gaps, bookmarks
         # and the overview are all rebuilt by the same Recompare path;
         # the two texts themselves did not change, so for identical
@@ -4180,8 +4289,11 @@ class Command:
         ct.msg_status(_('Differ 2: compared editors swapped'))
 
     # native_histogram / native_myers only work when cudatext.diff_proc
-    # is present. On older CudaText builds the plugin falls back to the
-    # closest pure-Python algorithm (documented in OPTS_META):
+    # is present. On older CudaText builds the plugin does NOT silently
+    # run a Python algorithm instead: every compare kick-off first asks
+    # the user (_confirm_native_fallback -- cancel the compare, or run
+    # it once with the closest Python equivalent) and only a consented
+    # fallback applies this mapping (documented in OPTS_META):
     #   native_histogram -> hybrid
     #   native_myers     -> myers
     _NATIVE_TO_PYTHON_FALLBACK = {
@@ -4196,7 +4308,11 @@ class Command:
         use_native is True only when a native algo is configured AND
         cudatext.diff_proc is available.
         fell_back is True when the user configured a native algo but
-        the native API is missing, so a Python equivalent is used.
+        the native API is missing, so a Python equivalent is used. The
+        silent automatic fallback is gone: a compare only runs the
+        mapped Python algorithm after the user accepts it in the
+        _confirm_native_fallback dialog (cancel keeps the configured
+        native algorithm and aborts the compare instead).
 
         A session whose temporary fast-mode flag is set (the slow-
         compare dialog's 'Switch to faster compare') resolves to
@@ -4217,15 +4333,65 @@ class Command:
             return self._NATIVE_TO_PYTHON_FALLBACK[algo], False, True
         return algo, False, False
 
+    def _confirm_native_fallback(self):
+        """The gate every compare kick-off passes when a NATIVE algorithm
+        is configured on a CudaText build without the diff_proc API.
+
+        Returns True when the compare may start: either the configured
+        algorithm is a pure-Python one, or the native engine is present,
+        or the user just accepted the one-time fallback in the dialog.
+
+        Returns False when the user cancelled: the caller must abort the
+        compare without touching anything (the gate runs BEFORE any
+        mutation of the compare tab -- no markers cleared, no overview
+        wiped -- so an aborted compare leaves the tab exactly as it
+        was).
+
+        The dialog explains the situation and the two ways out of it:
+        update CudaText (the native algorithms need the diff_proc API),
+        or change differ2.algorithm.diff_algorithm in the plugin config
+        to a pure-Python algorithm -- plus the buttons [Cancel compare]
+        / [Compare with Python algorithm '<mapped>'] for the current
+        compare. Asking every time is deliberate: the fallback is a
+        per-compare decision, and the repeated dialog is the reminder
+        that the configuration still names an algorithm this editor
+        cannot run.
+        """
+        algo = self.cfg.get('diff_algorithm', 'native_myers')
+        if algo not in self._NATIVE_TO_PYTHON_FALLBACK:
+            return True   # a pure-Python algorithm: nothing to ask
+        if dfn._HAS_NATIVE_DIFF:
+            return True   # the native engine is available
+        py_algo = self._NATIVE_TO_PYTHON_FALLBACK[algo]
+        res = ct.msg_box_ex(
+            _('Differ 2: native diff API not available'),
+            _('This CudaText version does not provide the native diff '
+              'API (cudatext.diff_proc), which the configured algorithm '
+              '"{}" requires.\n\n'
+              'To use the native algorithms, update CudaText to the '
+              'latest version. Alternatively, change the algorithm in '
+              'the plugin config (option "Diff algorithm", chapter '
+              '"Algorithm") to a pure-Python one: hybrid, myers, vscode, '
+              'patience or difflib.\n\n'
+              'Compare now with the closest Python algorithm "{}"?'
+              ).format(algo, py_algo),
+            [_('Cancel compare'),
+             _('Compare with Python algorithm "{}"').format(py_algo)],
+            ct.MB_ICONWARNING, 0)
+        return res == 1
+
     def _create_differ(self):
         """Create the appropriate Differ instance based on the configured
         algorithm. Returns a differ_native.Differ for native algorithms
         (when the native API is available), or a differ_python.Differ for
-        all Python algorithms and as a fallback when native is unavailable.
+        all Python algorithms and as the CONSENTED fallback when native
+        is unavailable (the compare kick-off gates on
+        _confirm_native_fallback first -- the fallback only ever runs
+        after the user accepted it in that dialog).
 
         When a native algorithm is configured on an old CudaText build
-        without diff_proc, the status bar reports the fallback to the
-        equivalent Python algorithm (native_histogram -> hybrid,
+        without diff_proc, the status bar reports the consented fallback
+        to the equivalent Python algorithm (native_histogram -> hybrid,
         native_myers -> myers).
         """
         algo, use_native, fell_back = self._resolve_algorithm()
@@ -4235,7 +4401,7 @@ class Command:
         if fell_back:
             configured = self.cfg.get('diff_algorithm', 'native_myers')
             ct.msg_status(
-                _('Differ 2: native API not available — falling back to Python algo {} '
+                _('Differ 2: native API not available — comparing with Python algo {} '
                   '(configured: {})').format(algo, configured))
         else:
             ct.msg_status(_("Differ 2: Using Python Algo {}").format(algo))
@@ -4259,7 +4425,10 @@ class Command:
 
         Also applies the native→Python algorithm mapping when the native
         API is missing, so the Python Differ never receives a
-        'native_*' name it cannot run.
+        'native_*' name it cannot run. (The mapping only takes effect
+        on a compare the user already consented to — the kick-off
+        sites gate on _confirm_native_fallback before this runs; the
+        Differ instance type itself is inert until a compare uses it.)
         """
         diff = self._session_diff(session)
         algo, want_native, fell_back = self._resolve_algorithm(session)
@@ -4398,6 +4567,18 @@ class Command:
         # enabling profiling in the config dialog would not be profiled
         # (self.cfg would still have the old value).
         self.config()
+
+        # Native algorithm configured on a CudaText build without the
+        # diff_proc API: no silent Python fallback anymore -- ask the
+        # user (update CudaText / change the algo in config; cancel this
+        # compare or run it once with the mapped Python algorithm).
+        # Placed BEFORE any mutation of the tab (markers, overview,
+        # scrollbars are all still untouched here), so a cancelled
+        # compare leaves everything exactly as it was.
+        if not self._confirm_native_fallback():
+            ct.msg_status(_('Differ 2: compare cancelled — configure a '
+                            'Python algorithm or update CudaText'))
+            return
 
         # Enable/disable profiling based on config. reset() clears any
         # stale data from a previous compare so the report only shows
@@ -4677,7 +4858,7 @@ class Command:
             diff.diff_algorithm = _algo
             if _fell_back:
                 ct.msg_status(
-                    _('Differ 2: native API not available — falling back to Python algo {} '
+                    _('Differ 2: native API not available — comparing with Python algo {} '
                       '(configured: {})').format(
                         _algo, self.cfg.get('diff_algorithm', 'native_myers')))
             if getattr(session, 'fast_temp', False):
@@ -6047,6 +6228,18 @@ class Command:
         around the viewport; the moved half's window would otherwise
         stay at the pre-move position until the next scroll event).
 
+        SCROLL-TO-CARET ("when compare is done, scroll to caret of the
+        focused editor"): before the shared pixel is written, the
+        reference half's caret is checked against its viewport (see
+        _caret_visible_pixel). A caret already inside the view changes
+        nothing (the overwhelming majority of compares); a caret that
+        the compare pushed out of the view -- alignment gaps inserted
+        between the viewport top and the caret line -- moves the shared
+        pixel so the caret line lands CENTERED, and both halves follow
+        together (the alignment invariant is kept: the same pixel goes
+        to both). Multi-caret halves skip the adjustment (no
+        unambiguous target line).
+
         Exception-safe per half: a dead handle (tab closed through a
         pump, cancel) or an exotic host without the property keeps
         whatever anchor that half has -- never worse than the
@@ -6073,6 +6266,7 @@ class Command:
         pos = self._true_viewport_pixel(ref, ref_counts, ref_line_h)
         if pos is None:
             return
+        pos = self._caret_visible_pixel(ref, ref_counts, ref_line_h, pos)
         session = job.session
         for e in (ref, other):
             try:
@@ -6150,6 +6344,83 @@ class Command:
             return rows_before * ch + gaps_above + off
         except Exception:
             return None
+
+    @staticmethod
+    def _caret_visible_pixel(ed, wrap_counts, line_h, pos):
+        """Adjust the viewport-top pixel POS so that ED's (single) caret
+        line is visible; return the possibly moved pixel.
+
+        The end-of-compare scroll-to-caret of the FOCUSED half: when a
+        compare's alignment-gap inserts land between the viewport top
+        and the caret line, the finished compare can leave the caret
+        pushed out of the view (the anchor the resync re-derives is
+        content-anchored, so the view keeps its top line but the caret
+        moves down by every gap inserted above it). This helper
+        computes the caret line's pixel span -- the same first-
+        principles math as _true_viewport_pixel (wrap rows above the
+        line + gap pixels above it) -- and checks it against the
+        viewport band [pos, pos + smooth_page] (the whole caret line
+        block must fit, CudaText's own IsCaretOnVisibleRect semantic:
+        fully visible -- even glued to the top or bottom edge -- counts
+        as visible, so a compare never nudges a view the user is happy
+        with).
+
+        Caret inside the band: POS returns unchanged (no view
+        movement -- the common compare, and the guarantee that an
+        already-aligned untouched compare is still a byte-for-byte
+        no-op). Caret outside: POS moves so the caret line lands
+        CENTERED in the viewport (clamped to >= 0; the scrollbar's
+        own smooth_pos_last clamp trims the far end at write time --
+        the double write of the caller handles its staleness).
+
+        Skipped (POS unchanged) when the state cannot be read, the
+        half has MULTIPLE carets (no unambiguous target line), or the
+        page/row geometry is unknown -- never worse than the pre-fix
+        behavior."""
+        try:
+            carets = ed.get_carets()
+            if len(carets) != 1:
+                return pos   # multi-caret / none: no unambiguous target
+            caret_line = carets[0][1]
+            if not isinstance(caret_line, int) or caret_line < 0:
+                return pos
+            info = ed.get_prop(ct.PROP_SCROLL_VERT_INFO)
+            if not isinstance(info, dict):
+                return pos
+            page = info.get('smooth_page')
+            ch = info.get('char_size') or line_h or 0
+            if not page or page <= 0 or ch <= 0:
+                return pos
+            # The caret line's top pixel: wrap rows above + gaps above
+            # (the e.gap() convention: gaps with index < caret_line sit
+            # above the line, index -1 = before line 0).
+            if caret_line == 0:
+                rows_before = 0
+            elif wrap_counts:
+                rows_before = sum(islice(wrap_counts, caret_line))
+            else:
+                rows_before = caret_line
+            gaps_above = 0
+            for g in ed.gap(ct.GAP_GET_ALL, 0, 0) or []:
+                g_line = g.get('line')
+                if g_line is not None and g_line < caret_line:
+                    gaps_above += g.get('size') or 0
+            caret_top = rows_before * ch + gaps_above
+            # The caret line's own height (a wrapped line can span
+            # several rows -- the whole line block must fit).
+            if wrap_counts and 0 <= caret_line < len(wrap_counts):
+                rows_here = wrap_counts[caret_line] or 1
+            else:
+                rows_here = 1
+            caret_bottom = caret_top + rows_here * ch
+            # Visible band: the whole caret-line block inside the page
+            # (edge-glued counts as visible).
+            if pos <= caret_top and caret_bottom <= pos + page:
+                return pos   # visible: don't move the view
+            # Scroll to the caret, centered in the viewport.
+            return max(0, caret_top - (page // 2))
+        except Exception:
+            return pos
 
     def _free_job_slot(self, job):
         """Free the session's job slot when this job finishes (or is

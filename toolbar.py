@@ -384,19 +384,25 @@ def resolve_align_mode(raw_val):
     returns ALIGN_FAST / ALIGN_SLOW / ALIGN_OFF from the raw stored
     value. Shared by the toolbar and Command.get_config -- ONE rule
     everywhere. A valid stored string passes through; anything else
-    (an absent key, a junk hand-edit) falls back to ALIGN_OFF."""
-    if raw_val in (ALIGN_FAST, ALIGN_SLOW):
+    (a junk hand-edit) falls back to the option's DEFAULT, which is
+    ALIGN_FAST -- the fast engine-driven alignment (Method 1) is the
+    out-of-the-box behavior since the default change from 'off'."""
+    if raw_val in (ALIGN_FAST, ALIGN_SLOW, ALIGN_OFF):
         return raw_val
-    return ALIGN_OFF
+    return ALIGN_FAST
 
 
 def get_align_mode():
     """The RESOLVED Align-by-similarity mode (one of ALIGN_MODES),
     read live from the plugin's settings (mtime-cached by cudax_lib,
     so config-dialog / toolbar / hand-edited changes are picked up at
-    once), through the shared resolve_align_mode."""
+    once), through the shared resolve_align_mode. The read's DEFAULT
+    is ALIGN_FAST: a fresh install (no stored value yet) gets the
+    fast engine-driven alignment -- the beautified side-by-side look
+    out of the box; users who want the raw algo-faithful rendering
+    set the dropdown to 'off' once and that choice persists."""
     return resolve_align_mode(
-        ctx.get_opt(_ALIGN_OPT, ALIGN_OFF, user_json=_JSON_FILE))
+        ctx.get_opt(_ALIGN_OPT, ALIGN_FAST, user_json=_JSON_FILE))
 
 
 def set_align_mode(mode):

@@ -118,6 +118,91 @@
   scroll, engine-phase scroll -- ends with both halves on the
   identical pixel and the focused half's view unmoved, in ONE
   compare; a compare at the top of the file moves nothing at all.
+- add: "when compare is done, scroll to caret of the focused editor".
+  The closing pass of every compare's paint phase (the same
+  _resync_scroll_after_paint that re-anchors the halves) now also
+  checks the FOCUSED half's caret against its viewport and scrolls so
+  the caret line is visible again: a compare's own alignment-gap
+  inserts between the viewport top and the caret line can push the
+  caret out of the view (the anchor the resync re-derives is
+  content-anchored, so the view keeps its top line while the caret
+  moves down by every gap inserted above it). Command._caret_visible_
+  pixel computes the caret line's pixel span with the same
+  first-principles math as _true_viewport_pixel (wrap rows above +
+  gap pixels above) and checks it against the viewport band
+  [top pixel, top pixel + smooth_page] with CudaText's own
+  IsCaretOnVisibleRect semantic (fully visible -- even edge-glued --
+  counts as visible). A visible caret moves nothing (the common
+  compare is still a byte-for-byte no-op); an invisible one moves the
+  SHARED pixel so the caret line lands centered, and both halves
+  follow together -- the alignment invariant is kept (the same pixel
+  goes to both). Multi-caret halves skip the adjustment (no
+  unambiguous target line); so do unreadable states (dead handle,
+  exotic host) -- never worse than before.
+- change: a NATIVE algorithm (Native Histogram / Native Myers)
+  configured on a CudaText build without the cudatext.diff_proc API
+  no longer SILENTLY runs the closest pure-Python algorithm. Every
+  compare kick-off (the side-by-side Recompare and the unified-diff
+  commands alike) passes a new gate, Command._confirm_native_fallback:
+  a dialog explains the situation and the two ways out of it -- update
+  CudaText (the native algorithms need the diff_proc API), or change
+  "Diff algorithm" in the plugin config to a pure-Python one (hybrid,
+  myers, vscode, patience, difflib) -- with the buttons [Cancel
+  compare] and [Compare with Python algorithm "<mapped>"] (native_
+  histogram -> hybrid, native_myers -> myers, the same mapping as
+  before). Cancel aborts the compare BEFORE anything is touched (no
+  markers cleared, no overview wiped, the tab stays exactly as it
+  was) with a status-bar hint; the fallback runs the mapped Python
+  algorithm for that one compare. The gate sits before any mutation
+  on purpose, and it asks every time: the fallback is a per-compare
+  decision, and the repeated dialog is the reminder that the
+  configuration still names an algorithm this editor cannot run.
+  Pure-Python configurations and native-capable builds never see the
+  dialog at all.
+- change: differ2.algorithm.beautify.align_by_similarity now defaults
+  to FAST (Method 1, the engine-driven joined-block mapper): a fresh
+  install gets the beautified, VS Code-like alignment out of the box
+  -- Method 1 runs in the diff engine itself, so "fast" costs almost
+  nothing compared to "off". The read's default (toolbar.get_align_
+  mode), the junk-hand-edit fallback (resolve_align_mode) and the
+  config dialog's default (OPTS_META 'def') all say 'fast' now;
+  users who want the raw algo-faithful rendering set the dropdown to
+  'off' once and that choice persists as before.
+- fix: the slow-compare dialog ("The compare has been running for
+  over a minute... switch to the faster mode?") fired on Preset 1
+  ("Fastest comparison" -- Native Myers + Align FAST + Absorb off)
+  after one minute -- pointless: the dialog's switch would stop the
+  running compare and re-run it in a mode that differs only by
+  turning the FAST alignment off; stop, inform, re-run nearly the
+  same compare, no sense (the user's report). _is_fast_mode now
+  counts the FAST Align-by-similarity (Method 1) as fast (it runs
+  entirely in the Pascal engine -- one engine call per REPLACE
+  block -- fast by construction, and Preset 1 keeps it ON), so
+  Preset 1 and the plain Myers+all-off combo the dialog switches to
+  never arm the 1-minute watchdog; Histogram, Method 2 (slow align)
+  and absorb-on configurations still get the dialog, where the
+  switch is a real speedup.
+- add: the green-title invariant -- whenever a compare tab's title is
+  colored green (all halves synced), PROP_MODIFIED is now False on
+  BOTH halves, so the tab never shows the modified dot next to its
+  green title. set_text_all sets Modified=True as a side effect
+  (Strs.SetNewCommandMark), which is what put the dot on every
+  freshly created compare tab; the flag is now cleared at every green
+  site: (1) set_files, right after the texts load (the first compare
+  starts from content identical to the originals -- nothing is
+  unsaved); (2) on_save_pre, for every half that just synced back to
+  its original tab, and for BOTH halves when the tab turns green (a
+  clean-but-unsynced half can carry a stale flag, e.g. the session
+  restore of a dirty tab brings both halves back modified); (3)
+  _apply_color_to_tab at session restore (restored untitled compare
+  tabs come back modified whatever their real state); (4) swap_view
+  (the swapped-in texts re-set the flag; the tab's PAIR of texts is
+  unchanged by the swap). A DIRTY tab keeps the flag: the dot and the
+  red title tell the same story, and the close-time 'Save changes?'
+  prompt stays as the reminder to sync. Clearing is safe for every
+  session concern -- CudaText's session saver always stores the text
+  of untitled tabs (the flag only gates the text of FILE tabs; see
+  on_close_pre).
 
 2026.10.06 (30th release, by @alkorsan)
 * add: "Method 1: Fast (Pascal engine, joined-block mapping)" -- the new

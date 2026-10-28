@@ -1,6 +1,7 @@
+ 
 
-
-
+__________________
+fix bug_a bug_b text ecome blanc in second editor when i scroll
  
 __________________
 i want to reduce events overead
@@ -8,28 +9,16 @@ remove all events from install inf except on_tab_menu, and subscribe dynamically
 this is just a suggestion if it s wrong and there is a better plan then do it
 ___________________
  
-change default of align_by_similarity to fast
 
  
-when compare is done, scroll to caret of the focused editor
-
-when i have a diff tab and i restart cudatxt then recompare, the align is wrong, i have to recompare again to get it right! seen in test2_a.py
-
-
-first compare show non aligned hunks, it get autocorrected when i scroll or move caret, it happens also when sidepanel is opened
-
-fast preset1 triggers dialog to use fast preset after 1Min,it should not
-
-remove native to python fallback
-
-
-when we start a compare for the first time, there is no changes yet in the diff tab, so we must set its change state to false to remove the dot on the tab
+ 
 
 
 
 cleanup doc and changelog
 
 
+fix toolbar icons fonts , some of them does not exist in default cudatext font in windows, in default cuda, so set toolbar font to a universal font which work on all os
 ===============================
 
 if cuda_hilite_occurrences is enbled, compare gave this error when i compare  140mb
