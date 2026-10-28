@@ -2644,9 +2644,15 @@ class Command:
 
         # Load each original's content into the two split halves.
         # The overview is docked, the scrollbars are hidden and the
-        # micromap columns are in place by now, so the editors
-        # already have their FINAL width and the text wraps only
-        # once.
+        # micromap columns are in place -- and ONE UI pump just made
+        # those docked/changed bounds LAND (the LCL re-alignment is
+        # message-driven: without the pump the editors' Width can still
+        # be the pre-dock one when the texts load, and set_text_all
+        # rebuilds the wrap table at that stale width -- the
+        # first-compare variant of the restart alignment bug). With the
+        # pump the editors have their FINAL width before the text wraps,
+        # so it wraps exactly once, correctly.
+        _pump_ui_messages()
         a_ed.set_text_all(orig_texts[0])
         b_ed.set_text_all(orig_texts[1])
 
@@ -2983,12 +2989,92 @@ class Command:
         the CudaText session restored, so the toolbars are back at
         startup exactly as they were before the restart. Tabs closed
         again in the meantime resolve to no editor and are skipped;
-        ensure_for_session itself checks the show_toolbar option."""
+        ensure_for_session itself checks the show_toolbar option.
+
+        The same pass then re-creates each restored tab's compare
+        LAYOUT (_restore_compare_layout): the overview panel, the
+        hidden built-in scrollbars and the micromap are the
+        width-affecting parts of a compare tab, and CudaText's session
+        restore brings the tab back WITHOUT them (the overview is a
+        plugin-side dialog, the scrollbar style is not saved in the
+        tab history). Docking them here -- seconds before the user can
+        possibly hit Recompare -- means the first Recompare of a
+        restored tab starts with the layout ALREADY settled: no
+        mid-compare width change, so the kick-off wrap read is valid
+        and the first compare aligns correctly (the restart bug where
+        only the SECOND recompare was aligned right)."""
         for session in list(self._sessions.values()):
             if difftb.get_for(session) is None:
                 ed = self._editor_by_tab_id(session.tab_id)
                 if ed is not None:
                     difftb.ensure_for_session(self, session, ed)
+            self._restore_compare_layout(session)
+
+    def _restore_compare_layout(self, session):
+        """Re-create the width-affecting parts of ONE restored compare
+        tab's layout: the overview panel (enable_overview), the hidden
+        built-in vertical scrollbars (overview on +
+        hide_builtin_scrollbars) and the micromap (enable_micromap).
+
+        CudaText's session restore does NOT bring these back: the
+        overview is a plugin-created docked dialog that died with the
+        old process, and the scrollbar-hiding style is not part of the
+        tab's saved history -- a restored compare tab comes up with the
+        panel missing and the scrollbars visible. Left alone, the
+        FIRST Recompare of that tab docks the overview / hides the
+        scrollbars in the middle of the compare, changing both halves'
+        width AFTER their wrap layout was built: the alignment gaps
+        end up sized against a stale wrap table and the two sides drift
+        apart (the 'recompare twice after restart to align it right'
+        bug). Doing the same docking here -- at restore time, 300ms
+        after the sessions were rebuilt, long before any Recompare --
+        settles the layout early; refresh_compare then finds the panel
+        in place (session.overview), the scrollbars already hidden
+        (session.scrollstyle_orig captured here) and the micromap on,
+        marks NOTHING dirty and reads a valid wrap table at kick-off.
+
+        No-ops when the layout is already normalized (mid-run session
+        switch back to a session whose tabs kept their live panels),
+        when a compare is running for the tab (session.job -- the
+        compare's own kick-off did its own layout work), or when the
+        tab was closed again before the timer fired. PaintboxOverview
+        creation is exception-safe: a failed docking leaves the session
+        without an overview and refresh_compare self-heals it at the
+        next compare, exactly the pre-existing behavior."""
+        if session is None or session.job is not None:
+            return
+        ed = self._editor_by_tab_id(session.tab_id)
+        if ed is None:
+            return
+        try:
+            if ed.get_prop(ct.PROP_EDITORS_LINKED):
+                return
+            a_ed = ct.Editor(ed.get_prop(ct.PROP_HANDLE_PRIMARY))
+            b_ed = ct.Editor(ed.get_prop(ct.PROP_HANDLE_SECONDARY))
+        except Exception:
+            return
+        overview_on = self.cfg.get('enable_overview', True)
+        if overview_on and session.overview is None:
+            try:
+                overview = PaintboxOverview()
+                overview.create(a_ed, b_ed)
+                session.overview = overview
+            except Exception:
+                # Docking failed (parent not laid out yet on an exotic
+                # host): leave session.overview None -- the next
+                # refresh_compare creates the panel itself (and marks
+                # the layout dirty, which _refresh_wrap_layout then
+                # settles with the synchronous wrap-table rebuild).
+                pass
+        try:
+            self._apply_scrollbar_visibility(
+                session, a_ed, b_ed,
+                overview_on and self.cfg.get('hide_builtin_scrollbars',
+                                             True))
+        except Exception:
+            pass
+        if self.cfg.get('enable_micromap', False):
+            self._setup_micromap(a_ed, b_ed)
 
     def _toolbar_refresh_timer(self, tag='', info=''):
         """100ms one-shot timer for toolbar-initiated refreshes: info
@@ -3463,8 +3549,16 @@ class Command:
         # before the main form shows; after a mid-run session switch the
         # parents are laid out already -- but in both cases the one-shot
         # 300ms timer is used anyway, so the editor parents are fully
-        # laid out when the docking happens.
-        if self.cfg.get('show_toolbar', True) and self._sessions:
+        # laid out when the docking happens. The same timer now also
+        # re-creates each restored tab's compare LAYOUT (overview panel,
+        # hidden scrollbars, micromap -- see _restore_compare_layout):
+        # normalizing the width-affecting parts at RESTORE time means
+        # the user's first Recompare finds an already-settled layout and
+        # takes the ordinary code path -- no mid-compare width change,
+        # no stale wrap table, one compare, correct alignment. Armed for
+        # every restored compare tab regardless of the show_toolbar
+        # option (the toolbar pass checks it itself).
+        if self._sessions:
             callback = 'module=cuda_differ2;cmd=_toolbar_restore_timer;info=_;'
             ct.timer_proc(ct.TIMER_START_ONE, callback, 300)
 
@@ -4362,16 +4456,20 @@ class Command:
 
             # Does THIS refresh change the editors' WIDTH? Everything that
             # docks/undocks a panel or flips a scrollbar/micromap style
-            # below (Recompare on a restored tab, the overview option just
-            # toggled, ...) resizes the halves AFTER their text was already
-            # loaded, and the wrap layout that the gap math must read is
-            # only rebuilt inside the editors' paint cycle -- so a wrap
-            # read at kick-off would describe the PRE-change geometry and
+            # below (Recompare on a restored tab the restore pass did
+            # NOT normalize -- see _restore_compare_layout --, the
+            # overview option just toggled, ...) resizes the halves
+            # AFTER their text was already loaded, and the wrap layout
+            # that the gap math must read is rebuilt by ATSynEdit either
+            # inside the editors' paint cycle or -- synchronously -- by
+            # the LineTop nudge of _refresh_wrap_layout, so a wrap read
+            # at kick-off would describe the PRE-change geometry and
             # the alignment gaps would drift once the halves re-wrap at
-            # their new width (the 'recompare twice after restart to get
-            # the alignment right' bug). When dirty, the wrap data is read
-            # at the paint-phase entry instead (_refresh_wrap_layout),
-            # after the layout has settled -- one compare, correct gaps.
+            # their new width. When dirty, the wrap data is re-read at
+            # the paint-phase entry instead (_refresh_wrap_layout),
+            # after the layout has settled and with a forced
+            # synchronous wrap-table rebuild -- one compare, correct
+            # gaps.
             _layout_dirty = False
 
             # Make sure the compare TOOLBAR exists (it is normally created
@@ -4628,15 +4726,17 @@ class Command:
             wrap_on = (wrap_a != ct.WRAP_OFF) or (wrap_b != ct.WRAP_OFF)
             if wrap_on and _layout_dirty:
                 # The wrap layout read NOW would describe the geometry
-                # BEFORE this refresh's panel changes: ATSynEdit rebuilds
-                # its wrap table only inside the editors' paint cycle, and
-                # the just-docked/undocked overview (or just-hidden
-                # scrollbars, just-enabled micromap) has neither finished
-                # the LCL re-alignment nor repainted the halves yet. Skip
-                # the (known-stale, expensive) kick-off read entirely;
-                # _refresh_wrap_layout re-reads everything at the
-                # paint-phase entry, after pumping the pending alignment
-                # and paints -- the gap math then sees the FINAL geometry.
+                # BEFORE this refresh's panel changes: ATSynEdit's wrap
+                # table is rebuilt inside the editors' paint cycle (or
+                # synchronously by a LineTop set -- see
+                # _refresh_wrap_layout), and the just-docked/undocked
+                # overview (or just-hidden scrollbars, just-enabled
+                # micromap) has not finished the LCL re-alignment yet.
+                # Skip the kick-off read entirely; _refresh_wrap_layout
+                # rebuilds the table synchronously (LineTop nudge) and
+                # re-reads everything at the paint-phase entry, after
+                # pumping the pending alignment -- the gap math then
+                # sees the FINAL geometry.
                 wrap_counts_a = None
                 wrap_counts_b = None
                 line_h_a = 0
@@ -4900,12 +5000,13 @@ class Command:
             # running', typing is blocked, a mid-paint close cancels
             # cleanly).
             session.job = job
-            # Layout-dirty wrap read must run BEFORE the paint lock: a
-            # locked editor paints only the 'busy' placeholder, so the
-            # wrap-table rebuild of _refresh_wrap_layout could not run
-            # under it. (Background compares take the lock only past the
-            # EDITOR_LOCK_DELAY_MS grace window and do the read at the
-            # paint-phase entry instead.)
+            # Layout-dirty wrap read runs BEFORE the paint lock for the
+            # same settle-early reasons as before (the LineTop-nudge
+            # rebuild is lock-SAFE, but settling the layout and reading
+            # the wrap data before the 'busy' placeholder covers the
+            # halves is still strictly better; background compares take
+            # the lock only past the EDITOR_LOCK_DELAY_MS grace window
+            # and do the read at the paint-phase entry instead).
             self._refresh_wrap_layout(job)
             self._lock_compare_editors(job)
             try:
@@ -5002,17 +5103,19 @@ class Command:
         overview = job.overview
         wrap_on = job.wrap_on
         # Layout-dirty compare (panels docked/undocked, scrollbars hidden,
-        # micromap enabled at kick-off -- Recompare on a restored tab, the
-        # overview option just toggled): refresh_compare skipped the wrap
-        # read because the just-changed layout had not settled yet. Read
-        # it NOW: the background engine phase gave the message loop time
-        # to run, and _refresh_wrap_layout pumps the remaining alignment /
-        # paints before reading, so the gap math below sees the wrap
-        # layout of the editors' FINAL geometry. No-op for every compare
-        # whose layout did not change (and for the inline path, which
-        # already ran it before taking the paint lock). MUST run before
-        # the job-field reads below -- it fills wrap_counts_a/b,
-        # line_h_a/b and align_gap_events.
+        # micromap enabled at kick-off -- Recompare on a restored tab the
+        # restore pass did not normalize, the overview option just
+        # toggled): refresh_compare skipped the wrap read because the
+        # just-changed layout had not settled yet. Read it NOW: the
+        # background engine phase gave the message loop time to run,
+        # _refresh_wrap_layout pumps the remaining alignment and then
+        # rebuilds the wrap table SYNCHRONOUSLY (the LineTop nudge --
+        # valid on every platform, under the paint lock too), so the
+        # gap math below sees the wrap layout of the editors' FINAL
+        # geometry. No-op for every compare whose layout did not change
+        # (and for the inline path, which already ran it before taking
+        # the paint lock). MUST run before the job-field reads below --
+        # it fills wrap_counts_a/b, line_h_a/b and align_gap_events.
         self._refresh_wrap_layout(job)
         # ALIGN events matter only when some line wraps to 2+ visual
         # rows (set by refresh_compare from the wrap counts). Gates the
@@ -6754,21 +6857,24 @@ class Command:
         alignment right" bug).
 
         The settle, in order:
-          1. one UI pump (_pump_ui_messages = app_proc(PROC_IDLE)) so
-             the pending LCL re-alignment of the just-docked panels
-             finishes and the pending editor paints run;
-          2. EDACTION_UPDATE on both halves (WITHOUT the "1" -- no
-             forced full wrap recalc) plus a second pump: the invalida-
-             tion is delivered synchronously through the pump on every
-             platform, and ATSynEdit's own UpdateWrapInfo rebuilds the
-             table when -- and only when -- it is actually stale for the
-             current width. Skipped while the whole-compare paint lock
-             is engaged (a locked editor paints only the 'busy'
-             placeholder, nothing could rebuild); a compare that
-             outlived the lock's grace window has had its tables rebuilt
-             by the natural paints long before the lock fired;
+          1. TWO UI pumps (_pump_ui_messages = app_proc(PROC_IDLE)):
+             the first delivers the LCL re-alignment of the just-docked /
+             undocked / re-shown panels (Resize / AlignControls), the
+             second flushes the paints the first one triggered -- by the
+             second pass the editors' Width is the FINAL one;
+          2. a synchronous wrap-table rebuild on both halves -- the
+             LineTop nudge (see the inline comment below): PROP_LINE_TOP's
+             setter calls TATSynEdit.SetLineTop, which calls UpdateWrapInfo
+             DIRECTLY (before any scrolling), rebuilding the wrap table
+             at the editor's LIVE width. This is CudaText's own restore
+             mechanism ("required for restoring LineTop for n tabs, on
+             opening CudaText") and is NOT gated by the paint lock
+             (IsRepaintEnabled only gates Update/Invalidate -- the rebuild
+             runs for a locked editor too), so it works on every platform
+             and for compares that outlived the lock's grace window;
           3. the wrap counts / cell sizes / ALIGN-event decision are
-             read into the job (read-only: no forced update here).
+             read into the job (read-only: the table is guaranteed fresh
+             by step 2, nothing is forced here).
 
         Called from the paint-phase entry of _paint_compare_events
         (background compares: the engine phase has already given the
@@ -6796,22 +6902,26 @@ class Command:
         a_ed = job.a_ed
         b_ed = job.b_ed
         try:
-            # 1) Let the pending panel alignment + editor paints settle.
+            # 1) Let the panel alignment (two passes: re-align, then the
+            #    paints the re-align triggered) settle, so the editors'
+            #    Width below is the FINAL one.
             _pump_ui_messages()
-            # 2) Deliver an invalidated repaint of both halves, so the
-            #    wrap table is rebuilt for the SETTLED width when it is
-            #    stale (and not rebuilt at all when it is not).
-            if not job.editor_lock:
-                for _ed in (a_ed, b_ed):
-                    try:
-                        _ed.action(ct.EDACTION_UPDATE)
-                    except Exception:
-                        pass
-                _pump_ui_messages()
-            # 3) Read the wrap layout of the settled geometry (the
-            #    forced-update variant is NOT used: step 2 already
-            #    delivered the repaint that consumes the wrap-update
-            #    flag the resize set).
+            _pump_ui_messages()
+            # 2) Synchronous wrap-table rebuild -- the LineTop nudge
+            #    (see _force_wrap_rebuild for why this is the only
+            #    cross-platform, paint-lock-safe way to make the table
+            #    describe the editors' LIVE width: a pump-driven settle
+            #    alone still read a stale table on hosts where the
+            #    invalidation never flushed, and a session-restored tab's
+            #    table describes the RESTORE-TIME geometry CudaText's own
+            #    history restore built it at -- over-large counts from
+            #    such a table were exactly the "gap taller than its chunk"
+            #    symptom).
+            self._force_wrap_rebuild(a_ed)
+            self._force_wrap_rebuild(b_ed)
+            # 3) Read the wrap layout of the settled geometry: the
+            #    table was just rebuilt by the nudge, so the plain read
+            #    (no forced update) returns the FINAL-width layout.
             Profiler.start('refresh:wrap_counts')
             try:
                 job.wrap_counts_a = self._get_wrap_counts(
@@ -6844,6 +6954,41 @@ class Command:
             except Exception:
                 pass
 
+    @staticmethod
+    def _force_wrap_rebuild(ed):
+        """Synchronously rebuild editor ed's word-wrap table at its
+        CURRENT (live) width -- the LineTop nudge.
+
+        PROP_LINE_TOP's setter (TATSynEdit.SetLineTop) calls UpdateWrapInfo
+        BEFORE any scrolling: an unforced-but-suspect rebuild that runs when
+        the table is flagged stale (Resize/micromap/scrollbar changes set
+        FWrapUpdateNeeded) or was simply built for a different width
+        (FWrapInfo.VisibleColumns <> current). Re-setting the CURRENT top
+        line is therefore a full synchronous wrap-table rebuild with NO
+        visible scroll change (DoScroll_LineTop lands on the same
+        position) -- the very mechanism CudaText's own session restore
+        uses ("required for restoring LineTop for n tabs, on opening
+        CudaText"). SetLineTop(0) early-exits WITHOUT the rebuild, so a
+        top-of-file view gets the 1 -> 0 dance instead (rebuild at 1,
+        scroll back to 0; the table stays rebuilt).
+
+        Unlike EDACTION_UPDATE("1") -- whose repaint is synchronous only
+        on Windows and never runs while the paint lock is engaged -- the
+        nudge is cross-platform, paint-lock-safe (IsRepaintEnabled gates
+        Update/Invalidate, not UpdateWrapInfo) and cheaper (no repaint at
+        all: the rebuild alone). Exception-safe: any failure (dead handle,
+        exotic host) returns False and the caller keeps its fallback."""
+        try:
+            top = ed.get_prop(ct.PROP_LINE_TOP)
+            if isinstance(top, int) and top > 0:
+                ed.set_prop(ct.PROP_LINE_TOP, top)
+            else:
+                ed.set_prop(ct.PROP_LINE_TOP, 1)
+                ed.set_prop(ct.PROP_LINE_TOP, 0)
+            return True
+        except Exception:
+            return False
+
     def _get_wrap_counts(self, ed, force_update=True):
         """Return a list where wrap_counts[i] = number of visual rows that
         line i occupies on screen. Uses Editor.get_wrapinfo() to query the
@@ -6855,28 +7000,31 @@ class Command:
         (sum of those lines' visual rows) * line_height pixels tall,
         otherwise the two compare sides drift apart visually.
 
-        force_update=False skips the EDACTION_UPDATE "1" pre-forcing and
-        just reads the CURRENT wrap table -- used by _refresh_wrap_layout,
-        which delivers its own (unforced) repaint through a UI pump first,
-        so a second forced full recalc would be pure waste."""
+        force_update=True forces the synchronous wrap-table rebuild (the
+        LineTop nudge -- see _force_wrap_rebuild) before reading, so the
+        counts describe the editor's LIVE width on every platform:
+        the old EDACTION_UPDATE "1" pre-forcing only guaranteed that on
+        Windows (its repaint is async elsewhere) and not at all under
+        the compare's paint lock. force_update=False just reads the
+        CURRENT table -- used by _refresh_wrap_layout, which runs the
+        nudge itself."""
         line_count = ed.get_line_count()
         if line_count <= 0:
             return []
         counts = [1] * line_count
-        # Force CudaText to refresh its internal WrapInfo structure before
-        # we query it. After text changes CudaText usually detects the
-        # change automatically, but not always -- EDACTION_UPDATE with
-        # param1="1" forces it. Profiled as its own row: this editor
-        # action is NOT cheap -- it forces the wrap recalculation AND a
-        # repaint (on Windows EDACTION_UPDATE maps to Ed.Repaint,
-        # SYNCHRONOUS), so on a 1M-line compare this two-line action
-        # can cost real time that otherwise hides inside
-        # refresh:wrap_counts' self and looks like unexplained Python
-        # work. Skipped entirely when the caller has already delivered
-        # the repaint itself (force_update=False).
+        # Force the wrap-table rebuild before the query. The kick-off
+        # wrap read runs while the editor may never have painted at its
+        # current width (fresh compare: set_files just docked the
+        # overview / enabled the micromap; session restore: CudaText's
+        # own LineTop restore built the table at a pre-layout width) --
+        # the nudge makes the table describe the LIVE geometry, then
+        # get_wrapinfo below reads exactly that. Profiled as its own row:
+        # the rebuild is the dominant cost of a wrapped kick-off read
+        # (no repaint is delivered -- cheaper than the old forced
+        # EDACTION_UPDATE on every platform).
         if force_update:
             with Profiler.section('refresh:wrapinfo_update'):
-                ed.action(ct.EDACTION_UPDATE, "1")
+                self._force_wrap_rebuild(ed)
         # get_wrapinfo is profiled as its own sub-row: on a 1M-line
         # compare the two calls (one per editor) cost ~4.9s -- the
         # single most expensive editor API of the whole refresh. Without

@@ -24,12 +24,16 @@ synced back to the original files automatically.
 - Remembers your compare tabs across CudaText restarts. If you close
   CudaText with a compare tab open, it is restored when you start again.
   A restored tab comes back uncolored and unaligned (the compare results
-  are not re-run at startup on purpose -- see KNOWN ISSUES); press F5
-  (Recompare) once and the full compare -- colors, alignment gaps and
-  overview -- is painted correctly in that single run, with word-wrap
-  on too: the wrap layout is re-read after the restored tab's side
-  panels (overview, hidden scrollbars, micromap) have settled at their
-  final size.
+  are not re-run at startup on purpose -- see KNOWN ISSUES), but its
+  compare layout -- the overview panel, the hidden built-in scrollbars,
+  the micromap -- is re-created at restore time, so the tab looks and is
+  sized exactly as it was before the restart. Press F5 (Recompare) once
+  and the full compare -- colors, alignment gaps and overview -- is
+  painted correctly in that single run, with word-wrap on too: the wrap
+  layout is rebuilt synchronously (a LineTop re-set, the same trick
+  CudaText's own tab restore uses) once the layout has settled, so the
+  very first Recompare aligns both halves right -- no second Recompare
+  needed.
 - Every diff tab is a fully standalone session: its diff records, overview
   panel, running compare and unsaved-change tracking live in their own
   per-tab world and are never shared with another diff tab. Open as many
