@@ -8,6 +8,7 @@ import time
 import typing as tp
 from bisect import bisect_left
 from collections import Counter
+from itertools import islice
 from operator import itemgetter
 
 import cudatext as ct
@@ -1587,10 +1588,6 @@ class _CompareJob:
         'fast_mode',        # started as the fast mode (Native Myers, both beautify off): the slow-compare dialog never asks
         'py_poll_cb',       # Python-engine completion poll timer callback (to TIMER_STOP on cancel), None when off
         'py_engine_thread', # daemon thread running the Python engine (diagnostic ref), None when off
-        'scroll_touched',   # a scroll event re-anchored a half while THIS compare ran
-                            # (see on_scroll / _resync_scroll_after_paint): the paint phase's
-                            # closing resync must re-derive both halves' anchors from the
-                            # mirror-equalized SmoothPos once the FINAL gap layout is in place
     )
 
     def __init__(self):
@@ -1631,7 +1628,6 @@ class _CompareJob:
         self.fast_mode = False
         self.py_poll_cb = None
         self.py_engine_thread = None
-        self.scroll_touched = False
 
 
 def _is_fast_mode(diff):
@@ -2952,21 +2948,6 @@ class Command:
         tab_id = ed_self.get_prop(ct.PROP_TAB_ID)
         session = self._session_for(tab_id)
         if session is not None:
-            # A scroll while THIS tab's compare is running (engine phase,
-            # paint-phase pump checkpoints, overview-driven) re-anchored a
-            # half against a NOT-YET-FINAL gap layout -- the user's wheel
-            # is dispatched by the paint's UI pumps (Application.-
-            # ProcessMessages), the mirror then copies SmoothPos to the
-            # other half and BOTH anchors are derived from the half-applied
-            # gaps; the gap events still to come then land above those
-            # anchors on ONE side only and the compare ends with the two
-            # halves showing non-corresponding lines (the "first compare
-            # shows non-aligned hunks, a scroll fixes it" bug). Remember
-            # it: _resync_scroll_after_paint re-derives both anchors from
-            # the mirror-equalized SmoothPos once ALL gaps are in place.
-            job = session.job
-            if job is not None:
-                job.scroll_touched = True
             overview = session.overview
             if overview is None:
                 self.scroll.on_scroll(ed_self)
@@ -5938,20 +5919,30 @@ class Command:
         # Windows (synchronous Repaint) would paint the 'busy'
         # placeholder screen mid-lock.
         outer_lock = job.editor_lock or {}
-        # Scroll-anchor resync: when a scroll event arrived while this
-        # compare ran (engine phase, or the paint's own UI-pump
-        # checkpoints dispatching the user's wheel), the halves' anchors
-        # were re-derived against a HALF-APPLIED gap layout and the gap
-        # events applied afterwards can have left them on
-        # non-corresponding lines -- the "first compare shows non-aligned
-        # hunks, scrolling fixes it" bug. Re-derive both anchors from the
-        # mirror-equalized SmoothPos NOW, against the FINAL gap layout:
-        # the exact correction the user's next wheel scroll makes
-        # manually, applied by the compare itself. No-op (and no view
-        # movement) when no scroll arrived: untouched anchors already
-        # sit on the correct pairs. Runs BEFORE the closing repaint so
-        # that repaint shows the corrected positions; under the lock the
-        # unlock's repaint does the same one pass later.
+        # Scroll-anchor resync: the compare's OWN gap inserts move the
+        # two viewports asymmetrically. api_ed_gap never touches the
+        # scroll state (NPos stays on its line, the stored SmoothPos
+        # goes stale), so each half's viewport top slides down by the
+        # pixels of the gaps added above IT -- and the halves get
+        # different gap amounts above their tops (the gaps are
+        # complementary: one half gets a gap where the other keeps its
+        # lines). No SmoothPos value changes, so no on_scroll fires and
+        # the mirror never re-equalizes: the finished compare shows the
+        # halves at different pixels, i.e. on non-corresponding lines --
+        # the "first compare shows non-aligned hunks, a scroll fixes it"
+        # bug, with NO user interaction at all. (A session-restored tab
+        # can add a second source: the two restored LineTops may sit at
+        # different pixels before the compare even starts.) The
+        # unconditional resync below reads the FOCUSED half's true
+        # viewport pixel (anchor + wrap rows + gap pixels -- the stored
+        # SmoothPos is stale and cannot be trusted) and writes it into
+        # both halves: the focused half keeps its view pixel-exact, the
+        # other half re-anchors at the same pixel = the correct line
+        # pair. Exactly the correction the user's next wheel scroll
+        # triggers through the mirror, applied by the compare itself.
+        # Runs BEFORE the closing repaint so that repaint shows the
+        # corrected positions; under the lock the unlock's repaint does
+        # the same one pass later.
         self._resync_scroll_after_paint(job)
         if 'a' not in outer_lock:
             a_ed.action(ct.EDACTION_UPDATE)
@@ -5992,47 +5983,53 @@ class Command:
         Profiler.stop('refresh')
 
     def _resync_scroll_after_paint(self, job):
-        """Re-derive BOTH halves' scroll anchors from their SmoothPos
-        after the compare's gap sequence finished -- the automatic twin
-        of the user's "scroll once and it aligns itself" workaround.
+        """Re-anchor both halves at ONE shared pixel -- the FOCUSED
+        half's -- now that the compare's FINAL gap layout is in place.
 
-        WHY THIS EXISTS (the 'first compare shows non-aligned hunks'
-        bug): side-by-side alignment is PIXEL equality of the two
-        viewports -- wrap rows + gap pixels above the anchor. Two
-        mechanisms keep it, and both only mean 'aligned' once ALL the
-        compare's gaps are in place:
+        WHY THIS RUNS ON EVERY COMPARE (the 'first compare shows
+        non-aligned hunks, a scroll fixes it' bug -- NO user
+        interaction is needed to hit it):
+
+        side-by-side alignment is PIXEL equality of the two viewports
+        (wrap rows + alignment-gap pixels above the top line). Two
+        mechanisms maintain it:
 
           - the scroll mirror (ScrollSplittedTab) copies SmoothPos (the
             stored pixel offset) to the other half, and every write
             re-derives the receiving half's anchor (NPos) from that
             pixel against the editor's CURRENT layout;
           - gap adds (api_ed_gap -> Ed.Update) do NOT touch the scroll
-            state: the anchor stays on its line and the stored
+            state: the anchor stays on its line, and the stored
             SmoothPos goes stale by the pixels of the gaps added above.
 
-        While a compare runs, the plugin PUMPS the message queue
-        (_pump_checkpoint -> Application.ProcessMessages), so the user's
-        wheel scrolls are dispatched mid-paint, between the gap-event
-        chunks -- and the same is true for scrolls during the whole
-        background ENGINE phase. Such a scroll re-anchors both halves at
-        one shared pixel that was aligned against a HALF-APPLIED (or
-        empty) gap layout; the gap events applied afterwards can then
-        land ABOVE that anchor on one side only, and the finished compare
-        shows the two halves at non-corresponding lines -- the visible
-        misalignment. Any LATER scroll re-derives both anchors from the
-        (still equal) SmoothPos against the FINAL layout and everything
-        snaps aligned: the user's manual 'autocorrect'.
+        A compare adds DIFFERENT amounts of gap pixels above each
+        half's viewport -- the gaps are complementary, one half gets a
+        gap where the other keeps its lines -- so each half's viewport
+        top (the pixel it really shows) slides down by its OWN
+        gap-pixels-above. No SmoothPos value changes, no on_scroll
+        fires, the mirror never runs: the finished compare shows the
+        two halves at DIFFERENT pixels, i.e. on non-corresponding
+        lines. A session-restored tab adds a second source: the two
+        saved LineTops can sit at different pixels before the compare
+        even starts (restored into the gapless buffers).
 
-        This method does that re-derivation at the END of the paint
-        phase, gated by job.scroll_touched (set by on_scroll for every
-        scroll event that arrived while this job ran -- engine phase,
-        paint pumps, overview-driven scrolls alike). Writing each
-        half's OWN smooth_pos back re-runs EditorStringToScrollInfo's
-        gap-aware conversion against the finished layout, landing both
-        halves on the same pixel -- the correct pair. No-op when no
-        scroll arrived: the anchors were never re-derived mid-compare
-        and already sit where the compare's gap math put them (the
-        view is not moved a single pixel in that case).
+        The user's NEXT scroll recomputes SmoothPos from the scrolled
+        half's anchor against the final layout, on_scroll fires, the
+        mirror copies the fresh pixel to the other half and it snaps
+        aligned -- the reported "autocorrected when I scroll". Caret
+        moves never trigger it: they change no SmoothPos, so only a
+        VIEWPORT change ever delivers the correction.
+
+        This method applies that correction at the END of the paint
+        phase, for every compare: it reads the FOCUSED half's TRUE
+        viewport pixel (top line + wrap rows + gap pixels above +
+        NPixelOffset -- see _true_viewport_pixel; the stored SmoothPos
+        is stale and cannot be used) and writes it into BOTH halves.
+        The focused half keeps its view pixel-exact; the other half
+        re-anchors at the same pixel, i.e. on the corresponding line
+        pair of the finished layout. An already-aligned pair of halves
+        is a true no-op (the same pixel written back, the same anchor
+        derived, not a pixel of view movement).
 
         The write is TWO identical set_prop calls per half: the first
         write's conversion may still clamp against the scrollbar data
@@ -6045,25 +6042,114 @@ class Command:
         the scrollbar data) -- the caller's closing EDACTION_UPDATE /
         unlock repaint shows the corrected anchors in the same paint.
 
+        A half whose anchor actually moved gets its marker window
+        re-centered (big-file compares apply diff markers in a window
+        around the viewport; the moved half's window would otherwise
+        stay at the pre-move position until the next scroll event).
+
         Exception-safe per half: a dead handle (tab closed through a
         pump, cancel) or an exotic host without the property keeps
         whatever anchor that half has -- never worse than the
         pre-fix behavior."""
-        if not job.scroll_touched:
+        a_ed = job.a_ed
+        b_ed = job.b_ed
+        if a_ed is None or b_ed is None:
             return
-        job.scroll_touched = False
-        for e in (job.a_ed, job.b_ed):
+        # The half the user is looking at keeps its pixel; the other
+        # half snaps to it. Focus outside the compare halves (toolbar
+        # button, config dialog) defaults to half A.
+        ref, other = a_ed, b_ed
+        ref_counts = job.wrap_counts_a
+        ref_line_h = job.line_h_a
+        try:
+            focus_h = ct.ed.get_prop(ct.PROP_HANDLE_SELF)
+            if focus_h is not None and \
+               focus_h == b_ed.get_prop(ct.PROP_HANDLE_SELF):
+                ref, other = b_ed, a_ed
+                ref_counts = job.wrap_counts_b
+                ref_line_h = job.line_h_b
+        except Exception:
+            pass  # no focused-editor API on this host: half A is the reference
+        pos = self._true_viewport_pixel(ref, ref_counts, ref_line_h)
+        if pos is None:
+            return
+        session = job.session
+        for e in (ref, other):
             try:
-                info = e.get_prop(ct.PROP_SCROLL_VERT_INFO)
-                if not isinstance(info, dict):
-                    continue
-                pos = info.get('smooth_pos')
-                if pos is None:
-                    continue
+                before = e.get_prop(ct.PROP_SCROLL_VERT_INFO)
+                before = (before.get('pos'), before.get('pixels')) \
+                    if isinstance(before, dict) else None
                 e.set_prop(ct.PROP_SCROLL_VERT_INFO, {'smooth_pos': pos})
                 e.set_prop(ct.PROP_SCROLL_VERT_INFO, {'smooth_pos': pos})
+                after = e.get_prop(ct.PROP_SCROLL_VERT_INFO)
+                after = (after.get('pos'), after.get('pixels')) \
+                    if isinstance(after, dict) else None
+                if before != after and session is not None:
+                    # The anchor moved: re-center this half's marker
+                    # window (a few prop reads when the current window
+                    # still covers the viewport).
+                    self._maintain_marker_window(session, e)
             except Exception:
                 pass  # dead handle / exotic host: keep the current anchor
+
+    @staticmethod
+    def _true_viewport_pixel(ed, wrap_counts, line_h):
+        """The pixel offset of ED's viewport top over the whole document,
+        with the CURRENT wrap layout and the CURRENT gaps -- V', the
+        quantity side-by-side alignment is made of.
+
+        Computed from first principles: the top line (PROP_LINE_TOP --
+        the editor's own native wrap-table lookup of the anchor row),
+        the wrap rows above it, the gap pixels above it, plus
+        NPixelOffset (which can even exceed the row height when the
+        anchor sits inside a gap after the top line -- a valid
+        ATSynEdit state, gaps are scrollable content). The STORED
+        SmoothPos is deliberately NOT used: gap adds leave it stale,
+        so it describes neither half's real view.
+
+        wrap_counts: the per-line visual-row counts the compare already
+        read into the job (job.wrap_counts_*); None/empty = wrap off
+        (one row per line, no table walk). line_h: fallback row height
+        (the live 'char_size' of the scroll info wins when present).
+
+        Returns None when the state cannot be read (dead handle,
+        handle-less never-painted editor, missing keys): the caller
+        then skips the resync -- never worse than pre-fix."""
+        try:
+            info = ed.get_prop(ct.PROP_SCROLL_VERT_INFO)
+            if not isinstance(info, dict):
+                return None
+            off = info.get('pixels')
+            if off is None:
+                return None
+            ch = info.get('char_size') or line_h or 0
+            if ch <= 0:
+                return None
+            top_line = ed.get_prop(ct.PROP_LINE_TOP)
+            if not isinstance(top_line, int) or top_line < 0:
+                return None
+            if top_line == 0:
+                rows_before = 0
+            elif wrap_counts:
+                # Wrap on: the wrap rows of the lines ABOVE the top
+                # line. islice avoids copying the front of a
+                # million-entry list just to sum it.
+                rows_before = sum(islice(wrap_counts, top_line))
+            else:
+                # Wrap off: the wrap table is virtual, one row per
+                # line -- the top line index IS the row count above it.
+                rows_before = top_line
+            gaps_above = 0
+            for g in ed.gap(ct.GAP_GET_ALL, 0, 0) or []:
+                g_line = g.get('line')
+                if g_line is not None and g_line < top_line:
+                    # The e.gap() convention: a gap at line L sits
+                    # AFTER line L, so every gap with index < top_line
+                    # is above the viewport (index -1 = before line 0).
+                    gaps_above += g.get('size') or 0
+            return rows_before * ch + gaps_above + off
+        except Exception:
+            return None
 
     def _free_job_slot(self, job):
         """Free the session's job slot when this job finishes (or is

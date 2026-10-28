@@ -66,40 +66,58 @@
   width. One compare, no double-compare anywhere.
 - fix: "first compare shows non-aligned hunks, it gets autocorrected
   when I scroll or move the caret" -- a long-standing bug, independent
-  of word-wrap and of the restart fix above. Side-by-side alignment is
-  PIXEL equality of the two viewports (wrap rows + alignment-gap
-  pixels above the top line). The scroll mirror keeps it by copying
-  SmoothPos between the halves, and every such write re-derives the
-  receiving half's top row from that pixel against the editor's
-  CURRENT layout; but gap adds (ed.gap) do NOT touch the scroll state
-  -- both only mean "aligned" once ALL the compare's gaps are in
-  place. While a compare runs the plugin pumps the message queue
-  (UI-pump checkpoints -> Application.ProcessMessages), and the same
-  holds for the whole background engine phase, so ANY wheel scroll the
-  user does while a compare is running is dispatched against a
-  half-applied (or empty) gap layout: both halves re-anchor at one
-  shared pixel that is NOT a corresponding line pair yet, and the gap
-  events applied afterwards can land ABOVE that anchor on one side
-  only -- the finished compare shows the two halves vertically
-  misaligned until the user scrolls again (which re-derives both
-  anchors from the mirror-equalized SmoothPos against the FINAL
-  layout -- the "autocorrect"). Fix: Command.on_scroll marks the
-  running job (job.scroll_touched) whenever a scroll event arrives
-  while the session's compare is in flight, and the paint phase's
-  closing pass (Command._resync_scroll_after_paint, right before the
-  final repaint / under the lock before the unlock's) re-derives BOTH
-  halves' anchors by writing each half's own smooth_pos back --
-  EditorStringToScrollInfo's gap-aware conversion then lands both on
-  the same pixel of the finished layout, i.e. on the CORRECT line
-  pair. That is exactly the user's manual correction, applied by the
-  compare itself; ONE compare, and scrolling during a compare is
-  harmless again. No-op (not one pixel of view movement) when no
-  scroll arrived mid-compare. Verified in the offline harness
-  (test_scroll_autocorrect.py): a wheel scroll dispatched mid-paint
-  used to leave the halves 80px (one not-yet-applied gap) apart /
-  an engine-phase scroll 400px apart on the wrong line pair; with the
-  resync both worlds end on the identical pixel, and an untouched
-  compare does not move the view at all.
+  of word-wrap and of the restart fix above, and hit with NO user
+  interaction at all. Side-by-side alignment is PIXEL equality of the
+  two viewports (wrap rows + alignment-gap pixels above the top line),
+  and the only mechanism that maintains it is the scroll mirror
+  (ScrollSplittedTab, driven by on_scroll): every mirror write
+  re-derives the receiving half's top row from the copied SmoothPos
+  pixel against the editor's CURRENT layout. But gap adds (ed.gap)
+  do NOT touch the scroll state -- the anchor NPos stays on its line
+  and the stored SmoothPos goes stale by the pixels of the gaps added
+  above -- and on_scroll only fires when the stored SmoothPos CHANGED.
+  A compare adds DIFFERENT amounts of gap pixels above each half's
+  viewport (the gaps are complementary: one half gets a gap where the
+  other keeps its lines), so each half's viewport top -- the pixel it
+  really shows -- slides down by its OWN gap-pixels-above while every
+  stored SmoothPos stays put: no event fires, the mirror never runs,
+  and the finished compare shows the two halves at different pixels =
+  on non-corresponding lines. A session-restored tab adds a second
+  source: the two saved LineTops can sit at different pixels before
+  the compare even starts (restored into the gapless buffers). The
+  user's NEXT scroll recomputes SmoothPos, on_scroll fires, the mirror
+  copies the fresh pixel over and the halves snap aligned -- the
+  reported "autocorrect"; caret moves change no SmoothPos, so they
+  never trigger it (only a viewport change does), exactly as reported.
+  Fix: the paint phase's closing pass (Command._resync_scroll_after_
+  paint, right before the final repaint / under the lock before the
+  unlock's) now runs for EVERY compare and re-anchors both halves at
+  ONE shared pixel -- the FOCUSED half's: it reads the focused half's
+  TRUE viewport pixel (top line + wrap rows above + gap pixels above +
+  the sub-row offset; the stored SmoothPos is stale and cannot be
+  used) via Command._true_viewport_pixel and writes it into both
+  halves with set_prop(PROP_SCROLL_VERT_INFO); EditorStringToScroll-
+  Info's gap-aware conversion re-derives each anchor at that pixel of
+  the finished layout. The focused half keeps its view pixel-exact;
+  the other half lands on the corresponding line pair. A half whose
+  anchor moved gets its big-file marker window re-centered
+  (_maintain_marker_window). An already-aligned compare is a true
+  no-op: not one pixel of view movement. This also subsumes the
+  earlier mid-compare-scroll theory (a wheel during the engine phase
+  or between paint chunks is healed the same way -- the resync no
+  longer needs a scroll_touched flag, which the real-world reports
+  disproved: the bug reproduced without any scroll). Verified in the
+  offline harness (test_scroll_autocorrect.py): with the resync
+  neutralized, a compare with NO interaction ends the halves 400px
+  apart (viewport mid-file; B's stored SmoothPos still the stale
+  2000 while its viewport really sits at 2400), and the restart
+  world (unequal restored tops) ends them 80px apart; one manual
+  wheel then re-derives both to the identical pixel (the user's
+  workaround, reproduced). With the resync active every one of those
+  worlds -- untouched mid-file compare, restart world, mid-paint
+  scroll, engine-phase scroll -- ends with both halves on the
+  identical pixel and the focused half's view unmoved, in ONE
+  compare; a compare at the top of the file moves nothing at all.
 
 2026.10.06 (30th release, by @alkorsan)
 * add: "Method 1: Fast (Pascal engine, joined-block mapping)" -- the new

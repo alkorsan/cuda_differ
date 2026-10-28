@@ -1056,12 +1056,16 @@ files are.
   runs, the status bar shows "Differ 2: comparing in background...", and
   the usual "Differ 2: compared in Xms" message reports the total time
   (background compare + painting) when it is done.
-- Scrolling while a compare is running is safe: the alignment gaps are
-  inserted while you can still scroll (the UI stays alive, so your wheel
-  input is dispatched between the painting steps), and a scroll that
-  lands mid-compare used to leave the two sides vertically misaligned
-  until you scrolled once more -- the finished compare now re-anchors
-  both sides by itself, so a single compare always ends aligned.
+- One compare always ends vertically aligned. The alignment gaps go
+  into the two sides in complementary amounts, which by itself used to
+  leave the sides misaligned right after the compare finished -- the
+  view only snapped aligned on your next scroll, and moving the caret
+  alone never fixed it (only a viewport change did). The compare now
+  re-anchors both sides by itself: the side you are looking at keeps
+  its position pixel-exact, the other side lands on the matching
+  content. Scrolling while a compare is running is safe too: whatever
+  a mid-compare scroll does to the positions is healed the same way
+  when the compare ends.
 - If you edit either side while a compare is running, the plugin detects
   it when the compare completes and re-runs the compare with the updated
   text automatically -- the painted result always matches the current
