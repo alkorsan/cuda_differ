@@ -1,91 +1,48 @@
-2026.10.27 (31st release, by @alkorsan)
-* fix: "restart CudaText with a diff tab open -> Recompare -> the align is
-  wrong -> recompare again to get it right" (TODO's test_2 case). Root
-  cause: the alignment gaps of a word-wrapped compare are sized from the
-  editors' wrap table (ATSynEdit WrapInfo -- which visual rows each line
-  occupies), and that table is (a) built only inside the editor's PAINT
-  cycle -- for a restored tab that has not been shown it does not exist
-  at all (CudaText #6398: get_wrapinfo() returns [] for passive tabs) --
-  and (b) built for the width the editor had when it last painted. On a
-  session-restored compare tab the texts are loaded by CudaText's session
-  restore BEFORE the plugin's own geometry exists (toolbar 'T' dock,
-  micromap gutter, hidden scrollbars, overview 'R' dock -- all of them
-  change the editors' width, and the docked forms' LCL align lands on
-  the message loop's own schedule), so the first Recompare could read a
-  wrap table that was EMPTY or built at the pre-overview width and size
-  every alignment gap from it: each wrapped line was counted as one row,
-  the gaps came out too short and the two halves drifted apart -- "the
-  align is wrong". The second Recompare then read the table the first
-  compare's own paints had rebuilt at the settled width and aligned
-  correctly -- which is exactly what the user had to do by hand. Three
-  cooperating pieces close the whole window:
-  1) DEFER ON MISSING TABLE: _get_wrap_counts now returns (counts,
-     trusted); trusted is False only when word-wrap is ON, the editor
-     has lines, and get_wrapinfo() returned nothing (the #6398
-     never-painted case). refresh_compare POSTPONES the compare
-     (WRAP_WAIT_RETRY_MS=200ms one-shot retries, WRAP_WAIT_MAX_RETRIES=10
-     ~= 2s, status "waiting for editor layout (word-wrap table)...") so
-     the gaps are never sized from the silent [1]*n estimate; past the
-     retry cap it compares best-effort (the old behavior) with a status
-     hint instead of blocking the user. Wrap-off compares are never
-     deferred: their wrap table is virtual (one row per line) and
-     always exact.
-  2) POST-COMPARE VERIFICATION: a compare whose editor geometry is not
-     yet PROVEN settled (the per-tab session flag wrap_geometry_settled
-     -- False for a restored tab, and for a fresh tab until its first
-     verification, because the overview dock's LCL align can slip past
-     even the set_files-ordered first compare; also re-armed when the
-     overview is created or destroyed by a refresh) arms the
-     WRAP_VERIFY_DELAY_MS=250ms one-shot _wrap_verify_timer after the
-     paint finishes. By then the compare's own paints + the finisher's
-     final repaint have rebuilt both halves' wrap tables at the settled
-     geometry, so the timer re-reads them and compares against the
-     snapshot the gaps were sized from: a MATCH settles the session
-     (later recomparers skip the check until the geometry changes
-     again); a MISMATCH proves the painted gaps stale -- the plugin
-     prints "editor layout settled -- recomparing automatically" and
-     re-runs the compare once, with true data (the manual second F5,
-     automated; the session is marked settled first, so one retry per
-     chain -- it can never loop). The re-read is skipped while another
-     compare is running (that one arms its own verification), when wrap
-     went off (virtual table, cannot be stale), and when the line
-     counts drifted (user edited -- a recompare is already due through
-     the edit path).
-  3) FINAL FORCED REPAINT: _finish_native_compare and the inline legacy
-     path now end with one EDACTION_UPDATE per half AFTER the editor
-     lock is released. EDACTION_UNLOCK only invalidates (the repaint is
-     queued), so without this the finished compare reached the screen
-     at the next message-loop paint -- and with wrap on, a viewport
-     still laid out by the pre-compare wrap table showed the halves
-     misaligned until some later repaint (scroll / caret move)
-     "fixed" them (the TODO's "first compare show non aligned hunks, it
-     get autocorrected when i scroll or move caret" report -- that
-     variant is also healed by piece 2, which now re-runs the compare
-     when the data itself was stale instead of waiting for the user to
-     scroll). Known limitation, unchanged: resizing the window / opening
-     or closing a side panel DURING a compare can still leave the gaps
-     sized for the old width -- no event tells the plugin about foreign
-     width changes mid-compare; press Recompare once after big layout
-     changes (the wrap read's forced EDACTION_UPDATE "1" then rebuilds
-     the table at the new width before the gaps are sized).
-  All three pieces are wrap-ON only -- wrap-off compares pay nothing
-  (their gap math is width-independent line counting). The verification
-  costs two get_wrapinfo reads per compare ONLY while a tab's geometry
-  is unproven (first wrap-on compare after a restart / tab creation /
-  overview toggle), never on the steady-state recomparers the profiling
-  report is about. Verified in the offline harness (stub CudaText with
-  a faithful ATSynEdit wrap-table + deferred-LCL-layout model) on three
-  scenarios: restart+Recompare (gap 48px-stale -> auto-corrected to the
-  true 96px), never-painted restored tab (deferred until painted, then
-  correct on the first paint), and the fresh set_files flow (converges
-  to the correct gap with at most one automatic recompare, no loop).
-* change: _TabSession grows four fields for the fix (wrap_geometry_settled,
-  wrap_wait_retries, wrap_verify_armed, wrap_verify_snapshot) and
-  _CompareJob one (wrap_verify_needed); _get_wrap_counts' return changed
-  from a bare list to a (counts, trusted) pair -- its only caller is
-  refresh_compare. No settings, no state file, no persisted format
-  changed (the session's persisted groups in cuda_differ2_state.json are
-  untouched -- the new state is runtime-only and dies with the tab).
+2026.10.27 (unreleased)
+- fix: wrong vertical alignment on the FIRST Recompare of a session-restored
+  compare tab (word-wrap on) -- the halves drifted apart and only a SECOND
+  Recompare painted them correctly. Root cause: that first Recompare is the
+  only one that CHANGES the editors' width during the refresh -- it docks
+  the overview panel (and hides the built-in scrollbars, enables the
+  micromap), all of which narrow the halves AFTER their text was already
+  loaded by the session restore -- and the word-wrap layout those gaps are
+  sized from (ATSynEdit's WrapInfo: which visual rows every wrapped line
+  occupies) is rebuilt only INSIDE the editors' paint cycle. The kick-off
+  read of get_wrapinfo() therefore returned the layout of the PRE-dock
+  width (EDACTION_UPDATE "1" only repaints synchronously on Windows, and
+  even there it can race the just-docked panel's LCL re-alignment); the
+  A_GAP/B_GAP/ALIGN gaps were sized from that stale layout, and when the
+  compare's final repaint re-wrapped the text at the new width, the two
+  halves no longer lined up. The second Recompare found everything already
+  docked -- no width change, valid wrap data -- which is why it looked
+  right. Fix (one compare, no double-compare): refresh_compare now tracks
+  whether THIS refresh changed the editors' width (overview created or
+  destroyed, scrollbar style actually flipped -- _apply_scrollbar_visibility
+  returns the changed-flag -- micromap just enabled); when it did and wrap
+  is on, the kick-off wrap read is SKIPPED (it was known-stale and is the
+  single most expensive editor API of a wrapped refresh) and the new
+  Command._refresh_wrap_layout reads it at the PAINT-PHASE entry instead:
+  one UI pump (app_proc(PROC_IDLE)) lets the pending LCL re-alignment of
+  the just-docked panels finish and the pending editor paints run, an
+  UNFORCED EDACTION_UPDATE + a second pump delivers a repaint at the
+  settled width (ATSynEdit's UpdateWrapInfo then rebuilds the table when,
+  and only when, it is actually stale -- no wasted full recalc), and the
+  wrap counts / cell sizes / align-gap decision are read into the job
+  right before the dispatch loop consumes them. The legacy inline path
+  runs the same settle BEFORE taking the paint lock (a locked editor
+  paints only the busy placeholder, nothing could rebuild under it);
+  background compares that outlived the lock's grace window skip the
+  forced repaint (their tables were rebuilt by the natural paints seconds
+  earlier) and just re-read. Compares whose layout did not change -- every
+  ordinary Recompare, every fresh compare (set_files docks all panels
+  BEFORE the texts load, which is why fresh compares never showed the
+  bug) -- take exactly the old code path, zero extra cost. The settle's
+  pumps run under the held job slot (a re-entering Recompare hits the
+  'compare already running' guard, same contract as the paint loop's own
+  pump checkpoints), and the whole read is exception-safe: an exotic host
+  without PROC_IDLE, or dead handles after a cancel dispatched through the
+  pump, degrade to the old empty-WrapInfo fallback (one visual row per
+  line, gaps sized by line counts) -- never a crash.
 
 2026.10.06 (30th release, by @alkorsan)
 * add: "Method 1: Fast (Pascal engine, joined-block mapping)" -- the new
