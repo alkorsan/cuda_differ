@@ -1587,6 +1587,10 @@ class _CompareJob:
         'fast_mode',        # started as the fast mode (Native Myers, both beautify off): the slow-compare dialog never asks
         'py_poll_cb',       # Python-engine completion poll timer callback (to TIMER_STOP on cancel), None when off
         'py_engine_thread', # daemon thread running the Python engine (diagnostic ref), None when off
+        'scroll_touched',   # a scroll event re-anchored a half while THIS compare ran
+                            # (see on_scroll / _resync_scroll_after_paint): the paint phase's
+                            # closing resync must re-derive both halves' anchors from the
+                            # mirror-equalized SmoothPos once the FINAL gap layout is in place
     )
 
     def __init__(self):
@@ -1627,6 +1631,7 @@ class _CompareJob:
         self.fast_mode = False
         self.py_poll_cb = None
         self.py_engine_thread = None
+        self.scroll_touched = False
 
 
 def _is_fast_mode(diff):
@@ -2947,6 +2952,21 @@ class Command:
         tab_id = ed_self.get_prop(ct.PROP_TAB_ID)
         session = self._session_for(tab_id)
         if session is not None:
+            # A scroll while THIS tab's compare is running (engine phase,
+            # paint-phase pump checkpoints, overview-driven) re-anchored a
+            # half against a NOT-YET-FINAL gap layout -- the user's wheel
+            # is dispatched by the paint's UI pumps (Application.-
+            # ProcessMessages), the mirror then copies SmoothPos to the
+            # other half and BOTH anchors are derived from the half-applied
+            # gaps; the gap events still to come then land above those
+            # anchors on ONE side only and the compare ends with the two
+            # halves showing non-corresponding lines (the "first compare
+            # shows non-aligned hunks, a scroll fixes it" bug). Remember
+            # it: _resync_scroll_after_paint re-derives both anchors from
+            # the mirror-equalized SmoothPos once ALL gaps are in place.
+            job = session.job
+            if job is not None:
+                job.scroll_touched = True
             overview = session.overview
             if overview is None:
                 self.scroll.on_scroll(ed_self)
@@ -5918,6 +5938,21 @@ class Command:
         # Windows (synchronous Repaint) would paint the 'busy'
         # placeholder screen mid-lock.
         outer_lock = job.editor_lock or {}
+        # Scroll-anchor resync: when a scroll event arrived while this
+        # compare ran (engine phase, or the paint's own UI-pump
+        # checkpoints dispatching the user's wheel), the halves' anchors
+        # were re-derived against a HALF-APPLIED gap layout and the gap
+        # events applied afterwards can have left them on
+        # non-corresponding lines -- the "first compare shows non-aligned
+        # hunks, scrolling fixes it" bug. Re-derive both anchors from the
+        # mirror-equalized SmoothPos NOW, against the FINAL gap layout:
+        # the exact correction the user's next wheel scroll makes
+        # manually, applied by the compare itself. No-op (and no view
+        # movement) when no scroll arrived: untouched anchors already
+        # sit on the correct pairs. Runs BEFORE the closing repaint so
+        # that repaint shows the corrected positions; under the lock the
+        # unlock's repaint does the same one pass later.
+        self._resync_scroll_after_paint(job)
         if 'a' not in outer_lock:
             a_ed.action(ct.EDACTION_UPDATE)
         if 'b' not in outer_lock:
@@ -5955,6 +5990,80 @@ class Command:
             Profiler.stop('paint:overview')
 
         Profiler.stop('refresh')
+
+    def _resync_scroll_after_paint(self, job):
+        """Re-derive BOTH halves' scroll anchors from their SmoothPos
+        after the compare's gap sequence finished -- the automatic twin
+        of the user's "scroll once and it aligns itself" workaround.
+
+        WHY THIS EXISTS (the 'first compare shows non-aligned hunks'
+        bug): side-by-side alignment is PIXEL equality of the two
+        viewports -- wrap rows + gap pixels above the anchor. Two
+        mechanisms keep it, and both only mean 'aligned' once ALL the
+        compare's gaps are in place:
+
+          - the scroll mirror (ScrollSplittedTab) copies SmoothPos (the
+            stored pixel offset) to the other half, and every write
+            re-derives the receiving half's anchor (NPos) from that
+            pixel against the editor's CURRENT layout;
+          - gap adds (api_ed_gap -> Ed.Update) do NOT touch the scroll
+            state: the anchor stays on its line and the stored
+            SmoothPos goes stale by the pixels of the gaps added above.
+
+        While a compare runs, the plugin PUMPS the message queue
+        (_pump_checkpoint -> Application.ProcessMessages), so the user's
+        wheel scrolls are dispatched mid-paint, between the gap-event
+        chunks -- and the same is true for scrolls during the whole
+        background ENGINE phase. Such a scroll re-anchors both halves at
+        one shared pixel that was aligned against a HALF-APPLIED (or
+        empty) gap layout; the gap events applied afterwards can then
+        land ABOVE that anchor on one side only, and the finished compare
+        shows the two halves at non-corresponding lines -- the visible
+        misalignment. Any LATER scroll re-derives both anchors from the
+        (still equal) SmoothPos against the FINAL layout and everything
+        snaps aligned: the user's manual 'autocorrect'.
+
+        This method does that re-derivation at the END of the paint
+        phase, gated by job.scroll_touched (set by on_scroll for every
+        scroll event that arrived while this job ran -- engine phase,
+        paint pumps, overview-driven scrolls alike). Writing each
+        half's OWN smooth_pos back re-runs EditorStringToScrollInfo's
+        gap-aware conversion against the finished layout, landing both
+        halves on the same pixel -- the correct pair. No-op when no
+        scroll arrived: the anchors were never re-derived mid-compare
+        and already sit where the compare's gap math put them (the
+        view is not moved a single pixel in that case).
+
+        The write is TWO identical set_prop calls per half: the first
+        write's conversion may still clamp against the scrollbar data
+        of the PRE-paint paint (SmoothPosLast is only recomputed inside
+        that same write, AFTER the conversion -- a real trap near the
+        end of the file, where the just-added gaps GREW the maximum),
+        so the second write re-derives against the now-fresh values.
+        Cheap either way: 4 API calls per compare, and the write does
+        not repaint by itself (EditorStringToScrollInfo only updates
+        the scrollbar data) -- the caller's closing EDACTION_UPDATE /
+        unlock repaint shows the corrected anchors in the same paint.
+
+        Exception-safe per half: a dead handle (tab closed through a
+        pump, cancel) or an exotic host without the property keeps
+        whatever anchor that half has -- never worse than the
+        pre-fix behavior."""
+        if not job.scroll_touched:
+            return
+        job.scroll_touched = False
+        for e in (job.a_ed, job.b_ed):
+            try:
+                info = e.get_prop(ct.PROP_SCROLL_VERT_INFO)
+                if not isinstance(info, dict):
+                    continue
+                pos = info.get('smooth_pos')
+                if pos is None:
+                    continue
+                e.set_prop(ct.PROP_SCROLL_VERT_INFO, {'smooth_pos': pos})
+                e.set_prop(ct.PROP_SCROLL_VERT_INFO, {'smooth_pos': pos})
+            except Exception:
+                pass  # dead handle / exotic host: keep the current anchor
 
     def _free_job_slot(self, job):
         """Free the session's job slot when this job finishes (or is

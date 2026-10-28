@@ -64,6 +64,42 @@
   (app_proc(PROC_IDLE)) right before loading the texts, so the docked
   geometry has landed and the text wraps exactly once, at the final
   width. One compare, no double-compare anywhere.
+- fix: "first compare shows non-aligned hunks, it gets autocorrected
+  when I scroll or move the caret" -- a long-standing bug, independent
+  of word-wrap and of the restart fix above. Side-by-side alignment is
+  PIXEL equality of the two viewports (wrap rows + alignment-gap
+  pixels above the top line). The scroll mirror keeps it by copying
+  SmoothPos between the halves, and every such write re-derives the
+  receiving half's top row from that pixel against the editor's
+  CURRENT layout; but gap adds (ed.gap) do NOT touch the scroll state
+  -- both only mean "aligned" once ALL the compare's gaps are in
+  place. While a compare runs the plugin pumps the message queue
+  (UI-pump checkpoints -> Application.ProcessMessages), and the same
+  holds for the whole background engine phase, so ANY wheel scroll the
+  user does while a compare is running is dispatched against a
+  half-applied (or empty) gap layout: both halves re-anchor at one
+  shared pixel that is NOT a corresponding line pair yet, and the gap
+  events applied afterwards can land ABOVE that anchor on one side
+  only -- the finished compare shows the two halves vertically
+  misaligned until the user scrolls again (which re-derives both
+  anchors from the mirror-equalized SmoothPos against the FINAL
+  layout -- the "autocorrect"). Fix: Command.on_scroll marks the
+  running job (job.scroll_touched) whenever a scroll event arrives
+  while the session's compare is in flight, and the paint phase's
+  closing pass (Command._resync_scroll_after_paint, right before the
+  final repaint / under the lock before the unlock's) re-derives BOTH
+  halves' anchors by writing each half's own smooth_pos back --
+  EditorStringToScrollInfo's gap-aware conversion then lands both on
+  the same pixel of the finished layout, i.e. on the CORRECT line
+  pair. That is exactly the user's manual correction, applied by the
+  compare itself; ONE compare, and scrolling during a compare is
+  harmless again. No-op (not one pixel of view movement) when no
+  scroll arrived mid-compare. Verified in the offline harness
+  (test_scroll_autocorrect.py): a wheel scroll dispatched mid-paint
+  used to leave the halves 80px (one not-yet-applied gap) apart /
+  an engine-phase scroll 400px apart on the wrong line pair; with the
+  resync both worlds end on the identical pixel, and an untouched
+  compare does not move the view at all.
 
 2026.10.06 (30th release, by @alkorsan)
 * add: "Method 1: Fast (Pascal engine, joined-block mapping)" -- the new
