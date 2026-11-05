@@ -22,7 +22,11 @@ this will not be fixed/implemented
     https://sparkles-docs.pages.dev/research/diff-review/beyond-compare.html
 - i did a lot of work in the plugin and native pascal code, progressive compare is a comletely diferent method and may need to rewrite everything again, and the native pascal algo are so fast currently specially Myers algo
 
-
+# issue 5
+- the plugin does not clean entries from cuda_differ2_state.json of sessions whose file no longer exists, this means the json file will keep growing for ever if user do compares and delete the session file where the compare happened before closing the diff tab
+- i intentionally keep it like that because "Doesn't exist now" legitimately happens to sessions that aren't dead: removable media / network shares not yet mounted; portable or cloud-synced settings folders (i deliberately made session paths relative "for portability" - and in a synced settings dir, the state JSON and the session files arrive on independent schedules, so a startup check easily runs before the session file has synced down); a file deleted by accident and restored from backup or re-created by saving the same session name again; stat() failing on perms / long Windows paths / case differences.
+so the plugin deletes only what it can PROVE dead. "File not on disk right now" is not proof , it's a flaky snapshot , and a wrong deletion is unrecoverable while a stale entry is free.
+- the only safe solution is to add a new command "Clean stale session entries" command, so the plugin show to the user all stale entries and he decide to remove them or not, TODO? i don t know yet, i need to think more about it
 
 
 
