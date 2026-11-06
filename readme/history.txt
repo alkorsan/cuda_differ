@@ -1,4 +1,65 @@
-2026.10.27 (unreleased)
+2026.11.06 (by @badrelmers)
+- change: runtime event subscriptions -- install.inf now declares ONLY
+  on_tab_menu; every other event is subscribed on demand. Objective: an
+  idle Differ 2 (loaded, no compare tab open) must cost CudaText
+  nothing on the hot editor events -- no per-keystroke on_change, no
+  per-click on_caret, no per-scroll on_scroll, no on_key -- instead of
+  paying a dict-lookup no-op dispatch for every one of them like the
+  old ten static install.inf events did.
+  * NEW module events_sub.py: the single registry (EventSubscriptions)
+    managing ALL runtime subscriptions. One EVENTS table in three
+    tiers: the SURVIVAL set (on_state~, on_exit_pre~ -- armed at plugin
+    load and never dropped: a session switch that restores compare tabs
+    can only be noticed through on_state while idle, and app exit still
+    cancels in-flight jobs), the COMPARE set (on_change~, on_close_pre~,
+    on_close~, on_save_pre~, on_state_ed~ -- while at least one compare
+    tab exists), and the OPTION-GATED set (on_caret~ with
+    enable_sync_caret, on_change_slow~ with enable_auto_refresh,
+    on_key~ with enable_keyboard_capture -- key-code filtered as
+    before, on_scroll with sync_scroll OR enable_overview).
+    Command._update_event_subscriptions() is the single funnel; it is
+    called at every transition: plugin load, set_files (BEFORE the
+    texts load -- on_change must already be subscribed when
+    set_text_all fires the two spurious events the suppression counter
+    swallows, or the user's first two real edits would be swallowed
+    instead), on_close (after the session is popped -- the LAST close
+    drops back to the survival set), _restore_session_tabs and the
+    toolbar-restore timer, refresh_compare, and every config() reload.
+  * The bus tracks what it subscribed and issues only the missing SUBs
+    / extra UNSUBs (unchanged state = zero app_proc calls), so callers
+    never guard against a redundant pass, and describe() answers "what
+    is subscribed right now". It only ever (un)subscribes names from
+    its own table, never the '*' wildcard -- the static on_tab_menu and
+    the plugins.ini on_start2 autostart entry cannot be killed by a
+    dynamic unsub (CudaText's PROC_EVENTS_UNSUB removes the event from
+    ALL of a module's entries, install.inf ones included). All runtime
+    subscriptions are lazy ('~'): they can never auto-import the
+    module. The app_proc calls are exception-guarded -- an events API
+    hiccup must never abort an on_close (its exit branch re-registers
+    persisted sessions right after) or a Command.__init__.
+  * The two older hand-rolled runtime subscriptions are replaced by the
+    same table: the _subscribe_on_key/_unsubscribe_on_key/
+    _sync_on_key_subscription trio is gone, and ScrollSplittedTab lost
+    its toggle() method and its tab_id set -- a parallel bookkeeping of
+    "which tabs need on_scroll" that had to be maintained by hand at
+    every call site (the old focused-tab condition could even
+    unsubscribe while compares were open). Command._sessions is the
+    single truth now; on_key is additionally NOT subscribed anymore
+    while no compare tab exists (the hotkeys only act inside compare
+    tabs, so the plugin stops seeing arrow/F5 presses in normal tabs).
+  * Side fix from the unified on_scroll condition: the overview thumb
+    now tracks keyboard / wheel scrolls while sync_scroll is OFF too
+    (event subscribed for the overview, sync_scroll or
+    enable_overview on); the position MIRROR stays gated on the
+    sync_scroll setting inside Command.on_scroll, so an overview-only
+    subscription never scrolls the opposite half by itself. Previously
+    the overview only followed scrolls it drove itself when
+    sync_scroll was off.
+  * install.inf carries the mirrored comment block listing every
+    dynamically-managed event and its condition, so the static file and
+    events_sub.py cannot silently drift apart.
+
+2026.10.27 (by @badrelmers)
 - fix: wrong vertical alignment on the FIRST Recompare of a session-restored
   compare tab (word-wrap on) -- the halves drifted apart, some alignment
   gaps came out TALLER than the changed chunk they compensated, and only
@@ -204,7 +265,7 @@
   of untitled tabs (the flag only gates the text of FILE tabs; see
   on_close_pre).
 
-2026.10.06 (30th release, by @alkorsan)
+2026.10.06 (30th release, by @badrelmers)
 * add: "Method 1: Fast (Pascal engine, joined-block mapping)" -- the new
   fast implementation of differ2.algorithm.beautify.align_by_similarity.
   The old implementation re-paired the lines of every unequal-count
@@ -292,7 +353,7 @@
   gains the joined_block_sub_diff row and notes which rows belong
   to which method.
 
-2026.10.05 (29th release, by @alkorsan)
+2026.10.05 (29th release, by @badrelmers)
 * change: the compare-tab state ("sessions") now goes through the SAME
   app option writer as everything else -- cudax_lib's key-level
   set_opt/get_opt -- instead of the plugin's own whole-file
@@ -323,7 +384,7 @@
   (close and re-open them); the key itself is yours to clean by hand,
   nothing in the plugin ever deletes it.
 
-2026.10.05 (28th release, by @alkorsan)
+2026.10.05 (28th release, by @badrelmers)
 * fix: comparing two FILES deleted the dir-compare state (report: 'when
   i compare two files and the plugin do cleaning, the history and all
   config of dir compare get deleted' -- differ2.dirs.hist_left,
@@ -359,7 +420,7 @@
   legal -- and after any file-compare-side save it is strict-JSON
   clean again.
 
-2026.10.05 (27th release, by @alkorsan)
+2026.10.05 (27th release, by @badrelmers)
 * fix: files and folders with the status "Cannot read" had no row
   color and no count in the status bar (report: 'files or folders with
   status "cannot read" must be colourised in red and shown in status
@@ -393,7 +454,7 @@
   width at every font/DPI; nothing else about the buttons moved (the
   anchors, the 50/50 path split, the folder picker they open).
 
-2026.10.05 (26th release, by @alkorsan)
+2026.10.05 (26th release, by @badrelmers)
 * fix: a folder with mixed content showed "Mixed" -- the user's rule
   is stricter and simpler (report: "when a folder have identical and
   only left or right files, the folder status show now 'mixed', it
@@ -455,7 +516,7 @@
   the settings file stays there -- the file is the user's to clean
   by hand.
 
-2026.10.05 (25th release, by @alkorsan)
+2026.10.05 (25th release, by @badrelmers)
 * fix: a folder that contains BOTH identical and one-sided files
   showed a one-sided status (report: "when a folder have identical
   and only left files, the folder status show only left, it s wrong,
@@ -509,7 +570,7 @@
   once per session, the first time a window opens, and nothing ever
   reads them from there again.
 
-2026.10.05 (24th release, by @alkorsan)
+2026.10.05 (24th release, by @badrelmers)
 * fix: two column-resize problems (report: "columns resizing is
   strangte, not like usual apps, not all columns allow to resize to
   left and right, and last column cannot be resized"). (1) THE DRAG
@@ -555,7 +616,7 @@
   spec is derived from the same width the rows paint by (the
   painted row width once calibrated, else the live control width).
 
-2026.10.05 (23rd release, by @alkorsan)
+2026.10.05 (23rd release, by @badrelmers)
 * fix: the drawn buttons' captions sat on a SECOND, darker
   rectangle -- "one background on the button and one on the text"
   (report: "the arrows have gone, but the buttons still have two
@@ -576,7 +637,7 @@
   nulling the listbox control's own pre-fill and border fill,
   which set the brush COLOR only -- never the style.)
 
-2026.10.05 (22nd release, by @alkorsan)
+2026.10.05 (22nd release, by @badrelmers)
 * fix: the drawn buttons showed TWO background colors and strange
   arrows along their right edge (report: "the new buttons style is
   worst, now they have two backgrounds colors and they have an
@@ -595,7 +656,7 @@
   button. The hover/pressed repaint jitter now steps DOWN a pixel
   first, so a repaint can never flash the scrollbar either.
 
-2026.10.05 (21st release, by @alkorsan)
+2026.10.05 (21st release, by @badrelmers)
 * fix: six reported folder-compare GUI problems, all in one round.
   (1) IDENTICAL FOLDERS said "Folder": the rolled-up folder status
   (the worst status of a folder's subtree) was only set when it was
@@ -682,7 +743,7 @@
   SET_ITEM_H invalidation counter, resize() helper. Scanner/span/
   import suites unchanged and green; static_check clean.
 
-2026.10.05 (20th release, by @alkorsan)
+2026.10.05 (20th release, by @badrelmers)
 * fix: the third theme-consistency round (reported: "text font color of
   hint in mask box in some themes is hard to read see pic / the box
   background in grey theme is green, is there another theme color
@@ -733,7 +794,7 @@
   pair like a real dark theme and re-asserts the inputs as
   editor-backed.
 
-2026.10.05 (19th release, by @alkorsan)
+2026.10.05 (19th release, by @badrelmers)
 * fix: every dialog control now follows the UI theme in BLACK themes
   too (reported: "checkboxes text and status bar background and font
   colors does not use theme colors, so in black themes they look
@@ -783,7 +844,7 @@
   is the point of the request. Still once per window, still never
   shrinks.
 
-2026.10.05 (18th release, by @alkorsan)
+2026.10.05 (18th release, by @badrelmers)
 * fix: the row height now grows with the drawn font (reported: "the
   list items height does not grow when font grow so text become eaten
   see pic") -- the 17th release made the painter SET the UI font, so
@@ -816,7 +877,7 @@ compare windows' lists shared one state); the healthy 14pt check
 now doubles as the guard-does-not-fire regression. Scanner/span/
 import unchanged and green; pyflakes/vermin 3.6/static_check clean.
 
-2026.10.05 (17th release, by @alkorsan)
+2026.10.05 (17th release, by @badrelmers)
 * fix: the rows STILL rendered small on the reporter's build (reported:
   "list items still use small font not ui font see pic") -- the 16th
   release kept an EMPTY CANVAS_SET_FONT name, trusting TATListbox's
@@ -869,7 +930,7 @@ picker's equal label pinning (137px = the wider caption) with BOTH
 combos at the same x/width before and after a resize. Scanner/span/
 import unchanged and green; pyflakes/vermin 3.6/static_check clean.
 
-2026.10.05 (16th release, by @alkorsan)
+2026.10.05 (16th release, by @badrelmers)
 * fix: the compare list's rows render in the CudaText UI font, the
   very font the list's own header, the tabs and the command palette
   use (reported: "text used in items is small it must use the font
@@ -913,7 +974,7 @@ import unchanged and green; pyflakes/vermin 3.6/static_check clean.
   battery re-checks its clamps under the new factor; 246 checks
   green, scanner/span/import unchanged and green, py_compile/
   static_check clean.
-2026.10.05 (15th release, by @alkorsan)
+2026.10.05 (15th release, by @badrelmers)
 * add: the compare list's columns are RESIZABLE with the mouse
   (requested: "i cannot resize the columns, i want to be able to
   resize them with mouse drag and drop, maybe api allow it or we
@@ -976,7 +1037,7 @@ import unchanged and green; pyflakes/vermin 3.6/static_check clean.
   253 checks green (was 194). scanner/span/import unchanged.
 
 
-2026.10.05 (14th release, by @alkorsan)
+2026.10.05 (14th release, by @badrelmers)
 * change: WinMerge-style TREE view for the folder-compare results.
   A recursive scan's rows are no longer one flat table: folders are
   FOLDED by default, and the user expands them INLINE -- the
@@ -1043,7 +1104,7 @@ import unchanged and green; pyflakes/vermin 3.6/static_check clean.
   scanner/span/import suites unchanged and green.
 
 
-2026.10.05 (13th release, by @alkorsan)
+2026.10.05 (13th release, by @badrelmers)
 * fix: the 12th release broke both folder-compare dialogs on real
   CudaText builds (reported: the picker showed ONE BIG CANCEL BUTTON
   only -- an empty dialog shell). Root cause, TWO properties of the
@@ -1088,7 +1149,7 @@ import unchanged and green; pyflakes/vermin 3.6/static_check clean.
   release code (Cancel = the whole form, 3 forward references,
   Apply = a 930px bar) before accepting the fix.
 
-2026.10.05 (12th release, by @alkorsan)
+2026.10.05 (12th release, by @badrelmers)
 * fix: folder-compare GUI round, from the user's screenshots:
   - the picker dialog ("Differ 2: compare folders") is now RESIZABLE
     (DBORDER_SIZE, the combos stretch between the labels and the
@@ -1128,7 +1189,7 @@ import unchanged and green; pyflakes/vermin 3.6/static_check clean.
   taskbar=1 check and the forced-125% scale battery (columns, item
   height, Name remainder, build wiring).
 
-2026.10.05 (11th release, by @alkorsan)
+2026.10.05 (11th release, by @badrelmers)
 - change: production cleanup -- the diagnostic machinery that hunted
   the update-6..10 slow-scan mystery is removed now that the mystery
   is solved (the GIL convoy; see the 10th release). Removed: the
@@ -1151,7 +1212,7 @@ import unchanged and green; pyflakes/vermin 3.6/static_check clean.
   block (scan mode, listing latency, tree sizes, content tests).
   compare_dir.py 4372 -> 3184 lines; all test suites re-run green.
 
-2026.10.05 (10th release, by @alkorsan)
+2026.10.05 (10th release, by @badrelmers)
 + change: differ2.dirs.scan_threading default flipped 'pool' ->
   'main' -- the update-9 A/B/C on the reporting box closed the
   case the deep probe had opened. Same folders, profiling on:
@@ -1186,7 +1247,7 @@ import unchanged and green; pyflakes/vermin 3.6/static_check clean.
   entry; module docstring: the A/B/C numbers, the convoy
   mechanism and the per-shape guidance in 'The scan engine'.
 
-2026.10.05 (9th release, by @alkorsan)
+2026.10.05 (9th release, by @badrelmers)
 + feature: option differ2.dirs.scan_threading -- the folder scan's
   threading SHAPE is switchable per scan, the missing control for
   the update-8 finding (the listing tax lives only in the REAL
@@ -1216,7 +1277,7 @@ import unchanged and green; pyflakes/vermin 3.6/static_check clean.
   and deep-probe headers with the ACTUAL thread (MAIN vs SCANNER),
   and replaces the old cProfile 'scan mode: SERIAL' tail line.
 
-2026.10.04 (8th release, by @alkorsan)
+2026.10.04 (8th release, by @badrelmers)
 + feature: the deep probe -- update 7 named the tax ('follows the
   THREAD'), and the round-5 standalone probe (run from both a plain
   python.exe and CudaText's own console) then proved the call, the
@@ -1262,7 +1323,7 @@ import unchanged and green; pyflakes/vermin 3.6/static_check clean.
   renderings), test_scanner 9d (real profiled run: deep facts,
   per-listing rows == listings, dirs:deep_probe row, verdict
   fixtures), test_gui (deep-probe row + facts lines).
-2026.10.03 (7th release, by @alkorsan)
+2026.10.03 (7th release, by @badrelmers)
 + feature: the engine experiment -- the report now names WHICH side
   of a listing is slow: the call, the thread, or the busy phase.
   The user's v6 reports (cProfile off + on) showed the strongest
@@ -1300,7 +1361,7 @@ import unchanged and green; pyflakes/vermin 3.6/static_check clean.
   slow on the main thread while scandir is fast" case (the ctypes
   ExW call itself), each with the numbers that produced it.
 
-2026.10.03 (6th release, by @alkorsan)
+2026.10.03 (6th release, by @badrelmers)
 + feature: the profiling report's SELF column now ADDS UP. The user's
   report showed worker 8.3 s + listing 5.1 s + walk_left 4.3 s for an
   8 s scan (sum 221.9%): the dirs:* rows were standalone marks that
@@ -1358,7 +1419,7 @@ import unchanged and green; pyflakes/vermin 3.6/static_check clean.
   computed from them (the old line summed the double counts).
 
 
-2026.10.03 (5th release, by @alkorsan)
+2026.10.03 (5th release, by @badrelmers)
 + feature: WinMerge's "quick contents" compare engine. The user's new
   profiling (8 s first compare, 2 s later ones) showed the listings
   themselves were down to 9 bulk calls but the "Contents" method still
@@ -1405,7 +1466,7 @@ import unchanged and green; pyflakes/vermin 3.6/static_check clean.
   float compare cost more than the work; the timestamp method's whole
   story is the walk + facts block).
 
-2026.10.03 (4th release, by @alkorsan)
+2026.10.03 (4th release, by @badrelmers)
 + feature: WinMerge's directory-listing call. The user's profiling
   showed the remaining 8 s was pure listing latency (9 x scandir
   open ~200 ms each + ~33 entry reads ~117 ms each, all in the
@@ -1438,7 +1499,7 @@ import unchanged and green; pyflakes/vermin 3.6/static_check clean.
   several times slower than the second, identical one (the user's
   walk_left 4.5 s vs walk_right 1.2 s).
 
-2026.10.03 (3rd release, by @alkorsan)
+2026.10.03 (3rd release, by @badrelmers)
 + fix: folder compare could take 20-30 s on the very same folders
   that later compared in 1 s. Profiling on the user's machine showed
   the scan was pure metadata-syscall latency (each stat/scandir/
@@ -1479,7 +1540,7 @@ import unchanged and green; pyflakes/vermin 3.6/static_check clean.
   or stdlib): the plugin requires 3.8, and the pool shutdown avoids
   the 3.9-only cancel_futures parameter.
 
-2026.10.03 (2nd release, by @alkorsan)
+2026.10.03 (2nd release, by @badrelmers)
 + feature: full-line row colors in the folder-compare list. The list
   is now an owner-drawn listbox (listbox_ex + LISTBOX_SET_DRAWN) --
   the API's listview has no per-row colors, so the plugin paints every
@@ -1523,7 +1584,7 @@ import unchanged and green; pyflakes/vermin 3.6/static_check clean.
   dlg_proc calls dropped from two (columns get + items set) to
   pure listbox_proc calls.
 
-2026.10.03 (by @alkorsan)
+2026.10.03 (by @badrelmers)
 + feature: folder comparison, WinMerge-style (new module compare_dir.py).
   "Compare two folders..." opens a non-modal compare window for two
   picked folders; any number of windows can be open at once (compare

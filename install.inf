@@ -9,7 +9,44 @@ api=1.0.483
 
 [item1]
 section=events
-events=on_state~,on_state_ed~,on_caret~,on_change~,on_change_slow~,on_tab_menu,on_close_pre~,on_close~,on_save_pre~,on_exit_pre~
+; on_tab_menu is the ONLY static event (non-lazy on purpose: the
+; right-click tab menu must auto-load the plugin, compare tabs or not).
+;
+; ALL other events are subscribed ON DEMAND at runtime by
+; events_sub.py (EventSubscriptions -- the single registry, see its
+; EVENTS table), and unsubscribed again when no longer needed:
+;
+; while the plugin is loaded (survival set, armed at load, kept even
+; with zero compare tabs -- the plugin's whole idle cost):
+;   on_state~      session-switch re-attach + theme reloads (rare
+;                  app-level event)
+;   on_exit_pre~   app exit: cancel in-flight background jobs
+;
+; while at least one compare tab exists (dropped when the LAST compare
+; tab closes):
+;   on_change~       dirty-half tracking, tab title color
+;   on_close_pre~    suppress 'Save changes?' for clean compare tabs
+;   on_close~        teardown of the closing tab's session
+;   on_save_pre~     Ctrl+S syncs dirty halves back to the originals
+;   on_state_ed~     word-wrap propagation between the two halves
+;
+; the same, plus their option on (a config reload re-evaluates):
+;   on_caret~        enable_sync_caret (caret mirroring)
+;   on_change_slow~  enable_auto_refresh (auto-refresh after pauses)
+;   on_key~          enable_keyboard_capture (in-compare hotkeys,
+;                    key-code filtered -- fires only for those keys)
+;   on_scroll~       sync_scroll OR enable_overview (scroll mirroring
+;                    + overview slider tracking)
+;
+; Every runtime subscription above is lazy ('~'): the bus in events_sub.py
+; adds the suffix itself, so no runtime event can ever auto-load the
+; plugin -- only on_tab_menu above does that.
+;
+; The on_start2 autostart entry is NOT here either: the plugin writes it
+; to plugins.ini itself while compare tabs persist across restarts
+; (Command._enable_autostart), so the plugin auto-loads on the next
+; startup to re-attach them.
+events=on_tab_menu
 
 [item2]
 section=commands

@@ -184,6 +184,16 @@ class ScrollSplittedTab:
       files (possible here when word-wrap makes the halves differ in
       visual height).
 
+    NOTE: this class is now purely the MIRROR engine -- it owns no
+    subscription state anymore. The on_scroll event itself is managed
+    by events_sub.py (subscribed while compare tabs exist and
+    sync_scroll / enable_overview needs it), and Command.on_scroll
+    decides per event whether the mirror runs at all (it is gated on
+    the sync_scroll setting there). The old tab_id set + toggle()
+    method -- a parallel bookkeeping of "which tabs need on_scroll"
+    that could only be kept correct by hand at every call site -- is
+    gone: Command._sessions is the single truth, and the bus reads it.
+
     WHY THE MIRRORED HALF USES EDACTION_UPDATE (synchronous Repaint)
     AND NOT cmd_RepaintEditor (forced Invalidate):
 
@@ -205,27 +215,12 @@ class ScrollSplittedTab:
     cascade).
     """
 
-    def __init__(self, name):
-        self.name = name
-        self.tab_id = set()
+    def __init__(self):
         # Re-entrancy guard: True while an on_scroll handler is mirroring
         # a position, so a nested (synchronous) on_scroll for the opposite
         # half cannot start a second mirror pass. EDACTION_UPDATE's
         # synchronous repaint makes this nesting actually happen now.
         self._busy = False
-
-    def toggle(self, on=True):
-        """(Un)subscribe the on_scroll event for this module.
-
-        Subscribe when sync is on AND at least one compare tab exists --
-        the focused tab does NOT have to be a compare tab: the event is
-        subscribed globally (on_scroll supports no event filter) and
-        filtered per event in __init__.py. The old condition (focused tab
-        must be a compare tab) could UNSUBSCRIBE while compares were open
-        (e.g. change_config ran from a normal tab), silently killing the
-        sync until the next compare was created."""
-        act = ct.PROC_EVENTS_SUB if on and self.tab_id else ct.PROC_EVENTS_UNSUB
-        ct.app_proc(act, self.name+';on_scroll;;')
 
     def on_scroll(self, ed_self):
         """Mirror the scroll position of ed_self to the opposite half of

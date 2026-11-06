@@ -37,6 +37,7 @@ from .profiling import (Profiler, enable_profiling, profiling_report,
                         reset_profiling, start_profiling, stop_profiling,
                         cancel_profiling)
 from .utils import split_lines_safe, ScrollSplittedTab
+from .events_sub import EventSubscriptions, build_events
 from .unidiff import (UnidiffRunner, report_status,
                       unified_diff_opcodes)
 from cudax_lib import get_translation
@@ -371,7 +372,7 @@ _TAB_GREEN = 0x00A000
 
 # Hotkeys for compare tabs, dispatched by Command.on_key. The plugin
 # subscribes to the lazy on_key~ event AT RUNTIME with a key-code filter
-# (see _sync_on_key_subscription) -- install.inf does NOT list on_key.
+# (see events_sub.py's EVENTS table) -- install.inf does NOT list on_key.
 # Key code -> tuple of (Command method name, required modifier state)
 # entries, tried in order until one matches EXACTLY:
 #   'a'  = Alt and only Alt,  'ca' = Ctrl+Alt and only those two,
@@ -1773,15 +1774,21 @@ class _TabSession:
 
 class Command:
     def __init__(self):
-        self.scroll = ScrollSplittedTab(__name__)
+        self.scroll = ScrollSplittedTab()
         self.cfg = self.get_config()
         # Register our (namespaced) bookmark kinds with the loaded
         # colors; config() re-applies them before every compare -- see
         # the constants block above for why this is never cached.
         self._register_bookmark_kinds()
-        # Subscribe to the on_key event when keyboard capture is enabled
-        # (runtime subscription -- install.inf no longer lists on_key).
-        self._sync_on_key_subscription()
+        # THE runtime event subscription bus: every event except the
+        # install.inf on_tab_menu is subscribed through it, on demand
+        # (see events_sub.py for the full table and rationale). The
+        # first update() runs at the END of __init__ (the survival set
+        # -- on_state / on_exit_pre: an idle plugin still notices
+        # session switches and cancels jobs at exit), after every
+        # attribute the bus conditions read is initialized.
+        self.evbus = EventSubscriptions(MODULE_NAME,
+                                        build_events(_HOTKEY_KEY_FILTER))
         # Set to True by on_exit_pre when CudaText is about to exit, so that
         # on_close (which fires next, once per closing tab) can skip
         # temp-file deletion and let compare tabs persist across restarts.
@@ -1823,6 +1830,14 @@ class Command:
         self.menuid_sep = None
         self.menuid_withfile = None
         self.menuid_withtab = None
+
+        # First subscription pass: with no compare tabs yet this arms
+        # exactly the survival set (on_state~, on_exit_pre~) -- the
+        # per-keystroke / per-caret / per-scroll events stay away from
+        # CudaText until the first compare tab exists (set_files runs
+        # the next pass). on_start2 (autostart restore) and the
+        # compare commands each run their own pass right after this.
+        self._update_event_subscriptions()
 
     def _session_key(self, session_path):
         """Convert a session file path to a state-file key. If the session
@@ -2039,45 +2054,46 @@ class Command:
         ct.ini_proc(ct.INI_DELETE_KEY, PLUGINS_INI, PLUGINS_INI_SECTION, MODULE_NAME)
 
     # ------------------------------------------------------------------
-    # on_key event subscription (runtime, via app_proc -- install.inf
-    # does NOT list on_key). Driven by the 'enable_keyboard_capture'
-    # setting: subscribed while enabled, unsubscribed while disabled.
+    # Runtime event subscriptions -- the single funnel. EVERY event but
+    # the install.inf on_tab_menu is subscribed through events_sub.py's
+    # bus, on demand: the survival set while the plugin is loaded with
+    # no compare tabs, the compare / option-gated sets while at least
+    # one compare tab exists. on_key, on_scroll and the eight events
+    # install.inf used to declare statically are all in that one table
+    # now -- the separate _subscribe_on_key/_sync_on_key_subscription
+    # helpers and ScrollSplittedTab.toggle() it replaces had each
+    # hand-rolled the same job. See events_sub.py for the full picture.
     # ------------------------------------------------------------------
 
-    def _subscribe_on_key(self):
-        """Subscribe to the on_key event at runtime (PROC_EVENTS_SUB).
+    def _update_event_subscriptions(self):
+        """Recompute every runtime event subscription from the plugin's
+        CURRENT state and hand the diff to self.evbus.
 
-        The lazy 'on_key~' form keeps keystrokes from ever auto-loading
-        the plugin: the event fires only while the plugin is loaded, and
-        a compare tab (the only place the hotkeys do anything) can only
-        exist with the plugin loaded anyway. The key-code filter
-        (_HOTKEY_KEY_FILTER) makes the event fire only for the hotkey
-        key codes instead of every keystroke; the exact-modifier check
-        stays in on_key. PROC_EVENTS_SUB first unsubscribes the listed
-        events (all lexer/filter combinations), so repeated calls never
-        stack duplicate subscriptions."""
-        ct.app_proc(ct.PROC_EVENTS_SUB,
-                    '{};on_key~;;{}'.format(MODULE_NAME, _HOTKEY_KEY_FILTER))
+        Cheap by construction: the bus remembers what it subscribed and
+        issues only the SUBs/UNSUBs the state change actually needs, so
+        a call with an unchanged state makes no app_proc calls at all --
+        callers never have to guard against a redundant pass.
 
-    def _unsubscribe_on_key(self):
-        """Unsubscribe from the on_key event at runtime
-        (PROC_EVENTS_UNSUB): key events stop reaching the plugin until
-        _subscribe_on_key runs again (re-enabling the setting, or the
-        next plugin load with the setting on)."""
-        ct.app_proc(ct.PROC_EVENTS_UNSUB,
-                    '{};on_key'.format(MODULE_NAME))
-
-    def _sync_on_key_subscription(self):
-        """Make the on_key subscription track the current value of the
-        'enable_keyboard_capture' setting: subscribe when enabled,
-        unsubscribe when disabled. Called at plugin load (Command
-        constructor) and on every config reload (config()), so both the
-        Options dialog and hand-edits to cuda_differ2.json take effect
-        without a restart."""
-        if self.cfg.get('enable_keyboard_capture', True):
-            self._subscribe_on_key()
-        else:
-            self._unsubscribe_on_key()
+        Called at every subscription-relevant transition:
+          Command.__init__      plugin load (arms the survival set)
+          set_files             compare tab created -- BEFORE the texts
+                                load, so on_change is already subscribed
+                                when set_text_all fires the two spurious
+                                events the suppression counter swallows
+          on_close              compare tab closed -- after the session
+                                is popped; the LAST close drops back to
+                                the survival set
+          _restore_session_tabs startup / session-switch re-attach
+          _toolbar_restore_timer overviews of restored tabs re-created
+                                (on_scroll's condition covers them)
+          refresh_compare       per compare (self-healing no-op)
+          config                config reload -- the option-gated
+                                events (enable_sync_caret,
+                                enable_auto_refresh,
+                                enable_keyboard_capture, sync_scroll /
+                                enable_overview) follow at once"""
+        self.evbus.update(has_compares=bool(self._sessions),
+                          cfg=self.cfg)
 
     def _visible_opts_meta(self):
         """OPTS_META filtered for what the current algorithm can use.
@@ -2133,9 +2149,12 @@ class Command:
                 path_keys_info=METAJSONFILE, subset=subset, how=how)
         if op_ed_dlg.show(_('Differ 2 Options')):  # Dialog caption
             # Need to use updated options
+            # (config() reloads the file -- its cache-miss branch runs
+            # _update_event_subscriptions(), so the option-gated events
+            # (on_caret / on_change_slow / on_key / on_scroll) follow
+            # the new settings at once; no separate scroll.toggle here
+            # anymore.)
             self.config()
-            self.scroll.toggle(self.cfg['sync_scroll'])
-            # self.scroll.enable_sync_caret = self.cfg['enable_sync_caret']
             # Toolbars follow the (possibly changed) toolbar options:
             # create missing ones, destroy the ones the option turned
             # off, apply show_btn_text, refresh Ignore captions/menus
@@ -2675,6 +2694,16 @@ class Command:
             # state that stays visible until the compare finishes.
             overview.repaint_static()
 
+        # Arm the runtime event subscriptions NOW -- this is the
+        # instant the plugin goes from idle (survival set only) to
+        # active (compare set): the session is registered above and
+        # the overview (if any) exists, and the two spurious on_change
+        # events set_text_all fires BELOW must find on_change already
+        # subscribed, or the suppression counter would still be 2 when
+        # the user's first REAL edits arrive and swallow them (the
+        # green title would not flip to red until the third edit).
+        self._update_event_subscriptions()
+
         # Load each original's content into the two split halves.
         # The overview is docked, the scrollbars are hidden and the
         # micromap columns are in place -- and ONE UI pump just made
@@ -2705,9 +2734,9 @@ class Command:
         # next startup to restore compare tabs.
         self._enable_autostart()
 
-        # Track this tab for scroll sync.
-        self.scroll.tab_id.add(compare_tab_id)
-        self.scroll.toggle(self.cfg.get('sync_scroll'))
+        # (No per-tab scroll bookkeeping anymore: the runtime
+        # subscription pass above and Command._sessions are the single
+        # truth of what needs on_scroll -- see events_sub.py.)
 
         # app sets LastLineOnTop automatically on adding 'gaps', but if file
         # don't have gaps, we must set it manually.
@@ -2840,6 +2869,13 @@ class Command:
         theme switch may have moved the compare colors; bracket CudaText
         session loads so session-switch tab closes keep their persisted
         registrations.
+
+        SURVIVAL-set event (events_sub.py): subscribed from plugin load
+        and NEVER dropped -- even with zero compare tabs this handler
+        must see APPSTATE_SESSION_LOAD, because a session switch that
+        just restored compare tabs can only be noticed here (the
+        re-attach pass below); idle cost is one cheap dispatch per
+        rare app-level state change.
 
         Note: EDSTATE_* values (word-wrap, read-only, zoom...) never
         arrive here. Since CudaText 1.94.0 (api 1.0.320) on_state only
@@ -2997,13 +3033,16 @@ class Command:
         session = self._session_for(tab_id)
         if session is not None:
             overview = session.overview
-            if overview is None:
-                self.scroll.on_scroll(ed_self)
-            elif overview.is_driving_scroll():
+            if overview is not None and overview.is_driving_scroll():
                 # Paint-completion signal for the overview's drag
                 # pipeline (no mirror: the overview writes both halves).
                 overview.note_scroll_painted()
-            else:
+            elif self.cfg.get('sync_scroll'):
+                # Mirror the position to the opposite half -- gated on
+                # the setting HERE now: the event subscription itself
+                # (events_sub.py) is armed for overview tracking too
+                # (sync_scroll off + overview on), and an overview-only
+                # subscription must never scroll the opposite half.
                 self.scroll.on_scroll(ed_self)
             if overview is not None:
                 overview.track_paint()
@@ -3058,6 +3097,14 @@ class Command:
                 if ed is not None:
                     difftb.ensure_for_session(self, session, ed)
             self._restore_compare_layout(session)
+        # Re-run the runtime event subscriptions now that the restored
+        # tabs' overviews exist: on_scroll's condition (events_sub.py)
+        # covers overview tracking even with sync_scroll off, but the
+        # pass _restore_session_tabs ran BEFORE this timer -- with the
+        # overviews still missing -- so an overview-only configuration
+        # (sync_scroll off) gets its on_scroll here. A no-op in every
+        # other configuration (the bus skips unchanged subscriptions).
+        self._update_event_subscriptions()
 
     def _restore_compare_layout(self, session):
         """Re-create the width-affecting parts of ONE restored compare
@@ -3184,7 +3231,13 @@ class Command:
             pass
 
     def on_caret(self, ed_self):
-        """Mirror caret to opposite editor when sync_caret is enabled."""
+        """Mirror caret to opposite editor when sync_caret is enabled.
+
+        RUNTIME subscription (events_sub.py): on_caret is subscribed
+        only while the enable_sync_caret setting is on AND at least one
+        compare tab exists -- with it off (the default), caret moves in
+        ANY tab never reach the plugin at all. The cfg check below is a
+        cheap safety net for a stale subscription."""
         if self.cfg.get('enable_sync_caret', False):
             self.sync_caret()
 
@@ -3214,7 +3267,12 @@ class Command:
 
         Performance: the session lookup is one dict get (no disk I/O),
         so non-compare tabs return in O(1). The handler is lightweight
-        enough for on_change."""
+        enough for on_change.
+
+        RUNTIME subscription (events_sub.py): the event reaches the
+        plugin only while at least one compare tab exists -- with none
+        open, keystrokes in other tabs carry no Differ 2 call at all
+        (the plugin's whole per-keystroke cost when idle is gone)."""
         tab_id = ed_self.get_prop(ct.PROP_TAB_ID)
         session = self._session_for(tab_id)
         if session is None:
@@ -3250,15 +3308,20 @@ class Command:
     def on_change_slow(self, ed_self):
         """Fires after the user edits and a short pause passes. Used only
         for auto-refreshing the diff markers if that option is enabled.
-        Color/saved-state logic is handled in on_change (immediate)."""
+        Color/saved-state logic is handled in on_change (immediate).
+
+        RUNTIME subscription (events_sub.py): subscribed only while the
+        enable_auto_refresh setting is on AND a compare tab exists; the
+        cfg check below is a cheap safety net for a stale subscription."""
         if self.cfg.get('enable_auto_refresh', False):
             self.refresh_compare(ed_self, show_dialog=False)  # automatic -- no dialog
 
     def on_key(self, ed_self, key, state):
-        """Hotkeys inside compare tabs (subscribed at RUNTIME to the lazy
-        on_key~ event with a key-code filter -- see
-        _sync_on_key_subscription -- so this only runs while the plugin
-        is loaded, and only for the hotkey key codes).
+        """Hotkeys inside compare tabs (a RUNTIME subscription -- events_sub.py
+        subscribes the lazy on_key~ event, with the key-code filter derived
+        from _HOTKEYS, only while the enable_keyboard_capture setting is on
+        AND at least one compare tab exists -- so keystrokes stop reaching
+        the plugin entirely the moment the last compare tab closes).
 
         Mapping (the same commands as the menu items, see _HOTKEYS):
             Alt+Left       -> "Copy current difference to the left"
@@ -3282,8 +3345,9 @@ class Command:
         meaning the user's keybindings give them.
 
         The 'enable_keyboard_capture' setting gates the event
-        subscription itself (subscribed when enabled, unsubscribed when
-        disabled -- see _sync_on_key_subscription); the cfg check below
+        subscription itself (events_sub.py's table: subscribed when
+        enabled AND a compare tab exists, unsubscribed otherwise -- a
+        config() reload re-runs the pass at once); the cfg check below
         is a cheap safety net for a stale subscription.
 
         Returns False when a hotkey was recognized and its command ran,
@@ -3581,7 +3645,6 @@ class Command:
             self._save_sessions(data)
 
         # --- Rebuild the sessions for the surviving compare tabs ---
-        self.scroll.tab_id = set()
         self._sessions = {}
         for tab_id_str, entry in group.items():
             if not isinstance(entry, dict):
@@ -3590,7 +3653,6 @@ class Command:
                 tab_id_int = int(tab_id_str)
             except (ValueError, TypeError):
                 tab_id_int = tab_id_str
-            self.scroll.tab_id.add(tab_id_int)
             # A restored tab gets a full standalone session, but its
             # Differ stays None until the first compare needs it (no
             # 'Using ... Algo' status spam at restore time; a restored
@@ -3629,9 +3691,13 @@ class Command:
             callback = 'module=cuda_differ2;cmd=_toolbar_restore_timer;info=_;'
             ct.timer_proc(ct.TIMER_START_ONE, callback, 300)
 
-        # Re-subscribe to on_scroll event if sync_scroll is enabled.
-        if self.cfg.get('sync_scroll') and self.scroll.tab_id:
-            ct.app_proc(ct.PROC_EVENTS_SUB, self.scroll.name+';on_scroll;;')
+        # Arm the runtime event subscriptions for the rebuilt world:
+        # compare tabs exist again, so the compare / option-gated sets
+        # come back (on_scroll is covered by the sync_scroll /
+        # enable_overview conditions; the overviews themselves arrive
+        # with the 300ms timer above, which runs its own pass). With no
+        # restored tab this is the no-op that keeps the survival set.
+        self._update_event_subscriptions()
 
     @staticmethod
     def _clear_modified(*eds):
@@ -3710,14 +3776,13 @@ class Command:
         # here -- see compare_dir.close_all).
         dfd.close_all()
 
-    '''
-    def on_tab_change(self, ed_self):
-        self.config()
-        self.scroll.toggle(self.cfg.get('sync_scroll'))
-    '''
-
     def on_tab_menu(self, ed_self):
-        """Build the right-click tab context menu (Compare with..., Recompare, etc.)."""
+        """Build the right-click tab context menu (Compare with..., Recompare, etc.).
+
+        THE only install.inf event: it is non-lazy on purpose, so the
+        menu works (and auto-loads the plugin) from the very first
+        right-click, compare tabs or not. Every other event is a
+        runtime subscription -- see events_sub.py."""
         self.tabmenu_init(ed_self)
 
     def _lock_compare_editors(self, job):
@@ -4845,8 +4910,12 @@ class Command:
                 del b_text_all
                 Profiler.stop('compare:split_lines')
 
-            self.scroll.tab_id.add(tab_id)
-            self.scroll.toggle(self.cfg.get('sync_scroll'))
+            # Self-healing subscription pass: a compare tab exists by
+            # definition here, so this is a no-op except on the exotic
+            # paths where the earlier passes could not see the full
+            # state yet (a restored tab whose overview this refresh
+            # just created with sync_scroll off, and the like).
+            self._update_event_subscriptions()
 
             diff.withdetail = self.cfg.get('compare_with_details')
             # Use the resolved algorithm (native→Python mapping when
@@ -7603,10 +7672,14 @@ class Command:
            self.cfg.get('theme_name') != theme_name or \
            self.cfg.get('ui_theme_name') != ui_theme_name:
             self.cfg = self.get_config()
-            # Keep the runtime on_key subscription in step with the
-            # (possibly changed) enable_keyboard_capture setting --
-            # takes effect at once, without a restart.
-            self._sync_on_key_subscription()
+            # Keep the runtime event subscriptions in step with the
+            # (possibly changed) option-gated settings --
+            # enable_sync_caret, enable_auto_refresh,
+            # enable_keyboard_capture, sync_scroll / enable_overview --
+            # takes effect at once, without a restart. (The pass is a
+            # tracked diff: only the events whose condition actually
+            # flipped get an app_proc call.)
+            self._update_event_subscriptions()
             # (No menu re-sync needed anymore: the diff-tab context menu
             # is rebuilt from the settings file by tabmenu_init on every
             # right-click, so it always mirrors the current values.)
@@ -8666,11 +8739,9 @@ class Command:
             # state_key).
             entry = self._unregister_compare_tab(session)
 
-        # Remove from in-memory scroll set.
-        try:
-            self.scroll.tab_id.discard(int(tab_id))
-        except (ValueError, TypeError):
-            pass
+        # (No in-memory scroll-set maintenance anymore: the runtime
+        # subscription pass below reads Command._sessions directly --
+        # one registry, nothing to keep in step by hand.)
 
         # Destroy the paintbox overview for this tab.
         overview = session.overview
@@ -8696,6 +8767,20 @@ class Command:
         # The session itself goes last -- after this the tab's world
         # (Differ/diffmap, caches, timer flags) is fully gone.
         self._sessions.pop(session.tab_id_str, None)
+
+        # THE drop-to-idle transition: recompute the runtime event
+        # subscriptions from the shrunken registry. While other compare
+        # tabs remain open this changes nothing; closing the LAST one
+        # unsubscribes every compare / option-gated event (on_change,
+        # on_caret, on_scroll, ...) and leaves exactly the survival set
+        # (on_state, on_exit_pre) plus the static on_tab_menu -- an
+        # idle plugin costs CudaText no per-keystroke / per-caret /
+        # per-scroll call until the next compare starts. Works for every
+        # close flavor (user close, session-switch close, app exit)
+        # because the bus diff is derived from the registry alone; the
+        # app-exit case is harmless (the UNSUBs only edit an in-memory
+        # list) and the exit branch below still runs afterwards.
+        self._update_event_subscriptions()
 
         # During app exit, keep the state entry and autostart subscription
         # so compare tabs persist restarts and the plugin auto-loads.
